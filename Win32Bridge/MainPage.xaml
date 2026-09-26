@@ -1,0 +1,57 @@
+﻿<Page
+    x:Class="Win32Bridge.MainPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:Win32Bridge"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d"
+    Background="{ThemeResource ApplicationPageBackgroundThemeBrush}">
+
+    <!-- TV-safe margins plus bounded diagnostics keep the guest surface usable
+         at Xbox 16:9 resolutions and on smaller desktop windows. -->
+    <Grid Padding="48,32,48,28" RowSpacing="16">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="64" />
+        </Grid.RowDefinitions>
+        <Grid Grid.Row="0" RowSpacing="12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <StackPanel Grid.Row="0" Spacing="3">
+                <TextBlock Text="Win32Bridge" FontSize="32" FontWeight="SemiBold" />
+                <TextBlock Text="Guest PE bootstrap" FontSize="18" />
+                <TextBlock x:Name="GuestStatusText" Text="Inspecting packaged guest..." MaxHeight="48" TextTrimming="WordEllipsis" TextWrapping="WrapWholeWords" Opacity="0.88" />
+                <TextBlock Text="USB mouse and keyboard bridge enabled." Opacity="0.65" />
+            </StackPanel>
+            <StackPanel Grid.Row="1" Orientation="Horizontal" Spacing="10">
+                <Button x:Name="RunGuestButton" MinWidth="160" Content="Run guest" Click="RunGuest_Click" IsEnabled="False" />
+                <Button x:Name="LoadGuestButton" MinWidth="150" Content="Load custom .exe" Click="LoadGuest_Click" />
+                <Button x:Name="Run7ZipButton" MinWidth="150" Content="Run 7-Zip UI" Click="Run7Zip_Click" IsEnabled="False" />
+                <Button x:Name="Test7ZipButton" MinWidth="130" Content="Test 7-Zip" Click="Test7Zip_Click" />
+            </StackPanel>
+        </Grid>
+        <Border Grid.Row="1" MinHeight="0" BorderBrush="{ThemeResource SystemControlForegroundBaseMediumBrush}" BorderThickness="1" Background="#FF101010" CornerRadius="6">
+            <Grid x:Name="GuestSurfaceHost">
+                <TextBlock x:Name="GuestSurfacePlaceholder" Text="Guest window surface will appear here." FontSize="18" HorizontalAlignment="Center" VerticalAlignment="Center" Opacity="0.7" />
+            </Grid>
+        </Border>
+        <Border Grid.Row="2" Padding="12" Background="#1AFFFFFF" CornerRadius="6">
+        <Grid RowSpacing="6">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <TextBlock Grid.Row="0" Text="Import catalog — full report: LocalStorage\Win32Bridge-imports.log" FontSize="14" />
+            <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <TextBlock x:Name="ApiReportText" FontFamily="Consolas" TextWrapping="WrapWholeWords" />
+            </ScrollViewer>
+            <TextBlock Grid.Row="2" Text="Execution requires every import to be bound." TextTrimming="WordEllipsis" Opacity="0.7" />
+        </Grid>
+        </Border>
+    </Grid>
+</Page>

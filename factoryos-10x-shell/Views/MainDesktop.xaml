@@ -1,0 +1,205 @@
+﻿<Page
+    x:Class="factoryos_10x_shell.Views.MainDesktop"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:Core="using:Microsoft.Xaml.Interactions.Core"
+    xmlns:Interactivity="using:Microsoft.Xaml.Interactivity"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="using:factoryos_10x_shell.Views"
+    xmlns:controls="using:factoryos_10x_shell.Controls"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <Page.Resources>
+        <CubicEase x:Key="CubicEaseInOut" EasingMode="EaseInOut" />
+        <QuadraticEase x:Key="QuadraticEaseInOut" EasingMode="EaseInOut" />
+    </Page.Resources>
+
+    <Grid x:Name="MainGrid">
+        <Image
+            x:Name="BackgroundWallpaper"
+            Grid.Row="0"
+            Source="ms-appx:///10x.png"
+            Stretch="UniformToFill" />
+        <Button
+            x:Name="DesktopFocusSink"
+            Width="1"
+            Height="1"
+            Opacity="0"
+            HorizontalAlignment="Left"
+            VerticalAlignment="Top"
+            IsHitTestVisible="False" />
+        <ItemsControl x:Name="WindowHost" IsHitTestVisible="True">
+            <ItemsControl.ItemsPanel>
+                <ItemsPanelTemplate>
+                    <Canvas />
+                </ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemContainerStyle>
+                <Style TargetType="ContentPresenter">
+                    <Setter Property="Canvas.Left" Value="{Binding Left}" />
+                    <Setter Property="Canvas.Top" Value="{Binding Top}" />
+                    <Setter Property="Canvas.ZIndex" Value="{Binding ZIndex}" />
+                    <Setter Property="Visibility" Value="{Binding Visibility}" />
+                </Style>
+            </ItemsControl.ItemContainerStyle>
+            <ItemsControl.ItemTemplate>
+                <DataTemplate>
+                    <controls:WebAppWindow />
+                </DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
+        <Canvas x:Name="FilesWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
+            <controls:FilesWindow x:Name="FilesWindow" Canvas.Left="160" Canvas.Top="80" Visibility="Collapsed" />
+        </Canvas>
+        <Canvas x:Name="NotepadWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
+            <controls:NotepadWindow x:Name="NotepadWindow" Canvas.Left="210" Canvas.Top="105" Visibility="Collapsed" />
+        </Canvas>
+        <Canvas x:Name="SettingsWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
+            <controls:SettingsWindow x:Name="SettingsWindow" Canvas.Left="90" Canvas.Top="45" Visibility="Collapsed" />
+        </Canvas>
+        <Grid
+            x:Name="TaskViewOverlay"
+            Margin="0,0,0,50"
+            Background="#D90A1830"
+            Visibility="Collapsed"
+            PointerPressed="TaskViewOverlay_PointerPressed">
+            <Grid MaxWidth="1200" Margin="70,55" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                </Grid.RowDefinitions>
+                <TextBlock Margin="8,0,8,24" FontSize="22" FontWeight="SemiBold" Text="Task view" />
+                <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Top" Orientation="Horizontal">
+                <Grid x:Name="FilesTaskCard" Width="280" Height="180" Margin="8" Visibility="Collapsed" Tapped="FilesTaskCard_Tapped">
+                    <Border Background="#FFF8F8F8" BorderBrush="#CCFFFFFF" BorderThickness="1" CornerRadius="3">
+                        <Grid>
+                            <Grid.RowDefinitions><RowDefinition Height="34" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                            <Grid Background="#FF303030">
+                                <TextBlock Margin="10,0,38,0" VerticalAlignment="Center" Foreground="White" Text="Files" TextTrimming="CharacterEllipsis" />
+                            </Grid>
+                            <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+                                <Image Width="52" Height="52" Source="ms-appx:///Assets/Files/files.png" Stretch="Uniform" />
+                                <TextBlock HorizontalAlignment="Center" Foreground="#FF555555" Text="Files" />
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+                    <Button Width="34" Height="34" Padding="0" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Click="FilesTaskClose_Click">
+                        <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE8BB;" />
+                    </Button>
+                </Grid>
+                <Grid x:Name="NotepadTaskCard" Width="280" Height="180" Margin="8" Visibility="Collapsed" Tapped="NotepadTaskCard_Tapped">
+                    <Border Background="#FFF8F8F8" BorderBrush="#CCFFFFFF" BorderThickness="1" CornerRadius="3">
+                        <Grid>
+                            <Grid.RowDefinitions><RowDefinition Height="34" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                            <Grid Background="#FF303030"><TextBlock Margin="10,0,38,0" VerticalAlignment="Center" Foreground="White" Text="Notepad" TextTrimming="CharacterEllipsis" /></Grid>
+                            <StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+                                <Image Width="52" Height="52" Source="ms-appx:///Assets/Notepad/notepad.png" Stretch="Uniform" />
+                                <TextBlock HorizontalAlignment="Center" Foreground="#FF555555" Text="Notepad" />
+                            </StackPanel>
+                        </Grid>
+                    </Border>
+                    <Button Width="34" Height="34" Padding="0" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Click="NotepadTaskClose_Click"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE8BB;" /></Button>
+                </Grid>
+                <Grid x:Name="SettingsTaskCard" Width="280" Height="180" Margin="8" Visibility="Collapsed" Tapped="SettingsTaskCard_Tapped">
+                    <Border Background="#FFF8F8F8" BorderBrush="#CCFFFFFF" BorderThickness="1" CornerRadius="3"><Grid><Grid.RowDefinitions><RowDefinition Height="34"/><RowDefinition Height="*"/></Grid.RowDefinitions><Grid Background="#FF303030"><TextBlock Margin="10,0,38,0" VerticalAlignment="Center" Foreground="White" Text="Settings"/></Grid><StackPanel Grid.Row="1" HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8"><Image Width="52" Height="52" Source="ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png" Stretch="Uniform"/><TextBlock HorizontalAlignment="Center" Foreground="#FF555555" Text="Settings"/></StackPanel></Grid></Border>
+                    <Button Width="34" Height="34" Padding="0" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Click="SettingsTaskClose_Click"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE8BB;"/></Button>
+                </Grid>
+                <GridView
+                    x:Name="TaskViewGrid"
+                    HorizontalAlignment="Left"
+                    IsItemClickEnabled="True"
+                    ItemClick="TaskViewGrid_ItemClick"
+                    ItemsSource="{Binding DataContext.Windows, ElementName=WindowHost}"
+                    SelectionMode="None">
+                    <GridView.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Width="280" Height="180" Margin="8">
+                                <Border Background="#FFF8F8F8" BorderBrush="#CCFFFFFF" BorderThickness="1" CornerRadius="3">
+                                    <Grid>
+                                        <Grid.RowDefinitions>
+                                            <RowDefinition Height="34" />
+                                            <RowDefinition Height="*" />
+                                        </Grid.RowDefinitions>
+                                        <Grid Background="#FF303030">
+                                            <Image Width="18" Height="18" Margin="10,0,0,0" HorizontalAlignment="Left" Source="{Binding App.IconUri}" Stretch="Uniform" />
+                                            <TextBlock Margin="38,0,38,0" VerticalAlignment="Center" Foreground="White" Text="{Binding App.Name}" TextTrimming="CharacterEllipsis" />
+                                        </Grid>
+                                        <Grid Grid.Row="1" Background="#FFEDEDED">
+                                            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+                                                <Image Width="46" Height="46" Source="{Binding App.IconUri}" Stretch="Uniform" />
+                                                <TextBlock HorizontalAlignment="Center" Foreground="#FF555555" Text="Web app" />
+                                            </StackPanel>
+                                        </Grid>
+                                    </Grid>
+                                </Border>
+                                <Button
+                                    Width="34"
+                                    Height="34"
+                                    Padding="0"
+                                    HorizontalAlignment="Right"
+                                    VerticalAlignment="Top"
+                                    Background="Transparent"
+                                    Click="TaskViewClose_Click"
+                                    ToolTipService.ToolTip="Close">
+                                    <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE8BB;" />
+                                </Button>
+                            </Grid>
+                        </DataTemplate>
+                    </GridView.ItemTemplate>
+                </GridView>
+                </StackPanel>
+            </Grid>
+        </Grid>
+        <Frame
+            x:Name="StartMenuFrame"
+            Canvas.ZIndex="30"
+            MaxWidth="810"
+            MaxHeight="685"
+            Margin="10,10,10,60"
+            HorizontalAlignment="Stretch"
+            VerticalAlignment="Bottom"
+            Background="Transparent"
+            CornerRadius="4">
+            <Frame.RenderTransform>
+                <TranslateTransform x:Name="StartMenuTransform" Y="800" />
+            </Frame.RenderTransform>
+        </Frame>
+        <Frame
+            x:Name="ActionCenterFrame"
+            Canvas.ZIndex="30"
+            MinHeight="50"
+            MaxWidth="400"
+            Margin="0,10,8,60"
+            HorizontalAlignment="Right"
+            VerticalAlignment="Bottom"
+            Background="Transparent"
+            CornerRadius="4">
+            <Frame.RenderTransform>
+                <TranslateTransform x:Name="ActionCenterTransform" Y="800" />
+            </Frame.RenderTransform>
+        </Frame>
+        <Frame
+            x:Name="TaskbarFrame"
+            Canvas.ZIndex="30"
+            MaxHeight="50"
+            VerticalAlignment="Bottom" />
+        <Button
+            x:Name="BgChangebutton"
+            Width="40"
+            Height="40"
+            HorizontalAlignment="Right"
+            VerticalAlignment="Top"
+            Click="BgChangebutton_Click">
+            <Button.Content>
+                <TextBlock
+                    Margin="0,-4,0,0"
+                    FontFamily="Segoe MDL2 Assets"
+                    FontSize="20"
+                    Text="&#xE771;" />
+
+            </Button.Content>
+
+        </Button>
+    </Grid>
+</Page>

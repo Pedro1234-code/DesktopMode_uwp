@@ -1,0 +1,1530 @@
+#include "pch.h"
+#include "Bridge\\GuestStorage.h"
+#include "Bridge/RuntimeDiagnostics.h"
+
+#include <windows.storage.fileproperties.h>
+
+#include <cwctype>
+#include <vector>
+
+using namespace Win32Bridge::Bridge;
+
+using namespace Platform;
+using namespace Windows::Storage;
+using namespace Windows::Storage::FileProperties;
+using namespace Windows::Storage::Streams;
+using namespace concurrency;
+
+namespace
+{
+    constexpr DWORD MaxSynchronousIo = 16 * 1024 * 1024;
+    constexpr size_t MaxGuestPathCharacters = 32767;
+    thread_local GuestStorageContext* g_currentGuestStorage = nullptr;
+    thread_local unsigned g_storageEnumerationDiagnostics = 0;
+
+    void SetError(std::wstring* error, const std::wstring& message)
+    {
+        if (error)
+        {
+            *error = message;
+        }
+    }
+
+    void SetWin32Error(DWORD* output, DWORD value)
+    {
+        if (output)
+        {
+            *output = value;
+        }
+    }
+
+    DWORD ErrorFromException(Exception^ exception)
+    {
+        if (!exception)
+        {
+            return ERROR_GEN_FAILURE;
+        }
+
+        const HRESULT code = exception->HResult;
+        if (HRESULT_FACILITY(code) == FACILITY_WIN32)
+        {
+            return HRESULT_CODE(code);
+        }
+        if (code == E_ACCESSDENIED)
+        {
+            return ERROR_ACCESS_DENIED;
+        }
+        if (code == E_INVALIDARG)
+        {
+            return ERROR_INVALID_PARAMETER;
+        }
+        return ERROR_GEN_FAILURE;
+    }
+
+    void RecordStorageException(const wchar_t* operation, Exception^ exception)
+    {
+        RuntimeDiagnostics::Record(
+            std::wstring(L"STORAGE EXCEPTION: ") + (operation ? operation : L"unknown") +
+            L"; HRESULT " + std::to_wstring(static_cast<unsigned long>(
+                exception ? exception->HResult : E_FAIL)) + L".");
+    }
+
+    std::vector<std::wstring> PhysicalComponents(const GuestPath& path)
+    {
+        std::vector<std::wstring> result;
+        result.reserve(path.components.size() + 1);
+        result.push_back(L"drive_c");
+        result.insert(result.end(), path.components.begin(), path.components.end());
+        return result;
+    }
+
+    bool HasReadAccess(DWORD access)
+    {
+        return (access & (GENERIC_READ | FILE_READ_DATA)) != 0;
+    }
+
+    bool HasWriteAccess(DWORD access)
+    {
+        return (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+    }
+
+    bool IsValidSearchPattern(const std::wstring& pattern)
+    {
+        if (pattern.empty() || pattern == L"." || pattern == L"..")
+        {
+            return false;
+        }
+
+        for (const wchar_t character : pattern)
+        {
+            if (character < 0x20 || character == L'<' || character == L'>' ||
+                character == L'"' || character == L'|' || character == L':' ||
+                character == L'\\' || character == L'/')
+            {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool SplitSearchPattern(
+        LPCWSTR searchPattern,
+        std::wstring* directory,
+        std::wstring* pattern,
+        DWORD* win32Error)
+    {
+        if (!searchPattern || !directory || !pattern)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
+        const size_t length = wcsnlen_s(searchPattern, MaxGuestPathCharacters + 1);
+        if (length == 0 || length > MaxGuestPathCharacters)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_NAME);
+            return false;
+        }
+
+        std::wstring value(searchPattern, length);
+        for (wchar_t& character : value)
+        {
+            if (character == L'/')
+            {
+                character = L'\\';
+            }
+        }
+
+        // Some desktop file managers probe the Win32 device-root spelling
+        // (\\.\\) while constructing their drive view. The bridge has no
+        // device namespace to expose; its only valid root is the guest C:
+        // drive. Treat this probe as an enumeration of that root instead of
+        // leaking ERROR_INVALID_NAME into normal shell navigation.
+        if (value == L"\\\\.\\" || value == L"\\\\?\\")
+        {
+            *directory = L"C:\\";
+            *pattern = L"*";
+            return true;
+        }
+
+        const size_t separator = value.find_last_of(L'\\');
+        if (separator == std::wstring::npos)
+        {
+            if (value.size() >= 2 && std::iswalpha(value[0]) && value[1] == L':')
+            {
+                *directory = value.substr(0, 2);
+                *pattern = value.substr(2);
+            }
+            else
+            {
+                *directory = L".";
+                *pattern = value;
+            }
+        }
+        else
+        {
+            *directory = value.substr(0, separator + 1);
+            *pattern = value.substr(separator + 1);
+        }
+
+        if (!IsValidSearchPattern(*pattern))
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_NAME);
+            return false;
+        }
+        return true;
+    }
+
+    bool WildcardMatch(const std::wstring& pattern, const std::wstring& name)
+    {
+        // Win32 treats *.* as an all-files wildcard, including names without a dot.
+        if (_wcsicmp(pattern.c_str(), L"*.*") == 0)
+        {
+            return true;
+        }
+
+        size_t patternIndex = 0;
+        size_t nameIndex = 0;
+        size_t lastStar = std::wstring::npos;
+        size_t starMatch = 0;
+        while (nameIndex < name.size())
+        {
+            if (patternIndex < pattern.size() &&
+                (pattern[patternIndex] == L'?' ||
+                 std::towlower(pattern[patternIndex]) == std::towlower(name[nameIndex])))
+            {
+                ++patternIndex;
+                ++nameIndex;
+            }
+            else if (patternIndex < pattern.size() && pattern[patternIndex] == L'*')
+            {
+                lastStar = patternIndex++;
+                starMatch = nameIndex;
+            }
+            else if (lastStar != std::wstring::npos)
+            {
+                patternIndex = lastStar + 1;
+                nameIndex = ++starMatch;
+            }
+            else
+            {
+                return false;
+            }
+        }
+
+        while (patternIndex < pattern.size() && pattern[patternIndex] == L'*')
+        {
+            ++patternIndex;
+        }
+        return patternIndex == pattern.size();
+    }
+
+    FILETIME ToFileTime(Windows::Foundation::DateTime value)
+    {
+        ULARGE_INTEGER raw = {};
+        raw.QuadPart = static_cast<ULONGLONG>(value.UniversalTime);
+        FILETIME result = {};
+        result.dwLowDateTime = raw.LowPart;
+        result.dwHighDateTime = raw.HighPart;
+        return result;
+    }
+
+    DWORD MapFileAttributes(IStorageItem^ item, bool isDirectory)
+    {
+        const DWORD source = static_cast<DWORD>(item->Attributes);
+        DWORD result = 0;
+        if ((source & static_cast<DWORD>(FileAttributes::ReadOnly)) != 0)
+        {
+            result |= FILE_ATTRIBUTE_READONLY;
+        }
+        if ((source & static_cast<DWORD>(FileAttributes::Archive)) != 0)
+        {
+            result |= FILE_ATTRIBUTE_ARCHIVE;
+        }
+        if ((source & static_cast<DWORD>(FileAttributes::Temporary)) != 0)
+        {
+            result |= FILE_ATTRIBUTE_TEMPORARY;
+        }
+        if (isDirectory)
+        {
+            result |= FILE_ATTRIBUTE_DIRECTORY;
+        }
+        return result == 0 ? FILE_ATTRIBUTE_NORMAL : result;
+    }
+
+    bool FillFindData(IStorageItem^ item, WIN32_FIND_DATAW* findData, DWORD* win32Error)
+    {
+        if (!item || !findData)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
+        const bool isDirectory = item->IsOfType(StorageItemTypes::Folder);
+        const std::wstring name(item->Name->Data());
+        if (name.empty() || name.size() >= ARRAYSIZE(findData->cFileName))
+        {
+            SetWin32Error(win32Error, ERROR_FILENAME_EXCED_RANGE);
+            return false;
+        }
+
+        try
+        {
+            auto properties = create_task(item->GetBasicPropertiesAsync()).get();
+            ZeroMemory(findData, sizeof(*findData));
+            findData->dwFileAttributes = MapFileAttributes(item, isDirectory);
+            findData->ftCreationTime = ToFileTime(item->DateCreated);
+            findData->ftLastWriteTime = ToFileTime(properties->DateModified);
+            // UWP exposes no separate access timestamp. Use the modified time,
+            // which is the least surprising value for old Win32 callers.
+            findData->ftLastAccessTime = findData->ftLastWriteTime;
+            if (!isDirectory)
+            {
+                const ULONGLONG size = properties->Size;
+                findData->nFileSizeLow = static_cast<DWORD>(size);
+                findData->nFileSizeHigh = static_cast<DWORD>(size >> 32);
+            }
+            wcsncpy_s(findData->cFileName, name.c_str(), _TRUNCATE);
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+        catch (Exception^ exception)
+        {
+            RecordStorageException(L"GetBasicPropertiesAsync during directory enumeration", exception);
+            SetWin32Error(win32Error, ErrorFromException(exception));
+            return false;
+        }
+    }
+}
+
+struct GuestStorageContext::FileRecord final
+{
+    FileRecord(IRandomAccessStream^ value, bool canRead, bool canWrite)
+        : stream(value), readable(canRead), writable(canWrite)
+    {
+    }
+
+    Platform::Agile<IRandomAccessStream^> stream;
+    bool readable;
+    bool writable;
+    // Protected by lock.  Closing first removes the handle from the shared
+    // table, then marks this record closed before releasing its stream.  An
+    // I/O operation that already retained the record therefore cannot race a
+    // subsequent stream close.
+    bool closed = false;
+    std::mutex lock;
+};
+
+struct GuestStorageContext::FindRecord final
+{
+    explicit FindRecord(std::vector<WIN32_FIND_DATAW> values)
+        : entries(std::move(values))
+    {
+    }
+
+    std::vector<WIN32_FIND_DATAW> entries;
+    size_t next = 1;
+    std::mutex lock;
+};
+
+GuestStorageContext::GuestStorageContext(StorageFolder^ localFolder, const std::wstring& modulePath)
+    : m_localFolder(localFolder)
+{
+    GuestPath module;
+    std::wstring ignored;
+    if (m_paths.Resolve(modulePath.c_str(), &module, &ignored))
+    {
+        m_modulePath = module.canonical;
+        const size_t lastSeparator = m_modulePath.find_last_of(L'\\');
+        GuestPath current;
+        if (lastSeparator != std::wstring::npos &&
+            m_paths.Resolve(m_modulePath.substr(0, lastSeparator).c_str(), &current, &ignored))
+        {
+            m_paths.SetCurrentDirectoryPath(current, &ignored);
+        }
+    }
+    else
+    {
+        m_modulePath = L"C:\\Program Files\\Win32Bridge\\Guest.exe";
+    }
+
+    // Preserve the staging-time default.  The resolver itself is reused
+    // across runs, so its mutable current directory must not become guest
+    // process state that leaks into the next invocation.
+    m_initialCurrentDirectory = m_paths.CurrentDirectory();
+}
+
+GuestStorageContext::~GuestStorageContext()
+{
+    CloseAll();
+}
+
+bool GuestStorageContext::Resolve(LPCWSTR path, GuestPath* resolved, DWORD* win32Error) const
+{
+    std::wstring error;
+    if (!m_paths.Resolve(path, resolved, &error))
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_NAME);
+        return false;
+    }
+    return true;
+}
+
+bool GuestStorageContext::GetFolder(
+    const std::vector<std::wstring>& physicalComponents,
+    bool createMissing,
+    StorageFolder^* folder,
+    DWORD* win32Error) const
+{
+    if (!folder)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    try
+    {
+        StorageFolder^ current = m_localFolder.Get();
+        if (!current)
+        {
+            SetWin32Error(win32Error, ERROR_PATH_NOT_FOUND);
+            return false;
+        }
+
+        for (const auto& component : physicalComponents)
+        {
+            const auto name = ref new String(component.c_str());
+            current = createMissing
+                ? create_task(current->CreateFolderAsync(name, CreationCollisionOption::OpenIfExists)).get()
+                : create_task(current->GetFolderAsync(name)).get();
+        }
+        *folder = current;
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        RecordStorageException(createMissing ? L"CreateFolderAsync" : L"GetFolderAsync", exception);
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::GetParentFolder(
+    const GuestPath& path,
+    StorageFolder^* parent,
+    std::wstring* leafName,
+    DWORD* win32Error) const
+{
+    if (path.components.empty() || !parent || !leafName)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_NAME);
+        return false;
+    }
+
+    std::vector<std::wstring> physical = PhysicalComponents(path);
+    *leafName = physical.back();
+    physical.pop_back();
+    return GetFolder(physical, false, parent, win32Error);
+}
+
+bool GuestStorageContext::GetDirectoryFolder(const GuestPath& path, StorageFolder^* folder, DWORD* win32Error) const
+{
+    return GetFolder(PhysicalComponents(path), false, folder, win32Error);
+}
+
+bool GuestStorageContext::EnsureLayout(std::wstring* error)
+{
+    const std::vector<std::vector<std::wstring>> requiredDirectories =
+    {
+        { L"drive_c" },
+        { L"drive_c", L"Program Files" },
+        { L"drive_c", L"Program Files", L"Win32Bridge" },
+        { L"drive_c", L"Users" },
+        { L"drive_c", L"Users", L"Default" },
+        { L"drive_c", L"Users", L"Default", L"Documents" },
+        { L"drive_c", L"Users", L"Default", L"AppData" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Local" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Local", L"Temp" },
+        { L"drive_c", L"Windows" },
+        { L"drive_c", L"Windows", L"System32" }
+    };
+
+    DWORD win32Error = ERROR_SUCCESS;
+    for (const auto& directory : requiredDirectories)
+    {
+        StorageFolder^ ignored = nullptr;
+        if (!GetFolder(directory, true, &ignored, &win32Error))
+        {
+            SetError(error, L"Could not initialize the virtual C: drive (" + std::to_wstring(win32Error) + L").");
+            return false;
+        }
+    }
+    return true;
+}
+
+bool GuestStorageContext::AddFile(
+    IRandomAccessStream^ stream,
+    bool readable,
+    bool writable,
+    HANDLE* guestHandle,
+    DWORD* win32Error)
+{
+    if (!stream || !guestHandle)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    auto record = std::make_shared<FileRecord>(stream, readable, writable);
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    ULONG_PTR token = 0;
+    if (!AllocateHandleLocked(&token))
+    {
+        SetWin32Error(win32Error, ERROR_TOO_MANY_OPEN_FILES);
+        return false;
+    }
+
+    m_files.emplace(token, record);
+    *guestHandle = reinterpret_cast<HANDLE>(token);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestStorageContext::AddFind(
+    const std::shared_ptr<FindRecord>& record,
+    HANDLE* guestHandle,
+    DWORD* win32Error)
+{
+    if (!record || !guestHandle)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    ULONG_PTR token = 0;
+    if (!AllocateHandleLocked(&token))
+    {
+        SetWin32Error(win32Error, ERROR_TOO_MANY_OPEN_FILES);
+        return false;
+    }
+
+    m_finds.emplace(token, record);
+    *guestHandle = reinterpret_cast<HANDLE>(token);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestStorageContext::AllocateHandleLocked(ULONG_PTR* token)
+{
+    if (!token || m_files.size() + m_finds.size() >= MaximumHandles)
+    {
+        return false;
+    }
+
+    // With the bounded table we will find a free token within this many
+    // probes.  The range check also makes a reused context recover cleanly if
+    // a previous run advanced the cursor to the synchronization namespace.
+    for (size_t attempt = 0; attempt <= MaximumHandles; ++attempt)
+    {
+        if (m_nextHandle < FirstHandleToken || m_nextHandle >= FirstReservedHandleToken)
+        {
+            m_nextHandle = FirstHandleToken;
+        }
+
+        const ULONG_PTR candidate = m_nextHandle++;
+        if (m_nextHandle >= FirstReservedHandleToken)
+        {
+            m_nextHandle = FirstHandleToken;
+        }
+
+        if (m_files.find(candidate) != m_files.end() ||
+            m_finds.find(candidate) != m_finds.end())
+        {
+            continue;
+        }
+
+        *token = candidate;
+        return true;
+    }
+
+    return false;
+}
+
+std::shared_ptr<GuestStorageContext::FileRecord> GuestStorageContext::LookupFile(HANDLE guestHandle) const
+{
+    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
+    if (token < FirstHandleToken || token >= FirstReservedHandleToken)
+    {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    const auto found = m_files.find(token);
+    return found == m_files.end() ? nullptr : found->second;
+}
+
+std::shared_ptr<GuestStorageContext::FindRecord> GuestStorageContext::LookupFind(HANDLE guestHandle) const
+{
+    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
+    if (token < FirstHandleToken || token >= FirstReservedHandleToken)
+    {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    const auto found = m_finds.find(token);
+    return found == m_finds.end() ? nullptr : found->second;
+}
+
+bool GuestStorageContext::CreateFile(
+    LPCWSTR fileName,
+    DWORD desiredAccess,
+    DWORD,
+    DWORD creationDisposition,
+    DWORD flagsAndAttributes,
+    HANDLE,
+    HANDLE* guestHandle,
+    DWORD* win32Error)
+{
+    if (!guestHandle)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    *guestHandle = INVALID_HANDLE_VALUE;
+
+    if ((flagsAndAttributes & FILE_FLAG_OVERLAPPED) != 0 ||
+        (flagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE) != 0)
+    {
+        SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
+        return false;
+    }
+
+    const bool readable = HasReadAccess(desiredAccess);
+    const bool writable = HasWriteAccess(desiredAccess);
+    if ((creationDisposition == CREATE_NEW || creationDisposition == CREATE_ALWAYS ||
+        creationDisposition == TRUNCATE_EXISTING) && !writable)
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+        return false;
+    }
+
+    GuestPath path;
+    if (!Resolve(fileName, &path, win32Error) || path.components.empty())
+    {
+        if (win32Error && *win32Error == ERROR_SUCCESS)
+        {
+            *win32Error = ERROR_INVALID_NAME;
+        }
+        return false;
+    }
+
+    StorageFolder^ parent = nullptr;
+    std::wstring leaf;
+    if (!GetParentFolder(path, &parent, &leaf, win32Error))
+    {
+        return false;
+    }
+
+    try
+    {
+        StorageFile^ file = nullptr;
+        const auto name = ref new String(leaf.c_str());
+        switch (creationDisposition)
+        {
+        case CREATE_NEW:
+            file = create_task(parent->CreateFileAsync(name, CreationCollisionOption::FailIfExists)).get();
+            break;
+        case CREATE_ALWAYS:
+            file = create_task(parent->CreateFileAsync(name, CreationCollisionOption::ReplaceExisting)).get();
+            break;
+        case OPEN_ALWAYS:
+            file = create_task(parent->CreateFileAsync(name, CreationCollisionOption::OpenIfExists)).get();
+            break;
+        case OPEN_EXISTING:
+        case TRUNCATE_EXISTING:
+            file = create_task(parent->GetFileAsync(name)).get();
+            break;
+        default:
+            SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
+        const FileAccessMode mode = writable ? FileAccessMode::ReadWrite : FileAccessMode::Read;
+        IRandomAccessStream^ stream = create_task(file->OpenAsync(mode)).get();
+        if (creationDisposition == TRUNCATE_EXISTING)
+        {
+            stream->Size = 0;
+            stream->Seek(0);
+        }
+        return AddFile(stream, readable || !writable, writable, guestHandle, win32Error);
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::ReadFile(HANDLE guestHandle, void* buffer, DWORD bytesToRead, DWORD* bytesRead, DWORD* win32Error)
+{
+    if (bytesRead)
+    {
+        *bytesRead = 0;
+    }
+    if ((bytesToRead != 0 && !buffer) || bytesToRead > MaxSynchronousIo)
+    {
+        SetWin32Error(win32Error, bytesToRead > MaxSynchronousIo ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    auto record = LookupFile(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    try
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        IRandomAccessStream^ stream = record->stream.Get();
+        if (record->closed || !stream)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        if (!record->readable)
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
+        if (bytesToRead == 0)
+        {
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+        auto requested = ref new Buffer(bytesToRead);
+        IBuffer^ data = create_task(stream->ReadAsync(requested, bytesToRead, InputStreamOptions::None)).get();
+        auto copy = ref new Array<byte>(data->Length);
+        DataReader::FromBuffer(data)->ReadBytes(copy);
+        memcpy(buffer, copy->Data, copy->Length);
+        if (bytesRead)
+        {
+            *bytesRead = copy->Length;
+        }
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWORD bytesToWrite, DWORD* bytesWritten, DWORD* win32Error)
+{
+    if (bytesWritten)
+    {
+        *bytesWritten = 0;
+    }
+    if ((bytesToWrite != 0 && !buffer) || bytesToWrite > MaxSynchronousIo)
+    {
+        SetWin32Error(win32Error, bytesToWrite > MaxSynchronousIo ? ERROR_NOT_ENOUGH_MEMORY : ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    auto record = LookupFile(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    try
+    {
+        IBuffer^ data = nullptr;
+        if (bytesToWrite != 0)
+        {
+            auto copy = ref new Array<byte>(bytesToWrite);
+            memcpy(copy->Data, buffer, bytesToWrite);
+            auto writer = ref new DataWriter();
+            writer->WriteBytes(copy);
+            data = writer->DetachBuffer();
+        }
+
+        std::lock_guard<std::mutex> guard(record->lock);
+        IRandomAccessStream^ stream = record->stream.Get();
+        if (record->closed || !stream)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        if (!record->writable)
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
+        if (bytesToWrite == 0)
+        {
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+        const unsigned int written = create_task(stream->WriteAsync(data)).get();
+        if (bytesWritten)
+        {
+            *bytesWritten = written;
+        }
+        if (written != bytesToWrite)
+        {
+            SetWin32Error(win32Error, ERROR_WRITE_FAULT);
+            return false;
+        }
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::CloseFile(HANDLE guestHandle, DWORD* win32Error)
+{
+    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
+    std::shared_ptr<FileRecord> record;
+    {
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        const auto found = m_files.find(token);
+        if (found == m_files.end())
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        record = found->second;
+        m_files.erase(found);
+    }
+
+    try
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->closed)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+
+        IRandomAccessStream^ stream = record->stream.Get();
+        record->closed = true;
+        record->stream = nullptr;
+        if (!stream)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        delete stream;
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::GetFileSize(HANDLE guestHandle, LARGE_INTEGER* fileSize, DWORD* win32Error)
+{
+    if (!fileSize)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    auto record = LookupFile(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    try
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        IRandomAccessStream^ stream = record->stream.Get();
+        if (record->closed || !stream)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        fileSize->QuadPart = static_cast<LONGLONG>(stream->Size);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::SetFilePointer(
+    HANDLE guestHandle,
+    LARGE_INTEGER distance,
+    LARGE_INTEGER* newPosition,
+    DWORD moveMethod,
+    DWORD* win32Error)
+{
+    auto record = LookupFile(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    try
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        IRandomAccessStream^ stream = record->stream.Get();
+        if (record->closed || !stream)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        ULONGLONG origin = 0;
+        switch (moveMethod)
+        {
+        case FILE_BEGIN: origin = 0; break;
+        case FILE_CURRENT: origin = stream->Position; break;
+        case FILE_END: origin = stream->Size; break;
+        default:
+            SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+            return false;
+        }
+
+        const LONGLONG offset = distance.QuadPart;
+        ULONGLONG position = 0;
+        if (offset < 0)
+        {
+            const ULONGLONG magnitude = static_cast<ULONGLONG>(-(offset + 1)) + 1;
+            if (magnitude > origin)
+            {
+                SetWin32Error(win32Error, ERROR_NEGATIVE_SEEK);
+                return false;
+            }
+            position = origin - magnitude;
+        }
+        else
+        {
+            const ULONGLONG magnitude = static_cast<ULONGLONG>(offset);
+            if (magnitude > ULLONG_MAX - origin)
+            {
+                SetWin32Error(win32Error, ERROR_NEGATIVE_SEEK);
+                return false;
+            }
+            position = origin + magnitude;
+        }
+
+        stream->Seek(position);
+        if (newPosition)
+        {
+            newPosition->QuadPart = static_cast<LONGLONG>(position);
+        }
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::SetEndOfFile(HANDLE guestHandle, DWORD* win32Error)
+{
+    auto record = LookupFile(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    try
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        IRandomAccessStream^ stream = record->stream.Get();
+        if (record->closed || !stream)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        if (!record->writable)
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
+        stream->Size = stream->Position;
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::FlushFile(HANDLE guestHandle, DWORD* win32Error)
+{
+    auto record = LookupFile(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    try
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        IRandomAccessStream^ stream = record->stream.Get();
+        if (record->closed || !stream)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        if (!create_task(stream->FlushAsync()).get())
+        {
+            SetWin32Error(win32Error, ERROR_WRITE_FAULT);
+            return false;
+        }
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::ReadAllBytes(LPCWSTR path, std::vector<BYTE>* bytes, DWORD* win32Error)
+{
+    if (!path || !bytes)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    bytes->clear();
+
+    HANDLE file = INVALID_HANDLE_VALUE;
+    if (!CreateFile(path, GENERIC_READ, FILE_SHARE_READ, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr, &file, win32Error))
+    {
+        return false;
+    }
+
+    bool success = false;
+    LARGE_INTEGER size{};
+    if (GetFileSize(file, &size, win32Error) && size.QuadPart >= 0 &&
+        static_cast<ULONGLONG>(size.QuadPart) <= 128ull * 1024ull * 1024ull)
+    {
+        try
+        {
+            bytes->resize(static_cast<size_t>(size.QuadPart));
+            size_t offset = 0;
+            while (offset < bytes->size())
+            {
+                const DWORD request = static_cast<DWORD>((std::min)(
+                    bytes->size() - offset,
+                    static_cast<size_t>(MaxSynchronousIo)));
+                DWORD received = 0;
+                if (!ReadFile(file, bytes->data() + offset, request, &received, win32Error) || received == 0)
+                {
+                    bytes->clear();
+                    break;
+                }
+                offset += received;
+            }
+            success = offset == bytes->size();
+            if (!success && bytes->empty() && size.QuadPart == 0)
+            {
+                success = true;
+            }
+            if (!success && win32Error && *win32Error == ERROR_SUCCESS)
+            {
+                *win32Error = ERROR_READ_FAULT;
+            }
+        }
+        catch (const std::bad_alloc&)
+        {
+            SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY);
+        }
+    }
+    else if (win32Error && *win32Error == ERROR_SUCCESS)
+    {
+        *win32Error = ERROR_FILE_TOO_LARGE;
+    }
+
+    DWORD closeError = ERROR_SUCCESS;
+    CloseFile(file, &closeError);
+    return success;
+}
+
+bool GuestStorageContext::CreateDirectory(LPCWSTR path, DWORD* win32Error)
+{
+    GuestPath resolved;
+    if (!Resolve(path, &resolved, win32Error) || resolved.components.empty())
+    {
+        if (win32Error && *win32Error == ERROR_SUCCESS)
+        {
+            *win32Error = ERROR_ALREADY_EXISTS;
+        }
+        return false;
+    }
+
+    StorageFolder^ parent = nullptr;
+    std::wstring leaf;
+    if (!GetParentFolder(resolved, &parent, &leaf, win32Error))
+    {
+        return false;
+    }
+
+    try
+    {
+        create_task(parent->CreateFolderAsync(ref new String(leaf.c_str()), CreationCollisionOption::FailIfExists)).get();
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::DeleteGuestFile(LPCWSTR path, DWORD* win32Error)
+{
+    GuestPath resolved;
+    if (!Resolve(path, &resolved, win32Error) || resolved.components.empty())
+    {
+        if (win32Error && *win32Error == ERROR_SUCCESS)
+        {
+            *win32Error = ERROR_ACCESS_DENIED;
+        }
+        return false;
+    }
+
+    StorageFolder^ parent = nullptr;
+    std::wstring leaf;
+    if (!GetParentFolder(resolved, &parent, &leaf, win32Error))
+    {
+        return false;
+    }
+
+    try
+    {
+        IStorageItem^ item = create_task(parent->GetItemAsync(ref new String(leaf.c_str()))).get();
+        if (!item->IsOfType(StorageItemTypes::File))
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
+        create_task(item->DeleteAsync()).get();
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::MoveGuestPath(
+    LPCWSTR existingPath,
+    LPCWSTR newPath,
+    DWORD flags,
+    DWORD* win32Error)
+{
+    // Every move remains in LocalFolder\drive_c. MOVEFILE_COPY_ALLOWED is
+    // unnecessary for that single volume, and delayed moves have no UWP
+    // equivalent, so reject rather than silently changing Win32 semantics.
+    const DWORD supportedFlags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    if ((flags & ~supportedFlags) != 0)
+    {
+        SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
+        return false;
+    }
+
+    GuestPath source;
+    GuestPath destination;
+    if (!Resolve(existingPath, &source, win32Error) ||
+        !Resolve(newPath, &destination, win32Error) ||
+        source.components.empty() || destination.components.empty())
+    {
+        if (win32Error && *win32Error == ERROR_SUCCESS)
+        {
+            *win32Error = ERROR_ACCESS_DENIED;
+        }
+        return false;
+    }
+
+    StorageFolder^ sourceParent = nullptr;
+    StorageFolder^ destinationParent = nullptr;
+    std::wstring sourceName;
+    std::wstring destinationName;
+    if (!GetParentFolder(source, &sourceParent, &sourceName, win32Error) ||
+        !GetParentFolder(destination, &destinationParent, &destinationName, win32Error))
+    {
+        return false;
+    }
+
+    try
+    {
+        IStorageItem^ item = create_task(sourceParent->GetItemAsync(ref new String(sourceName.c_str()))).get();
+        const NameCollisionOption collision = (flags & MOVEFILE_REPLACE_EXISTING) != 0
+            ? NameCollisionOption::ReplaceExisting
+            : NameCollisionOption::FailIfExists;
+
+        if (item->IsOfType(StorageItemTypes::File))
+        {
+            StorageFile^ file = safe_cast<StorageFile^>(item);
+            create_task(file->MoveAsync(destinationParent, ref new String(destinationName.c_str()), collision)).get();
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+
+        if (item->IsOfType(StorageItemTypes::Folder))
+        {
+            // Windows.Storage only exposes a folder rename, not a cross-folder
+            // move. A same-parent move is still a useful and lossless subset.
+            bool sameParent = source.components.size() == destination.components.size();
+            if (sameParent)
+            {
+                for (size_t index = 0; index + 1 < source.components.size(); ++index)
+                {
+                    if (_wcsicmp(source.components[index].c_str(), destination.components[index].c_str()) != 0)
+                    {
+                        sameParent = false;
+                        break;
+                    }
+                }
+            }
+            if (!sameParent)
+            {
+                SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
+                return false;
+            }
+
+            StorageFolder^ folder = safe_cast<StorageFolder^>(item);
+            create_task(folder->RenameAsync(ref new String(destinationName.c_str()), collision)).get();
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+
+        SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error)
+{
+    GuestPath resolved;
+    if (!Resolve(path, &resolved, win32Error) || resolved.components.empty())
+    {
+        if (win32Error && *win32Error == ERROR_SUCCESS)
+        {
+            *win32Error = ERROR_ACCESS_DENIED;
+        }
+        return false;
+    }
+
+    StorageFolder^ folder = nullptr;
+    if (!GetDirectoryFolder(resolved, &folder, win32Error))
+    {
+        return false;
+    }
+
+    try
+    {
+        auto items = create_task(folder->GetItemsAsync()).get();
+        if (items->Size != 0)
+        {
+            SetWin32Error(win32Error, ERROR_DIR_NOT_EMPTY);
+            return false;
+        }
+        create_task(folder->DeleteAsync()).get();
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+DWORD GuestStorageContext::GetGuestFileAttributes(LPCWSTR path, DWORD* win32Error)
+{
+    GuestPath resolved;
+    if (!Resolve(path, &resolved, win32Error))
+    {
+        return INVALID_FILE_ATTRIBUTES;
+    }
+
+    if (resolved.components.empty())
+    {
+        StorageFolder^ root = nullptr;
+        if (!GetDirectoryFolder(resolved, &root, win32Error))
+        {
+            return INVALID_FILE_ATTRIBUTES;
+        }
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return FILE_ATTRIBUTE_DIRECTORY;
+    }
+
+    StorageFolder^ parent = nullptr;
+    std::wstring leaf;
+    if (!GetParentFolder(resolved, &parent, &leaf, win32Error))
+    {
+        return INVALID_FILE_ATTRIBUTES;
+    }
+
+    try
+    {
+        IStorageItem^ item = create_task(parent->GetItemAsync(ref new String(leaf.c_str()))).get();
+        const DWORD attributes = MapFileAttributes(item, item->IsOfType(StorageItemTypes::Folder));
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return attributes;
+    }
+    catch (Exception^ exception)
+    {
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return INVALID_FILE_ATTRIBUTES;
+    }
+}
+
+bool GuestStorageContext::FindFirstGuestFile(
+    LPCWSTR searchPattern,
+    WIN32_FIND_DATAW* findData,
+    HANDLE* guestHandle,
+    DWORD* win32Error)
+{
+    if (!findData || !guestHandle)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    *guestHandle = INVALID_HANDLE_VALUE;
+
+    std::wstring directory;
+    std::wstring pattern;
+    if (!SplitSearchPattern(searchPattern, &directory, &pattern, win32Error))
+    {
+        return false;
+    }
+
+    GuestPath resolvedDirectory;
+    if (!Resolve(directory.c_str(), &resolvedDirectory, win32Error))
+    {
+        return false;
+    }
+
+    StorageFolder^ folder = nullptr;
+    if (!GetDirectoryFolder(resolvedDirectory, &folder, win32Error))
+    {
+        return false;
+    }
+
+    try
+    {
+        auto items = create_task(folder->GetItemsAsync()).get();
+        std::vector<WIN32_FIND_DATAW> matches;
+        matches.reserve(items->Size);
+        for (unsigned int index = 0; index < items->Size; ++index)
+        {
+            IStorageItem^ item = items->GetAt(index);
+            const std::wstring name(item->Name->Data());
+            if (!WildcardMatch(pattern, name))
+            {
+                continue;
+            }
+
+            WIN32_FIND_DATAW entry = {};
+            if (!FillFindData(item, &entry, win32Error))
+            {
+                return false;
+            }
+            matches.push_back(entry);
+        }
+
+        if (matches.empty())
+        {
+            SetWin32Error(win32Error, ERROR_FILE_NOT_FOUND);
+            return false;
+        }
+
+        if (g_storageEnumerationDiagnostics < 64)
+        {
+            ++g_storageEnumerationDiagnostics;
+            RuntimeDiagnostics::Record(
+                L"STORAGE: directory query produced " + std::to_wstring(matches.size()) + L" matching item(s).");
+        }
+        *findData = matches.front();
+        return AddFind(std::make_shared<FindRecord>(std::move(matches)), guestHandle, win32Error);
+    }
+    catch (Exception^ exception)
+    {
+        RecordStorageException(L"GetItemsAsync during directory enumeration", exception);
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
+    }
+}
+
+bool GuestStorageContext::FindNextGuestFile(HANDLE guestHandle, WIN32_FIND_DATAW* findData, DWORD* win32Error)
+{
+    if (!findData)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    auto record = LookupFind(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(record->lock);
+    if (record->next >= record->entries.size())
+    {
+        SetWin32Error(win32Error, ERROR_NO_MORE_FILES);
+        return false;
+    }
+
+    *findData = record->entries[record->next++];
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestStorageContext::CloseFindHandle(HANDLE guestHandle, DWORD* win32Error)
+{
+    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    const auto found = m_finds.find(token);
+    if (found == m_finds.end())
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    m_finds.erase(found);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestStorageContext::SetCurrentDirectory(LPCWSTR path, DWORD* win32Error)
+{
+    GuestPath resolved;
+    if (!Resolve(path, &resolved, win32Error))
+    {
+        return false;
+    }
+
+    StorageFolder^ folder = nullptr;
+    if (!GetDirectoryFolder(resolved, &folder, win32Error))
+    {
+        return false;
+    }
+
+    std::wstring ignored;
+    if (!m_paths.SetCurrentDirectoryPath(resolved, &ignored))
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_NAME);
+        return false;
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestStorageContext::ResetCurrentDirectory(DWORD* win32Error)
+{
+    GuestPath initial;
+    std::wstring ignored;
+    if (!m_paths.Resolve(m_initialCurrentDirectory.c_str(), &initial, &ignored) ||
+        !m_paths.SetCurrentDirectoryPath(initial, &ignored))
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_NAME);
+        return false;
+    }
+
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+std::wstring GuestStorageContext::CurrentDirectory() const
+{
+    return m_paths.CurrentDirectory();
+}
+
+std::wstring GuestStorageContext::TempPath() const
+{
+    return L"C:\\Users\\Default\\AppData\\Local\\Temp\\";
+}
+
+void GuestStorageContext::CloseAll()
+{
+    std::unordered_map<ULONG_PTR, std::shared_ptr<FileRecord>> files;
+    {
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        files.swap(m_files);
+        m_finds.clear();
+        m_nextHandle = FirstHandleToken;
+    }
+
+    for (const auto& pair : files)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> guard(pair.second->lock);
+            if (pair.second->closed)
+            {
+                continue;
+            }
+
+            IRandomAccessStream^ stream = pair.second->stream.Get();
+            pair.second->closed = true;
+            pair.second->stream = nullptr;
+            if (stream)
+            {
+                delete stream;
+            }
+        }
+        catch (...)
+        {
+            // Process teardown semantics: a failed close must not keep a guest alive.
+        }
+    }
+}
+
+GuestStorageContext* Win32Bridge::Bridge::CurrentGuestStorageContext()
+{
+    return g_currentGuestStorage;
+}
+
+GuestStorageScope::GuestStorageScope(GuestStorageContext* context)
+    : m_previous(g_currentGuestStorage)
+{
+    g_currentGuestStorage = context;
+}
+
+GuestStorageScope::~GuestStorageScope()
+{
+    g_currentGuestStorage = m_previous;
+}
