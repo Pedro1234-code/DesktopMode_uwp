@@ -1,4 +1,4 @@
-# CoreShell 10X
+# Windows 10X Desktop Mode para Xbox
 
 CoreShell 10X é uma shell UWP inspirada no design do Windows 10X, adaptada para rodar no Windows e no Xbox. O projeto recria uma experiência de desktop leve dentro de um único aplicativo: menu Iniciar, barra de tarefas, janelas, Task View, aplicativos internos e Web Apps.
 
