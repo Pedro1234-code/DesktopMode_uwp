@@ -1,52 +1,52 @@
-# CoreShell 10X
+# DesktopMode
 
-CoreShell 10X é uma shell UWP inspirada no design do Windows 10X, adaptada para rodar no Windows e no Xbox. O projeto recria uma experiência de desktop leve dentro de um único aplicativo: menu Iniciar, barra de tarefas, janelas, Task View, aplicativos internos e Web Apps.
+DesktopMode is a UWP shell inspired by the Windows 10X design language and adapted for both Windows and Xbox. It recreates a lightweight desktop experience inside a single application, including a Start menu, taskbar, window management, Task View, built-in apps, and Web Apps.
 
-> O CoreShell não substitui o sistema operacional do Xbox. Ele executa como um aplicativo UWP e respeita as limitações da plataforma.
+> DesktopMode does not replace the Xbox operating system. It runs as a UWP application and operates within platform limitations.
 
-## Destaques
+## Highlights
 
-- Interface inspirada no Windows 10X, com suporte a tema claro e escuro.
-- Cursor personalizado e ajustes de escala/DPI para uso no Xbox.
-- Menu Iniciar com aplicativos do sistema, Web Apps e itens fixados.
-- Barra de tarefas com indicadores de janela aberta, menus de contexto e persistência de itens fixados.
-- Task View, alternância com `Alt` + `Tab` e gerenciamento de foco entre janelas.
-- Web Apps instaláveis com WebView2, favicon, várias janelas, redimensionamento, minimizar, maximizar e fechar.
-- Files: explorador de arquivos baseado nas permissões UWP e no seletor de pastas, incluindo mídia removível quando autorizada pelo usuário.
-- Notepad: abertura e edição de arquivos `.txt`, salvar e salvar como.
-- Settings: aplicativo interno com páginas de personalização, taskbar, informações do dispositivo e Windows Update visual.
-- Action Center próprio com volume, estado de rede e atalhos para configurações do sistema.
+- Windows 10X-inspired interface with light and dark theme support.
+- Custom mouse cursor and DPI/scale adjustments for Xbox use.
+- Start menu with system apps, Web Apps, and pinned items.
+- Taskbar with open-window indicators, context menus, and persistent pinned items.
+- Task View, `Alt` + `Tab` switching, and window focus management.
+- Installable Web Apps powered by WebView2, with favicons, multiple windows, resizing, minimize, maximize, and close controls.
+- Files: a file browser built around UWP permissions and folder pickers, including removable media after user authorization.
+- Notepad: open, edit, save, and save-as support for `.txt` files.
+- Settings: a built-in app with personalization, taskbar, device information, and a visual Windows Update page.
+- A custom Action Center with volume, network status, and system settings shortcuts.
 
-## Estrutura
+## Project structure
 
-| Pasta/projeto | Descrição |
+| Folder/project | Description |
 | --- | --- |
-| `factoryos-10x-shell` | Aplicativo UWP principal e interface do CoreShell. |
-| `factoryos-10x-shell.Library` | Modelos, serviços e view models compartilhados. |
-| `Windows10x-js-main` | Referência HTML/CSS/JS da recriação original do Windows 10X. |
-| `Win32Bridge` | Componentes auxiliares de integração, quando aplicáveis. |
+| `factoryos-10x-shell` | Main UWP application and DesktopMode interface. |
+| `factoryos-10x-shell.Library` | Shared models, services, and view models. |
+| `Windows10x-js-main` | HTML/CSS/JS reference implementation of the original Windows 10X recreation. |
+| `Win32Bridge` | Auxiliary integration components, where applicable. |
 
-## Compilação
+## Building
 
-1. Instale o Visual Studio 2022 com a carga de trabalho **Desenvolvimento para Plataforma Universal do Windows**.
-2. Instale o Windows 10 SDK `10.0.19041` ou compatível.
-3. Abra [`factoryos-10x-shell.sln`](factoryos-10x-shell.sln).
-4. Selecione a arquitetura correta:
-   - `x64` para teste no PC;
-   - `ARM` para o Xbox, quando estiver usando o ambiente de desenvolvimento compatível.
-5. Compile e inicie pelo Visual Studio.
+1. Install Visual Studio 2022 with the **Universal Windows Platform development** workload.
+2. Install Windows 10 SDK `10.0.19041` or a compatible version.
+3. Open [`factoryos-10x-shell.sln`](factoryos-10x-shell.sln).
+4. Select the appropriate architecture:
+   - `x64` for local PC testing;
+   - `ARM` for Xbox, when using a compatible development environment.
+5. Build and launch the application from Visual Studio.
 
-Caso o Visual Studio informe que o certificado de assinatura não está disponível, gere ou associe um certificado de desenvolvimento ao pacote antes de implantar.
+If Visual Studio reports that the signing certificate is unavailable, create or associate a development certificate with the package before deployment.
 
-## Limitações conhecidas
+## Known limitations
 
-- O acesso a arquivos fora do armazenamento do aplicativo depende de o usuário conceder acesso pelo seletor de arquivos/pastas do UWP.
-- Aplicativos externos são abertos por URI/protocolo quando o pacote oferece suporte a isso.
-- O botão de Windows Update no Settings é apenas visual por enquanto; atualizações reais continuam sendo responsabilidade do sistema.
-- Alguns comportamentos podem variar entre PC, Xbox One e Xbox Series devido às APIs e restrições do UWP/Xbox.
+- Access to files outside the application's local storage depends on access granted by the user through UWP file and folder pickers.
+- External applications are launched through URIs or protocols when the package supports them.
+- The Windows Update button in Settings is currently visual only; real system updates remain managed by the operating system.
+- Some behavior can vary across PC, Xbox One, and Xbox Series devices because of UWP and Xbox platform restrictions.
 
-## Créditos e licença
+## Credits and license
 
-O projeto parte da recriação original de Windows 10X shell de [Pdawg-bytes](https://github.com/Pdawg-bytes/factoryos-10x-shell), expandida para o CoreShell com recursos voltados ao Xbox e desktop.
+This project builds on the original Windows 10X shell recreation by [Pdawg-bytes](https://github.com/Pdawg-bytes/factoryos-10x-shell), expanded into DesktopMode with Xbox- and desktop-focused features.
 
-Distribuído sob a licença [MIT](LICENSE).
+Distributed under the [MIT License](LICENSE).
