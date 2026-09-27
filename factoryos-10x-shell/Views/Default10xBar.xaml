@@ -251,6 +251,11 @@
                 Margin="0,0,0,0"
                 VerticalAlignment="Center"
                 Orientation="Horizontal" />
+            <StackPanel
+                x:Name="OpenWin32AppsPanel"
+                Margin="0,0,0,0"
+                VerticalAlignment="Center"
+                Orientation="Horizontal" />
             <StackPanel x:Name="OpenFilesPanel" VerticalAlignment="Center" Orientation="Horizontal" />
             <StackPanel
                 x:Name="PinnedWebAppsPanel"

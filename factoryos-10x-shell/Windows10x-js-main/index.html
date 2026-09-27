@@ -1,0 +1,1487 @@
+<html>
+
+<head profile="http://www.w3.org/2005/10/profile">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="icon" type="image/png" href="icon.png">
+    <link rel="shortcut icon" type="image/x-icon" href="favicon.ico">
+    <title>Windows 10X</title>
+    <link rel="stylesheet" href="css.css">
+    <link rel="stylesheet" href="segoe.css">
+    <link rel="stylesheet" href="twitter.css">
+    <link rel="stylesheet" href="taskbar.css">
+    <link rel="stylesheet" href="firstBoot.css">
+    <link rel="stylesheet" href="startMenu.css">
+    <link rel="stylesheet" href="calculator.css">
+    <link rel="stylesheet" href="settingsApp.css">
+    <link rel="stylesheet" href="actionCenter.css">
+    <script src="area-palette.js"></script>
+</head>
+
+<body id="body" onload="windowLoad()">
+
+    <div class="firstBoot" id="firstBoot">
+        <div class="fbBootScreen">
+            <div class="bootLogo"></div>
+            <div id="preBootstrapLoading">
+                <svg class="loaderIcon" viewBox="0 0 16 16">
+                    <circle class="radial-bg" cx="8px" cy="8px" r="7px"></circle>
+                    <circle class="radial radial-infinite" cx="8px" cy="8px" r="7px"></circle>
+                </svg>
+            </div>
+        </div>
+        <div class="fbOOBE">
+            <div class="fbOBackground" id="fbOBackground"></div>
+            <div class="fbOStatus"> </div>
+            <div class="fboContainer fboScreen1" id="fboScreen1">
+                <div class="fbosLR fbos1Left">
+                    <img src="OOBE\5.png" class="fbLeftImage fbLeftImg1" id="oobeImg1">
+                </div>
+                <div class="fbosLR fbosRight fbosRight1">
+                    <div class="fbrH fh1" data-frHeader="Tell us about yourself"></div>
+                    <div class="fbrB fb1">Enter the information below to get your account set up.<br>You can change any information you enter here later from the Settings app.</div>
+                    <div class="fbrEI fei1">All information is stored locally, on your device. Nothing is sent to Microsoft or Futur3Sn0w Studio.</div>
+                <div class="fbr1Form" id="fbr1Form">
+                    <label class="f1Lbl f1NameLbl">Name:</label>
+                    <input type="text" class="ffTextbox ffName" id="ffName" placeholder="John Doe"></input>
+                    <label class="f1Lbl f1NameLbl">Email:</label>
+                    <input type="text" class="ffTextbox ffEmail" id="ffEmail" placeholder="johndoe@contoso.com"></input>
+                    <span class="fbrError" id="fbrErr2">Note: Leaving a field blank will result in a placeholder value being used.<br>If you change your mind later, visit the Accounts section of the Settings app.</span>
+                </div>
+                <div class="fbr1ComeBack" id="fbr1ComeBack"></div>
+                <div class="frNextBtn" onclick="OOBEs1Next();">Next</div>
+                </div>
+            </div>
+            <div class="fboContainer fboScreen2" id="fboScreen2">
+                <div class="fbosBackBtn fbosBack1" onclick="OOBEs1Back()"></div>
+                <div class="fbosLR fbos2Left">
+                    <img src="OOBE\6.png" class="fbLeftImage fbLeftImg2" id="oobeImg2">
+                </div>
+                <div class="fbosLR fbosRight fbosRight2">
+                    <div class="fbrH fh2" data-frHeader="Choose your look"></div>
+                    <div class="fbrB fb2" style="padding-bottom: 30px;">Pick from the options below to customize your device.<br>You can change more at any time from the Settings app.</div>
+                    <div class="wallStrip wsFB">
+                        <div class="wsp ws1" onclick="wall1()"></div>
+                        <div class="wsp ws2" onclick="wall2()"></div>
+                        <div class="wsp ws3" onclick="wall3()"></div>
+                        <div class="wsp ws4" onclick="wall4()"></div>
+                        <div class="wsp ws5" onclick="wall5()"></div>
+                    </div>
+                    <div class="accentColorSect">
+                        <label class="CYAC">Choose your accent color</label>
+                        <div class="accentColors" style="padding-top: 10px;">
+                            <div class="aColor ac1" onclick="accentColor1()"></div>
+                            <div class="aColor ac2" onclick="accentColor2()"></div>
+                            <div class="aColor ac3" onclick="accentColor3()"></div>
+                            <div class="aColor ac4" onclick="accentColor4()"></div>
+                            <div class="aColor ac5" onclick="accentColor5()"></div>
+                        </div>
+                    </div>
+                <div class="frNextBtn frNext2Skip" onclick="OOBEs2Next();">Skip for now</div>
+                <div class="frNextBtn frNext2" onclick="OOBEs2Next();">Next</div>
+                </div>
+            </div>
+            <div class="fboContainer fboScreen3" id="fboScreen3">
+                <div class="fbosBackBtn fbosBack1" onclick="OOBEs1Next()"></div>
+                <div class="fbosLR fbos3Left">
+                    <img src="OOBE\2.png" class="fbLeftImage fbLeftImg3" id="oobeImg3">
+                </div>
+                <div class="fbosLR fbosRight fbosRight3">
+                    <div class="fbrH fh3" data-frHeader="Before we finish..."></div>
+                    <div class="fbrB fb3">Please read the information below to finish setup.</div>
+                    <div class="fbr3Box" id="fbr3Box"></div>
+                <div class="frNextBtn frNext3" onclick="OOBEs3Next();">Next</div>
+            </div>
+            </div>
+            <div class="fboContainer fboScreenLast" id="fboScreenLast">
+                <div class="fbLastCover"></div>
+                <div class="fbLastLbl1">You're all done!</div>
+                <div class="fbLastLbl2">Windows is now all yours. Enjoy!</div>
+                <img src="OOBE\final.svg" class="fbLastImg">
+                <div class="frNextBtn frNext4" onclick="OOBEsLastFinish();">Start using Windows 10X</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="desktopLayer" id="desktopLayer"></div>
+
+    <div id="colorPrev" style="width: 0; height: 0;"></div>
+    <img id="wallImgAC" src="" style="width: 0;" alt="">
+    
+    <div class="desktopContext" id="desktopContext">
+        <div class="dci dc1" id="dc1" onclick="openSettingsToBackground()"></div>
+    </div>
+
+    <div class="iconContext" id="icSettings">
+        <div class="ici ics1" id="settPinBtn" onclick="ifPinSettings()">Pin to taskbar</div>
+    </div>
+
+    <div class="iconContext" id="icCalc">
+        <div class="ici icc1" id="calcPinBtn" onclick="ifPinCalc()">Pin to taskbar</div>
+    </div>
+
+    <!-- <div class="twitterApp">
+        <iframe class="taObject" is="x-frame-bypass" src="https://open.spotify.com" frameborder="0"></iframe>
+    </div> -->
+    
+    <div class="calculator" id="calculator">
+        <div class="calcTitlebar" data-titlebar="Calculator">
+            <label class="titlebarText">Calculator</label>
+            <div class="windowButtons">
+                <div class="wbMin" onclick="hideCalculator()"></div>
+                <div class="wbClose" id="calcCloseBtn" onclick="closeCalculator()"></div>
+            </div>
+        </div>
+        <table class="calcTable">
+            <tr id="tr1">
+               <td colspan="4" rowspan="1"><input placeholder="0" type="text" id="result" readonly/></td>
+            </tr>
+            <tr>
+               <td><input class="calcBtn" type="button" value="C" onclick="clr()"/></td>
+               <td><input class="calcBtn cbPlaceholder" type="button" value=""/></td>
+               <td><input class="calcBtn cbPlaceholder" type="button" value=""/></td>
+               <td><input class="calcBtn cbSymb" type="button" value="÷" onclick="dis('/')"/> </td>
+            </tr>
+            <tr>
+               <td><input class="calcBtn cbNumber" type="button" value="1" onclick="dis('1')"/> </td>
+               <td><input class="calcBtn cbNumber" type="button" value="2" onclick="dis('2')"/> </td>
+               <td><input class="calcBtn cbNumber" type="button" value="3" onclick="dis('3')"/> </td>
+               <td><input class="calcBtn cbSymb" type="button" value="" onclick="dis('*')"/> </td>
+            </tr>
+            <tr>
+               <td><input class="calcBtn cbNumber" type="button" value="4" onclick="dis('4')"/> </td>
+               <td><input class="calcBtn cbNumber" type="button" value="5" onclick="dis('5')"/> </td>
+               <td><input class="calcBtn cbNumber" type="button" value="6" onclick="dis('6')"/> </td>
+               <td><input class="calcBtn cbSymb" type="button" value="ﱰ" onclick="dis('-')"/> </td>
+            </tr>
+            <tr>
+               <td><input class="calcBtn cbNumber" type="button" value="7" onclick="dis('7')"/> </td>
+               <td><input class="calcBtn cbNumber" type="button" value="8" onclick="dis('8')"/> </td>
+               <td><input class="calcBtn cbNumber" type="button" value="9" onclick="dis('9')"/> </td>
+               <td><input class="calcBtn cbSymb" type="button" value="" onclick="dis('+')"/> </td>
+            </tr>
+            <tr>
+               <td><input class="calcBtn cbPlaceholder" type="button" value=""/></td>
+               <td><input class="calcBtn cbNumber" type="button" value="0" onclick="dis('0')"/> </td>
+               <td><input class="calcBtn" type="button" value="." onclick="dis('.')"/> </td>
+               <td><input class="calcBtn cbSolve" type="button" value="" onclick="solve()"/> </td>
+            </tr>
+         </table>
+    </div>
+
+    <div class="actionCenter" id="actionCenter">
+        <div class="acPage acToggles" id="acToggles">
+            <div class="actHead">
+                <div class="acthCollapse" id="acthCollapse" onclick="acCollapse()"></div>
+            </div>
+            <div class="actBody" id="actBody">
+                <div class="actbVolume">
+                    <div class="actbvIcon">ﱦ</div>
+                    <div class="actbvSlider">
+                        <div class="actvbsIndicator"></div>
+                    </div>
+                </div>
+                <div class="actbToggles">
+                    <div class="actbTogg actbt1" data-actGlyph="" data-actLabel="Bluetooth">
+                        <div class="acbtArrow aa1"></div>
+                    </div>
+                    <div class="actbTogg actbt2" data-actGlyph="" data-actLabel="Display">
+                        <div class="acbtArrow"></div>
+                    </div>
+                    <div class="actbTogg actbt3" data-actGlyph="" data-actLabel="Compose Mode"></div>
+                    <div class="actbTogg actbt4" data-actGlyph="ﰺ" data-actLabel="Rotation lock"></div>
+                    <div class="actbTogg actbt5" data-actGlyph="" data-actLabel="Keyboard layout">
+                        <div class="acbtArrow"></div>
+                    </div>
+                    <div class="actbTogg actbt6" data-actGlyph="" data-actLabel="Do not disturb"></div>
+                    <div class="actbTogg actbt7" data-actGlyph="" data-actLabel="Airplane mode"></div>
+                    <div class="actbTogg actbt8" data-actGlyph="" data-actLabel="Location"></div>
+                    <div class="actbTogg actbt9" data-actGlyph="" data-actLabel="Ease of Access">
+                        <div class="acbtArrow"></div>
+                    </div>
+                </div>
+            </div>
+            <div class="actFooter">
+                <div class="actfButtons">
+                    <div class="actfBtn actfbKeyboard"></div>
+                    <div class="actfBtn actfbSettings" onclick="openSettings()"></div>
+                    <div class="actfBtn actfbPower"></div>
+                    <div class="actfBtn actfbUsertile">
+                        <div class="aUTUsername" id="aUTUsername">Name</div>
+                        <div class="aUTIcon" id="aUTIcon"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="startMenu" id="startMenu">
+        <div class="smTop">
+            <textarea class="searchBar" rows="1" placeholder="Search the web and your stuff"></textarea>
+            <div class="smtIcon searchIcon">︵</div>
+            <div class="smtIcon micIcon"></div>
+        </div>
+        <div class="smBottom">
+            <div class="smbSection smbSect1">
+                <label class="ss1Lbl">My apps and websites</label>
+                <div class="ss1Btn" id="showAllBtn" onclick="showAllLauncherBtn()">Show all</div>
+            </div>
+            <div class="smbSection smbSect2" id="smbSect2">
+                <div class="ss2Icon ss2Icon13" id="ss2IconSettings" data-label="Settings" onclick="openSettingsFromStartMenu()"></div>
+                <div class="ss2Icon ss2Icon15" id="ss2IconCalc" data-label="Calculator" onclick="openCalcFromStartMenu()"></div>
+                <div class="ss2Icon ss2Icon1" id="ss2Icon" data-label="Microsoft Edge"></div>
+                <div class="ss2Icon ss2Icon2" id="ss2Icon" data-label="Mail"></div>
+                <div class="ss2Icon ss2Icon3" id="ss2Icon" data-label="Calendar"></div>
+                <div class="ss2Icon ss2Icon4" id="ss2Icon" data-label="OneNote"></div>
+                <div class="ss2Icon ss2Icon5" id="ss2Icon" data-label="Photos"></div>
+                <div class="ss2Icon ss2Icon6" id="ss2Icon" data-label="To Do"></div>
+                <div class="ss2Icon ss2Icon7" id="ss2Icon" data-label="Voice Recorder"></div>
+                <div class="ss2Icon ss2Icon8" id="ss2Icon" data-label="Microsoft Store"></div>
+                <div class="ss2Icon ss2Icon9" id="ss2Icon" data-label="News"></div>
+                <div class="ss2Icon ss2Icon10" id="ss2Icon" data-label="Files"></div>
+                <div class="ss2Icon ss2Icon11" id="ss2Icon" data-label="Sticky Notes"></div>
+                <div class="ss2Icon ss2Icon12" id="ss2Icon" data-label="Maps"></div>
+                <div class="ss2Icon ss2Icon14" id="ss2Icon" data-label="Weather"></div>
+                <div class="ss2icon ss2Icon16" id="ss2Icon" data-label="WinFR"></div>
+                <div class="ss2icon ss2Icon17" id="ss2Icon" data-label="Remote Desktop"></div>
+                <div class="ss2icon ss2Icon18" id="ss2Icon" data-label="Teams"></div>
+                <div class="ss2icon ss2Icon19" id="ss2Icon" data-label="Alarms & Clock"></div>
+                <div class="ss2icon ss2Icon20" id="ss2Icon" data-label="Movies & TV"></div>
+                <div class="ss2icon ss2Icon21" id="ss2Icon" data-label="Camera"></div>
+                <div class="ss2icon ss2Icon22" id="ss2Icon" data-label="Get Help"></div>
+                <div class="ss2icon ss2Icon23" id="ss2Icon" data-label="Tips"></div>
+                <div class="ss2icon ss2Icon24" id="ss2Icon" data-label="Solitare Collection"></div>
+                <div class="ss2icon ss2Icon25" id="ss2Icon" data-label="Messaging"></div>
+                <div class="ss2icon ss2Icon26" id="ss2Icon" data-label="OneDrive"></div>
+                <div class="ss2icon ss2Icon27" id="ss2Icon" data-label="People"></div>
+                <div class="ss2icon ss2Icon28" id="ss2Icon" data-label="Whiteboard"></div>
+                <div class="ss2icon ss2Icon29" id="ss2Icon" data-label="Groove Music"></div>
+                <div class="ss2icon ss2Icon30" id="ss2Icon" data-label="Paint 3D"></div>
+                <div class="ss2icon ss2Icon31" id="ss2Icon" data-label="Office"></div>
+                <div class="ss2icon ss2Icon32" id="ss2Icon" data-label="Snip & Sketch"></div>
+                <div class="ss2icon ss2Icon33" id="ss2Icon" data-label="Video Editor"></div>
+                <div class="ss2icon ss2Icon34" id="ss2Icon" data-label="Skype"></div>
+                <div class="ss2icon ss2Icon35" id="ss2Icon" data-label="Notepad"></div>
+                <div class="ss2icon ss2Icon36" id="ss2Icon" data-label="Feedback Hub"></div>
+                <div class="ss2icon ss2Icon37" id="ss2Icon" data-label="Security"></div>
+                <div class="ss2icon ss2Icon38" id="ss2Icon" data-label="Windows Terminal"></div>
+                <div class="ss2icon ss2Icon39" id="ss2Icon" data-label="Your Phone"></div>
+                <i class="iHide" aria-hidden="true"></i>
+            </div>
+            <div class="smbSep"></div>
+            <div class="smbSection smbSect3" id="smbSect3">
+                <label class="ss3Lbl">My websites</label>
+                <label class="ss3Lbl2">Visit popular online sites by clicking the links below.</label>
+                <div class="recentTiles">
+                    <a class="recTile rt1" data-label1="Reddit" href="https://www.reddit.com" data-subLabel="Social networking"></a>
+                    <a class="recTile rt2" data-label1="Spotify" href="https://open.spotify.com" data-subLabel="Music & Video"></a>
+                    <a class="recTile rt3" data-label1="Twitter" href="https://www.twitter.com" data-subLabel="Social networking"></a>
+                    <a class="recTile rt4" data-label1="YouTube" href="https://www.youtube.com" data-subLabel="Music & Video"></a>
+                    <a class="recTile rt5" data-label1="Office Online" href="https://www.office.com" data-subLabel="Office apps"></a>
+                    <a class="recTile rt6" data-label1="Netflix" href="https://www.netflix.com" data-subLabel="Music & Video"></a>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <div class="settingsApp" id="settingsApp">
+        <div class="titlebar" data-titlebar="Settings">
+            <label class="titlebarText" id="settingsTitlebarText">Settings</label>
+            <div class="settingsBackButton" id="settBack" onclick="resetSettings()"></div>
+            <div class="windowButtons">
+                <div class="wbMin" onclick="hideSettings()"></div>
+                <div class="wbClose" id="settingsCloseBtn" onclick="closeSettings()"></div>
+            </div>
+        </div>
+        <div class="appContent page0" id="page0">
+            <div class="p0Head">
+                <div class="acHead" data-achead="Settings"></div>
+                <div class="p0hSpacer"></div>
+                <textarea rows="1" placeholder="Find a setting" class="FindaSetting"></textarea>
+                <!-- <div class="settSearchIcon"></div> -->
+            </div>
+            <div class="settingsTiles">
+                <div class="setTile st1" onclick="settTab1()" data-tileName="System" data-tileDesc="Display, sounds, notifications, battery"></div>
+                <div class="setTile st2" data-tileName="Devices" data-tileDesc="Bluetooth, printers, mouse"></div>
+                <div class="setTile st3" data-tileName="Network & Internet" data-tileDesc="Wi-Fi, airplane mode, VPN"></div>
+                <div class="setTile st4" onclick="settTab4()" data-tileName="Personalization" data-tileDesc="Background, colors, taskbar"></div>
+                <div class="setTile st5" data-tileName="Apps" data-tileDesc="Uninstall, apps for websites, offline maps"></div>
+                <div class="setTile st6" data-tileName="Accounts" data-tileDesc="Your accounts, email, sync"></div>
+                <div class="setTile st7" data-tileName="Time & Language" data-tileDesc="Region, keyboard"></div>
+                <div class="setTile st8" data-tileName="Ease of Access" data-tileDesc="Narrator, text size"></div>
+                <div class="setTile st9" data-tileName="Search" data-tileDesc="Find my files, permissions"></div>
+                <div class="setTile st10" data-tileName="Privacy" data-tileDesc="Location, camera, microphone, feedback">ﰡ</div>
+                <div class="setTile st11" data-tileName="Update & Security" data-tileDesc="Troubleshoot, Find my device"></div>
+                <div class="setTile stSpacer"></div>
+            </div>
+        </div>
+        <div class="sp2Sidebar">
+            <div class="sp2sbTab ssTab0" data-tabLabel="Home" onclick="resetSettings()"></div>
+            <textarea rows="1" placeholder="Find a setting" class="FindaSetting2"></textarea>
+            <label class="ssLabel" id="ssLabel">Personalization</label>
+            <div class="sp2Tabs" id="sp2Tabs">
+                <div class="sp2sbTab ssTab1" id="ssTab1" onclick="settT4P1()" data-tabLabel="Background"></div>
+                <div class="sp2sbTab ssTab2" id="ssTab2" onclick="settT4P2()" data-tabLabel="Colors"></div>
+                <div class="sp2sbTab ssTab3" id="ssTab3" data-tabLabel="Lock screen"></div>
+                <div class="sp2sbTab ssTab4" id="ssTab4" data-tabLabel="Themes"></div>
+                <div class="sp2sbTab ssTab5" id="ssTab5" data-tabLabel="Fonts"></div>
+                <div class="sp2sbTab ssTab6" id="ssTab6" onclick="settT4P6()" data-tabLabel="Launcher"></div>
+                <div class="sp2sbTab ssTab7" id="ssTab7" onclick="settT4P7()" data-tabLabel="Taskbar"></div>
+                <div class="sp2sbTab ssTab8" id="ssTab8" data-tabLabel="Device usage">ﴅ</div>
+            </div>
+            <div class="sp1Tabs" id="sp1Tabs">
+                <div class="sp2sbTab ss2Tab1" id="ss2Tab1" data-tabLabel="About"></div>
+            </div>
+        </div>
+
+        <div class="sp1Sidebar">
+            <div class="sp1sbTab ssTab0" data-tabLabel="Home" onclick="resetSettings()"></div>
+            <textarea rows="1" placeholder="Find a setting" class="FindaSetting2"></textarea>
+            <label class="ssLabel">System</label>
+            <div class="sp1sbTab ssTab1" id="ssTab1" onclick="" data-tabLabel="About"></div>
+        </div>
+
+        <div class="appContent page1" id="page1">
+            <div class="p1page p1about" id="ss2page1">
+                <label class="p2bLabel">About</label>
+                <div class="deviceSpecs" data-specLBL="Device specifications">
+                    <div class="devspec dvspc1" data-devSpecLBL="Device name">MinWin10X-PC</div>
+                    <div class="devspec dvspc2" data-devSpecLBL="Manufacturer">Futur3Sn0w Studio</div>
+                    <div class="devspec dvspc3" data-devSpecLBL="Model">HTML5 & CSS3</div>
+                    <div class="devspec dvspc4" data-devSpecLBL="Processor">Chromium</div>
+                    <div class="devspec dvspc5" data-devSpecLBL="Installed RAM">###</div>
+                    <div class="devspec dvspc6" data-devSpecLBL="Serial number">T3I0A1R5SN</div>
+                    <div class="devspec dvspc7" data-devSpecLBL="Device ID">G052003-C050374-H112206-B052276-W103197</div>
+                    <div class="devspec dvspc8" data-devSpecLBL="System type">Web-bit operating system, xWeb-based processor</div>
+                    <div class="devspec dvspc9" data-devSpecLBL="Chip SOC version">Futur3(R) Center(TM) i21-21514X CPU @ 2.21GHz</div>
+                </div>
+                <div class="windowsSpecs" data-specLBL="Windows specifications">
+                    <div class="devspec dvspc1" data-devSpecLBL="Edition">Windows 10X</div>
+                    <div class="devspec dvspc2" data-devSpecLBL="Version">Web</div>
+                    <div class="devspec dvspc3" data-devSpecLBL="Installed on">5/9/21</div>
+                    <div class="devspec dvspc4" data-devSpecLBL="OS build">21513.1</div>
+                    <div class="devspec dvspc5" data-devSpecLBL="Experience">Windows 10X Futur3Sn0w Edition Experience Pack 2.0</div>
+                </div>
+            </div>
+        </div>
+        <div class="appContent page2" id="page2">
+            <div class="p2page p2Background" id="sspage0">
+                <label class="p2bLabel">Background</label>
+                <div class="wallPrev" id="wallPrev">
+                    <div class="wpStartMenu" id="wpStartMenu0">
+                        <div class="wpsmTop">
+                            <div class="wpsmtSearchbar"></div>
+                        </div>
+                        <div class="wpsmBottom">
+                            <div class="wpsmbIcons" id="wpsmbIcons0">
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                            </div>
+                            <div class="wpsmbSep"></div>
+                            <div class="wpsmbIcons2">
+                                <div class="wpsmbi2"></div>
+                                <div class="wpsmbi2"></div>
+                                <div class="wpsmbi2"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="wpTaskbar">
+                        <div class="wptDot wptd1"></div>
+                        <div class="wptDot wptd2"></div>
+                        <div class="wptDot wptd3"></div>
+                    </div>
+                </div>
+                <div class="wallStrip wsSettStatic" data-wallType="Static wallpaper">
+                    <div class="wsp ws1" onclick="wall1()"></div>
+                    <div class="wsp ws2" onclick="wall2()"></div>
+                    <div class="wsp ws3" onclick="wall3()"></div>
+                    <div class="wsp ws4" onclick="wall4()"></div>
+                    <div class="wsp ws5" onclick="wall5()"></div>
+                </div>
+
+                <div class="wallStrip wsSettDyn" data-wallType="Dynamic wallpaper">
+                    <div class="wsp wspDyn wsd1" onclick="dynaWall1()"></div>
+                    <div class="wsp wspDyn wsd2" onclick="dynaWall2()"></div>
+                    <div class="wsp wspDyn wsd3" onclick="dynaWall3()"></div>
+                    <div class="wsp wspDyn wsd4" onclick="dynaWall4()"></div>
+                </div>
+                <div class="customWall"></div>
+            </div>
+            <div class="p2page p2Colors" id="ssPage2">
+                <label class="p2bLabel">Colors</label>
+                <div class="accentColorSect">
+                    <label class="CYAC">Choose your accent color</label>
+                    <div class="accentColors">
+                        <div class="aColor ac1" onclick="accentColor1()"></div>
+                        <div class="aColor ac2" onclick="accentColor2()"></div>
+                        <div class="aColor ac3" onclick="accentColor3()"></div>
+                        <div class="aColor ac4" onclick="accentColor4()"></div>
+                        <div class="aColor ac5" onclick="accentColor5()"></div>
+                        <div class="aColor ac6" onclick="accentColor6()"></div>
+                </div>
+                </div>
+            </div>
+            <div class="p2page p2Taskbar" id="ssPage7">
+                <label class="p2bLabel">Taskbar</label>
+                <div class="taskbarSize">
+                    <label class="taskbarSizeLbl"></label>
+                    <div class="tbSize tbSmall" onclick="smallTB()" data-taskbarSize="Small"></div>
+                    <div class="tbSize tbMedium" onclick="medTB()" data-taskbarSize="Medium (Default)"></div>
+                    <div class="tbSize tbLarge" onclick="largeTB()" data-taskbarSize="Large"></div>
+                </div>
+                <div class="autoHide">
+                    <label class="autoHideLbl"></label>
+                    <label class="switch">
+                        <input type="checkbox" id="autoHideCheckbox" onclick="autoHideToggle()" checked>
+                        <span class="slider round"></span>
+                      </label>
+                    <label id="ahLabel"></label>
+                </div>
+            </div>
+            <div class="p2page p2Launcher" id="ssPage6">
+                <label class="p2bLabel">Launcher</label>
+                <label class="launcherWidthLabel" data-label="Launcher size"></label>
+                <div class="wallPrev" id="wallPrev2">
+                    <div class="wpStartMenu" id="wpStartMenu">
+                        <div class="wpsmTop">
+                            <div class="wpsmtSearchbar"></div>
+                        </div>
+                        <div class="wpsmBottom">
+                            <div class="wpsmbIcons" id="wpsmbIcons">
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                                <div class="wpsmbi"></div>
+                            </div>
+                            <div class="wpsmbSep"></div>
+                            <div class="wpsmbIcons2">
+                                <div class="wpsmbi2"></div>
+                                <div class="wpsmbi2"></div>
+                                <div class="wpsmbi2"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="wpTaskbar">
+                        <div class="wptDot wptd1"></div>
+                        <div class="wptDot wptd2"></div>
+                        <div class="wptDot wptd3"></div>
+                    </div>
+                </div>
+                <div class="launcherSize">
+                    <div class="laus lsOpt2" data-label="Normal" onclick="launcherMed()"></div>
+                    <div class="laus lsOpt3" data-label="Wide" onclick="launcherLarge()"></div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    
+
+    <div class="taskBar" id="taskbar">
+        <div class="tbIndicator" id="tbIndicator"></div>
+        <div class="tbButtons" id="tbButtons">
+            <div class="tbbBtn tbbStart" id="startButton" data-tooltip="Start" onclick="startBtn()"></div>
+        <div class="tbApplications tbPinned" id="tbPinned">
+        </div>
+            <div class="tbPinSep" id="tbPinSep"></div>
+            <div class="tbNonVisible" id="tbNonVisible">
+                <div class="tbbBtn tbbAppIcon tbbSettings tbbUnpinned" id="tbbSettings" data-tooltip="Settings" onclick="openSettingsFromStartMenu()"></div>
+                <div class="tbbBtn tbbAppIcon tbbCalculator tbbUnpinned" id="tbbCalculator" data-tooltip="Calculator" onclick="openCalcFromStartMenu()"></div>
+            </div>
+        <div class="tbApplications tbUnpinned" id="tbUnpinned">
+        </div>
+            <div class="tbbBtn tbbTaskView" data-tooltip="Task View"></div>
+        </div>
+        <div class="statusArea" id="statusArea" onclick="actionCenterBtn()" data-tooltip="Action Center">
+            <div class="saIcons" id="saIcons"></div>
+            <div class="saTime" id="saTime"></div>
+        </div>
+    </div>
+
+<script>
+    $("textarea").keydown(function(e){
+// Enter was pressed without shift key
+if (e.keyCode == 13)
+{
+    // prevent default behavior
+    e.preventDefault();
+}
+});
+</script>
+
+<script>
+    fetch('eula.txt')
+  .then(response => response.text())
+  .then(eulaData => {
+  	// Do something with your data
+  	document.getElementById("fbr3Box").innerHTML = eulaData;
+  });
+</script>
+
+<script>
+    var ffs1Name = document.getElementById("ffName");
+    var ffs1Email = document.getElementById("ffEmail");
+    var errMsg = document.getElementById("fbrErr2");
+    var oobeScreen1 = document.getElementById("fboScreen1");
+    var oobeScreen2 = document.getElementById("fboScreen2");
+    var oobeScreen3 = document.getElementById("fboScreen3");
+    var oobeScreenLast = document.getElementById("fboScreenLast");
+    var firstBoot = document.getElementById("firstBoot");
+
+    function OOBES1SetCookies() {
+        if (ffs1Name.value == ''){
+            document.cookie = "ffNameCookie=User";
+        } else {
+            document.cookie = "ffNameCookie=" + ffs1Name.value;
+        }
+
+        if (ffs1Email.value == ''){
+            document.cookie = "ffEmailCookie=beta@contoso.com";
+        } else {
+            document.cookie = "ffEmailCookie=" + ffs1Email.value;
+        }
+    }
+
+    function OOBESetUsername(){
+        const userNameCookie = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('ffNameCookie='))
+                .split('=')[1];
+
+                document.getElementById("aUTUsername").innerHTML = userNameCookie;
+    }
+    
+    function OOBEs1Next() {
+        OOBES1SetCookies();
+        OOBESetUsername;
+        oobeScreen1.style.opacity = "0"
+        oobeScreen1.style.zIndex = "0"
+        oobeScreen3.style.opacity = "0"
+        oobeScreen3.style.zIndex = "0"
+        oobeScreenLast.style.opacity = "0"
+        oobeScreenLast.style.zIndex = "0"
+        oobeScreen2.style.opacity = "1"
+        oobeScreen2.style.zIndex = "2"
+        document.getElementById("fbr1ComeBack").style.color = "black";
+        document.getElementById("fbr1Form").style.opacity = ".5";
+        document.getElementById("fbr1Form").style.pointerEvents = "none";
+        document.cookie = "OOBEFinished=1"
+        document.getElementById("oobeImg2").style.opacity = "1"
+        document.getElementById("oobeImg2").style.transform = "translate(0%)"
+    }
+
+    function OOBEs1Back() {
+        oobeScreen2.style.opacity = "0"
+        oobeScreen2.style.zIndex = "0"
+        oobeScreen3.style.opacity = "0"
+        oobeScreen3.style.zIndex = "0"
+        oobeScreenLast.style.opacity = "0"
+        oobeScreenLast.style.zIndex = "0"
+        oobeScreen1.style.opacity = "1"
+        oobeScreen1.style.zIndex = "2"
+        document.cookie = "OOBEFinished=1"
+    }
+
+    function OOBEs2Next(){
+        oobeScreen1.style.opacity = "0"
+        oobeScreen1.style.zIndex = "0"
+        oobeScreen2.style.opacity = "0"
+        oobeScreen2.style.zIndex = "0"
+        oobeScreenLast.style.opacity = "0"
+        oobeScreenLast.style.zIndex = "0"
+        oobeScreen3.style.opacity = "1"
+        oobeScreen3.style.zIndex = "2"
+        document.cookie = "OOBEFinished=2"
+        document.getElementById("oobeImg3").style.opacity = "1"
+        document.getElementById("oobeImg3").style.transform = "translate(0%)"
+    }
+
+    function OOBEs3Next(){
+        oobeScreen1.style.opacity = "0"
+        oobeScreen1.style.zIndex = "0"
+        oobeScreen2.style.opacity = "0"
+        oobeScreen2.style.zIndex = "0"
+        oobeScreen3.style.opacity = "0"
+        oobeScreen3.style.zIndex = "0"
+        oobeScreenLast.style.opacity = "1"
+        oobeScreenLast.style.zIndex = "1"
+        document.cookie = "OOBEFinished=3"
+    }
+
+    function OOBEsLastFinish() {
+        firstBoot.style.opacity = "0";
+        firstBoot.style.transform = "scale(2)";
+        firstBoot.style.zIndex = "-4";
+        document.cookie = "OOBEFinished=4";
+        OOBECompletedCheck;
+    }
+
+    function OOBECompletedCheck() {
+        const oobeCompCookie = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('OOBEFinished='))
+                .split('=')[1];
+
+        if (oobeCompCookie === "4"){
+        firstBoot.style.display = "none";
+        } else {
+        firstBoot.style.display = "flex";
+        }
+
+    }
+</script>
+
+    <script>
+        function ifPinSettings(){
+            if (document.getElementById("settPinBtn").innerHTML === "Pin to taskbar"){
+                pinSettings();
+            } else {
+                unpinSettings();
+            }
+        }
+
+        function pinSettings() {
+            document.getElementById("settPinBtn").innerHTML = "Unpin from taskbar";
+            document.getElementById("dc1").onclick = openSettingsToBackgroundTB;
+            document.getElementById("tbbSettings").onclick = openSettingsFromTaskbar;
+            document.getElementById("ss2IconSettings").onclick = openSettingsFromTaskbar;
+            document.getElementById("settingsCloseBtn").onclick = closeSettingsPinned;
+            document.getElementById("tbPinned").appendChild(document.getElementById("tbbSettings"));
+            document.cookie = "settingsPinned=tbPinned";
+        }
+        
+        function unpinSettings(){
+            document.getElementById("settPinBtn").innerHTML = "Pin to taskbar";
+            document.getElementById("dc1").onclick = openSettingsToBackgroundSM;
+            document.getElementById("tbbSettings").onclick = showHideSettings;
+            document.getElementById("ss2IconSettings").onclick = openSettingsFromStartMenu;
+            document.getElementById("settingsCloseBtn").onclick = closeSettings;
+            if (document.getElementById("settingsApp").style.opacity === "1") {
+            document.getElementById("tbUnpinned").appendChild(document.getElementById("tbbSettings"));
+            } else {
+            document.getElementById("tbNonVisible").appendChild(document.getElementById("tbbSettings"));
+            }
+            document.cookie = "settingsPinned=tbUnpinned";
+        }
+
+        function getSettingsPinnedState(){
+            const settPinCookie = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('settingsPinned='))
+                .split('=')[1];
+
+            if (settPinCookie === "tbPinned"){
+                pinSettings();
+            } else {
+                unpinSettings();
+            }
+        }
+    </script>
+
+<script>
+    function ifPinCalc(){
+        if (document.getElementById("calcPinBtn").innerHTML === "Pin to taskbar"){
+            pinCalc();
+        } else {
+            unpinCalc();
+        }
+    }
+
+    function pinCalc() {
+        document.getElementById("calcPinBtn").innerHTML = "Unpin from taskbar";
+        document.getElementById("tbbCalculator").onclick = openCalcFromTaskbar;
+        document.getElementById("ss2IconCalc").onclick = openCalcFromTaskbar;
+        document.getElementById("calcCloseBtn").onclick = closeCalculatorPinned;
+        document.getElementById("tbPinned").appendChild(document.getElementById("tbbCalculator"));
+        document.cookie = "calcPinned=tbPinned";
+    }
+    
+    function unpinCalc(){
+        document.getElementById("calcPinBtn").innerHTML = "Pin to taskbar";
+        document.getElementById("tbbCalculator").onclick = showHideCalculator;
+        document.getElementById("ss2IconCalc").onclick = openCalcFromStartMenu;
+        document.getElementById("calcCloseBtn").onclick = closeCalculator;
+        if (document.getElementById("calculator").style.opacity === "1") {
+        document.getElementById("tbUnpinned").appendChild(document.getElementById("tbbCalculator"));
+        } else {
+        document.getElementById("tbNonVisible").appendChild(document.getElementById("tbbCalculator"));
+        }
+        document.cookie = "calcPinned=tbUnpinned";
+    }
+
+    function getCalcPinnedState(){
+        const calcPinCookie = document.cookie
+            .split('; ')
+            .find(row => row.startsWith('calcPinned='))
+            .split('=')[1];
+
+        if (calcPinCookie === "tbPinned"){
+            pinCalc();
+        } else {
+            unpinCalc();
+        }
+    }
+</script>
+
+    <script>
+        function acCollapse() {
+            if (document.getElementById("acthCollapse").innerHTML === "") {
+                document.getElementById("acToggles").style.height = "400px";
+                document.getElementById("actBody").style.height = "290px";
+                document.getElementById("acthCollapse").innerHTML = "";
+            } else {
+                document.getElementById("acToggles").style.height = "240px";
+                document.getElementById("actBody").style.height = "133px";
+                document.getElementById("acthCollapse").innerHTML = "";
+            }
+        }
+
+        function actionCenterBtn() {
+            if (document.getElementById("actionCenter").style.opacity === "0") {
+                document.getElementById("actionCenter").style.opacity = "1";
+                document.getElementById("actionCenter").style.transform = "translateY(0)";
+            } else {
+                document.getElementById("actionCenter").style.opacity = "0";
+                document.getElementById("actionCenter").style.transform = "translateY(100%)";
+            }
+        }
+    </script>
+
+    <script>
+        var startMenu = document.getElementById("startMenu");
+        var startButton = document.getElementById("startButton");
+        var appSection = document.getElementById("smbSect2");
+            var siteSection = document.getElementById("smbSect3");
+            var showAll = document.getElementById("showAllBtn");
+
+        function startBtn() {
+            if (document.getElementById("startMenu").style.opacity === "0") {
+                document.getElementById("startMenu").style.opacity = "1";
+                document.getElementById("startMenu").style.transform = "translateX(-50%) translateY(0)";
+                startButton.removeEventListener("mouseenter", colorStartBtn);
+                startButton.removeEventListener("mouseleave", resetStartBtn);
+                colorStartBtn();
+            } else {
+                document.getElementById("startMenu").style.opacity = "0";
+                document.getElementById("startMenu").style.transform = "translateX(-50%) translateY(100%)";
+                startButton.addEventListener("mouseenter", colorStartBtn);
+                startButton.addEventListener("mouseleave", resetStartBtn);
+                resetStartBtn();
+            }
+        }
+
+        document.addEventListener('mouseup', function(e) {
+            var container = document.getElementById("startMenu");
+            if (!container.contains(e.target)) {
+                container.style.transform = "translateX(-50%) translateY(100%)";
+                container.style.opacity = '0';
+                startButton.addEventListener("mouseenter", colorStartBtn);
+                startButton.addEventListener("mouseleave", resetStartBtn);
+                appSection.style.height = "300px";
+                siteSection.style.display = "flex";
+                showAll.innerHTML = "Show all";
+                resetStartBtn();
+            }
+        });
+
+        startButton.addEventListener("mouseenter", colorStartBtn);
+        startButton.addEventListener("mouseleave", resetStartBtn);
+
+        function colorStartBtn() {
+            startButton.style.backgroundImage = "url(btnIcons/startColor.svg)";
+        }
+
+        function resetStartBtn() {
+            startButton.style.backgroundImage = "var(--start-btn)";
+        }
+    </script>
+
+    <script>
+        document.addEventListener('mouseup', function(e) {
+            var container2 = document.getElementById("actionCenter");
+            if (!container2.contains(e.target)) {
+                container2.style.transform = "translateY(100%)";
+                container2.style.opacity = '0';
+            }
+        });
+    </script>
+
+    <script>
+        function showTime() {
+            var date = new Date();
+            var h = date.getHours(); // 0 - 23
+            var m = date.getMinutes(); // 0 - 59
+            var session = "AM";
+
+            if (h == 0) {
+                h = 12;
+            }
+
+            if (h > 12) {
+                h = h - 12;
+                session = "PM";
+            }
+
+            h = (h < 10) ? h : h;
+            m = (m < 10) ? "0" + m : m;
+
+            var time = h + ":" + m;
+            document.getElementById("saTime").innerText = time;
+            document.getElementById("saTime").textContent = time;
+
+            setTimeout(showTime, 1000);
+
+        }
+
+        showTime();
+    </script>
+
+    <script>
+        function showAllLauncherBtn() {
+            var appSection = document.getElementById("smbSect2");
+            var siteSection = document.getElementById("smbSect3");
+            var showAll = document.getElementById("showAllBtn");
+
+            if (appSection.style.height === "300px") {
+                appSection.style.height = "780px";
+                siteSection.style.display = "none";
+                showAll.innerHTML = "Show less";
+            } else {
+                appSection.style.height = "300px";
+                siteSection.style.display = "flex";
+                showAll.innerHTML = "Show all";
+            }
+        }
+    </script>
+
+    <script>
+        document.onclick = hideMenu;
+        document.getElementById("desktopLayer").oncontextmenu = rightClick;
+
+        function hideMenu() {
+            document.getElementById("desktopContext").style.opacity = "0";
+            document.getElementById("icSettings").style.opacity = "0";
+            document.getElementById("icSettings").style.zIndex = "1";
+            document.getElementById("icCalc").style.opacity = "0";
+            document.getElementById("icCalc").style.zIndex = "1";
+        }
+
+        function rightClick(e) {
+            e.preventDefault();
+
+            if (document.getElementById("desktopContext").style.opacity == "1")
+                hideMenu();
+            else {
+                var menu = document.getElementById("desktopContext")
+
+                menu.style.opacity = '1';
+                menu.style.left = e.pageX + "px";
+                menu.style.top = e.pageY + "px";
+            }
+        }
+    </script>
+
+<script>
+    document.getElementById("tbbSettings").oncontextmenu = rightClick2;
+    document.getElementById("tbbCalculator").oncontextmenu = rightClick3;
+
+    function rightClick2(e) {
+        e.preventDefault();
+
+        if (document.getElementById("icSettings").style.opacity == "1")
+            hideMenu();
+        else {
+            var menu2 = document.getElementById("icSettings")
+
+            menu2.style.opacity = '1';
+            menu2.style.zIndex = '30';
+        }
+    }
+
+    function rightClick3(e) {
+        e.preventDefault();
+
+        if (document.getElementById("icCalc").style.opacity == "1")
+            hideMenu();
+        else {
+            var menu2 = document.getElementById("icCalc")
+
+            menu2.style.opacity = '1';
+            menu2.style.zIndex = '30';
+        }
+    }
+</script>
+
+    <script>
+        function setWall() {
+            const wallCookie = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('wall='))
+                .split('=')[1];
+
+            document.getElementById("body").style.backgroundImage = wallCookie;
+            document.getElementById("wallPrev").style.backgroundImage = wallCookie;
+            document.getElementById("wallPrev2").style.backgroundImage = wallCookie;
+            document.getElementById("wallImgAC").style.backgroundImage = wallCookie;
+            document.getElementById("fbOBackground").style.backgroundImage = wallCookie;
+        }
+
+        function wall1() {
+            document.cookie = "wall=var(--wall1)";
+            document.getElementById("body").style.backgroundImage = "var(--wall1)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--wall1)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--wall1)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--wall1)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--wall1)";
+        }
+
+        function wall2() {
+            document.cookie = "wall=var(--wall2)";
+            document.getElementById("body").style.backgroundImage = "var(--wall2)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--wall2)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--wall2)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--wall2)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--wall2)";
+        }
+
+        function wall3() {
+            document.cookie = "wall=var(--wall3)";
+            document.getElementById("body").style.backgroundImage = "var(--wall3)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--wall3)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--wall3)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--wall3)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--wall3)";
+        }
+
+        function wall4() {
+            document.cookie = "wall=var(--wall4)";
+            document.getElementById("body").style.backgroundImage = "var(--wall4)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--wall4)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--wall4)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--wall4)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--wall4)";
+        }
+
+        function wall5() {
+            document.cookie = "wall=var(--wall5)";
+            document.getElementById("body").style.backgroundImage = "var(--wall5)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--wall5)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--wall5)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--wall5)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--wall5)";
+        }
+
+        function dynaWall1() {
+            document.cookie = "wall=var(--dynamicWall1)";
+            document.getElementById("body").style.backgroundImage = "var(--dynamicWall1)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--dynamicWall1)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--dynamicWall1)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--dynamicWall1)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--dynamicWall1)";
+        }
+
+        function dynaWall2() {
+            document.cookie = "wall=var(--dynamicWall2)";
+            document.getElementById("body").style.backgroundImage = "var(--dynamicWall2)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--dynamicWall2)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--dynamicWall2)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--dynamicWall2)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--dynamicWall2)";
+        }
+
+        function dynaWall3() {
+            document.cookie = "wall=var(--dynamicWall3)";
+            document.getElementById("body").style.backgroundImage = "var(--dynamicWall3)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--dynamicWall3)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--dynamicWall3)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--dynamicWall3)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--dynamicWall3)";
+        }
+
+        function dynaWall4() {
+            document.cookie = "wall=var(--dynamicWall4)";
+            document.getElementById("body").style.backgroundImage = "var(--dynamicWall4)";
+            document.getElementById("wallPrev").style.backgroundImage = "var(--dynamicWall4)";
+            document.getElementById("wallPrev2").style.backgroundImage = "var(--dynamicWall4)";
+            document.getElementById("wallImgAC").style.backgroundImage = "var(--dynamicWall4)";
+            document.getElementById("fbOBackground").style.backgroundImage = "var(--dynamicWall4)";
+        }
+    </script>
+
+    <script>
+        var startMenu = document.getElementById("startMenu");
+        var wpStartMenu = document.getElementById("wpStartMenu");
+        var wpStartMenu0 = document.getElementById("wpStartMenu0");
+        var wpIcons0 = document.getElementById("wpsmbIcons");
+        var wpIcons = document.getElementById("wpsmbIcons0");
+
+        function launcherMed() {
+            startMenu.style.width = "700px";
+            wpStartMenu.style.width = "120px";
+            wpStartMenu0.style.width = "120px";
+            wpIcons.style.gap = "16% 7%";
+            wpIcons0.style.gap = "16% 7%";
+            document.cookie = "launcherSize=medium";
+        }
+
+        function launcherLarge() {
+            startMenu.style.width = "900px";
+            wpStartMenu.style.width = "160px";
+            wpStartMenu0.style.width = "160px";
+            wpIcons.style.gap = "16% 10%";
+            wpIcons0.style.gap = "16% 10%";
+            document.cookie = "launcherSize=large";
+        }
+
+        function loadLauncherSize() {
+            const launcherSizeC = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('launcherSize='))
+                .split('=')[1];
+
+            if (launcherSizeC === "medium") {
+                launcherMed();
+            } else if (launcherSizeC === "large") {
+                launcherLarge();
+            }
+        }
+    </script>
+
+    <script>
+        function accentColor1() {
+            root.style.setProperty('--accent', "#3D7FD5");
+            root.style.setProperty('--accent-hov', "#2E60A2");
+            document.cookie = "accentColor=#3D7FD5"
+            document.cookie = "accentColorHov=#2E60A2"
+        }
+
+        function accentColor2() {
+            root.style.setProperty('--accent', "#30AEAA");
+            root.style.setProperty('--accent-hov', "#217B78");
+            document.cookie = "accentColor=#30AEAA"
+            document.cookie = "accentColorHov=#217B78"
+        }
+
+        function accentColor3() {
+            root.style.setProperty('--accent', "#B32B1D");
+            root.style.setProperty('--accent-hov', "#801E14");
+            document.cookie = "accentColor=#B32B1D"
+            document.cookie = "accentColorHov=#801E14"
+        }
+
+        function accentColor4() {
+            root.style.setProperty('--accent', "#0283E5");
+            root.style.setProperty('--accent-hov', "#0165B2");
+            document.cookie = "accentColor=#0283E5"
+            document.cookie = "accentColorHov=#0165B2"
+        }
+
+        function accentColor5() {
+            root.style.setProperty('--accent', "#C67AB8");
+            root.style.setProperty('--accent-hov', "#935A88");
+            document.cookie = "accentColor=#C67AB8"
+            document.cookie = "accentColorHov=#935A88"
+        }
+
+        function accentColorLd() {
+            const accentCookie = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('accentColor='))
+                .split('=')[1];
+
+            const accentCookieHov = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('accentColorHov='))
+                .split('=')[1];
+
+            root.style.setProperty('--accent', accentCookie)
+            root.style.setProperty('--accent-hov', accentCookieHov)
+        }
+    </script>
+
+<script>
+    function openCalcFromStartMenu() {
+        document.getElementById("calculator").style.transformOrigin = "center";
+        document.getElementById("calculator").style.transform = "scale(1)";
+        document.getElementById("calculator").style.opacity = "1";
+        document.getElementById("tbUnpinned").appendChild(document.getElementById("tbbCalculator"));
+        document.getElementById("startMenu").style.transform = "translateX(-50%) translateY(100%)";
+        document.getElementById("startMenu").style.opacity = '0';
+        document.getElementById("actionCenter").style.transform = "translateY(100%)";
+        document.getElementById("actionCenter").style.opacity = '0';
+        document.getElementById("tbbCalculator").onclick = showHideCalculator;
+    }
+
+    function openCalcFromTaskbar() {
+        document.getElementById("calculator").style.transformOrigin = "center";
+        document.getElementById("calculator").style.transform = "scale(1)";
+        document.getElementById("calculator").style.opacity = "1";
+        document.getElementById("startMenu").style.transform = "translateX(-50%) translateY(100%)";
+        document.getElementById("startMenu").style.opacity = '0';
+        document.getElementById("actionCenter").style.transform = "translateY(100%)";
+        document.getElementById("actionCenter").style.opacity = '0';
+        document.getElementById("tbbCalculator").onclick = showHideCalculator;
+    }
+
+    function closeCalculatorPinned() {
+        document.getElementById("calculator").style.transformOrigin = "center";
+        document.getElementById("calculator").style.transform = "scale(0)";
+        document.getElementById("calculator").style.opacity = "0";
+        document.getElementById("tbbSettings").onclick = openCalcFromTaskbar;
+        resetCalculator();
+    }
+
+    function closeCalculator() {
+        document.getElementById("calculator").style.transformOrigin = "center";
+        document.getElementById("calculator").style.transform = "scale(0)";
+        document.getElementById("calculator").style.opacity = "0";
+        document.getElementById("tbNonVisible").appendChild(document.getElementById("tbbCalculator"));
+        resetCalculator();
+    }
+
+    function hideCalculator() {
+        document.getElementById("calculator").style.transformOrigin = "bottom";
+        document.getElementById("calculator").style.transform = "scale(0)";
+        document.getElementById("calculator").style.opacity = "0";
+    }
+
+    function showCalculator() {
+        document.getElementById("calculator").style.transformOrigin = "bottom";
+        document.getElementById("calculator").style.transform = "scale(1) ";
+        document.getElementById("calculator").style.opacity = "1";
+    }
+
+    function resetCalculator() {
+        document.getElementById("result").value = "";
+    }
+
+    function showHideCalculator() {
+        if (document.getElementById("calculator").style.transform === "scale(0)") {
+            showCalculator();
+        } else {
+            hideCalculator();
+        }
+    }
+</script>
+
+    <script>
+
+        function openSettingsFromStartMenu() {
+            document.getElementById("settingsApp").style.transformOrigin = "center";
+            document.getElementById("settingsApp").style.transform = "scale(1)";
+            document.getElementById("settingsApp").style.opacity = "1";
+            document.getElementById("tbUnpinned").appendChild(document.getElementById("tbbSettings"));
+            document.getElementById("startMenu").style.transform = "translateX(-50%) translateY(100%)";
+            document.getElementById("startMenu").style.opacity = '0';
+            document.getElementById("actionCenter").style.transform = "translateY(100%)";
+            document.getElementById("actionCenter").style.opacity = '0';
+            document.getElementById("tbbSettings").onclick = showHideSettings;
+        }
+
+        function openSettingsFromTaskbar() {
+            document.getElementById("settingsApp").style.transformOrigin = "center";
+            document.getElementById("settingsApp").style.transform = "scale(1)";
+            document.getElementById("settingsApp").style.opacity = "1";
+            document.getElementById("startMenu").style.transform = "translateX(-50%) translateY(100%)";
+            document.getElementById("startMenu").style.opacity = '0';
+            document.getElementById("actionCenter").style.transform = "translateY(100%)";
+            document.getElementById("actionCenter").style.opacity = '0';
+            document.getElementById("tbbSettings").onclick = showHideSettings;
+        }
+
+        function openSettingsToBackgroundSM() {
+            settTab4();
+            openSettingsFromStartMenu();
+        }
+
+        function openSettingsToBackgroundTB() {
+            settTab4();
+            openSettingsFromTaskbar();
+        }
+
+        function closeSettingsPinned() {
+            document.getElementById("settingsApp").style.transformOrigin = "center";
+            document.getElementById("settingsApp").style.transform = "scale(0)";
+            document.getElementById("settingsApp").style.opacity = "0";
+            document.getElementById("tbbSettings").onclick = openSettingsFromTaskbar;
+            resetSettings();
+        }
+
+        function closeSettings() {
+            document.getElementById("settingsApp").style.transformOrigin = "center";
+            document.getElementById("settingsApp").style.transform = "scale(0)";
+            document.getElementById("settingsApp").style.opacity = "0";
+            document.getElementById("tbNonVisible").appendChild(document.getElementById("tbbSettings"));
+            resetSettings();
+        }
+
+        function hideSettings() {
+            document.getElementById("settingsApp").style.transformOrigin = "bottom";
+            document.getElementById("settingsApp").style.transform = "scale(0)";
+            document.getElementById("settingsApp").style.opacity = "0";
+        }
+
+        function showSettings() {
+            document.getElementById("settingsApp").style.transformOrigin = "bottom";
+            document.getElementById("settingsApp").style.transform = "scale(1)";
+            document.getElementById("settingsApp").style.opacity = "1";
+        }
+
+        function resetSettings() {
+            document.getElementById("page0").style.opacity = "1";
+            document.getElementById("page0").style.zIndex = "5";
+            document.getElementById("page0").style.transform = "scale(1)";
+            document.getElementById("page1").style.opacity = "0";
+            document.getElementById("page1").style.zIndex = "4";
+            document.getElementById("page1").style.transform = "scale(.8)";
+            document.getElementById("page2").style.opacity = "0";
+            document.getElementById("page2").style.zIndex = "4";
+            document.getElementById("page2").style.transform = "scale(.8)";
+            document.getElementById("settBack").style.display = "none";
+            document.getElementById("settingsTitlebarText").style.left = "15px";
+            settT4P1();
+        }
+
+        function settTab1() {
+            document.getElementById("page1").style.zIndex = "5";
+            document.getElementById("page1").style.opacity = "1";
+            document.getElementById("page1").style.transform = "scale(1)";
+            document.getElementById("page2").style.opacity = "0";
+            document.getElementById("page2").style.zIndex = "4";
+            document.getElementById("page2").style.transform = "scale(.8)";
+            document.getElementById("page0").style.opacity = "0";
+            document.getElementById("page0").style.zIndex = "4";
+            document.getElementById("page0").style.transform = "scale(1.2)";
+            document.getElementById("settBack").style.display = "flex";
+            document.getElementById("settingsTitlebarText").style.left = "60px";
+            document.getElementById("sp2Tabs").style.display = "none"
+            document.getElementById("sp1Tabs").style.display = "flex"
+            document.getElementById("ssLabel").innerHTML = "System"
+        }
+
+        function settTab4() {
+            document.getElementById("page2").style.zIndex = "5";
+            document.getElementById("page2").style.opacity = "1";
+            document.getElementById("page2").style.transform = "scale(1)";
+            document.getElementById("page0").style.opacity = "0";
+            document.getElementById("page0").style.zIndex = "4";
+            document.getElementById("page0").style.transform = "scale(1.2)";
+            document.getElementById("settBack").style.display = "flex";
+            document.getElementById("settingsTitlebarText").style.left = "60px";
+            document.getElementById("sp2Tabs").style.display = "flex"
+            document.getElementById("sp1Tabs").style.display = "none"
+            document.getElementById("ssLabel").innerHTML = "Personalization"
+        }
+
+        function settT4P1() {
+            document.getElementById("ssTab1").style.borderLeftColor = "var(--accent)"
+            document.getElementById("ssTab2").style.borderLeftColor = "transparent"
+            document.getElementById("ssTab6").style.borderLeftColor = "transparent"
+            document.getElementById("ssTab7").style.borderLeftColor = "transparent"
+            document.getElementById("sspage0").style.opacity = 1;
+            document.getElementById("sspage0").style.zIndex = 6;
+            document.getElementById("ssPage2").style.opacity = 0;
+            document.getElementById("ssPage2").style.zIndex = 4;
+            document.getElementById("ssPage7").style.opacity = 0;
+            document.getElementById("ssPage7").style.zIndex = 4;
+            document.getElementById("ssPage6").style.opacity = 0;
+            document.getElementById("ssPage6").style.zIndex = 4;
+        }
+
+        function settT4P2() {
+            document.getElementById("ssTab2").style.borderLeftColor = "var(--accent)"
+            document.getElementById("ssTab1").style.borderLeftColor = "transparent"
+            document.getElementById("ssTab6").style.borderLeftColor = "transparent"
+            document.getElementById("ssTab7").style.borderLeftColor = "transparent"
+            document.getElementById("ssPage2").style.opacity = 1;
+            document.getElementById("ssPage2").style.zIndex = 6;
+            document.getElementById("sspage0").style.opacity = 0;
+            document.getElementById("sspage0").style.zIndex = 4;
+            document.getElementById("ssPage7").style.opacity = 0;
+            document.getElementById("ssPage7").style.zIndex = 4;
+            document.getElementById("ssPage6").style.opacity = 0;
+            document.getElementById("ssPage6").style.zIndex = 4;
+        }
+
+        function settT4P6() {
+            document.getElementById("ssTab6").style.borderLeftColor = "var(--accent)"
+            document.getElementById("ssTab1").style.borderLeftColor = "transparent"
+            document.getElementById("ssTab2").style.borderLeftColor = "transparent"
+            document.getElementById("ssTab7").style.borderLeftColor = "transparent"
+            document.getElementById("ssPage6").style.opacity = 1;
+            document.getElementById("ssPage6").style.zIndex = 6;
+            document.getElementById("ssPage7").style.opacity = 0;
+            document.getElementById("ssPage7").style.zIndex = 4;
+            document.getElementById("ssPage2").style.opacity = 0;
+            document.getElementById("ssPage2").style.zIndex = 4;
+            document.getElementById("sspage0").style.opacity = 0;
+            document.getElementById("sspage0").style.zIndex = 4;
+        }
+
+        function settT4P7() {
+            document.getElementById("ssTab7").style.borderLeftColor = "var(--accent)"
+            document.getElementById("ssTab6").style.borderLeftColor = "transparent"
+            document.getElementById("ssTab1").style.borderLeftColor = "transparent"
+            document.getElementById("ssTab2").style.borderLeftColor = "transparent"
+            document.getElementById("ssPage7").style.opacity = 1;
+            document.getElementById("ssPage7").style.zIndex = 6;
+            document.getElementById("sspage0").style.opacity = 0;
+            document.getElementById("sspage0").style.zIndex = 4;
+            document.getElementById("ssPage2").style.opacity = 0;
+            document.getElementById("ssPage2").style.zIndex = 4;
+            document.getElementById("ssPage6").style.opacity = 0;
+            document.getElementById("ssPage6").style.zIndex = 4;
+        }
+
+        function settT1P1() {
+            document.getElementById("ss2Tab1").style.borderLeftColor = "var(--accent)"
+            document.getElementById("ss2Page1").style.opacity = 1;
+            document.getElementById("ssPage1").style.zIndex = 6;
+        }
+
+        function showHideSettings() {
+            if (document.getElementById("settingsApp").style.transform === "scale(0)") {
+                showSettings();
+            } else {
+                hideSettings();
+            }
+        }
+    </script>
+
+    <script>
+        let root = document.documentElement;
+        var ahCheckbox = document.getElementById("autoHideCheckbox");
+        var taskbar = document.getElementById("taskbar");
+
+        function autoHideToggle() {
+            if (ahCheckbox.checked == true) {
+                taskbar.addEventListener("mouseenter", showTaskbar);
+                taskbar.addEventListener("mouseleave", hideTaskbar);
+                hideTaskbar();
+                document.getElementById("ahLabel").innerHTML = "On"
+                document.cookie = "autoHideTB=true";
+            } else {
+                taskbar.addEventListener("mouseenter", showTaskbar);
+                taskbar.removeEventListener("mouseleave", hideTaskbar);
+                showTaskbar();
+                document.getElementById("ahLabel").innerHTML = "Off"
+                document.cookie = "autoHideTB=false";
+            }
+        }
+
+        function hideTaskbar() {
+            taskbar.style.height = "30px";
+            document.getElementById("tbButtons").style.opacity = "0";
+            document.getElementById("tbIndicator").style.opacity = "1";
+            document.getElementById("statusArea").style.paddingRight = "0";
+            document.getElementById("statusArea").style.alignItems = "center";
+            document.getElementById("statusArea").style.flexDirection = "row";
+
+        }
+
+        function showTaskbar() {
+            taskbar.style.height = "var(--tbSizeM)";
+            document.getElementById("tbButtons").style.opacity = "1";
+            document.getElementById("tbIndicator").style.opacity = "0";
+            document.getElementById("statusArea").style.paddingRight = "10px";
+            document.getElementById("statusArea").style.alignItems = "flex-end";
+            document.getElementById("statusArea").style.flexDirection = "column-reverse";
+        }
+
+        function autoHideSave() {
+            const tbAutoHide = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('autoHideTB='))
+                .split('=')[1];
+
+            if (tbAutoHide === "true") {
+                ahCheckbox.checked = true;
+            } else {
+                ahCheckbox.checked = false;
+            }
+        }
+
+        function setTBSize() {
+            const tbSizeCookie = document.cookie
+                .split('; ')
+                .find(row => row.startsWith('tbSize='))
+                .split('=')[1];
+
+            root.style.setProperty('--tbSizeM', tbSizeCookie);
+        }
+
+        function smallTB() {
+            root.style.setProperty('--tbSizeM', '40px');
+            document.cookie = "tbSize=40px";
+        }
+
+        function medTB() {
+            root.style.setProperty('--tbSizeM', '50px');
+            document.cookie = "tbSize=50px";
+        }
+
+        function largeTB() {
+            root.style.setProperty('--tbSizeM', '60px');
+            document.cookie = "tbSize=60px";
+        }
+    </script>
+    <script>
+        //function that display value
+        function dis(val)
+        {
+            document.getElementById("result").value+=val
+        }
+          
+        //function that evaluates the digit and return result
+        function solve()
+        {
+            let x = document.getElementById("result").value
+            let y = eval(x)
+            document.getElementById("result").value = y
+        }
+
+        function clr()
+        {
+            document.getElementById("result").value = ""
+        }
+     </script>
+    <script>
+        function windowLoad() {
+            OOBECompletedCheck();
+            OOBESetUsername();
+            setWall();
+            accentColorLd();
+            loadLauncherSize();
+            setTBSize();
+            autoHideSave();
+            autoHideToggle();
+            getSettingsPinnedState();
+            getCalcPinnedState();
+        }
+    </script>
+</body>
+
+</html>

@@ -9,6 +9,9 @@
 #include <cwctype>
 
 using namespace Win32Bridge::Bridge;
+using namespace Windows::Storage;
+using namespace Windows::Storage::Streams;
+using namespace concurrency;
 
 namespace
 {
@@ -41,8 +44,13 @@ struct GuestModuleLoader::Module final
     ULONG references = 1;
 };
 
-GuestModuleLoader::GuestModuleLoader(std::shared_ptr<GuestStorageContext> storage, ImportResolver resolver)
-    : m_storage(std::move(storage)), m_resolver(std::move(resolver))
+GuestModuleLoader::GuestModuleLoader(
+    std::shared_ptr<GuestStorageContext> storage,
+    ImportResolver resolver,
+    StorageFolder^ moduleSourceFolder)
+    : m_storage(std::move(storage)),
+      m_resolver(std::move(resolver)),
+      m_moduleSourceFolder(moduleSourceFolder)
 {
 }
 
@@ -85,10 +93,96 @@ std::shared_ptr<GuestModuleLoader::Module> GuestModuleLoader::FindModuleLocked(H
     return nullptr;
 }
 
+bool GuestModuleLoader::ReadAuthorizedModuleBytes(
+    const std::wstring& relativeName,
+    std::vector<BYTE>* bytes) const
+{
+    StorageFolder^ current = m_moduleSourceFolder.Get();
+    if (!current || !bytes || relativeName.empty() ||
+        relativeName.front() == L'\\' || relativeName.find(L':') != std::wstring::npos)
+    {
+        return false;
+    }
+
+    std::vector<std::wstring> components;
+    size_t cursor = 0;
+    while (cursor <= relativeName.size())
+    {
+        const size_t separator = relativeName.find(L'\\', cursor);
+        const size_t end = separator == std::wstring::npos ? relativeName.size() : separator;
+        const std::wstring component = relativeName.substr(cursor, end - cursor);
+        if (component.empty() || component == L"." || component == L"..")
+        {
+            return false;
+        }
+        components.push_back(component);
+        if (separator == std::wstring::npos)
+        {
+            break;
+        }
+        cursor = separator + 1;
+    }
+    if (components.empty())
+    {
+        return false;
+    }
+
+    try
+    {
+        for (size_t index = 0; index + 1 < components.size(); ++index)
+        {
+            current = create_task(current->GetFolderAsync(
+                ref new Platform::String(components[index].c_str()))).get();
+        }
+
+        StorageFile^ file = create_task(current->GetFileAsync(
+            ref new Platform::String(components.back().c_str()))).get();
+        IBuffer^ buffer = create_task(FileIO::ReadBufferAsync(file)).get();
+        if (!buffer || buffer->Length > 128u * 1024u * 1024u)
+        {
+            return false;
+        }
+
+        auto managedBytes = ref new Platform::Array<unsigned char>(buffer->Length);
+        DataReader^ reader = DataReader::FromBuffer(buffer);
+        reader->ReadBytes(managedBytes);
+        bytes->assign(managedBytes->Data, managedBytes->Data + managedBytes->Length);
+        delete reader;
+        return true;
+    }
+    catch (Platform::Exception^)
+    {
+        bytes->clear();
+        return false;
+    }
+}
+
+bool GuestModuleLoader::ReadModuleBytes(
+    const std::wstring& canonicalName,
+    std::vector<BYTE>* bytes,
+    DWORD* win32Error) const
+{
+    if (ReadAuthorizedModuleBytes(canonicalName, bytes))
+    {
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        RuntimeDiagnostics::Record(L"DLL SOURCE: loaded " + canonicalName + L" from the authorized executable folder.");
+        return true;
+    }
+
+    if (m_storage && m_storage->ReadAllBytes(canonicalName.c_str(), bytes, win32Error))
+    {
+        RuntimeDiagnostics::Record(L"DLL SOURCE: loaded " + canonicalName + L" from LocalStorage\\drive_c.");
+        return true;
+    }
+
+    SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
+    return false;
+}
+
 bool GuestModuleLoader::LoadLibrary(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error)
 {
     RuntimeDiagnostics::Record(L"DLL: LoadLibrary request for " + (requestedName ? std::wstring(requestedName) : L"<null>") + L".");
-    if (!module || !m_storage || !m_resolver)
+    if (!module || !m_resolver)
     {
         SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
         RuntimeDiagnostics::Record(L"DLL FAILED: invalid LoadLibrary context.");
@@ -120,7 +214,7 @@ bool GuestModuleLoader::LoadLibrary(LPCWSTR requestedName, HMODULE* module, DWOR
 
     std::vector<BYTE> fileBytes;
     DWORD storageError = ERROR_SUCCESS;
-    if (!m_storage->ReadAllBytes(canonicalName.c_str(), &fileBytes, &storageError))
+    if (!ReadModuleBytes(canonicalName, &fileBytes, &storageError))
     {
         SetWin32Error(win32Error, storageError);
         RuntimeDiagnostics::Record(L"DLL FAILED: could not read " + canonicalName + L" (Win32 error " + std::to_wstring(storageError) + L").");

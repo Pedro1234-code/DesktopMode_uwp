@@ -1,0 +1,276 @@
+.actionCenter {
+    position: absolute;
+    z-index: 11;
+    transform: translateY(100%);
+    cursor: default;
+    opacity: 0;
+    transition: opacity .2s, transform .3s;
+    bottom: calc(var(--tbSizeM) + 5px);
+    right: 5px;
+}
+
+.acPage {
+    width: 400px;
+    height: var(--qsHeight);
+    border-radius: var(--objectRadi);
+    box-shadow: 0px 20px 30px 0px rgba(0, 0, 0, 0.2);
+    background-color: var(--startMenu);
+    backdrop-filter: blur(90px) saturate(400%);
+    color: var(--font2);
+    overflow: hidden;
+    transition: height .3s;
+}
+
+
+/* HEADER */
+
+.actHead {
+    position: absolute;
+    width: 100%;
+    height: 50px;
+    background-color: rgba(0, 0, 0, .1);
+    border-bottom: 2px solid rgba(0, 0, 0, .1);
+    display: flex;
+    align-items: center;
+}
+
+.actHead::before {
+    content: "Quick settings";
+    padding-left: 15px;
+}
+
+.acthCollapse {
+    position: absolute;
+    right: 10px;
+    width: 25px;
+    height: 25px;
+    border-radius: 50%;
+    background-color: rgba(255, 255, 255, .2);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 400 18px FLNTREG;
+    transition: background-color .1s;
+}
+
+.acthCollapse:hover {
+    background-color: rgba(255, 255, 255, .3);
+}
+
+
+/* BODY */
+
+.actBody {
+    height: 133px;
+    width: 100%;
+    position: absolute;
+    top: 50px;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    flex-direction: column;
+    transition: height .3s;
+}
+
+.actbVolume {
+    position: absolute;
+    left: 50%;
+    transform: translateX(-50%);
+    top: 20px;
+    display: flex;
+    align-items: center;
+    width: fit-content;
+}
+
+.actbvIcon {
+    font: 100 20px FLNTREG;
+    padding-right: 15px;
+}
+
+.actbvSlider {
+    width: 320px;
+    height: 6px;
+    border-radius: 50px;
+    background-color: var(--accent);
+    display: flex;
+    align-items: center;
+    opacity: .8;
+}
+
+.actvbsIndicator {
+    width: 25px;
+    height: 25px;
+    background-color: var(--accent-hov);
+    border-radius: 50%;
+    transition: background-color .1s;
+}
+
+.actbToggles {
+    padding: 60px 0 0 0;
+    display: grid;
+    gap: 35px 15px;
+    width: 100%;
+    place-content: center;
+    place-items: center;
+    grid-template-columns: auto auto auto;
+    grid-template-rows: auto auto auto;
+}
+
+.actbTogg {
+    position: relative;
+    width: 110px;
+    height: 45px;
+    background-color: var(--accent);
+    border-radius: 3px;
+    transition: background-color .1s;
+    color: var(--font2);
+}
+
+.actbTogg:hover {
+    background-color: var(--accent-hov);
+}
+
+.actvbsIndicator:hover {
+    background-color: var(--accent);
+}
+
+.actbTogg::after {
+    position: absolute;
+    content: attr(data-actLabel);
+    bottom: -20px;
+    left: 50%;
+    width: fit-content;
+    transform: translateX(-50%);
+    font: 100 12px Seg;
+    pointer-events: none;
+}
+
+.actbTogg::before {
+    font: 400 18px FLNTREG;
+    content: attr(data-actGlyph);
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+}
+
+.actbt1::before {
+    padding-right: 45px;
+}
+
+.acbtArrow {
+    height: 100%;
+    width: 40%;
+    position: absolute;
+    display: flex;
+    top: 0;
+    right: 0;
+    align-items: center;
+    justify-content: center;
+    font: 400 16px FLNTREG;
+    border-radius: 0 3px 3px 0;
+}
+
+.aa1 {
+    border-left: 1px solid rgba(0, 0, 0, .3);
+    background-color: var(--accent);
+}
+
+.actbt2,
+.actbt3,
+.actbt4,
+.actbt5,
+.actbt6,
+.actbt7,
+.actbt8,
+.actbt9 {
+    background-color: rgba(0, 0, 0, .3);
+}
+
+.actbt2:hover,
+.actbt3:hover,
+.actbt4:hover,
+.actbt5:hover,
+.actbt6:hover,
+.actbt9:hover {
+    background-color: rgba(0, 0, 0, .6);
+}
+
+.actbt7:hover,
+.actbt8:hover {
+    background-color: rgba(0, 0, 0, .3);
+}
+
+.actbt7,
+.actbt8 {
+    opacity: .5;
+}
+
+
+/* FOOTER */
+
+.actFooter {
+    position: absolute;
+    bottom: 0;
+    width: 100%;
+    height: 55px;
+    border-top: 2px solid rgba(0, 0, 0, .1);
+    display: flex;
+    align-items: center;
+}
+
+.actFooter::before {
+    content: "";
+    padding-left: 15px;
+}
+
+.actfButtons {
+    position: absolute;
+    right: 0;
+    height: calc(100% + 2px);
+    width: fit-content;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 0 13px;
+}
+
+.actfBtn {
+    width: 27px;
+    height: 27px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font: 100 18px FLNTREG;
+    transition: background-color 150ms;
+}
+
+.actfBtn:hover {
+    background-color: rgba(0, 0, 0, .1);
+}
+
+.actfbUsertile {
+    border-radius: 100px;
+    height: fit-content;
+    width: fit-content;
+    display: flex;
+    align-items: center;
+    padding: 3px 6px;
+}
+
+.aUTUsername{
+    font: 400 13px Segsb;
+    color: var(--font2);
+    padding-right: 4px;
+}
+.aUTIcon{
+    width: 25px;
+    height: 25px;
+    border-radius: 50%;
+    background-image: var(--userImage);
+    background-size: contain;
+    background-position: center;
+    background-repeat: no-repeat;
+}

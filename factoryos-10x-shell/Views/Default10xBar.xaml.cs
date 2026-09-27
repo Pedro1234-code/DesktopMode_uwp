@@ -29,6 +29,7 @@ using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Media;
 using Windows.UI.Xaml.Media.Imaging;
 using factoryos_10x_shell.Library.Services.WebApps;
+using factoryos_10x_shell.Services.Win32;
 
 
 namespace factoryos_10x_shell.Views
@@ -38,6 +39,7 @@ namespace factoryos_10x_shell.Views
         private readonly AppHelper _appHelper;
         private readonly IWindowManagerService _windowManager;
         private readonly IWebAppService _webAppService;
+        private readonly Win32WindowManagerService _nativeWindowManager;
 
 
         public Default10xBar()
@@ -48,6 +50,7 @@ namespace factoryos_10x_shell.Views
             _appHelper = App.ServiceProvider.GetRequiredService<AppHelper>();
             _windowManager = App.ServiceProvider.GetRequiredService<IWindowManagerService>();
             _webAppService = App.ServiceProvider.GetRequiredService<IWebAppService>();
+            _nativeWindowManager = Win32WindowManagerService.Instance;
 
             AppState.Instance.OnSearchButtonVisibilityChanged += UpdateSearchButtonVisibility;
             AppState.Instance.OnCopilotButtonVisibilityChanged += UpdateCopilotButtonVisibility;
@@ -83,11 +86,14 @@ namespace factoryos_10x_shell.Views
                 RefreshOpenWebApps();
                 RefreshPinnedWebApps();
             };
+            _nativeWindowManager.Windows.CollectionChanged += (s, args) => RefreshOpenWin32Apps();
+            _nativeWindowManager.WindowsChanged += (s, args) => RefreshOpenWin32Apps();
             AppState.Instance.OnFilesStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnNotepadStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnSettingsStateChanged += RefreshInternalTaskbar;
             RefreshOpenWebApps();
             RefreshPinnedWebApps();
+            RefreshOpenWin32Apps();
             RefreshFilesTaskbar();
         }
 
@@ -247,6 +253,36 @@ namespace factoryos_10x_shell.Views
                 button.Click += (sender, args) => _windowManager.ToggleFromTaskbar((WebAppDefinition)((Button)sender).Tag);
                 AddWebAppTaskbarMenu(button, app);
                 PinnedWebAppsPanel.Children.Add(button);
+            }
+        }
+
+        private void RefreshOpenWin32Apps()
+        {
+            OpenWin32AppsPanel.Children.Clear();
+            foreach (Win32WindowModel window in _nativeWindowManager.Windows)
+            {
+                bool isActive = window.IsActive && window.Visibility == Visibility.Visible;
+                var button = new Button
+                {
+                    Width = 48,
+                    Height = 48,
+                    Margin = new Thickness(2),
+                    Tag = window,
+                    Style = (Style)Application.Current.Resources["TaskbarButtonStyle"],
+                    Background = new SolidColorBrush(Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180)),
+                    Content = new TextBlock
+                    {
+                        Text = "\uE7C3",
+                        FontFamily = new FontFamily("Segoe MDL2 Assets"),
+                        FontSize = 23,
+                        HorizontalAlignment = HorizontalAlignment.Center,
+                        VerticalAlignment = VerticalAlignment.Center
+                    }
+                };
+                ToolTipService.SetToolTip(button, window.DisplayName);
+                button.Click += (sender, args) =>
+                    _nativeWindowManager.ToggleFromTaskbar((Win32WindowModel)((Button)sender).Tag);
+                OpenWin32AppsPanel.Children.Add(button);
             }
         }
 

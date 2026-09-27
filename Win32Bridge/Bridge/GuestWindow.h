@@ -42,6 +42,7 @@ namespace Bridge
 
         void Activate();
         void Deactivate();
+        void SetInputEnabled(bool enabled) { m_inputEnabled.store(enabled); }
 
         ATOM RegisterGuestClass(const GuestAbi::WndClassExW* windowClass, DWORD* win32Error);
         ATOM RegisterGuestClass(const GuestAbi::WndClassW* windowClass, DWORD* win32Error);
@@ -207,6 +208,7 @@ namespace Bridge
         std::condition_variable m_popupMenuChanged;
         PopupMenuSession m_popupMenu;
         std::atomic<bool> m_active{ false };
+        std::atomic<bool> m_inputEnabled{ true };
         std::atomic<bool> m_eventsAttached{ false };
 
         GuestMessageQueue m_messages;

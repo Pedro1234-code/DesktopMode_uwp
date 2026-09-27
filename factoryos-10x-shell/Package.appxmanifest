@@ -60,6 +60,7 @@
   </Applications>
   <Capabilities>
     <Capability Name="internetClient" />
+    <rescap:Capability Name="codeGeneration" />
     <uap3:Capability Name="userNotificationListener"/>
     <rescap:Capability Name="packageQuery" />
     <rescap:Capability Name="appDiagnostics" />

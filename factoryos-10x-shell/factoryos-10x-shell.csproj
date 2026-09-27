@@ -149,6 +149,9 @@
     <Compile Include="Controls\WebAppWindow.xaml.cs">
       <DependentUpon>WebAppWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Controls\Win32GuestWindow.xaml.cs">
+      <DependentUpon>Win32GuestWindow.xaml</DependentUpon>
+    </Compile>
     <Compile Include="Controls\ActionCenterSegmentedToggle.xaml.cs">
       <DependentUpon>ActionCenterSegmentedToggle.xaml</DependentUpon>
     </Compile>
@@ -163,6 +166,8 @@
     <Compile Include="Services\Input\MouseInputService.cs" />
     <Compile Include="Services\WebApps\WebAppService.cs" />
     <Compile Include="Services\WebApps\WindowManagerService.cs" />
+    <Compile Include="Services\GuestRuntime\Win32WindowModel.cs" />
+    <Compile Include="Services\GuestRuntime\Win32WindowManagerService.cs" />
     <Compile Include="Services\Managers\ActionCenterManagerService.cs" />
     <Compile Include="Services\Managers\NotificationManager.cs" />
     <Compile Include="Views\FallbackErrorPage.xaml.cs">
@@ -342,6 +347,10 @@
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
+    <Page Include="Controls\Win32GuestWindow.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
     <Page Include="Views\FallbackErrorPage.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
@@ -405,6 +414,10 @@
     <ProjectReference Include="..\factoryos-10x-shell.Library\factoryos-10x-shell.Library.csproj">
       <Project>{4345e98b-2f22-4824-9c67-90de0e7ee619}</Project>
       <Name>factoryos-10x-shell.Library</Name>
+    </ProjectReference>
+    <ProjectReference Include="..\Win32Bridge\Win32Bridge.vcxproj">
+      <Project>{4fc5183e-e778-46d3-b30c-012b98d294a9}</Project>
+      <Name>Win32Bridge.Runtime</Name>
     </ProjectReference>
   </ItemGroup>
   <ItemGroup>

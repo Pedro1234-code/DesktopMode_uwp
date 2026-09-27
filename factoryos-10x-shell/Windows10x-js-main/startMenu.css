@@ -1,0 +1,446 @@
+.startMenu {
+    z-index: 10;
+    position: absolute;
+    left: 50%;
+    bottom: calc(var(--tbSizeM) + 5px);
+    transform: translateX(-50%) translateY(100%);
+    box-shadow: 0px 20px 30px 0px rgba(0, 0, 0, 0.2);
+    width: 700px;
+    height: 750px;
+    max-height: 100%;
+    max-width: 100%;
+    background-color: var(--startMenu);
+    backdrop-filter: blur(90px) saturate(400%);
+    border-radius: var(--objectRadi);
+    overflow: hidden;
+    opacity: 0;
+    transition: opacity .2s, transform .3s, width .2s;
+    color: var(--font2);
+}
+
+.smTop {
+    position: absolute;
+    top: 0;
+    height: 17%;
+    width: 100%;
+    background: rgba(0, 0, 0, .07);
+    display: flex;
+    place-items: center;
+    place-content: center;
+    box-shadow: 0px 4px 8px 0px rgba(0, 0, 0, 0.05);
+}
+
+.searchBar {
+    resize: none;
+    width: 80%;
+    height: 50px;
+    border-radius: var(--buttonRadi);
+    border: none;
+    font: 400 16px Segsb;
+    line-height: 50px;
+    padding: 0 50px 0 50px;
+    box-shadow: 0px 2px 3px 0px rgba(0, 0, 0, 0.15);
+    transition: box-shadow .2s;
+    background-color: var(--searchBar);
+    color: var(--font2);
+}
+
+::placeholder {
+    color: var(--font2);
+    opacity: .4;
+}
+
+.searchBar:focus {
+    outline: none;
+    box-shadow: 0px 3px 4px 0px rgba(0, 0, 0, 0.3);
+}
+
+.smtIcon {
+    position: absolute;
+    font: 400 23px FLNTREG;
+}
+
+.searchIcon {
+    transform: rotateY(180deg);
+    left: 12%;
+}
+
+.micIcon {
+    right: 12%;
+}
+
+.smBottom {
+    position: absolute;
+    bottom: 0;
+    width: 100%;
+    height: 83%;
+    color: var(--font2);
+    overflow-y: scroll;
+    overflow-x: hidden;
+}
+
+.smbSection {
+    width: 100%;
+}
+
+.smbSect1 {
+    display: flex;
+    height: 80px;
+    align-items: center;
+    width: 80%;
+    margin: 0 auto;
+}
+
+.ss1Lbl {
+    font: 100 16px Segb;
+}
+
+.ss1Btn {
+    margin-left: auto;
+    font: 400 13px Segsb;
+    background-color: var(--searchBar);
+    color: var(--font2);
+    padding: 4px 15px;
+    border-radius: 100px;
+    transition: background-color .1s;
+    cursor: pointer;
+}
+
+.ss1Btn:hover {
+    background-color: var(--startMenu);
+}
+
+.smbSect2 {
+    display: flex;
+    flex-wrap: wrap;
+    width: 100%;
+    justify-content: center;
+    align-content: flex-start;
+    gap: 7px;
+    height: 300px;
+    vertical-align: top;
+    overflow: hidden;
+    transition: height .3s;
+}
+
+.ss2Icon {
+    position: relative;
+    width: 17.4%;
+    height: 90px;
+    border-radius: var(--buttonRadi);
+    display: inline-flex;
+    justify-content: center;
+    background-repeat: no-repeat;
+    background-size: 48px;
+    background-position: 50% 10px;
+    transition: background-color .1s, background-size .2s;
+    cursor: pointer;
+}
+
+.ss2Icon:active {
+    background-size: 40px;
+}
+
+.ss2Icon:hover,
+.recTile:hover {
+    background-color: var(--icn-hov);
+}
+
+.ss2Icon::after {
+    position: absolute;
+    bottom: 5px;
+    content: attr(data-label);
+    font: 400 14px Segsb;
+    width: max-content;
+}
+
+#ss2Icon{
+    opacity: .4;
+}
+
+#ss2Icon:hover,
+#ss2Icon:focus {
+    background-color: transparent;
+    background-size: 48px;
+    cursor: not-allowed;
+}
+
+.ss2Icon1 {
+    background-image: url(Icons/MicrosoftEdge.png);
+}
+
+.ss2Icon2 {
+    background-image: url(Icons/Mail.png);
+}
+
+.ss2Icon3 {
+    background-image: url(Icons/Calendar.png);
+}
+
+.ss2Icon4 {
+    background-image: url(Icons/OneNote.png);
+}
+
+.ss2Icon5 {
+    background-image: url(Icons/MicrosoftPhotos.png);
+}
+
+.ss2Icon6 {
+    background-image: url(Icons/MicrosoftToDo.png);
+}
+
+.ss2Icon7 {
+    background-image: url(Icons/WindowsVoiceRecorder.png);
+}
+
+.ss2Icon8 {
+    background-image: var(--storeIcon);
+}
+
+.ss2Icon9 {
+    background-image: url(Icons/MicrosoftNews.png);
+}
+
+.ss2Icon10 {
+    background-image: url(Icons/WindowsFileExplorer.png);
+}
+
+.ss2Icon11 {
+    background-image: var(--stickiesIcon);
+}
+
+.ss2Icon12 {
+    background-image: url(Icons/WindowsMaps.png);
+}
+
+.ss2Icon13 {
+    background-image: url(Icons/WindowsSettings.png);
+}
+
+.ss2Icon14 {
+    background-image: url(Icons/MSNWeather.png);
+}
+
+.ss2Icon15 {
+    background-image: url(Icons/WindowsCalculator.png);
+}
+
+.ss2Icon16 {
+    background-image: url(Icons/WinFR.png);
+}
+
+.ss2Icon17 {
+    background-image: url(Icons/MicrosoftRemoteDesktop.png);
+}
+
+.ss2Icon18 {
+    background-image: url(Icons/MicrosoftTeams.png);
+}
+
+.ss2Icon19 {
+    background-image: url(Icons/WindowsAlarmsAndClock.png);
+}
+
+.ss2Icon20 {
+    background-image: url(Icons/MoviesAndTV.png);
+}
+
+.ss2Icon21 {
+    background-image: url(Icons/WindowsCamera.png);
+}
+
+.ss2Icon22 {
+    background-image: url(Icons/GetHelp.png);
+}
+
+.ss2Icon23 {
+    background-image: url(Icons/MicrosoftTips.png);
+}
+
+.ss2Icon24 {
+    background-image: url(Icons/MicrosoftSolitareCollection.png);
+}
+
+.ss2Icon25 {
+    background-image: url(Icons/MicrosoftMessaging.png);
+}
+
+.ss2Icon26 {
+    background-image: url(Icons/OneDrive.png);
+}
+
+.ss2Icon27 {
+    background-image: url(Icons/MicrosoftPeople.png);
+}
+
+.ss2Icon28 {
+    background-image: url(Icons/MicrosoftWhiteboard.png);
+}
+
+.ss2Icon29 {
+    background-image: url(Icons/GrooveMusic.png);
+}
+
+.ss2Icon30 {
+    background-image: url(Icons/Paint3D.png);
+}
+
+.ss2Icon31 {
+    background-image: url(Icons/Office.png);
+}
+
+.ss2Icon32 {
+    background-image: url(Icons/SnipAndSketch.png);
+}
+
+.ss2Icon33 {
+    background-image: url(Icons/VideoEditor.png);
+}
+
+.ss2Icon34 {
+    background-image: url(Icons/Skype.png);
+}
+
+.ss2Icon35 {
+    background-image: url(Icons/WindowsNotepad.png);
+}
+
+.ss2Icon36 {
+    background-image: url(Icons/FeedbackHub.png);
+}
+
+.ss2Icon37 {
+    background-image: url(Icons/WindowsSecurity.png);
+}
+
+.ss2Icon38 {
+    background-image: url(Icons/WindowsTerminal.png);
+}
+
+.ss2Icon39 {
+    background-image: url(Icons/YourPhone.png);
+}
+
+.smbSep {
+    height: 1px;
+    margin-top: 20px;
+    background-color: rgba(0, 0, 0, .2);
+}
+
+.smbSect3 {
+    height: 300px;
+}
+
+.ss3Lbl {
+    font: 100 16px Segb;
+    position: absolute;
+    padding: 30px 60px;
+}
+
+.ss3Lbl2 {
+    font: 100 14px Seg;
+    position: absolute;
+    width: 100%;
+    padding: 70px 0;
+    text-align: center;
+}
+
+.recentTiles {
+    position: absolute;
+    display: grid;
+    place-content: center;
+    place-items: center;
+    grid-template-columns: auto auto auto;
+    grid-template-rows: auto auto;
+    width: 100%;
+    margin: 110px auto;
+    gap: 6px;
+}
+
+.recTile {
+    width: 180px;
+    height: 50px;
+    padding: 10px;
+    border-radius: var(--buttonRadi);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    background-repeat: no-repeat;
+    background-size: 43px;
+    background-position: 10px 50%;
+    transition: background-color .1s, background-size .2s;
+    text-decoration: none;
+    color: var(--font2);
+}
+
+.recTile:active {
+    background-size: 35px;
+}
+
+.recTile::before {
+    font: 100 13px Segsb;
+    padding-left: 55px;
+    content: attr(data-label1);
+}
+
+.recTile::after {
+    opacity: 60%;
+    font: 100 12px Segsb;
+    padding-left: 55px;
+    content: attr(data-subLabel);
+}
+
+.rt1 {
+    background-image: url(Icons/Reddit.png);
+}
+
+.rt2 {
+    background-image: url(Icons/Spotify.png);
+}
+
+.rt3 {
+    background-image: url(Icons/Twitter.png);
+}
+
+.rt4 {
+    background-image: url(Icons/YouTube.png);
+}
+
+.rt5 {
+    background-image: url(Icons/Office.png);
+}
+
+.rt6 {
+    background-image: url(Icons/Netflix.png);
+    background-size: 25px;
+    background-position: 15px 50%;
+}
+
+.rt6:active {
+    background-size: 17px;
+}
+
+.iHide{
+    width: 120px;
+}
+
+@media screen and (max-width: 600px) {
+    .startMenu {
+        width: 95%;
+        height: calc(100% - 80px);
+        top: 10px;
+    }
+    .smbSect1,
+    .searchBar {
+        width: 86%;
+    }
+    .ss2Icon {
+        width: 20%;
+    }
+    .ss2Icon:hover {
+        background-color: transparent;
+    }
+    .ss1Btn:hover {
+        background-color: var(--searchBar);
+    }
+}

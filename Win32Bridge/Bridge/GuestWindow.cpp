@@ -803,7 +803,10 @@ namespace
             try
             {
                 GeneralTransform^ transform = image->TransformToVisual(nullptr);
-                const Point origin = transform ? transform->TransformPoint(Point()) : Point();
+                GeneralTransform^ inverse = transform ? transform->Inverse : nullptr;
+                const Point localPosition = inverse
+                    ? inverse->TransformPoint(hostPosition)
+                    : hostPosition;
                 const double scale = (std::min)(
                     image->ActualWidth / static_cast<double>(hostWidth),
                     image->ActualHeight / static_cast<double>(hostHeight));
@@ -811,8 +814,13 @@ namespace
                 {
                     const double renderedWidth = static_cast<double>(hostWidth) * scale;
                     const double renderedHeight = static_cast<double>(hostHeight) * scale;
-                    x = (hostPosition.X - origin.X - (image->ActualWidth - renderedWidth) / 2.0) / scale;
-                    y = (hostPosition.Y - origin.Y - (image->ActualHeight - renderedHeight) / 2.0) / scale;
+                    // Convert the CoreWindow point all the way back into the
+                    // Image's local coordinate space first.  Subtracting only
+                    // the transformed origin mixes physical view coordinates
+                    // with pre-transform ActualWidth/ActualHeight when the
+                    // CoreShell desktop has an outer RenderTransform (Xbox).
+                    x = (localPosition.X - (image->ActualWidth - renderedWidth) / 2.0) / scale;
+                    y = (localPosition.Y - (image->ActualHeight - renderedHeight) / 2.0) / scale;
                 }
             }
             catch (...)
@@ -7463,7 +7471,7 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
 {
     try
     {
-    if (!m_active.load() || !args || !args->CurrentPoint || !args->CurrentPoint->PointerDevice ||
+    if (!m_active.load() || !m_inputEnabled.load() || !args || !args->CurrentPoint || !args->CurrentPoint->PointerDevice ||
         args->CurrentPoint->PointerDevice->PointerDeviceType != PointerDeviceType::Mouse)
     {
         return;
@@ -7642,7 +7650,7 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
 {
     try
     {
-    if (!m_active.load() || !args || !args->CurrentPoint || !args->CurrentPoint->Properties)
+    if (!m_active.load() || !m_inputEnabled.load() || !args || !args->CurrentPoint || !args->CurrentPoint->Properties)
     {
         return;
     }
@@ -7741,7 +7749,7 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
 
 void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
 {
-    if (!m_active.load() || !args)
+    if (!m_active.load() || !m_inputEnabled.load() || !args)
     {
         return;
     }

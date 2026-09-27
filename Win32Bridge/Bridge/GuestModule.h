@@ -8,18 +8,23 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <agile.h>
+#include <windows.storage.h>
 
 namespace Win32Bridge
 {
 namespace Bridge
 {
-    // Maps PE DLLs stored in the guest C: drive. Module handles are guest
-    // image bases, never host HMODULEs, and exports therefore remain inside
-    // the same W^X-managed runtime as the main executable.
+    // Maps PE DLLs from the executable's authorized source folder, falling
+    // back to the guest C: drive for modules intentionally placed there.
+    // Module handles are guest image bases, never host HMODULEs.
     class GuestModuleLoader final
     {
     public:
-        GuestModuleLoader(std::shared_ptr<GuestStorageContext> storage, ImportResolver resolver);
+        GuestModuleLoader(
+            std::shared_ptr<GuestStorageContext> storage,
+            ImportResolver resolver,
+            Windows::Storage::StorageFolder^ moduleSourceFolder);
         ~GuestModuleLoader();
 
         bool LoadLibrary(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error);
@@ -32,9 +37,17 @@ namespace Bridge
 
         static std::wstring CanonicalName(LPCWSTR requestedName);
         std::shared_ptr<Module> FindModuleLocked(HMODULE module) const;
+        bool ReadModuleBytes(
+            const std::wstring& canonicalName,
+            std::vector<BYTE>* bytes,
+            DWORD* win32Error) const;
+        bool ReadAuthorizedModuleBytes(
+            const std::wstring& relativeName,
+            std::vector<BYTE>* bytes) const;
 
         std::shared_ptr<GuestStorageContext> m_storage;
         ImportResolver m_resolver;
+        Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
         mutable std::mutex m_lock;
         std::vector<std::shared_ptr<Module>> m_modules;
     };

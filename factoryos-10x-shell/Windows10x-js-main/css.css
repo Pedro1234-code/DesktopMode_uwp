@@ -1,0 +1,167 @@
+html {
+    overflow: hidden;
+}
+
+:root {
+    --wall1: url("Walls/wall1.jpg");
+    --wall2: url("Walls/wall2.jpg");
+    --wall3: url("Walls/wall3.jpg");
+    --wall4: url("Walls/wall4.jpg");
+    --wall5: url("Walls/wall5.jpg");
+    --tbSizeM: 50px;
+    --tbSize: 30px;
+    --appSidebar: 300px;
+    --objectRadi: 7px;
+    --buttonRadi: 4px;
+    --userImage: url("user.png");
+    --qsHeight: 240px;
+    --accent: #397079;
+    --accent-hov: #50929c;
+    --OOBEBack: #ffffff;
+    --OOBESearch: #ffffff;
+}
+
+body {
+    background-image: var(--wall1);
+    background-size: cover;
+    background-position: center;
+    padding: 0;
+    margin: 0;
+    font: 400 14px Seg;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+::-webkit-scrollbar {
+    width: 8px;
+}
+
+::-webkit-scrollbar-track,
+ ::-webkit-scrollbar-corner {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background-color: var(--scrollbar);
+    border-radius: 20px;
+    transition: .2s;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background-color: var(--scrollbar-hov);
+}
+
+@media (prefers-color-scheme: light) {
+     :root {
+        --scrollbar: rgba(255, 255, 255, 0.4);
+        --scrollbar-hov: rgba(255, 255, 255, 0.6);
+        --taskbar: #efedecab;
+        --startMenu: #efedec96;
+        --searchBar: #ffffff;
+        --searchBar2: #ffffff;
+        --searchBar-border: #dddddd;
+        --searchBar-border2: #dddddd;
+        --windowClear: #efedeccc;
+        --context-menu: #efefef;
+        --context-hov: #e0e0e0;
+        --tb-indicator: #615F5F;
+        --font: #615F5F;
+        --font2: #000000;
+        --tb-hov: #FFFFFF;
+        --icn-hov: #ffffff60;
+        --btn-hov: #eeeeee;
+        --start-btn: url(btnIcons/startDark.svg);
+        --tskvw-btn: url(btnIcons/taskviewDark.svg);
+        --storeIcon: url(Icons/MicrosoftStoreDark.png);
+        --stickiesIcon: url(Icons/MicrosoftStickyNotesDark.png);
+        --window-main: #FFFFFF;
+
+        --dynamicWall1: url(DynaWalls/0Light.jpg);
+        --dynamicWall2: url(DynaWalls/1Light.jpg);
+        --dynamicWall3: url(DynaWalls/2Light.jpg);
+        --dynamicWall4: url(DynaWalls/3Light.jpg);
+    }
+}
+
+@media (prefers-color-scheme: dark) {
+     :root {
+        --scrollbar: rgba(0, 0, 0, 0.4);
+        --scrollbar-hov: rgba(0, 0, 0, 0.6);
+        --taskbar: #3a3a3acb;
+        --startMenu: #272727ad;
+        --searchBar: #ffffff25;
+        --searchBar2: #00000094;
+        --searchBar-border: #4b4b4b;
+        --searchBar-border2: #7e7e7e;
+        --windowClear: #1f1f1fbe;
+        --context-menu: #444444;
+        --context-hov: #686868;
+        --tb-indicator: #B0B0B0;
+        --font: #B0B0B0;
+        --font2: #FFFFFF;
+        --tb-hov: #605D5E;
+        --icn-hov: #ffffff26;
+        --btn-hov: #4b4b4b;
+        --start-btn: url(btnIcons/startLight.svg);
+        --tskvw-btn: url(btnIcons/taskviewLight.svg);
+        --storeIcon: url(Icons/MicrosoftStoreLight.png);
+        --stickiesIcon: url(Icons/MicrosoftStickyNotesLight.png);
+        --window-main: #000000;
+
+        --dynamicWall1: url(DynaWalls/0Dark.jpg);
+        --dynamicWall2: url(DynaWalls/1Dark.jpg);
+        --dynamicWall3: url(DynaWalls/2Dark.jpg);
+        --dynamicWall4: url(DynaWalls/3Dark.jpg);
+    }
+}
+
+.desktopContext {
+    z-index: 3;
+    position: absolute;
+    opacity: 0;
+    color: var(--font2);
+    font: 400 14px Segsb;
+    transition: opacity .1s;
+    border-radius: var(--buttonRadi);
+    background-color: var(--context-menu);
+    overflow: hidden;
+    box-shadow: 0px 5px 20px 0px rgba(0, 0, 0, 0.3);
+}
+
+.dci, .ici {
+    padding: 8px 15px;
+}
+
+.dci:hover, .ici:hover {
+    background-color: var(--context-hov);
+}
+
+.dc1::before {
+    content: "Change your wallpaper";
+}
+
+.desktopLayer {
+    position: absolute;
+    z-index: 2;
+    width: 100%;
+    height: 100%;
+}
+
+.iconContext{
+    z-index: 30;
+    position: absolute;
+    opacity: 0;
+    color: var(--font2);
+    font: 400 14px Segsb;
+    transition: opacity .2s;
+    width: fit-content;
+    height: fit-content;
+    border-radius: var(--buttonRadi);
+    background-color: var(--context-menu);
+    overflow: hidden;
+    transform: translateX(-50%);
+    left: 50%;
+    bottom: calc(var(--tbSizeM) + 10px);
+    box-shadow: 0px 5px 20px 0px rgba(0, 0, 0, 0.3);
+}

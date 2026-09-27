@@ -1,0 +1,5 @@
+LIBRARY "Win32Bridge.Runtime"
+
+EXPORTS
+    DllCanUnloadNow PRIVATE
+    DllGetActivationFactory PRIVATE

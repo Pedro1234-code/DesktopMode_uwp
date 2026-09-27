@@ -13,6 +13,7 @@ using Windows.UI.Xaml.Media;
 using Windows.UI.Xaml.Media.Imaging;
 using Windows.UI.ViewManagement;
 using factoryos_10x_shell.Services.Helpers;
+using factoryos_10x_shell.Services.Win32;
 
 namespace factoryos_10x_shell.Controls
 {
@@ -30,6 +31,7 @@ namespace factoryos_10x_shell.Controls
             SearchToggle.IsOn = AppState.Instance.IsSearchButtonVisible;
             CopilotToggle.IsOn = AppState.Instance.IsCopilotButtonVisible;
             BackgroundToggle.IsOn = AppState.Instance.IsBgChangeButtonVisible;
+            Win32SupportToggle.IsOn = Win32WindowManagerService.Instance.IsAppSupportEnabled;
             m_initializing = false;
             PopulateDeviceInformation();
         }
@@ -108,7 +110,9 @@ namespace factoryos_10x_shell.Controls
         {
             ListView navigation = page == "About"
                 ? SystemNavigation
-                : page == "Windows Update" ? UpdateSecurityNavigation : PersonalizationNavigation;
+                : page == "Windows Update" || page == "For developers"
+                    ? UpdateSecurityNavigation
+                    : PersonalizationNavigation;
             foreach (object entry in navigation.Items)
             {
                 var item = entry as ListViewItem;
@@ -127,6 +131,7 @@ namespace factoryos_10x_shell.Controls
             TaskbarPanel.Visibility = page == "Taskbar" ? Visibility.Visible : Visibility.Collapsed;
             AboutPanel.Visibility = page == "About" ? Visibility.Visible : Visibility.Collapsed;
             WindowsUpdatePanel.Visibility = page == "Windows Update" ? Visibility.Visible : Visibility.Collapsed;
+            ForDevelopersPanel.Visibility = page == "For developers" ? Visibility.Visible : Visibility.Collapsed;
             DetailTitle.Text = page;
         }
         private void CheckForUpdates_Click(object sender, RoutedEventArgs e) => UpdateStatusText.Text = "Update checks are not available yet in CoreShell.";
@@ -219,5 +224,6 @@ namespace factoryos_10x_shell.Controls
         private void SearchToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) { AppState.Instance.IsSearchButtonVisible = SearchToggle.IsOn; ApplicationData.Current.LocalSettings.Values["IsSearchButtonVisible"] = SearchToggle.IsOn; } }
         private void CopilotToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) { AppState.Instance.IsCopilotButtonVisible = CopilotToggle.IsOn; ApplicationData.Current.LocalSettings.Values["IsCopilotButtonVisible"] = CopilotToggle.IsOn; } }
         private void BackgroundToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) { AppState.Instance.IsBgChangeButtonVisible = BackgroundToggle.IsOn; ApplicationData.Current.LocalSettings.Values["IsBgChangeButtonVisible"] = BackgroundToggle.IsOn; } }
+        private void Win32SupportToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) Win32WindowManagerService.Instance.IsAppSupportEnabled = Win32SupportToggle.IsOn; }
     }
 }

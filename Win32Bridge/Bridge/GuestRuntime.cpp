@@ -90,7 +90,10 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
     // Kernel objects are per invocation, just like the current guest storage
     // and window scopes.  They must not survive a later run of the same image.
     m_kernel = std::make_shared<GuestKernelContext>();
-    m_modules = std::make_shared<GuestModuleLoader>(m_storage, m_resolver);
+    m_modules = std::make_shared<GuestModuleLoader>(
+        m_storage,
+        m_resolver,
+        m_moduleSourceFolder.Get());
     m_registry = std::make_shared<GuestRegistryContext>();
     GuestKernelScope kernelScope(m_kernel.get());
     GuestModuleScope moduleScope(m_modules.get());

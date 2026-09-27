@@ -38,7 +38,6 @@
                                 IsSettingsVisible="False"
                                 OpenPaneLength="180"
                                 PaneDisplayMode="Left"
-                                PaneTitle="Locations"
                                 ItemInvoked="LocationsNavigation_ItemInvoked">
                     <NavigationView.MenuItems>
                         <NavigationViewItem x:Name="HomeNavigationItem" Content="Home" Tag="Home"><NavigationViewItem.Icon><SymbolIcon Symbol="Home" /></NavigationViewItem.Icon></NavigationViewItem>

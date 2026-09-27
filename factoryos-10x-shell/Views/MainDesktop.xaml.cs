@@ -32,6 +32,7 @@ using System.Threading.Tasks;
 using factoryos_10x_shell.Services.Helpers;
 using factoryos_10x_shell.Library.Services.WebApps;
 using factoryos_10x_shell.Library.Models.InternalData;
+using factoryos_10x_shell.Services.Win32;
 
 namespace factoryos_10x_shell.Views
 {
@@ -47,6 +48,7 @@ namespace factoryos_10x_shell.Views
         private readonly IStartManagerService m_startManager;
         private readonly IActionCenterManagerService m_actionManager;
         private readonly IWindowManagerService m_windowManager;
+        private readonly Win32WindowManagerService m_nativeWindowManager;
 
         public MainDesktop()
         {
@@ -63,6 +65,11 @@ namespace factoryos_10x_shell.Views
             m_windowManager.TaskViewChanged += WindowManager_TaskViewChanged;
             WindowHost.DataContext = m_windowManager;
             WindowHost.ItemsSource = m_windowManager.Windows;
+            m_nativeWindowManager = Win32WindowManagerService.Instance;
+            NativeWindowHost.DataContext = m_nativeWindowManager;
+            NativeWindowHost.ItemsSource = m_nativeWindowManager.Windows;
+            m_nativeWindowManager.WindowsChanged += NativeWindowsChanged;
+            m_nativeWindowManager.DesktopFocusRequested += WindowManager_DesktopFocusRequested;
             Loaded += MainDesktop_Loaded;
             SizeChanged += MainDesktop_SizeChanged;
 
@@ -111,9 +118,11 @@ namespace factoryos_10x_shell.Views
         private void FilesActivated()
         {
             m_windowManager.DeactivateAll();
+            m_nativeWindowManager.DeactivateAll();
             // Files and Web Apps live in separate hosts. Raise the active host rather
             // than sending the inactive one below the wallpaper.
             Canvas.SetZIndex(WindowHost, 1);
+            Canvas.SetZIndex(NativeWindowHost, 1);
             Canvas.SetZIndex(FilesWindowHost, 2);
             Canvas.SetZIndex(NotepadWindowHost, 1);
             Canvas.SetZIndex(SettingsWindowHost, 1);
@@ -129,7 +138,9 @@ namespace factoryos_10x_shell.Views
         private void NotepadActivated()
         {
             m_windowManager.DeactivateAll();
+            m_nativeWindowManager.DeactivateAll();
             Canvas.SetZIndex(WindowHost, 1);
+            Canvas.SetZIndex(NativeWindowHost, 1);
             Canvas.SetZIndex(FilesWindowHost, 1);
             Canvas.SetZIndex(NotepadWindowHost, 2);
             Canvas.SetZIndex(SettingsWindowHost, 1);
@@ -140,7 +151,9 @@ namespace factoryos_10x_shell.Views
         private void SettingsActivated()
         {
             m_windowManager.DeactivateAll();
+            m_nativeWindowManager.DeactivateAll();
             Canvas.SetZIndex(WindowHost, 1);
+            Canvas.SetZIndex(NativeWindowHost, 1);
             Canvas.SetZIndex(FilesWindowHost, 1);
             Canvas.SetZIndex(NotepadWindowHost, 1);
             Canvas.SetZIndex(SettingsWindowHost, 2);
@@ -154,6 +167,21 @@ namespace factoryos_10x_shell.Views
                 Canvas.SetZIndex(NotepadWindowHost, 1);
                 Canvas.SetZIndex(SettingsWindowHost, 1);
                 Canvas.SetZIndex(WindowHost, 2);
+                Canvas.SetZIndex(NativeWindowHost, 1);
+                m_nativeWindowManager.DeactivateAll();
+            }
+        }
+
+        private void NativeWindowsChanged(object sender, EventArgs e)
+        {
+            if (m_nativeWindowManager.Windows.Any(window => window.IsActive && window.Visibility == Visibility.Visible))
+            {
+                m_windowManager.DeactivateAll();
+                Canvas.SetZIndex(WindowHost, 1);
+                Canvas.SetZIndex(FilesWindowHost, 1);
+                Canvas.SetZIndex(NotepadWindowHost, 1);
+                Canvas.SetZIndex(SettingsWindowHost, 1);
+                Canvas.SetZIndex(NativeWindowHost, 2);
             }
         }
 
@@ -221,6 +249,7 @@ namespace factoryos_10x_shell.Views
             UpdateFilesTaskCard();
             UpdateNotepadTaskCard();
             UpdateSettingsTaskCard();
+            UpdateNativeInputSuppression();
         }
 
         private void UpdateFilesTaskCard()
@@ -290,6 +319,19 @@ namespace factoryos_10x_shell.Views
                 m_windowManager.Close(window);
         }
 
+        private async void NativeTaskViewGrid_ItemClick(object sender, ItemClickEventArgs e)
+        {
+            if (!(e.ClickedItem is Win32WindowModel window)) return;
+            m_windowManager.CloseTaskView();
+            await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => m_nativeWindowManager.Activate(window));
+        }
+
+        private void NativeTaskViewClose_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as FrameworkElement)?.DataContext is Win32WindowModel window)
+                m_nativeWindowManager.Close(window);
+        }
+
         private void TaskViewOverlay_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
             if (e.OriginalSource == TaskViewOverlay)
@@ -303,6 +345,9 @@ namespace factoryos_10x_shell.Views
             m_windowManager.SetWorkspaceBounds(
                 WindowHost.ActualWidth,
                 Math.Max(0, WindowHost.ActualHeight - 50));
+            m_nativeWindowManager.SetWorkspaceBounds(
+                NativeWindowHost.ActualWidth,
+                Math.Max(0, NativeWindowHost.ActualHeight - 50));
         }
 
         private void OnPointerPressed(object sender, PointerRoutedEventArgs args)
@@ -435,12 +480,20 @@ namespace factoryos_10x_shell.Views
         {
             if (e.CurrentVisibility) { OpenStartStoryboard.Begin(); }
             else { CloseStartStoryboard.Begin(); }
+            UpdateNativeInputSuppression();
         }
 
         private void ActionCenterManager_ActionVisibilityChanged(object sender, Library.Events.ActionCenterVisibilityChangedEventArgs e)
         {
             if (e.CurrentVisibility) { OpenActionStoryboard.Begin(); }
             else { CloseActionStoryboard.Begin(); }
+            UpdateNativeInputSuppression();
+        }
+
+        private void UpdateNativeInputSuppression()
+        {
+            m_nativeWindowManager.SetInputSuppressed(
+                m_windowManager.IsTaskViewOpen || m_startManager.IsStartOpen || m_actionManager.IsActionCenterOpen);
         }
     }
 }

@@ -1,0 +1,171 @@
+.taskbar {
+    z-index: 15;
+    position: absolute;
+    bottom: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: var(--tbSize);
+    box-shadow: 0px 20px 30px 0px rgba(0, 0, 0, 0.4);
+    background-color: var(--taskbar);
+    backdrop-filter: blur(90px) saturate(400%);
+    transition: height .2s;
+}
+
+.taskbar:hover {
+    height: var(--tbSizeM);
+}
+
+.taskbar:hover .tbButtons {
+    opacity: 1;
+}
+
+.taskbar:hover .tbIndicator {
+    opacity: 0;
+}
+
+.taskbar:hover .statusArea {
+    padding-right: 10px;
+    align-items: flex-end;
+    flex-direction: column-reverse;
+}
+
+.tbIndicator {
+    width: 30px;
+    height: 5px;
+    background: var(--tb-indicator);
+    border-radius: 100px;
+    transition: opacity .1s;
+}
+
+.tbButtons {
+    opacity: 0;
+    transition: .2s opacity;
+    position: absolute;
+    display: flex;
+    gap: 1px;
+}
+
+.tbbBtn::before,
+.statusArea::before {
+    content: attr(data-tooltip);
+    position: absolute;
+    top: -40px;
+    box-shadow: 0px 5px 30px 0px rgba(0, 0, 0, 0.30);
+    width: max-content;
+    height: max-content;
+    background: var(--taskbar);
+    backdrop-filter: blur(90px) saturate(400%);
+    color: var(--font);
+    border-radius: 4px;
+    padding: 5px 10px;
+    opacity: 0;
+    transition: .2s opacity .4s;
+    pointer-events: none;
+}
+
+.tbbBtn::before {
+    left: 50%;
+    transform: translateX(-50%);
+}
+
+.statusArea::before {
+    right: 5px;
+}
+
+.tbbBtn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    position: relative;
+    width: calc(var(--tbSizeM) + 5px);
+    height: var(--tbSizeM);
+    background-color: transparent;
+    background-repeat: no-repeat;
+    background-size: 40%;
+    background-position: center;
+    transition: background-color .2s, background-size .05s, opacity .2s, background-image .2s;
+    cursor: pointer;
+}
+
+.tbbBtn:active {
+    background-size: 32%;
+}
+
+.tbbStart {
+    background-image: var(--start-btn);
+}
+
+.tbbTaskView {
+    background-image: var(--tskvw-btn);
+}
+
+.tbbSettings {
+    background-image: url(Icons/WindowsSettings.png);
+    background-size: 46%;
+}
+
+.tbbCalculator {
+    background-image: url(Icons/WindowsCalculator.png);
+    background-size: 46%;
+}
+
+.tbbSettings:active, .tbbCalculator:active {
+    background-size: 40%;
+}
+
+.tbbStart:hover {
+    background-image: url(btnIcons/startColor.svg);
+}
+
+.tbbTaskView:hover {
+    background-image: url(btnIcons/taskviewColor.svg);
+}
+
+.tbbBtn:hover,
+.statusArea:hover {
+    background-color: rgba(0, 0, 0, 0.10);
+}
+
+.tbbBtn:hover::before,
+.statusArea:hover::before {
+    opacity: 1;
+}
+
+.statusArea {
+    width: 60px;
+    height: 100%;
+    position: absolute;
+    right: 2px;
+    background: transparent;
+    color: var(--font);
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    gap: 5px;
+}
+
+.saIcons {
+    font: 600 13px FLNTREG;
+}
+
+.tbPinSep{
+    margin: auto 5px;
+    height: 30px;
+    width: 1px;
+    background-color: rgba(0, 0, 0, 0.4);
+    /* display: none; */
+}
+
+.tbApplications, .tbPinned{
+    width: fit-content;
+    height: 100%;
+    display: flex;
+}
+
+.tbNonVisible{
+    display: none;
+}

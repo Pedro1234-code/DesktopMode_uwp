@@ -2,6 +2,7 @@ using System;
 using System.Collections.ObjectModel;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using factoryos_10x_shell.Services.Win32;
 using Windows.Storage;
 using Windows.Storage.AccessCache;
 using Windows.Storage.Pickers;
@@ -210,6 +211,8 @@ namespace factoryos_10x_shell.Controls
         {
             if (!(e.ClickedItem is FileEntry entry)) return;
             if (entry.Folder != null) await OpenFolderAsync(entry.Folder, entry.Folder.Name, true);
+            else if (entry.File != null && string.Equals(entry.File.FileType, ".exe", StringComparison.OrdinalIgnoreCase))
+                Win32WindowManagerService.Instance.Open(entry.File, m_currentFolder);
             else if (entry.File != null && string.Equals(entry.File.FileType, ".txt", StringComparison.OrdinalIgnoreCase))
                 AppState.Instance.RequestNotepadOpen(entry.File);
             else if (entry.File != null) await Launcher.LaunchFileAsync(entry.File);

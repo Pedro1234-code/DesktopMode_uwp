@@ -5,6 +5,8 @@
 #include "Bridge\\GuestStorage.h"
 
 #include <memory>
+#include <agile.h>
+#include <windows.storage.h>
 
 namespace Win32Bridge
 {
@@ -22,6 +24,7 @@ namespace Bridge
     public:
         void SetStorageContext(std::shared_ptr<GuestStorageContext> storage) { m_storage = std::move(storage); }
         void SetWindowManager(std::shared_ptr<GuestWindowManager> windows) { m_windows = std::move(windows); }
+        void SetModuleSourceFolder(Windows::Storage::StorageFolder^ folder) { m_moduleSourceFolder = folder; }
         bool Prepare(const BYTE* fileBytes, size_t fileSize, const ImportResolver& resolver, std::wstring* error);
         bool Run(int* exitCode, std::wstring* error);
 
@@ -38,6 +41,7 @@ namespace Bridge
         std::shared_ptr<GuestKernelContext> m_kernel;
         std::shared_ptr<GuestModuleLoader> m_modules;
         std::shared_ptr<GuestRegistryContext> m_registry;
+        Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
         ImportResolver m_resolver;
         bool m_ready = false;
     };

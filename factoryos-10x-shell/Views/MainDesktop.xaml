@@ -49,6 +49,22 @@
                 </DataTemplate>
             </ItemsControl.ItemTemplate>
         </ItemsControl>
+        <ItemsControl x:Name="NativeWindowHost" IsHitTestVisible="True">
+            <ItemsControl.ItemsPanel>
+                <ItemsPanelTemplate><Canvas /></ItemsPanelTemplate>
+            </ItemsControl.ItemsPanel>
+            <ItemsControl.ItemContainerStyle>
+                <Style TargetType="ContentPresenter">
+                    <Setter Property="Canvas.Left" Value="{Binding Left}" />
+                    <Setter Property="Canvas.Top" Value="{Binding Top}" />
+                    <Setter Property="Canvas.ZIndex" Value="{Binding ZIndex}" />
+                    <Setter Property="Visibility" Value="{Binding Visibility}" />
+                </Style>
+            </ItemsControl.ItemContainerStyle>
+            <ItemsControl.ItemTemplate>
+                <DataTemplate><controls:Win32GuestWindow /></DataTemplate>
+            </ItemsControl.ItemTemplate>
+        </ItemsControl>
         <Canvas x:Name="FilesWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
             <controls:FilesWindow x:Name="FilesWindow" Canvas.Left="160" Canvas.Top="80" Visibility="Collapsed" />
         </Canvas>
@@ -142,6 +158,38 @@
                                     Background="Transparent"
                                     Click="TaskViewClose_Click"
                                     ToolTipService.ToolTip="Close">
+                                    <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE8BB;" />
+                                </Button>
+                            </Grid>
+                        </DataTemplate>
+                    </GridView.ItemTemplate>
+                </GridView>
+                <GridView
+                    x:Name="NativeTaskViewGrid"
+                    HorizontalAlignment="Left"
+                    IsItemClickEnabled="True"
+                    ItemClick="NativeTaskViewGrid_ItemClick"
+                    ItemsSource="{Binding DataContext.Windows, ElementName=NativeWindowHost}"
+                    SelectionMode="None">
+                    <GridView.ItemTemplate>
+                        <DataTemplate>
+                            <Grid Width="280" Height="180" Margin="8">
+                                <Border Background="#FFF8F8F8" BorderBrush="#CCFFFFFF" BorderThickness="1" CornerRadius="3">
+                                    <Grid>
+                                        <Grid.RowDefinitions><RowDefinition Height="34" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+                                        <Grid Background="#FF303030">
+                                            <TextBlock Margin="10,0,0,0" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="16" Foreground="White" Text="&#xE7C3;" />
+                                            <TextBlock Margin="38,0,38,0" VerticalAlignment="Center" Foreground="White" Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis" />
+                                        </Grid>
+                                        <Grid Grid.Row="1" Background="#FFEDEDED">
+                                            <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="8">
+                                                <TextBlock HorizontalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="44" Foreground="#FF2878B8" Text="&#xE7C3;" />
+                                                <TextBlock MaxWidth="220" HorizontalAlignment="Center" Foreground="#FF555555" Text="{Binding Status}" TextAlignment="Center" TextTrimming="CharacterEllipsis" />
+                                            </StackPanel>
+                                        </Grid>
+                                    </Grid>
+                                </Border>
+                                <Button Width="34" Height="34" Padding="0" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Click="NativeTaskViewClose_Click">
                                     <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE8BB;" />
                                 </Button>
                             </Grid>
