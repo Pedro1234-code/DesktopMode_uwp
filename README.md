@@ -1,4 +1,4 @@
-# DesktopMode
+# DesktopMode UWP
 
 ## Windows 10X Desktop Mode para Xbox
 
@@ -25,7 +25,6 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 | --- | --- |
 | `factoryos-10x-shell` | Main UWP application and DesktopMode interface. |
 | `factoryos-10x-shell.Library` | Shared models, services, and view models. |
-| `Windows10x-js-main` | HTML/CSS/JS reference implementation of the original Windows 10X recreation. |
 | `Win32Bridge` | Auxiliary integration components, where applicable. |
 
 ## Building
@@ -33,19 +32,15 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 1. Install Visual Studio 2022 with the **Universal Windows Platform development** workload.
 2. Install Windows 10 SDK `10.0.19041` or a compatible version.
 3. Open [`factoryos-10x-shell.sln`](factoryos-10x-shell.sln).
-4. Select the appropriate architecture:
-   - `x64` for local PC testing;
-   - `ARM` for Xbox, when using a compatible development environment.
-5. Build and launch the application from Visual Studio.
+4. Build and launch the application from Visual Studio.
 
-If Visual Studio reports that the signing certificate is unavailable, create or associate a development certificate with the package before deployment.
+If Visual Studio reports that the signing certificate is unavailable, create or associate a development certificate with the package before deployment. Note that, in order for the Mouse APIs to work on Xbox, Microsoft's CN must be used on the cert.
 
 ## Known limitations
 
 - Access to files outside the application's local storage depends on access granted by the user through UWP file and folder pickers.
-- External applications are launched through URIs or protocols when the package supports them.
+- External applications are launched through URIs when the package supports them. If a UWP app doesn't include an URI, it can't be launched through Desktop Mode on Xbox.
 - The Windows Update button in Settings is currently visual only; real system updates remain managed by the operating system.
-- Some behavior can vary across PC, Xbox One, and Xbox Series devices because of UWP and Xbox platform restrictions.
 
 ## Credits and license
 
