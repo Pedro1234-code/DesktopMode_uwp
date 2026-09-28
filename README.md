@@ -15,6 +15,7 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 ## Highlights
 
 - Windows 10X-inspired interface with light and dark theme support.
+- Native USB mouse support.
 - Custom mouse cursor and DPI/scale adjustments for Xbox use.
 - Start menu with system apps, Web Apps, and pinned items.
 - Taskbar with open-window indicators, context menus, and persistent pinned items.
@@ -58,6 +59,7 @@ If Visual Studio reports that the signing certificate is unavailable, create or 
 - Access to files outside the application's local storage depends on access granted by the user through UWP file and folder pickers.
 - External applications are launched through URIs when the package supports them. If a UWP app doesn't include an URI, it can't be launched through Desktop Mode on Xbox.
 - The Windows Update button in Settings is currently visual only; real system updates remain managed by the operating system.
+- It has not been tested with a controller.
 
 ## Credits and license
 
