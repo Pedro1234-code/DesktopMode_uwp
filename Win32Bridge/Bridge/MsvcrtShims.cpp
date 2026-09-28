@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge/MsvcrtShims.h"
+#include "Bridge/RuntimeDiagnostics.h"
 
 #include <cstdlib>
 #include <cstdio>
@@ -12,6 +13,7 @@ namespace
     int g_fmode = 0;
     char g_commandLine[] = "";
     char* g_acmdln = g_commandLine;
+    constexpr DWORD GuestCxxExceptionCode = 0xE0425742; // "BWB" bridge exception.
 
     bool IsMsvcrt(const std::wstring& library)
     {
@@ -38,9 +40,22 @@ namespace
     uintptr_t __cdecl BridgeBeginThreadEx(void*, unsigned, unsigned(__stdcall*)(void*), void*, unsigned, unsigned* threadId) { if (threadId) *threadId = 0; return 0; }
     EXCEPTION_DISPOSITION __cdecl BridgeCSpecificHandler(PEXCEPTION_RECORD, PVOID, PCONTEXT, PDISPATCHER_CONTEXT) { return ExceptionContinueSearch; }
     EXCEPTION_DISPOSITION __cdecl BridgeCxxFrameHandler(PEXCEPTION_RECORD, PVOID, PCONTEXT, PDISPATCHER_CONTEXT) { return ExceptionContinueSearch; }
-    void __cdecl BridgeCxxThrowException(void*, void*) { }
+    void __cdecl BridgeCxxThrowException(void*, void*)
+    {
+        // Returning from _CxxThrowException is invalid: callers assume the
+        // stack has been unwound. Until the guest CRT's full catch/type-info
+        // machinery is implemented, raise a non-continuable bridge exception
+        // so the runtime's top-level SEH boundary can stop this one guest
+        // cleanly instead of continuing into a DebugBreak or corrupted state.
+        Win32Bridge::Bridge::RuntimeDiagnostics::Record(L"CRT: guest requested C++ exception; controlled guest shutdown.");
+        RaiseException(GuestCxxExceptionCode, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    }
     void __cdecl BridgeTypeInfoDestructor() { }
-    void __cdecl BridgeTerminate() { }
+    void __cdecl BridgeTerminate()
+    {
+        Win32Bridge::Bridge::RuntimeDiagnostics::Record(L"CRT: guest called terminate/purecall; controlled guest shutdown.");
+        RaiseException(GuestCxxExceptionCode, EXCEPTION_NONCONTINUABLE, 0, nullptr);
+    }
     void __cdecl BridgeExit(int) { }
     void __cdecl BridgeCExit() { }
     void* __cdecl BridgeDllOnExit(void*, void**, void**) { return nullptr; }

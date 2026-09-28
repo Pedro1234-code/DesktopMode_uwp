@@ -134,6 +134,15 @@ namespace Bridge
 
         struct WindowClass;
         struct WindowRecord;
+        struct PopupMenuLevel final
+        {
+            HMENU menu = nullptr;
+            int left = 0;
+            int top = 0;
+            int parentItem = -1;
+            int hotItem = -1;
+        };
+
         struct PopupMenuSession final
         {
             HMENU menu = nullptr;
@@ -142,8 +151,13 @@ namespace Bridge
             int left = 0;
             int top = 0;
             bool open = false;
+            bool menuBar = false;
             bool returnCommand = false;
+            bool notifyOwner = true;
+            bool allowRightButton = false;
             UINT selectedCommand = 0;
+            int topMenuIndex = -1;
+            std::vector<PopupMenuLevel> levels;
         };
 
         std::shared_ptr<WindowRecord> FindWindow(HWND window) const;
@@ -175,6 +189,14 @@ namespace Bridge
         bool EraseGuestBackground(const std::shared_ptr<WindowRecord>& window, HDC dc, const RECT& rect);
         void PostPaint(const std::shared_ptr<WindowRecord>& window, const RECT* rect = nullptr, BOOL erase = TRUE);
         void Present(const std::shared_ptr<WindowRecord>& window);
+        // Leaf SEH gateways for CoreWindow delegates. The UI dispatcher must
+        // never receive a guest/bridge structured exception directly.
+        static DWORD InvokePointerInput(GuestWindowManager* manager, Windows::UI::Core::PointerEventArgs^ args, UINT message);
+        static DWORD InvokeWheelInput(GuestWindowManager* manager, Windows::UI::Core::PointerEventArgs^ args);
+        static DWORD InvokeKeyInput(GuestWindowManager* manager, Windows::UI::Core::KeyEventArgs^ args, UINT message);
+        static void InvokePointerInputThunk(void* context);
+        static void InvokeWheelInputThunk(void* context);
+        static void InvokeKeyInputThunk(void* context);
         void HandlePointer(Windows::UI::Core::PointerEventArgs^ args, UINT message);
         void HandleWheel(Windows::UI::Core::PointerEventArgs^ args);
         void HandleKey(Windows::UI::Core::KeyEventArgs^ args, UINT message);

@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "Bridge/DialogResources.h"
 #include "Bridge\\Win32Shims.h"
 #include "Bridge\\Gdi32Shims.h"
 #include "Bridge/Advapi32Shims.h"
@@ -12,12 +13,6 @@
 
 using namespace Win32Bridge::Bridge;
 
-using namespace Platform;
-using namespace Windows::ApplicationModel::Core;
-using namespace Windows::UI::Core;
-using namespace Windows::UI::Xaml::Controls;
-using namespace concurrency;
-
 namespace
 {
     bool IsUserLibrary(const std::wstring& library)
@@ -27,62 +22,15 @@ namespace
             _wcsnicmp(library.c_str(), L"ext-ms-win-ntuser-", 18) == 0;
     }
 
-    void ShowMessageDialog(String^ text, String^ caption, task_completion_event<int> completion)
-    {
-        auto dialog = ref new ContentDialog();
-        dialog->Title = caption;
-        dialog->Content = text;
-        dialog->PrimaryButtonText = L"OK";
-
-        create_task(dialog->ShowAsync()).then([completion](ContentDialogResult result)
-        {
-            completion.set(result == ContentDialogResult::Primary ? IDOK : IDCANCEL);
-        });
-    }
 }
 
 namespace Win32Bridge
 {
 namespace Bridge
 {
-int WINAPI BridgeMessageBoxW(HWND, LPCWSTR text, LPCWSTR caption, UINT)
+int WINAPI BridgeMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type)
 {
-    try
-    {
-        auto dispatcher = CoreApplication::MainView->CoreWindow->Dispatcher;
-        // Waiting synchronously from the UI thread would deadlock ContentDialog.
-        // The guest runtime will always run PE entry points on a worker thread.
-        if (!dispatcher || dispatcher->HasThreadAccess)
-        {
-            return IDCANCEL;
-        }
-
-        String^ dialogText = ref new String(text ? text : L"");
-        String^ dialogCaption = ref new String(caption ? caption : L"Win32 application");
-        task_completion_event<int> completion;
-        auto handler = ref new DispatchedHandler([dialogText, dialogCaption, completion]() mutable
-        {
-            ShowMessageDialog(dialogText, dialogCaption, completion);
-        });
-
-        create_task(dispatcher->RunAsync(CoreDispatcherPriority::Normal, handler)).then([completion](task<void> dispatch)
-        {
-            try
-            {
-                dispatch.get();
-            }
-            catch (...)
-            {
-                completion.set(IDCANCEL);
-            }
-        });
-
-        return create_task(completion).get();
-    }
-    catch (...)
-    {
-        return IDCANCEL;
-    }
+    return ShowGuestMessageBox(owner, text, caption, type);
 }
 
 BOOL WINAPI BridgeGetCursorPos(LPPOINT point)

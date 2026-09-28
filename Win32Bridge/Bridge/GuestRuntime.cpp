@@ -17,6 +17,31 @@ namespace
             *error = message;
         }
     }
+
+    // This is intentionally a leaf function. A guest PE shares our process,
+    // and an SEH failure in its message loop would otherwise terminate the
+    // CoreShell host before RuntimeSession can persist diagnostics.
+    bool InvokeGuestEntryPoint(int(WINAPI* entryPoint)(), int* exitCode, DWORD* exceptionCode)
+    {
+        if (exceptionCode)
+        {
+            *exceptionCode = ERROR_SUCCESS;
+        }
+
+        __try
+        {
+            *exitCode = entryPoint();
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (exceptionCode)
+            {
+                *exceptionCode = GetExceptionCode();
+            }
+            return false;
+        }
+    }
 }
 
 bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportResolver& resolver, std::wstring* error)
@@ -126,7 +151,21 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
     try
     {
         RuntimeDiagnostics::Record(L"RUN: entering guest entry point.");
-        *exitCode = entryPoint();
+        DWORD guestException = ERROR_SUCCESS;
+        if (!InvokeGuestEntryPoint(entryPoint, exitCode, &guestException))
+        {
+            if (m_storage)
+            {
+                m_storage->CloseAll();
+            }
+            m_kernel->CloseAll();
+            m_modules->ReleaseAll();
+            SetError(error, L"The guest raised a structured exception (" +
+                std::to_wstring(static_cast<unsigned long>(guestException)) + L").");
+            RuntimeDiagnostics::Record(L"RUN FAILED: guest structured exception " +
+                std::to_wstring(static_cast<unsigned long>(guestException)) + L".");
+            return false;
+        }
         if (m_storage)
         {
             m_storage->CloseAll();

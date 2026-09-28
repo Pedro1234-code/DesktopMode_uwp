@@ -17,6 +17,7 @@
 #include <functional>
 #include <limits>
 #include <new>
+#include <numeric>
 #include <unordered_set>
 #include <vector>
 
@@ -53,11 +54,81 @@ namespace
     thread_local unsigned g_ownerDataDisplayInfoDiagnostics = 0;
     thread_local unsigned g_listViewPopulationDiagnostics = 0;
 
+    using SehInvocation = void(*)(void*);
+
+    // The function containing __try must stay entirely native. C++/CX
+    // tracking handles (^) need unwinding cleanup and are carried by the
+    // call-context structs below, outside this SEH leaf.
+    DWORD InvokeSehProtected(SehInvocation invocation, void* context)
+    {
+        __try
+        {
+            invocation(context);
+            return ERROR_SUCCESS;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return GetExceptionCode();
+        }
+    }
+
+    struct PointerInputCall final
+    {
+        GuestWindowManager* manager;
+        PointerEventArgs^ args;
+        UINT message;
+    };
+
+    struct WheelInputCall final
+    {
+        GuestWindowManager* manager;
+        PointerEventArgs^ args;
+    };
+
+    struct KeyInputCall final
+    {
+        GuestWindowManager* manager;
+        KeyEventArgs^ args;
+        UINT message;
+    };
+
     void SetWin32Error(DWORD* output, DWORD value)
     {
         if (output)
         {
             *output = value;
+        }
+    }
+
+    // Guest window procedures are native code from the mapped PE. They run
+    // in the same process as the UWP host, so an access violation must never
+    // be allowed to tear down CoreShell without leaving diagnostics. Keep the
+    // SEH boundary in this tiny leaf function: MSVC forbids __try in functions
+    // which need C++ object unwinding.
+    LRESULT InvokeGuestWindowProcedure(
+        GuestAbi::WndProc procedure,
+        HWND window,
+        UINT message,
+        WPARAM wParam,
+        LPARAM lParam,
+        DWORD* exceptionCode)
+    {
+        if (exceptionCode)
+        {
+            *exceptionCode = ERROR_SUCCESS;
+        }
+
+        __try
+        {
+            return procedure(window, message, wParam, lParam);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (exceptionCode)
+            {
+                *exceptionCode = GetExceptionCode();
+            }
+            return 0;
         }
     }
 
@@ -94,6 +165,8 @@ namespace
         StatusBar,
         Rebar,
         Tab,
+        Progress,
+        TreeView,
         UpDown,
         ToolTip
     };
@@ -162,6 +235,14 @@ namespace
         {
             return BuiltinControlKind::Tab;
         }
+        if (_wcsicmp(className, L"msctls_progress32") == 0)
+        {
+            return BuiltinControlKind::Progress;
+        }
+        if (_wcsicmp(className, L"systreeview32") == 0)
+        {
+            return BuiltinControlKind::TreeView;
+        }
         if (_wcsicmp(className, L"msctls_updown32") == 0 ||
             _wcsicmp(className, L"updown") == 0)
         {
@@ -182,7 +263,8 @@ namespace
             kind == BuiltinControlKind::Toolbar ||
             kind == BuiltinControlKind::StatusBar ||
             kind == BuiltinControlKind::Rebar ||
-            kind == BuiltinControlKind::Tab
+            kind == BuiltinControlKind::Tab ||
+            kind == BuiltinControlKind::Progress
             ? 16 // COLOR_BTNFACE + 1
             : 6; // COLOR_WINDOW + 1
         return reinterpret_cast<HBRUSH>(colorPlusOne);
@@ -227,6 +309,43 @@ namespace
         const size_t cappedCharacters = (std::min)(caption.size(),
             static_cast<size_t>(((std::numeric_limits<int>::max)() - 16) / MiniGdi::DefaultTextGlyphWidth));
         return (std::max)(36, static_cast<int>(cappedCharacters) * MiniGdi::DefaultTextGlyphWidth + 16);
+    }
+
+    constexpr UINT MenuFlagGrayed = 0x0001;
+    constexpr UINT MenuFlagDisabled = 0x0002;
+    constexpr UINT MenuFlagChecked = 0x0008;
+    constexpr UINT MenuFlagPopup = 0x0010;
+    constexpr UINT MenuFlagHighlighted = 0x0080;
+    constexpr UINT MenuFlagSeparator = 0x0800;
+    constexpr UINT MenuFlagMouseSelect = 0x8000;
+
+    bool IsMenuItemDisabled(const GuestMenuVisualItem& item)
+    {
+        return (item.state & (MenuFlagGrayed | MenuFlagDisabled)) != 0;
+    }
+
+    bool IsMenuItemSeparator(const GuestMenuVisualItem& item)
+    {
+        return (item.type & MenuFlagSeparator) != 0 ||
+            (item.identifier == 0 && !item.subMenu && item.text.empty());
+    }
+
+    int PopupMenuWidth(const std::vector<GuestMenuVisualItem>& items)
+    {
+        size_t characters = 0;
+        for (const auto& item : items)
+            characters = (std::max)(characters, MenuCaptionForDisplay(item.text).size());
+        const size_t bounded = (std::min)(characters, static_cast<size_t>(40));
+        return (std::max)(140, (std::min)(360,
+            static_cast<int>(bounded) * MiniGdi::DefaultTextGlyphWidth + 56));
+    }
+
+    UINT MenuSelectFlags(const GuestMenuVisualItem& item, bool mouseSelection)
+    {
+        UINT flags = item.type | item.state;
+        if (item.subMenu) flags |= MenuFlagPopup;
+        if (mouseSelection) flags |= MenuFlagMouseSelect;
+        return flags & 0xffffu;
     }
 
     constexpr BYTE ToolbarStyleSeparator = 0x01;
@@ -275,8 +394,17 @@ namespace
         }
     }
 
-    int ToolbarItemWidth(const std::vector<BYTE>& styles, const std::vector<int>& bitmaps, size_t index, int buttonWidth)
+    int ToolbarItemWidth(
+        const std::vector<BYTE>& styles,
+        const std::vector<int>& bitmaps,
+        const std::vector<BYTE>& states,
+        size_t index,
+        int buttonWidth)
     {
+        if (index < states.size() && (states[index] & 0x08) != 0) // TBSTATE_HIDDEN
+        {
+            return 0;
+        }
         const BYTE style = index < styles.size() ? styles[index] : 0;
         if ((style & ToolbarStyleSeparator) != 0)
         {
@@ -288,12 +416,21 @@ namespace
         return (std::max)(16, buttonWidth);
     }
 
-    int ToolbarItemLeft(const std::vector<BYTE>& styles, const std::vector<int>& bitmaps, size_t index, int buttonWidth)
+    int ToolbarItemLeft(
+        const std::vector<BYTE>& styles,
+        const std::vector<int>& bitmaps,
+        const std::vector<BYTE>& states,
+        size_t index,
+        int buttonWidth)
     {
         int left = 2;
         for (size_t previous = 0; previous < index; ++previous)
         {
-            left += ToolbarItemWidth(styles, bitmaps, previous, buttonWidth) + 1;
+            const int width = ToolbarItemWidth(styles, bitmaps, states, previous, buttonWidth);
+            if (width != 0)
+            {
+                left += width + 1;
+            }
         }
         return left;
     }
@@ -358,16 +495,29 @@ namespace
     constexpr UINT ComboBoxExGetItemW = 0x040d;
     constexpr UINT ScrollBarSetPosition = 0x00e0;
     constexpr UINT ScrollBarGetPosition = 0x00e1;
+    constexpr UINT CommonControlSetUnicodeFormat = 0x2005;
+    constexpr UINT CommonControlGetUnicodeFormat = 0x2006;
+    constexpr UINT ListViewGetBackgroundColor = 0x1000;
+    constexpr UINT ListViewGetImageList = 0x1002;
     constexpr UINT ListViewGetItemCount = 0x1004;
+    constexpr UINT ListViewGetCallbackMask = 0x100a;
     constexpr UINT ListViewSetBackgroundColor = 0x1001;
     constexpr UINT ListViewSetImageList = 0x1003;
     constexpr UINT ListViewDeleteItem = 0x1008;
     constexpr UINT ListViewDeleteAllItems = 0x1009;
     constexpr UINT ListViewGetNextItem = 0x100c;
     constexpr UINT ListViewSetCallbackMask = 0x100b;
+    constexpr UINT ListViewGetItemRect = 0x100e;
+    constexpr UINT ListViewGetItemPosition = 0x1010;
+    constexpr UINT ListViewHitTest = 0x1012;
+    constexpr UINT ListViewRedrawItems = 0x1015;
     constexpr UINT ListViewSetColumnWidth = 0x101e;
+    constexpr UINT ListViewGetColumnWidth = 0x101d;
+    constexpr UINT ListViewGetTextColor = 0x1023;
     constexpr UINT ListViewSetTextColor = 0x1024;
+    constexpr UINT ListViewGetTextBackgroundColor = 0x1025;
     constexpr UINT ListViewSetTextBackgroundColor = 0x1026;
+    constexpr UINT ListViewGetItemState = 0x102c;
     constexpr UINT ListViewSetItemState = 0x102b;
     constexpr UINT ListViewSetItemCount = 0x102f;
     constexpr UINT ListViewEnsureVisible = 0x1013;
@@ -375,7 +525,14 @@ namespace
     constexpr UINT ListViewGetTopIndex = 0x1027;
     constexpr UINT ListViewGetCountPerPage = 0x1028;
     constexpr UINT ListViewSetExtendedStyle = 0x1036;
+    constexpr UINT ListViewGetExtendedStyle = 0x1037;
+    constexpr UINT ListViewGetSubItemRect = 0x1038;
+    constexpr UINT ListViewSubItemHitTest = 0x1039;
     constexpr UINT ListViewSetColumnOrderArray = 0x103a;
+    constexpr UINT ListViewGetColumnOrderArray = 0x103b;
+    constexpr UINT ListViewGetSelectionMark = 0x1042;
+    constexpr UINT ListViewSetSelectionMark = 0x1043;
+    constexpr UINT ListViewSortItems = 0x1030;
     constexpr UINT ListViewGetSelectedCount = 0x1032;
     constexpr UINT ListViewDeleteColumn = 0x101c;
     constexpr UINT ListViewInsertItemW = 0x104d;
@@ -383,9 +540,28 @@ namespace
     constexpr UINT ListViewSetItemTextW = 0x1074;
     constexpr UINT ListViewGetItemTextW = 0x1073;
     constexpr UINT ListViewGetItemW = 0x104b;
+    constexpr UINT ListViewGetColumnW = 0x105f;
+    constexpr UINT ListViewGetStringWidthW = 0x1057;
     constexpr UINT ListViewInsertColumnW = 0x1061;
     constexpr UINT ListViewSetColumnW = 0x1060;
     constexpr UINT ToolbarButtonStructSize = 0x041e;
+    constexpr UINT ToolbarEnableButton = 0x0401;
+    constexpr UINT ToolbarCheckButton = 0x0402;
+    constexpr UINT ToolbarPressButton = 0x0403;
+    constexpr UINT ToolbarHideButton = 0x0404;
+    constexpr UINT ToolbarIndeterminateButton = 0x0405;
+    constexpr UINT ToolbarMarkButton = 0x0406;
+    constexpr UINT ToolbarIsButtonEnabled = 0x0409;
+    constexpr UINT ToolbarIsButtonChecked = 0x040a;
+    constexpr UINT ToolbarIsButtonPressed = 0x040b;
+    constexpr UINT ToolbarIsButtonHidden = 0x040c;
+    constexpr UINT ToolbarIsButtonIndeterminate = 0x040d;
+    constexpr UINT ToolbarIsButtonHighlighted = 0x040e;
+    constexpr UINT ToolbarSetState = 0x0411;
+    constexpr UINT ToolbarGetState = 0x0412;
+    constexpr UINT ToolbarDeleteButton = 0x0416;
+    constexpr UINT ToolbarGetButton = 0x0417;
+    constexpr UINT ToolbarCommandToIndex = 0x0419;
     constexpr UINT ToolbarSetButtonSize = 0x041f;
     constexpr UINT ToolbarSetBitmapSize = 0x0420;
     constexpr UINT ToolbarAutoSize = 0x0421;
@@ -396,7 +572,13 @@ namespace
     constexpr UINT ToolbarSetImageList = 0x0430;
     constexpr UINT ToolbarGetImageList = 0x0431;
     constexpr UINT ToolbarGetItemRect = 0x041d;
+    constexpr UINT ToolbarSetCommandId = 0x042a;
+    constexpr UINT ToolbarChangeBitmap = 0x042b;
+    constexpr UINT ToolbarGetBitmap = 0x042c;
+    constexpr UINT ToolbarGetRect = 0x0433;
     constexpr UINT ToolbarSetButtonWidth = 0x043b;
+    constexpr UINT ToolbarInsertButtonW = 0x0443;
+    constexpr UINT ToolbarHitTest = 0x0445;
     constexpr UINT RebarSetBarInfo = 0x0404;
     constexpr UINT RebarInsertBandW = 0x040a;
     constexpr UINT RebarSetBandInfoW = 0x040b;
@@ -404,11 +586,150 @@ namespace
     constexpr UINT RebarGetBandCount = 0x040c;
     constexpr UINT RebarGetBarHeight = 0x041b;
     constexpr UINT RebarGetRowHeight = 0x041c;
+    constexpr UINT StatusBarSetTextW = 0x040b;
+    constexpr UINT StatusBarGetTextLengthW = 0x040c;
+    constexpr UINT StatusBarGetTextW = 0x040d;
+    constexpr UINT StatusBarSetParts = 0x0404;
+    constexpr UINT StatusBarGetParts = 0x0406;
+    constexpr UINT StatusBarGetRect = 0x040a;
+    constexpr UINT StatusBarSetMinimumHeight = 0x0408;
+    constexpr UINT StatusBarSetSimple = 0x0409;
+    constexpr UINT StatusBarIsSimple = 0x040e;
+    constexpr UINT ProgressSetRange = 0x0401;
+    constexpr UINT ProgressSetPosition = 0x0402;
+    constexpr UINT ProgressDeltaPosition = 0x0403;
+    constexpr UINT ProgressSetStep = 0x0404;
+    constexpr UINT ProgressStep = 0x0405;
+    constexpr UINT ProgressSetRange32 = 0x0406;
+    constexpr UINT ProgressGetRange = 0x0407;
+    constexpr UINT ProgressGetPosition = 0x0408;
+    constexpr UINT ProgressSetBarColor = 0x0409;
+    constexpr UINT ProgressSetBackgroundColor = 0x2001;
+    constexpr UINT ProgressSetMarquee = 0x040a;
+    constexpr UINT ProgressGetStep = 0x040d;
+    constexpr UINT ProgressGetBackgroundColor = 0x040e;
+    constexpr UINT ProgressGetBarColor = 0x040f;
+    constexpr UINT ProgressSetState = 0x0410;
+    constexpr UINT ProgressGetState = 0x0411;
+    constexpr UINT TabGetImageList = 0x1302;
+    constexpr UINT TabSetImageList = 0x1303;
+    constexpr UINT TabGetItemCount = 0x1304;
+    constexpr UINT TabDeleteItem = 0x1308;
+    constexpr UINT TabDeleteAllItems = 0x1309;
+    constexpr UINT TabGetItemRect = 0x130a;
+    constexpr UINT TabGetCurrentSelection = 0x130b;
+    constexpr UINT TabSetCurrentSelection = 0x130c;
+    constexpr UINT TabHitTest = 0x130d;
+    constexpr UINT TabAdjustRect = 0x1328;
+    constexpr UINT TabSetItemSize = 0x1329;
+    constexpr UINT TabSetPadding = 0x132b;
+    constexpr UINT TabGetRowCount = 0x132c;
+    constexpr UINT TabGetCurrentFocus = 0x132f;
+    constexpr UINT TabSetCurrentFocus = 0x1330;
+    constexpr UINT TabGetItemW = 0x133c;
+    constexpr UINT TabSetItemW = 0x133d;
+    constexpr UINT TabInsertItemW = 0x133e;
+    constexpr UINT TabItemText = 0x0001;
+    constexpr UINT TabItemImage = 0x0002;
+    constexpr UINT TabItemParam = 0x0008;
+    constexpr UINT TabItemState = 0x0010;
+    constexpr UINT TabNotifySelectionChange = static_cast<UINT>(-551);
+    constexpr UINT TabNotifySelectionChanging = static_cast<UINT>(-552);
+    constexpr UINT HeaderGetItemCount = 0x1200;
+    constexpr UINT HeaderDeleteItem = 0x1202;
+    constexpr UINT HeaderLayout = 0x1205;
+    constexpr UINT HeaderHitTest = 0x1206;
+    constexpr UINT HeaderGetItemRect = 0x1207;
+    constexpr UINT HeaderSetImageList = 0x1208;
+    constexpr UINT HeaderGetImageList = 0x1209;
+    constexpr UINT HeaderInsertItemW = 0x120a;
+    constexpr UINT HeaderGetItemW = 0x120b;
+    constexpr UINT HeaderSetItemW = 0x120c;
+    constexpr UINT HeaderOrderToIndex = 0x120f;
+    constexpr UINT HeaderGetOrderArray = 0x1211;
+    constexpr UINT HeaderSetOrderArray = 0x1212;
+    constexpr UINT HeaderItemWidth = 0x0001;
+    constexpr UINT HeaderItemText = 0x0002;
+    constexpr UINT HeaderItemFormat = 0x0004;
+    constexpr UINT HeaderItemParam = 0x0008;
+    constexpr UINT HeaderItemImage = 0x0020;
+    constexpr UINT HeaderItemOrder = 0x0080;
+    constexpr UINT HeaderNotifyItemClickW = static_cast<UINT>(-322);
+    constexpr UINT TreeDeleteItem = 0x1101;
+    constexpr UINT TreeExpand = 0x1102;
+    constexpr UINT TreeGetItemRect = 0x1104;
+    constexpr UINT TreeGetCount = 0x1105;
+    constexpr UINT TreeGetIndent = 0x1106;
+    constexpr UINT TreeSetIndent = 0x1107;
+    constexpr UINT TreeGetImageList = 0x1108;
+    constexpr UINT TreeSetImageList = 0x1109;
+    constexpr UINT TreeGetNextItem = 0x110a;
+    constexpr UINT TreeSelectItem = 0x110b;
+    constexpr UINT TreeGetVisibleCount = 0x1110;
+    constexpr UINT TreeHitTest = 0x1111;
+    constexpr UINT TreeEnsureVisible = 0x1114;
+    constexpr UINT TreeSetItemHeight = 0x111b;
+    constexpr UINT TreeGetItemHeight = 0x111c;
+    constexpr UINT TreeSetBackgroundColor = 0x111d;
+    constexpr UINT TreeSetTextColor = 0x111e;
+    constexpr UINT TreeGetBackgroundColor = 0x111f;
+    constexpr UINT TreeGetTextColor = 0x1120;
+    constexpr UINT TreeGetItemState = 0x1127;
+    constexpr UINT TreeInsertItemW = 0x1132;
+    constexpr UINT TreeGetItemW = 0x113e;
+    constexpr UINT TreeSetItemW = 0x113f;
+    constexpr UINT TreeItemText = 0x0001;
+    constexpr UINT TreeItemImage = 0x0002;
+    constexpr UINT TreeItemParam = 0x0004;
+    constexpr UINT TreeItemState = 0x0008;
+    constexpr UINT TreeItemHandle = 0x0010;
+    constexpr UINT TreeItemSelectedImage = 0x0020;
+    constexpr UINT TreeItemChildren = 0x0040;
+    constexpr UINT TreeStateSelected = 0x0002;
+    constexpr UINT TreeStateExpanded = 0x0020;
+    constexpr UINT TreeExpandCollapse = 0x0001;
+    constexpr UINT TreeExpandExpand = 0x0002;
+    constexpr UINT TreeExpandToggle = 0x0003;
+    constexpr UINT TreeNextRoot = 0x0000;
+    constexpr UINT TreeNextSibling = 0x0001;
+    constexpr UINT TreePreviousSibling = 0x0002;
+    constexpr UINT TreeParent = 0x0003;
+    constexpr UINT TreeChild = 0x0004;
+    constexpr UINT TreeFirstVisible = 0x0005;
+    constexpr UINT TreeNextVisible = 0x0006;
+    constexpr UINT TreePreviousVisible = 0x0007;
+    constexpr UINT TreeCaret = 0x0009;
+    constexpr UINT TreeLastVisible = 0x000a;
+    constexpr UINT TreeNotifySelectionChangingW = static_cast<UINT>(-450);
+    constexpr UINT TreeNotifySelectionChangedW = static_cast<UINT>(-451);
+    constexpr UINT UpDownSetRange = 0x0465;
+    constexpr UINT UpDownGetRange = 0x0466;
+    constexpr UINT UpDownSetPosition = 0x0467;
+    constexpr UINT UpDownGetPosition = 0x0468;
+    constexpr UINT UpDownSetBuddy = 0x0469;
+    constexpr UINT UpDownGetBuddy = 0x046a;
+    constexpr UINT UpDownSetBase = 0x046d;
+    constexpr UINT UpDownGetBase = 0x046e;
+    constexpr UINT UpDownSetRange32 = 0x046f;
+    constexpr UINT UpDownGetRange32 = 0x0470;
+    constexpr UINT UpDownSetPosition32 = 0x0471;
+    constexpr UINT UpDownGetPosition32 = 0x0472;
+    constexpr UINT UpDownNotifyDeltaPosition = static_cast<UINT>(-722);
+    constexpr UINT ListViewColumnFormat = 0x0001;
+    constexpr UINT ListViewColumnWidth = 0x0002;
     constexpr UINT ListViewColumnText = 0x0004;
+    constexpr UINT ListViewColumnSubItem = 0x0008;
+    constexpr UINT ListViewColumnImage = 0x0010;
+    constexpr UINT ListViewColumnOrder = 0x0020;
     constexpr UINT ListViewItemText = 0x0001;
+    constexpr UINT ListViewItemImage = 0x0002;
     constexpr UINT ListViewItemParam = 0x0004;
     constexpr UINT ListViewItemState = 0x0008;
     constexpr UINT ListViewStateSelected = 0x0002;
+    constexpr UINT ListViewStateFocused = 0x0001;
+    constexpr UINT ListViewHitNowhere = 0x0001;
+    constexpr UINT ListViewHitOnItemIcon = 0x0002;
+    constexpr UINT ListViewHitOnItemLabel = 0x0004;
     // LVS_OWNERDATA. LVM_SETITEMCOUNT is defined only for this virtual
     // ListView style; applying it to a retained-item view invents blank rows.
     constexpr DWORD ListViewStyleOwnerData = 0x00001000u;
@@ -420,6 +741,11 @@ namespace
     constexpr UINT NotifyClick = static_cast<UINT>(-2); // NM_CLICK
     constexpr UINT NotifyDoubleClick = static_cast<UINT>(-3); // NM_DBLCLK
     constexpr BYTE ToolbarStateEnabled = 0x04;
+    constexpr BYTE ToolbarStateChecked = 0x01;
+    constexpr BYTE ToolbarStatePressed = 0x02;
+    constexpr BYTE ToolbarStateHidden = 0x08;
+    constexpr BYTE ToolbarStateIndeterminate = 0x10;
+    constexpr BYTE ToolbarStateMarked = 0x80;
     constexpr BYTE ToolbarStyleDropDown = 0x08;
 
     MiniGdi::Color ColorFromGuestColorRef(COLORREF color)
@@ -483,6 +809,15 @@ namespace
         GuestListViewItemW item;
     };
 
+    struct GuestListViewHitTestInfo final
+    {
+        POINT point;
+        UINT flags;
+        int item;
+        int subItem;
+        int group;
+    };
+
     // NMLISTVIEW/NMITEMACTIVATE share this prefix.  The compact bridge model
     // deliberately sends the common fields for selection and activation, so
     // owners can keep their usual WM_NOTIFY dispatch rather than special-case
@@ -501,6 +836,33 @@ namespace
     };
     static_assert(sizeof(GuestListViewNotification) == 72,
         "Guest NMITEMACTIVATE layout must remain x64-compatible.");
+
+    using GuestListViewCompare = int(CALLBACK*)(LPARAM, LPARAM, LPARAM);
+
+    int InvokeGuestListViewCompare(
+        GuestListViewCompare compare,
+        LPARAM left,
+        LPARAM right,
+        LPARAM parameter,
+        DWORD* exceptionCode)
+    {
+        if (exceptionCode)
+        {
+            *exceptionCode = ERROR_SUCCESS;
+        }
+        __try
+        {
+            return compare(left, right, parameter);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (exceptionCode)
+            {
+                *exceptionCode = GetExceptionCode();
+            }
+            return 0;
+        }
+    }
 
     struct GuestToolbarButton final
     {
@@ -537,6 +899,197 @@ namespace
         int minimumHeight = 24;
         int width = 0;
     };
+
+    struct GuestProgressRange final
+    {
+        int low;
+        int high;
+    };
+
+    struct GuestTabItemW final
+    {
+        UINT mask;
+        DWORD state;
+        DWORD stateMask;
+        LPWSTR text;
+        int textCapacity;
+        int image;
+        LPARAM itemData;
+    };
+
+    struct GuestTabHitTestInfo final
+    {
+        POINT point;
+        UINT flags;
+    };
+
+    struct GuestHeaderItemW final
+    {
+        UINT mask;
+        int width;
+        LPWSTR text;
+        HBITMAP bitmap;
+        int textCapacity;
+        int format;
+        LPARAM itemData;
+        int image;
+        int order;
+    };
+
+    struct GuestHeaderHitTestInfo final
+    {
+        POINT point;
+        UINT flags;
+        int item;
+    };
+
+    // WINDOWPOS is hidden by some UWP SDK partitions even though HDLAYOUT
+    // still carries a pointer to its ABI. Keep the Win32 layout locally so the
+    // guest structure remains binary-compatible without depending on that
+    // desktop-only declaration.
+    struct GuestWindowPosition final
+    {
+        HWND window;
+        HWND insertAfter;
+        int x;
+        int y;
+        int cx;
+        int cy;
+        UINT flags;
+    };
+    static_assert(sizeof(GuestWindowPosition) == 40,
+        "Guest WINDOWPOS layout must remain x64-compatible.");
+
+    struct GuestHeaderLayout final
+    {
+        RECT* rect;
+        GuestWindowPosition* windowPosition;
+    };
+
+    struct GuestHeaderNotification final
+    {
+        GuestNotifyHeader header;
+        int item;
+        int button;
+        GuestHeaderItemW* headerItem;
+    };
+
+    struct GuestTreeItemW final
+    {
+        UINT mask;
+        HANDLE item;
+        UINT state;
+        UINT stateMask;
+        LPWSTR text;
+        int textCapacity;
+        int image;
+        int selectedImage;
+        int children;
+        LPARAM itemData;
+    };
+
+    struct GuestTreeInsertW final
+    {
+        HANDLE parent;
+        HANDLE insertAfter;
+        GuestTreeItemW item;
+    };
+
+    struct GuestTreeHitTestInfo final
+    {
+        POINT point;
+        UINT flags;
+        HANDLE item;
+    };
+
+    struct GuestTreeNotification final
+    {
+        GuestNotifyHeader header;
+        UINT action;
+        GuestTreeItemW oldItem;
+        GuestTreeItemW newItem;
+        POINT dragPoint;
+    };
+
+    struct GuestUpDownNotification final
+    {
+        GuestNotifyHeader header;
+        int position;
+        int delta;
+    };
+
+    struct TreeNode final
+    {
+        ULONG_PTR token = 0;
+        ULONG_PTR parent = 0;
+        std::vector<ULONG_PTR> children;
+        std::wstring text;
+        LPARAM itemData = 0;
+        UINT state = 0;
+        int image = -1;
+        int selectedImage = -1;
+        int declaredChildren = 0;
+    };
+
+    struct VisibleTreeNode final
+    {
+        ULONG_PTR token = 0;
+        int depth = 0;
+    };
+
+    const TreeNode* FindTreeNode(const std::vector<TreeNode>& nodes, ULONG_PTR token)
+    {
+        const auto found = std::find_if(nodes.begin(), nodes.end(), [token](const TreeNode& node)
+        {
+            return node.token == token;
+        });
+        return found == nodes.end() ? nullptr : &*found;
+    }
+
+    TreeNode* FindTreeNode(std::vector<TreeNode>& nodes, ULONG_PTR token)
+    {
+        const auto found = std::find_if(nodes.begin(), nodes.end(), [token](const TreeNode& node)
+        {
+            return node.token == token;
+        });
+        return found == nodes.end() ? nullptr : &*found;
+    }
+
+    void AppendVisibleTreeNodes(
+        const std::vector<TreeNode>& nodes,
+        ULONG_PTR parent,
+        int depth,
+        std::vector<VisibleTreeNode>* visible)
+    {
+        if (!visible || visible->size() >= 4096 || depth > 128)
+        {
+            return;
+        }
+        for (const auto& node : nodes)
+        {
+            if (node.parent != parent)
+            {
+                continue;
+            }
+            visible->push_back(VisibleTreeNode{ node.token, depth });
+            if (visible->size() >= 4096)
+            {
+                return;
+            }
+            if ((node.state & TreeStateExpanded) != 0)
+            {
+                AppendVisibleTreeNodes(nodes, node.token, depth + 1, visible);
+            }
+        }
+    }
+
+    std::vector<VisibleTreeNode> VisibleTreeNodes(const std::vector<TreeNode>& nodes)
+    {
+        std::vector<VisibleTreeNode> visible;
+        visible.reserve(nodes.size());
+        AppendVisibleTreeNodes(nodes, 0, 0, &visible);
+        return visible;
+    }
 
     // LVITEM/LVCOLUMN text is a pointer into guest-owned mapped memory.  It
     // is optional even when the structure itself is present, and real-world
@@ -761,6 +1314,13 @@ namespace
         return static_cast<int>(result);
     }
 
+    WORD SignedCoordinateWord(int value)
+    {
+        const int bounded = (std::max)(static_cast<int>((std::numeric_limits<short>::min)()),
+            (std::min)(static_cast<int>((std::numeric_limits<short>::max)()), value));
+        return static_cast<WORD>(static_cast<short>(bounded));
+    }
+
     WPARAM MouseKeyState(PointerPointProperties^ properties)
     {
         if (!properties)
@@ -785,7 +1345,8 @@ namespace
         int targetLeft,
         int targetTop,
         const Point& hostPosition,
-        Image^ image)
+        Image^ image,
+        bool clampToTarget = true)
     {
         const int hostWidth = (std::max)(1, rootWidth);
         const int hostHeight = (std::max)(1, rootHeight);
@@ -830,9 +1391,20 @@ namespace
             }
         }
 
-        const int pixelX = (std::max)(0, (std::min)(width - 1, static_cast<int>(x) - targetLeft));
-        const int pixelY = (std::max)(0, (std::min)(height - 1, static_cast<int>(y) - targetTop));
-        return GuestAbi::MakeMouseLParam(static_cast<WORD>(pixelX), static_cast<WORD>(pixelY));
+        int pixelX = static_cast<int>(x) - targetLeft;
+        int pixelY = static_cast<int>(y) - targetTop;
+        if (clampToTarget)
+        {
+            pixelX = (std::max)(0, (std::min)(width - 1, pixelX));
+            pixelY = (std::max)(0, (std::min)(height - 1, pixelY));
+        }
+        else
+        {
+            pixelX = static_cast<int>(static_cast<short>(SignedCoordinateWord(pixelX)));
+            pixelY = static_cast<int>(static_cast<short>(SignedCoordinateWord(pixelY)));
+        }
+        return GuestAbi::MakeMouseLParam(
+            SignedCoordinateWord(pixelX), SignedCoordinateWord(pixelY));
     }
 
     WORD XButtonFromUpdate(PointerUpdateKind update)
@@ -1293,17 +1865,25 @@ struct GuestWindowManager::WindowRecord final
     int scrollPosition = 0;
     std::vector<std::wstring> listViewColumns;
     std::vector<int> listViewColumnWidths;
+    std::vector<int> listViewColumnFormats;
+    std::vector<int> listViewColumnSubItems;
+    std::vector<int> listViewColumnImages;
+    std::vector<int> listViewColumnOrders;
     // Each inner element is one report-view row.  Keeping subitems here is
     // important: file managers populate the name first and then fill size,
     // type and timestamp through LVM_SETITEMTEXTW.
     std::vector<std::vector<std::wstring>> listViewItems;
     std::vector<LPARAM> listViewItemData;
+    std::vector<UINT> listViewItemStates;
+    std::vector<int> listViewItemImages;
+    HANDLE listViewImageLists[3] = {};
     COLORREF listViewBackgroundColor = 0x00ffffff;
     COLORREF listViewTextColor = 0x00000000;
     COLORREF listViewTextBackgroundColor = 0x00ffffff;
     UINT listViewExtendedStyle = 0;
     UINT listViewCallbackMask = 0;
     int listViewSelectedItem = -1;
+    int listViewSelectionMark = -1;
     int listViewTopItem = 0;
     int listViewPressedItem = -1;
     std::chrono::steady_clock::time_point listViewLastClick = {};
@@ -1312,13 +1892,63 @@ struct GuestWindowManager::WindowRecord final
     std::vector<int> toolbarBitmaps;
     std::vector<BYTE> toolbarButtonStates;
     std::vector<BYTE> toolbarButtonStyles;
+    std::vector<UINT_PTR> toolbarButtonData;
     int toolbarButtonWidth = 24;
     int toolbarButtonHeight = 24;
     int toolbarBitmapWidth = 16;
     int toolbarBitmapHeight = 16;
     int toolbarPressedIndex = -1;
     HANDLE toolbarImageList = nullptr;
+    bool commonControlUnicode = true;
     std::vector<RebarBand> rebarBands;
+    std::vector<int> statusBarParts;
+    std::vector<std::wstring> statusBarTexts;
+    std::vector<UINT> statusBarTextStyles;
+    std::wstring statusBarSimpleText;
+    UINT statusBarSimpleStyle = 0;
+    int statusBarMinimumHeight = 18;
+    bool statusBarSimple = false;
+    int progressMinimum = 0;
+    int progressMaximum = 100;
+    int progressPosition = 0;
+    int progressStep = 10;
+    UINT progressState = 1;
+    COLORREF progressBarColor = 0xffffffffu;
+    COLORREF progressBackgroundColor = 0xffffffffu;
+    bool progressMarquee = false;
+    std::vector<std::wstring> tabItems;
+    std::vector<LPARAM> tabItemData;
+    std::vector<int> tabItemImages;
+    std::vector<UINT> tabItemStates;
+    HANDLE tabImageList = nullptr;
+    int tabSelectedItem = -1;
+    int tabFocusedItem = -1;
+    int tabItemWidth = 0;
+    int tabItemHeight = 24;
+    int tabHorizontalPadding = 6;
+    int tabVerticalPadding = 3;
+    std::vector<std::wstring> headerItems;
+    std::vector<int> headerItemWidths;
+    std::vector<int> headerItemFormats;
+    std::vector<LPARAM> headerItemData;
+    std::vector<int> headerItemImages;
+    std::vector<int> headerItemOrders;
+    HANDLE headerImageList = nullptr;
+    int headerPressedItem = -1;
+    std::vector<TreeNode> treeNodes;
+    ULONG_PTR nextTreeToken = 0x100000;
+    ULONG_PTR treeSelectedItem = 0;
+    ULONG_PTR treeTopItem = 0;
+    HANDLE treeImageLists[2] = {};
+    int treeIndent = 16;
+    int treeItemHeight = 18;
+    COLORREF treeBackgroundColor = 0x00ffffff;
+    COLORREF treeTextColor = 0x00000000;
+    int upDownMinimum = 0;
+    int upDownMaximum = 100;
+    int upDownPosition = 0;
+    UINT upDownBase = 10;
+    HWND upDownBuddy = nullptr;
     bool addressBackButton = false;
     bool menuBar = false;
     int openMenuIndex = -1;
@@ -1361,56 +1991,98 @@ GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHos
     m_pointerMovedToken = coreWindow->PointerMoved += ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(
         [callbacks](CoreWindow^, PointerEventArgs^ args)
     {
-        std::lock_guard<std::mutex> guard(callbacks->lock);
-        if (callbacks->owner)
+        try
         {
-            callbacks->owner->HandlePointer(args, GuestAbi::WmMouseMove);
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner)
+            {
+                const DWORD exceptionCode = GuestWindowManager::InvokePointerInput(callbacks->owner, args, GuestAbi::WmMouseMove);
+                if (exceptionCode != ERROR_SUCCESS)
+                    RuntimeDiagnostics::Record(L"HOST INPUT SEH: PointerMoved code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+            }
         }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: PointerMoved HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: PointerMoved raised an unknown exception."); }
     });
     m_pointerPressedToken = coreWindow->PointerPressed += ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(
         [callbacks](CoreWindow^, PointerEventArgs^ args)
     {
-        std::lock_guard<std::mutex> guard(callbacks->lock);
-        if (callbacks->owner)
+        try
         {
-            callbacks->owner->HandlePointer(args, 0);
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner)
+            {
+                const DWORD exceptionCode = GuestWindowManager::InvokePointerInput(callbacks->owner, args, 0);
+                if (exceptionCode != ERROR_SUCCESS)
+                    RuntimeDiagnostics::Record(L"HOST INPUT SEH: PointerPressed code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+            }
         }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: PointerPressed HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: PointerPressed raised an unknown exception."); }
     });
     m_pointerReleasedToken = coreWindow->PointerReleased += ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(
         [callbacks](CoreWindow^, PointerEventArgs^ args)
     {
-        std::lock_guard<std::mutex> guard(callbacks->lock);
-        if (callbacks->owner)
+        try
         {
-            callbacks->owner->HandlePointer(args, 0);
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner)
+            {
+                const DWORD exceptionCode = GuestWindowManager::InvokePointerInput(callbacks->owner, args, 0);
+                if (exceptionCode != ERROR_SUCCESS)
+                    RuntimeDiagnostics::Record(L"HOST INPUT SEH: PointerReleased code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+            }
         }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: PointerReleased HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: PointerReleased raised an unknown exception."); }
     });
     m_pointerWheelToken = coreWindow->PointerWheelChanged += ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(
         [callbacks](CoreWindow^, PointerEventArgs^ args)
     {
-        std::lock_guard<std::mutex> guard(callbacks->lock);
-        if (callbacks->owner)
+        try
         {
-            callbacks->owner->HandleWheel(args);
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner)
+            {
+                const DWORD exceptionCode = GuestWindowManager::InvokeWheelInput(callbacks->owner, args);
+                if (exceptionCode != ERROR_SUCCESS)
+                    RuntimeDiagnostics::Record(L"HOST INPUT SEH: PointerWheelChanged code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+            }
         }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: PointerWheelChanged HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: PointerWheelChanged raised an unknown exception."); }
     });
     m_keyDownToken = coreWindow->KeyDown += ref new TypedEventHandler<CoreWindow^, KeyEventArgs^>(
         [callbacks](CoreWindow^, KeyEventArgs^ args)
     {
-        std::lock_guard<std::mutex> guard(callbacks->lock);
-        if (callbacks->owner)
+        try
         {
-            callbacks->owner->HandleKey(args, GuestAbi::WmKeyDown);
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner)
+            {
+                const DWORD exceptionCode = GuestWindowManager::InvokeKeyInput(callbacks->owner, args, GuestAbi::WmKeyDown);
+                if (exceptionCode != ERROR_SUCCESS)
+                    RuntimeDiagnostics::Record(L"HOST INPUT SEH: KeyDown code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+            }
         }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: KeyDown HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: KeyDown raised an unknown exception."); }
     });
     m_keyUpToken = coreWindow->KeyUp += ref new TypedEventHandler<CoreWindow^, KeyEventArgs^>(
         [callbacks](CoreWindow^, KeyEventArgs^ args)
     {
-        std::lock_guard<std::mutex> guard(callbacks->lock);
-        if (callbacks->owner)
+        try
         {
-            callbacks->owner->HandleKey(args, GuestAbi::WmKeyUp);
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner)
+            {
+                const DWORD exceptionCode = GuestWindowManager::InvokeKeyInput(callbacks->owner, args, GuestAbi::WmKeyUp);
+                if (exceptionCode != ERROR_SUCCESS)
+                    RuntimeDiagnostics::Record(L"HOST INPUT SEH: KeyUp code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+            }
         }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: KeyUp HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: KeyUp raised an unknown exception."); }
     });
     m_eventsAttached.store(true);
 }
@@ -1679,6 +2351,12 @@ HWND GuestWindowManager::CreateGuestWindow(
     window->controlId = parent ? reinterpret_cast<UINT_PTR>(menu) : 0;
     window->editCaret = window->title.size();
     window->enabled = (style & GuestWsDisabled) == 0;
+    if (registered->builtinKind == BuiltinControlKind::StatusBar)
+    {
+        window->statusBarParts.push_back(-1);
+        window->statusBarTexts.push_back(window->title);
+        window->statusBarTextStyles.push_back(0);
+    }
     try
     {
         window->extraBytes.resize(static_cast<size_t>(registered->windowExtraBytes));
@@ -1698,7 +2376,11 @@ HWND GuestWindowManager::CreateGuestWindow(
     const int defaultWidth = 800;
     const int defaultHeight = builtinKind == BuiltinControlKind::Toolbar ||
         builtinKind == BuiltinControlKind::Rebar ||
-        builtinKind == BuiltinControlKind::StatusBar
+        builtinKind == BuiltinControlKind::StatusBar ||
+        builtinKind == BuiltinControlKind::Header ||
+        builtinKind == BuiltinControlKind::Progress ||
+        builtinKind == BuiltinControlKind::UpDown ||
+        builtinKind == BuiltinControlKind::ToolTip
         ? 24
         : 480;
     window->bounds.left = DefaultCoordinate(x);
@@ -2034,7 +2716,23 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
     }
     if (procedure)
     {
-        const LRESULT result = procedure(handle, message, wParam, lParam);
+        DWORD guestException = ERROR_SUCCESS;
+        const LRESULT result = InvokeGuestWindowProcedure(
+            procedure,
+            handle,
+            message,
+            wParam,
+            lParam,
+            &guestException);
+        if (guestException != ERROR_SUCCESS)
+        {
+            RuntimeDiagnostics::Record(
+                L"GUEST CALLBACK EXCEPTION: code " +
+                std::to_wstring(static_cast<unsigned long>(guestException)) +
+                L", message " + std::to_wstring(message) +
+                L", window " + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)) + L".");
+            return 0;
+        }
         if (message == GuestAbi::WmPaint)
         {
             bool paintActive = false;
@@ -2352,20 +3050,40 @@ UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int 
         return 0;
     }
 
-    // TPM_RETURNCMD is the only result-affecting flag. For the ordinary form
-    // the selected command is posted to the owner after the modal menu closes.
+    // TrackPopupMenuEx initializes the popup before taking its visual snapshot;
+    // applications commonly change captions and enabled state from this
+    // callback. The bridge never keeps a menu-model lock while invoking guest
+    // code, so dynamic InsertMenuItem/SetMenuItemInfo calls are safe here.
     constexpr UINT TpmReturnCommand = 0x0100;
+    constexpr UINT TpmNoNotify = 0x0080;
+    constexpr UINT TpmRightButton = 0x0002;
+    SendGuestMessage(owner, GuestAbi::WmInitMenuPopup,
+        reinterpret_cast<WPARAM>(menu), 0, nullptr);
     const std::vector<GuestMenuVisualItem> popupItems = GetGuestMenuItems(menu);
+    if (popupItems.empty())
+    {
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return 0;
+    }
+    const int popupWidth = PopupMenuWidth(popupItems);
+    const int popupLeft = (std::max)(0, (std::min)(x,
+        (std::max)(0, rootWidth - popupWidth)));
+    const int popupTop = (std::max)(0, (std::min)(y,
+        (std::max)(0, rootHeight - 20)));
     {
         std::lock_guard<std::mutex> guard(m_popupMenuLock);
+        m_popupMenu = PopupMenuSession{};
         m_popupMenu.menu = menu;
         m_popupMenu.owner = owner;
         m_popupMenu.root = root;
-        m_popupMenu.left = (std::max)(0, (std::min)(x, (std::max)(0, rootWidth - 40)));
-        m_popupMenu.top = (std::max)(0, (std::min)(y, (std::max)(0, rootHeight - 20)));
+        m_popupMenu.left = popupLeft;
+        m_popupMenu.top = popupTop;
         m_popupMenu.returnCommand = (flags & TpmReturnCommand) != 0;
+        m_popupMenu.notifyOwner = (flags & TpmNoNotify) == 0;
+        m_popupMenu.allowRightButton = (flags & TpmRightButton) != 0;
         m_popupMenu.selectedCommand = 0;
         m_popupMenu.open = true;
+        m_popupMenu.levels.push_back(PopupMenuLevel{ menu, popupLeft, popupTop, -1, -1 });
     }
     size_t captionCount = 0;
     for (const auto& item : popupItems)
@@ -2382,11 +3100,12 @@ UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int 
     m_popupMenuChanged.wait(lock, [this] { return !m_popupMenu.open || !m_active.load(); });
     const UINT command = m_popupMenu.selectedCommand;
     const bool returnCommand = m_popupMenu.returnCommand;
+    const bool notifyOwner = m_popupMenu.notifyOwner;
     m_popupMenu = PopupMenuSession{};
     lock.unlock();
-    if (command && !returnCommand)
+    if (command && !returnCommand && notifyOwner)
     {
-        PostGuestMessage(owner, GuestAbi::WmCommand,
+        SendGuestMessage(owner, GuestAbi::WmCommand,
             GuestAbi::MakeCommandWParam(static_cast<WORD>(command), 0), 0, nullptr);
     }
     SetWin32Error(win32Error, ERROR_SUCCESS);
@@ -2989,7 +3708,10 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
 
 bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int rootY, UINT message)
 {
-    if (message != GuestAbi::WmLButtonDown && message != GuestAbi::WmLButtonUp)
+    if (message != GuestAbi::WmMouseMove &&
+        message != GuestAbi::WmLButtonDown && message != GuestAbi::WmLButtonUp &&
+        message != GuestAbi::WmRButtonDown && message != GuestAbi::WmRButtonUp &&
+        message != GuestAbi::WmMButtonDown && message != GuestAbi::WmMButtonUp)
     {
         return false;
     }
@@ -2999,6 +3721,50 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
         return false;
     }
 
+    constexpr int popupRowHeight = 20;
+    const auto notifyMenuClosed = [this](HWND owner)
+    {
+        if (owner)
+            SendGuestMessage(owner, GuestAbi::WmMenuSelect,
+                GuestAbi::MakeCommandWParam(0, 0xffff), 0, nullptr);
+    };
+    const auto notifyMenuSelection = [this](HWND owner, HMENU containingMenu,
+        const GuestMenuVisualItem& item, size_t index)
+    {
+        if (!owner) return;
+        const UINT selected = item.subMenu ? static_cast<UINT>(index) : item.identifier;
+        SendGuestMessage(owner, GuestAbi::WmMenuSelect,
+            GuestAbi::MakeCommandWParam(static_cast<WORD>(selected),
+                static_cast<WORD>(MenuSelectFlags(item, true))),
+            reinterpret_cast<LPARAM>(containingMenu), nullptr);
+    };
+    const auto dismissPopup = [this, root, rootWindow, &notifyMenuClosed](UINT command)
+    {
+        PopupMenuSession closing;
+        {
+            std::lock_guard<std::mutex> guard(m_popupMenuLock);
+            if (!m_popupMenu.open || m_popupMenu.root != rootWindow) return;
+            m_popupMenu.selectedCommand = command;
+            m_popupMenu.open = false;
+            closing = m_popupMenu;
+        }
+        {
+            std::lock_guard<std::mutex> guard(root->lock);
+            if (!root->destroyed) root->openMenuIndex = -1;
+        }
+        notifyMenuClosed(closing.owner);
+        RuntimeDiagnostics::Record(command
+            ? L"MENU: selected command " + std::to_wstring(command) + L"."
+            : L"MENU: dismissed without a command.");
+        m_popupMenuChanged.notify_all();
+        InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+        if (command && closing.menuBar && closing.notifyOwner)
+        {
+            SendGuestMessage(closing.owner, GuestAbi::WmCommand,
+                GuestAbi::MakeCommandWParam(static_cast<WORD>(command), 0), 0, nullptr);
+        }
+    };
+
     PopupMenuSession popup;
     {
         std::lock_guard<std::mutex> guard(m_popupMenuLock);
@@ -3006,65 +3772,189 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
     }
     if (popup.open && popup.root == rootWindow)
     {
-        const std::vector<GuestMenuVisualItem> items = GetGuestMenuItems(popup.menu);
-        constexpr int popupWidth = 220;
-        constexpr int popupRowHeight = 20;
-        const int popupHeight = static_cast<int>((std::min)(items.size(), static_cast<size_t>(32))) * popupRowHeight;
-        const bool inside = rootX >= popup.left && rootX < SaturatingAdd(popup.left, popupWidth) &&
-            rootY >= popup.top && rootY < SaturatingAdd(popup.top, popupHeight);
-        if (message == GuestAbi::WmLButtonUp)
+        // While a menu-bar popup is active, clicking another top-level caption
+        // switches menus without first delivering the click to the guest
+        // client area.
+        if (popup.menuBar && rootY >= 0 && rootY < 22 && message == GuestAbi::WmLButtonDown)
         {
-            UINT command = 0;
-            HMENU childMenu = nullptr;
-            size_t childIndex = 0;
-            if (inside)
+            std::vector<GuestMenuVisualItem> barItems = GetGuestMenuBarItems(rootWindow);
+            int selected = -1;
+            int left = 8;
+            for (size_t index = 0; index < barItems.size(); ++index)
             {
-                const size_t index = static_cast<size_t>((rootY - popup.top) / popupRowHeight);
-                if (index < items.size() && (items[index].state & 0x0002u) == 0)
+                const int width = MenuBarItemWidth(barItems[index]);
+                if (rootX >= left && rootX < SaturatingAdd(left, width))
                 {
-                    if (items[index].subMenu)
-                    {
-                        childMenu = items[index].subMenu;
-                        childIndex = index;
-                    }
-                    else if (items[index].identifier != 0)
-                    {
-                        command = items[index].identifier;
-                    }
+                    selected = static_cast<int>(index);
+                    break;
                 }
+                left = SaturatingAdd(left, width);
             }
-            if (childMenu)
+            if (selected < 0 || selected == popup.topMenuIndex ||
+                !barItems[static_cast<size_t>(selected)].subMenu ||
+                IsMenuItemDisabled(barItems[static_cast<size_t>(selected)]))
             {
-                {
-                    std::lock_guard<std::mutex> guard(m_popupMenuLock);
-                    if (m_popupMenu.open && m_popupMenu.root == rootWindow)
-                    {
-                        m_popupMenu.menu = childMenu;
-                        m_popupMenu.left = SaturatingAdd(popup.left, popupWidth - 2);
-                        m_popupMenu.top = SaturatingAdd(popup.top,
-                            static_cast<int>(childIndex) * popupRowHeight);
-                    }
-                }
-                SendGuestMessage(popup.owner, GuestAbi::WmInitMenuPopup,
-                    reinterpret_cast<WPARAM>(childMenu),
-                    GuestAbi::MakeCommandWParam(static_cast<WORD>(childIndex), 0), nullptr);
-                RuntimeDiagnostics::Record(L"MENU: opened a nested popup submenu.");
-                InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+                dismissPopup(0);
                 return true;
+            }
+            const HMENU child = barItems[static_cast<size_t>(selected)].subMenu;
+            SendGuestMessage(rootWindow, GuestAbi::WmInitMenuPopup,
+                reinterpret_cast<WPARAM>(child),
+                GuestAbi::MakeCommandWParam(static_cast<WORD>(selected), 0), nullptr);
+            barItems = GetGuestMenuBarItems(rootWindow);
+            if (static_cast<size_t>(selected) >= barItems.size() ||
+                !barItems[static_cast<size_t>(selected)].subMenu)
+            {
+                dismissPopup(0);
+                return true;
+            }
+            left = 8;
+            for (int index = 0; index < selected; ++index)
+                left = SaturatingAdd(left, MenuBarItemWidth(barItems[static_cast<size_t>(index)]));
+            const int switchedWidth = PopupMenuWidth(GetGuestMenuItems(
+                barItems[static_cast<size_t>(selected)].subMenu));
+            {
+                std::lock_guard<std::mutex> guard(root->lock);
+                left = (std::max)(0, (std::min)(left,
+                    (std::max)(0, root->surface.Width() - switchedWidth)));
             }
             {
                 std::lock_guard<std::mutex> guard(m_popupMenuLock);
                 if (m_popupMenu.open && m_popupMenu.root == rootWindow)
                 {
-                    m_popupMenu.selectedCommand = command;
-                    m_popupMenu.open = false;
+                    m_popupMenu.menu = barItems[static_cast<size_t>(selected)].subMenu;
+                    m_popupMenu.left = left;
+                    m_popupMenu.top = 22;
+                    m_popupMenu.topMenuIndex = selected;
+                    m_popupMenu.levels.clear();
+                    m_popupMenu.levels.push_back(PopupMenuLevel{
+                        m_popupMenu.menu, left, 22, selected, -1 });
                 }
             }
-            RuntimeDiagnostics::Record(command ?
-                L"MENU: popup selected command " + std::to_wstring(command) + L"." :
-                L"MENU: popup dismissed without a command.");
-            m_popupMenuChanged.notify_all();
+            {
+                std::lock_guard<std::mutex> guard(root->lock);
+                if (!root->destroyed) root->openMenuIndex = selected;
+            }
+            notifyMenuSelection(rootWindow, BridgeGetMenu(rootWindow),
+                barItems[static_cast<size_t>(selected)], static_cast<size_t>(selected));
             InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+            return true;
+        }
+        if (popup.menuBar && rootY >= 0 && rootY < 22)
+        {
+            // Releasing the click that opened the menu must not immediately
+            // close it merely because the pointer is still over its caption.
+            return true;
+        }
+
+        int hitLevel = -1;
+        int hitItem = -1;
+        std::vector<GuestMenuVisualItem> hitItems;
+        for (size_t reverse = popup.levels.size(); reverse > 0; --reverse)
+        {
+            const size_t levelIndex = reverse - 1;
+            const PopupMenuLevel& level = popup.levels[levelIndex];
+            std::vector<GuestMenuVisualItem> items = GetGuestMenuItems(level.menu);
+            const int width = PopupMenuWidth(items);
+            const int height = static_cast<int>((std::min)(items.size(), static_cast<size_t>(32))) * popupRowHeight;
+            if (rootX >= level.left && rootX < SaturatingAdd(level.left, width) &&
+                rootY >= level.top && rootY < SaturatingAdd(level.top, height))
+            {
+                hitLevel = static_cast<int>(levelIndex);
+                hitItem = (rootY - level.top) / popupRowHeight;
+                hitItems = std::move(items);
+                break;
+            }
+        }
+
+        if (hitLevel < 0)
+        {
+            if (message != GuestAbi::WmMouseMove)
+                dismissPopup(0);
+            return true;
+        }
+        if (hitItem < 0 || static_cast<size_t>(hitItem) >= hitItems.size()) return true;
+        const GuestMenuVisualItem hit = hitItems[static_cast<size_t>(hitItem)];
+        const PopupMenuLevel hitGeometry = popup.levels[static_cast<size_t>(hitLevel)];
+
+        bool hotChanged = false;
+        {
+            std::lock_guard<std::mutex> guard(m_popupMenuLock);
+            if (m_popupMenu.open && m_popupMenu.root == rootWindow &&
+                static_cast<size_t>(hitLevel) < m_popupMenu.levels.size())
+            {
+                PopupMenuLevel& level = m_popupMenu.levels[static_cast<size_t>(hitLevel)];
+                hotChanged = level.hotItem != hitItem;
+                level.hotItem = hitItem;
+                if ((!hit.subMenu || IsMenuItemDisabled(hit) || IsMenuItemSeparator(hit)) &&
+                    m_popupMenu.levels.size() > static_cast<size_t>(hitLevel + 1))
+                    m_popupMenu.levels.resize(static_cast<size_t>(hitLevel + 1));
+            }
+        }
+        if (hotChanged)
+        {
+            notifyMenuSelection(popup.owner, hitGeometry.menu, hit,
+                static_cast<size_t>(hitItem));
+            InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+        }
+
+        if (IsMenuItemDisabled(hit) || IsMenuItemSeparator(hit)) return true;
+        if (hit.subMenu && (message == GuestAbi::WmMouseMove || message == GuestAbi::WmLButtonUp))
+        {
+            bool alreadyOpen = false;
+            {
+                std::lock_guard<std::mutex> guard(m_popupMenuLock);
+                alreadyOpen = m_popupMenu.open &&
+                    m_popupMenu.levels.size() > static_cast<size_t>(hitLevel + 1) &&
+                    m_popupMenu.levels[static_cast<size_t>(hitLevel + 1)].menu == hit.subMenu;
+            }
+            if (!alreadyOpen)
+            {
+                SendGuestMessage(popup.owner, GuestAbi::WmInitMenuPopup,
+                    reinterpret_cast<WPARAM>(hit.subMenu),
+                    GuestAbi::MakeCommandWParam(static_cast<WORD>(hitItem), 0), nullptr);
+                const std::vector<GuestMenuVisualItem> refreshed = GetGuestMenuItems(hitGeometry.menu);
+                if (static_cast<size_t>(hitItem) < refreshed.size() &&
+                    refreshed[static_cast<size_t>(hitItem)].subMenu)
+                {
+                    const HMENU child = refreshed[static_cast<size_t>(hitItem)].subMenu;
+                    const std::vector<GuestMenuVisualItem> childItems = GetGuestMenuItems(child);
+                    if (childItems.empty()) return true;
+                    int rootWidth = 0;
+                    int rootHeight = 0;
+                    {
+                        std::lock_guard<std::mutex> rootGuard(root->lock);
+                        rootWidth = root->surface.Width();
+                        rootHeight = root->surface.Height();
+                    }
+                    const int childWidth = PopupMenuWidth(childItems);
+                    int childLeft = SaturatingAdd(hitGeometry.left, PopupMenuWidth(refreshed) - 2);
+                    if (childLeft + childWidth > rootWidth)
+                        childLeft = (std::max)(0, hitGeometry.left - childWidth + 2);
+                    const int childHeight = static_cast<int>((std::min)(
+                        childItems.size(), static_cast<size_t>(32))) * popupRowHeight;
+                    const int childTop = (std::max)(0, (std::min)(
+                        SaturatingAdd(hitGeometry.top, hitItem * popupRowHeight),
+                        (std::max)(0, rootHeight - childHeight)));
+                    std::lock_guard<std::mutex> guard(m_popupMenuLock);
+                    if (m_popupMenu.open && m_popupMenu.root == rootWindow)
+                    {
+                        m_popupMenu.levels.resize(static_cast<size_t>(hitLevel + 1));
+                        m_popupMenu.levels.push_back(PopupMenuLevel{
+                            child, childLeft, childTop, hitItem, -1 });
+                    }
+                    RuntimeDiagnostics::Record(L"MENU: opened nested submenu at level " +
+                        std::to_wstring(hitLevel + 1) + L".");
+                    InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+                }
+            }
+            return true;
+        }
+        const bool activate = message == GuestAbi::WmLButtonUp ||
+            (message == GuestAbi::WmRButtonUp && popup.allowRightButton);
+        if (activate && hit.identifier)
+        {
+            dismissPopup(hit.identifier);
         }
         return true;
     }
@@ -3074,14 +3964,12 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
         return false;
     }
 
-    int openIndex = -1;
     {
         std::lock_guard<std::mutex> guard(root->lock);
         if (root->destroyed || !root->menuBar)
         {
             return false;
         }
-        openIndex = root->openMenuIndex;
     }
 
     int menuLeft = 8;
@@ -3100,16 +3988,9 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
         }
         if (message == GuestAbi::WmLButtonDown)
         {
-            HMENU openedSubMenu = nullptr;
-            {
-                std::lock_guard<std::mutex> guard(root->lock);
-                root->openMenuIndex = selected >= 0 && menuItems[static_cast<size_t>(selected)].subMenu
-                    ? selected : -1;
-                if (root->openMenuIndex >= 0)
-                {
-                    openedSubMenu = menuItems[static_cast<size_t>(root->openMenuIndex)].subMenu;
-                }
-            }
+            if (selected < 0 || !menuItems[static_cast<size_t>(selected)].subMenu ||
+                IsMenuItemDisabled(menuItems[static_cast<size_t>(selected)])) return true;
+            HMENU openedSubMenu = menuItems[static_cast<size_t>(selected)].subMenu;
             if (openedSubMenu)
             {
                 // Let the guest update enabled state and populate dynamic
@@ -3124,6 +4005,43 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                 SendGuestMessage(rootWindow, GuestAbi::WmInitMenuPopup,
                     reinterpret_cast<WPARAM>(openedSubMenu),
                     GuestAbi::MakeCommandWParam(static_cast<WORD>(selected), 0), nullptr);
+                const std::vector<GuestMenuVisualItem> refreshed = GetGuestMenuBarItems(rootWindow);
+                if (static_cast<size_t>(selected) >= refreshed.size() ||
+                    !refreshed[static_cast<size_t>(selected)].subMenu)
+                    return true;
+                openedSubMenu = refreshed[static_cast<size_t>(selected)].subMenu;
+                menuLeft = 8;
+                for (int index = 0; index < selected; ++index)
+                    menuLeft = SaturatingAdd(menuLeft,
+                        MenuBarItemWidth(refreshed[static_cast<size_t>(index)]));
+                const int openedWidth = PopupMenuWidth(GetGuestMenuItems(openedSubMenu));
+                {
+                    std::lock_guard<std::mutex> guard(root->lock);
+                    menuLeft = (std::max)(0, (std::min)(menuLeft,
+                        (std::max)(0, root->surface.Width() -
+                            openedWidth)));
+                }
+                {
+                    std::lock_guard<std::mutex> guard(m_popupMenuLock);
+                    m_popupMenu = PopupMenuSession{};
+                    m_popupMenu.menu = openedSubMenu;
+                    m_popupMenu.owner = rootWindow;
+                    m_popupMenu.root = rootWindow;
+                    m_popupMenu.left = menuLeft;
+                    m_popupMenu.top = 22;
+                    m_popupMenu.open = true;
+                    m_popupMenu.menuBar = true;
+                    m_popupMenu.notifyOwner = true;
+                    m_popupMenu.topMenuIndex = selected;
+                    m_popupMenu.levels.push_back(PopupMenuLevel{
+                        openedSubMenu, menuLeft, 22, selected, -1 });
+                }
+                {
+                    std::lock_guard<std::mutex> guard(root->lock);
+                    if (!root->destroyed) root->openMenuIndex = selected;
+                }
+                notifyMenuSelection(rootWindow, BridgeGetMenu(rootWindow),
+                    refreshed[static_cast<size_t>(selected)], static_cast<size_t>(selected));
                 RuntimeDiagnostics::Record(L"MENU: initialized top-level submenu " +
                     std::to_wstring(selected) + L".");
             }
@@ -3132,57 +4050,6 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
         return true;
     }
 
-    if (openIndex < 0 || static_cast<size_t>(openIndex) >= menuItems.size())
-    {
-        return false;
-    }
-    for (int index = 0; index < openIndex; ++index)
-    {
-        menuLeft = SaturatingAdd(menuLeft, MenuBarItemWidth(menuItems[static_cast<size_t>(index)]));
-    }
-    const std::vector<GuestMenuVisualItem> popupItems =
-        GetGuestMenuItems(menuItems[static_cast<size_t>(openIndex)].subMenu);
-    const int popupWidth = 220;
-    const int popupRowHeight = 20;
-    const int popupHeight = static_cast<int>((std::min)(popupItems.size(), static_cast<size_t>(32))) * popupRowHeight;
-    if (rootX >= menuLeft && rootX < SaturatingAdd(menuLeft, popupWidth) &&
-        rootY >= 22 && rootY < SaturatingAdd(22, popupHeight))
-    {
-        if (message == GuestAbi::WmLButtonUp)
-        {
-            const size_t itemIndex = static_cast<size_t>((rootY - 22) / popupRowHeight);
-            if (itemIndex < popupItems.size())
-            {
-                const GuestMenuVisualItem& item = popupItems[itemIndex];
-                if (!item.subMenu && item.identifier != 0 && (item.state & 0x0002u) == 0)
-                {
-                    // USER32 delivers a normal menu selection to its owner
-                    // synchronously. Posting it left 7-Zip's modal command
-                    // paths waiting for a message that was never observed.
-                    RuntimeDiagnostics::Record(
-                        L"MENU: invoking command " + std::to_wstring(item.identifier) +
-                        L" from the top-level menu.");
-                    SendGuestMessage(rootWindow, GuestAbi::WmCommand,
-                        GuestAbi::MakeCommandWParam(static_cast<WORD>(item.identifier), 0), 0, nullptr);
-                }
-            }
-            {
-                std::lock_guard<std::mutex> guard(root->lock);
-                root->openMenuIndex = -1;
-            }
-            InvalidateGuestRect(rootWindow, nullptr, TRUE, nullptr);
-        }
-        return true;
-    }
-
-    if (message == GuestAbi::WmLButtonDown)
-    {
-        {
-            std::lock_guard<std::mutex> guard(root->lock);
-            root->openMenuIndex = -1;
-        }
-        InvalidateGuestRect(rootWindow, nullptr, TRUE, nullptr);
-    }
     return false;
 }
 
@@ -3972,6 +4839,19 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         return 0;
     }
 
+    if (message == CommonControlSetUnicodeFormat)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        const bool previous = window->commonControlUnicode;
+        window->commonControlUnicode = wParam != FALSE;
+        return previous ? TRUE : FALSE;
+    }
+    if (message == CommonControlGetUnicodeFormat)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        return window->commonControlUnicode ? TRUE : FALSE;
+    }
+
     if (controlKind == BuiltinControlKind::Rebar &&
         (message == GuestAbi::WmCommand || message == GuestAbi::WmNotify))
     {
@@ -4184,7 +5064,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 std::lock_guard<std::mutex> guard(window->lock);
                 window->listViewItems.clear();
                 window->listViewItemData.clear();
+                window->listViewItemStates.clear();
+                window->listViewItemImages.clear();
                 window->listViewSelectedItem = -1;
+                window->listViewSelectionMark = -1;
                 window->listViewTopItem = 0;
                 window->listViewPressedItem = -1;
             }
@@ -4205,6 +5088,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     window->listViewItemData.erase(window->listViewItemData.begin() + item);
                 }
+                if (static_cast<size_t>(item) < window->listViewItemStates.size())
+                {
+                    window->listViewItemStates.erase(window->listViewItemStates.begin() + item);
+                }
+                if (static_cast<size_t>(item) < window->listViewItemImages.size())
+                {
+                    window->listViewItemImages.erase(window->listViewItemImages.begin() + item);
+                }
                 if (window->listViewSelectedItem == item)
                 {
                     window->listViewSelectedItem = -1;
@@ -4212,6 +5103,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 else if (window->listViewSelectedItem > item)
                 {
                     --window->listViewSelectedItem;
+                }
+                if (window->listViewSelectionMark == item)
+                {
+                    window->listViewSelectionMark = -1;
+                }
+                else if (window->listViewSelectionMark > item)
+                {
+                    --window->listViewSelectionMark;
                 }
                 window->listViewTopItem = (std::min)(window->listViewTopItem,
                     (std::max)(0, static_cast<int>(window->listViewItems.size()) - 1));
@@ -4230,6 +5129,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 }
                 window->listViewColumns.erase(window->listViewColumns.begin() + column);
                 window->listViewColumnWidths.erase(window->listViewColumnWidths.begin() + column);
+                window->listViewColumnFormats.erase(window->listViewColumnFormats.begin() + column);
+                window->listViewColumnSubItems.erase(window->listViewColumnSubItems.begin() + column);
+                window->listViewColumnImages.erase(window->listViewColumnImages.begin() + column);
+                window->listViewColumnOrders.erase(window->listViewColumnOrders.begin() + column);
+                for (size_t index = 0; index < window->listViewColumnOrders.size(); ++index)
+                {
+                    window->listViewColumnOrders[index] = static_cast<int>(index);
+                }
                 for (auto& row : window->listViewItems)
                 {
                     if (static_cast<size_t>(column) < row.size())
@@ -4244,18 +5151,43 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         if (message == ListViewGetSelectedCount)
         {
             std::lock_guard<std::mutex> guard(window->lock);
-            return window->listViewSelectedItem >= 0 ? 1 : 0;
+            return static_cast<LRESULT>(std::count_if(
+                window->listViewItemStates.begin(),
+                window->listViewItemStates.end(),
+                [](UINT state) { return (state & ListViewStateSelected) != 0; }));
+        }
+        if (message == ListViewGetSelectionMark)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->listViewSelectionMark;
+        }
+        if (message == ListViewSetSelectionMark)
+        {
+            const int requested = static_cast<int>(lParam);
+            std::lock_guard<std::mutex> guard(window->lock);
+            const int previous = window->listViewSelectionMark;
+            window->listViewSelectionMark = requested >= 0 &&
+                static_cast<size_t>(requested) < window->listViewItems.size()
+                ? requested
+                : -1;
+            return previous;
         }
         if (message == ListViewGetNextItem)
         {
-            if ((static_cast<UINT>(lParam) & ListViewNextItemSelected) == 0)
-            {
-                return -1;
-            }
             std::lock_guard<std::mutex> guard(window->lock);
-            return window->listViewSelectedItem > static_cast<int>(wParam)
-                ? window->listViewSelectedItem
-                : -1;
+            const UINT requestedState = static_cast<UINT>(lParam) &
+                (ListViewStateFocused | ListViewStateSelected);
+            const int first = static_cast<int>(wParam) + 1;
+            for (int item = (std::max)(0, first);
+                static_cast<size_t>(item) < window->listViewItemStates.size(); ++item)
+            {
+                const UINT state = window->listViewItemStates[static_cast<size_t>(item)];
+                if (requestedState == 0 || (state & requestedState) == requestedState)
+                {
+                    return item;
+                }
+            }
+            return -1;
         }
         if (message == ListViewGetItemTextW || message == ListViewGetItemW)
         {
@@ -4268,8 +5200,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             const int item = message == ListViewGetItemTextW ? static_cast<int>(wParam) : request.item;
             const int subItem = request.subItem;
             std::wstring text;
-            bool selected = false;
+            UINT itemState = 0;
             LPARAM itemData = 0;
+            int itemImage = -1;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 if (item < 0 || subItem < 0 || static_cast<size_t>(item) >= window->listViewItems.size())
@@ -4281,10 +5214,17 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     text = row[static_cast<size_t>(subItem)];
                 }
-                selected = window->listViewSelectedItem == item;
+                if (static_cast<size_t>(item) < window->listViewItemStates.size())
+                {
+                    itemState = window->listViewItemStates[static_cast<size_t>(item)];
+                }
                 if (static_cast<size_t>(item) < window->listViewItemData.size())
                 {
                     itemData = window->listViewItemData[static_cast<size_t>(item)];
+                }
+                if (static_cast<size_t>(item) < window->listViewItemImages.size())
+                {
+                    itemImage = window->listViewItemImages[static_cast<size_t>(item)];
                 }
             }
             size_t copied = 0;
@@ -4299,11 +5239,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
                 if ((request.mask & ListViewItemState) != 0)
                 {
-                    request.state = selected ? ListViewStateSelected : 0;
+                    request.state = itemState & request.stateMask;
                 }
                 if ((request.mask & ListViewItemParam) != 0)
                 {
                     request.itemData = itemData;
+                }
+                if ((request.mask & ListViewItemImage) != 0)
+                {
+                    request.image = itemImage;
                 }
                 if (!TryWriteGuestValue(guestItem, request))
                 {
@@ -4312,6 +5256,21 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return TRUE;
             }
             return static_cast<LRESULT>(copied);
+        }
+        if (message == ListViewGetBackgroundColor)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return static_cast<LRESULT>(window->listViewBackgroundColor);
+        }
+        if (message == ListViewGetTextColor)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return static_cast<LRESULT>(window->listViewTextColor);
+        }
+        if (message == ListViewGetTextBackgroundColor)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return static_cast<LRESULT>(window->listViewTextBackgroundColor);
         }
         if (message == ListViewSetBackgroundColor ||
             message == ListViewSetTextColor ||
@@ -4336,13 +5295,103 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             return TRUE;
         }
-        if (message == ListViewSetImageList || message == ListViewSetColumnOrderArray)
+        if (message == ListViewSetImageList)
         {
-            // Image lists and visual column order are retained by the guest.
-            // The first MiniGDI report-view renderer has no icon surface yet,
-            // but returning the documented success keeps the standard Wine
-            // setup sequence progressing into item population.
-            return 0;
+            const size_t imageList = static_cast<size_t>(wParam);
+            if (imageList >= _countof(window->listViewImageLists))
+            {
+                return 0;
+            }
+            HANDLE previous = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                previous = window->listViewImageLists[imageList];
+                window->listViewImageLists[imageList] = reinterpret_cast<HANDLE>(lParam);
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return reinterpret_cast<LRESULT>(previous);
+        }
+        if (message == ListViewGetImageList)
+        {
+            const size_t imageList = static_cast<size_t>(wParam);
+            std::lock_guard<std::mutex> guard(window->lock);
+            return imageList < _countof(window->listViewImageLists)
+                ? reinterpret_cast<LRESULT>(window->listViewImageLists[imageList])
+                : 0;
+        }
+        if (message == ListViewSetColumnOrderArray || message == ListViewGetColumnOrderArray)
+        {
+            const size_t count = static_cast<size_t>(wParam);
+            auto values = reinterpret_cast<int*>(lParam);
+            if (!values || count > 256)
+            {
+                return FALSE;
+            }
+            std::vector<int> order(count);
+            if (message == ListViewSetColumnOrderArray)
+            {
+                for (size_t position = 0; position < count; ++position)
+                {
+                    if (!TryReadGuestValue(values + position, &order[position]) ||
+                        order[position] < 0 || static_cast<size_t>(order[position]) >= count)
+                    {
+                        return FALSE;
+                    }
+                }
+                std::vector<bool> seen(count, false);
+                for (const int column : order)
+                {
+                    if (seen[static_cast<size_t>(column)])
+                    {
+                        return FALSE;
+                    }
+                    seen[static_cast<size_t>(column)] = true;
+                }
+                {
+                    std::lock_guard<std::mutex> guard(window->lock);
+                    if (count != window->listViewColumns.size())
+                    {
+                        return FALSE;
+                    }
+                    for (size_t position = 0; position < count; ++position)
+                    {
+                        window->listViewColumnOrders[static_cast<size_t>(order[position])] =
+                            static_cast<int>(position);
+                    }
+                }
+                InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+                return TRUE;
+            }
+
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (count != window->listViewColumns.size())
+                {
+                    return FALSE;
+                }
+                for (size_t column = 0; column < count; ++column)
+                {
+                    const int position = window->listViewColumnOrders[column];
+                    if (position < 0 || static_cast<size_t>(position) >= count)
+                    {
+                        return FALSE;
+                    }
+                    order[static_cast<size_t>(position)] = static_cast<int>(column);
+                }
+            }
+            for (size_t position = 0; position < count; ++position)
+            {
+                if (!TryWriteGuestValue(values + position, order[position]))
+                {
+                    return FALSE;
+                }
+            }
+            return TRUE;
+        }
+        if (message == ListViewGetCallbackMask)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->listViewCallbackMask;
         }
         if (message == ListViewSetCallbackMask)
         {
@@ -4376,6 +5425,195 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             const int height = (std::max)(0, static_cast<int>(window->bounds.bottom - window->bounds.top));
             return (std::max)(0, (height - 24) / MiniGdi::DefaultTextGlyphHeight);
         }
+        if (message == ListViewGetStringWidthW)
+        {
+            std::wstring text;
+            if (!TryReadGuestWideString(reinterpret_cast<LPCWSTR>(lParam), &text))
+            {
+                return 0;
+            }
+            const size_t maximumCharacters = static_cast<size_t>(
+                (std::numeric_limits<int>::max)() / MiniGdi::DefaultTextGlyphWidth);
+            return static_cast<LRESULT>((std::min)(text.size(), maximumCharacters) *
+                MiniGdi::DefaultTextGlyphWidth);
+        }
+        if (message == ListViewGetItemRect || message == ListViewGetSubItemRect)
+        {
+            RECT result = {};
+            if (!TryReadGuestValue(reinterpret_cast<const RECT*>(lParam), &result))
+            {
+                return FALSE;
+            }
+            const int item = static_cast<int>(wParam);
+            int topItem = 0;
+            int clientWidth = 0;
+            size_t itemCount = 0;
+            std::vector<int> widths;
+            std::vector<int> orders;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                topItem = window->listViewTopItem;
+                clientWidth = window->surface.Width();
+                itemCount = window->listViewItems.size();
+                widths = window->listViewColumnWidths;
+                orders = window->listViewColumnOrders;
+            }
+            if (item < 0 || static_cast<size_t>(item) >= itemCount)
+            {
+                return FALSE;
+            }
+
+            const int rowTop = 24 + (item - topItem) * MiniGdi::DefaultTextGlyphHeight;
+            int column = 0;
+            const int portion = result.left;
+            if (message == ListViewGetSubItemRect)
+            {
+                column = result.top;
+                if (column < 0 || static_cast<size_t>(column) >= widths.size())
+                {
+                    return FALSE;
+                }
+            }
+            int columnLeft = 1;
+            std::vector<size_t> displayColumns(widths.size());
+            std::iota(displayColumns.begin(), displayColumns.end(), static_cast<size_t>(0));
+            if (orders.size() == displayColumns.size())
+            {
+                std::stable_sort(displayColumns.begin(), displayColumns.end(), [&orders](size_t left, size_t right)
+                {
+                    return orders[left] < orders[right];
+                });
+            }
+            for (const size_t displayedColumn : displayColumns)
+            {
+                if (displayedColumn == static_cast<size_t>(column))
+                {
+                    break;
+                }
+                columnLeft += (std::max)(24, widths[displayedColumn]);
+            }
+            const int columnWidth = static_cast<size_t>(column) < widths.size()
+                ? (std::max)(24, widths[static_cast<size_t>(column)])
+                : (std::max)(1, clientWidth - columnLeft - 1);
+
+            result.top = rowTop;
+            result.bottom = rowTop + MiniGdi::DefaultTextGlyphHeight;
+            if (portion == 0) // LVIR_BOUNDS
+            {
+                result.left = message == ListViewGetSubItemRect ? columnLeft : 1;
+                result.right = message == ListViewGetSubItemRect
+                    ? columnLeft + columnWidth
+                    : (std::max)(1, clientWidth - 1);
+            }
+            else if (portion == 1) // LVIR_ICON
+            {
+                result.left = columnLeft + 2;
+                result.right = (std::min)(columnLeft + columnWidth, columnLeft + 20);
+            }
+            else // LVIR_LABEL / LVIR_SELECTBOUNDS
+            {
+                result.left = columnLeft + 2;
+                result.right = columnLeft + columnWidth;
+            }
+            return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
+        }
+        if (message == ListViewGetItemPosition)
+        {
+            const int item = static_cast<int>(wParam);
+            POINT result = {};
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (item < 0 || static_cast<size_t>(item) >= window->listViewItems.size())
+                {
+                    return FALSE;
+                }
+                result.x = 1;
+                result.y = 24 + (item - window->listViewTopItem) * MiniGdi::DefaultTextGlyphHeight;
+            }
+            return TryWriteGuestValue(reinterpret_cast<POINT*>(lParam), result) ? TRUE : FALSE;
+        }
+        if (message == ListViewHitTest || message == ListViewSubItemHitTest)
+        {
+            auto destination = reinterpret_cast<GuestListViewHitTestInfo*>(lParam);
+            GuestListViewHitTestInfo result = {};
+            if (!TryReadGuestValue(destination, &result))
+            {
+                return -1;
+            }
+            int topItem = 0;
+            int clientWidth = 0;
+            int clientHeight = 0;
+            size_t itemCount = 0;
+            std::vector<int> widths;
+            std::vector<int> orders;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                topItem = window->listViewTopItem;
+                clientWidth = window->surface.Width();
+                clientHeight = window->surface.Height();
+                itemCount = window->listViewItems.size();
+                widths = window->listViewColumnWidths;
+                orders = window->listViewColumnOrders;
+            }
+            result.flags = ListViewHitNowhere;
+            result.item = -1;
+            result.subItem = 0;
+            result.group = -1;
+            if (result.point.x >= 0 && result.point.x < clientWidth &&
+                result.point.y >= 24 && result.point.y < clientHeight)
+            {
+                const int item = topItem +
+                    (result.point.y - 24) / MiniGdi::DefaultTextGlyphHeight;
+                if (item >= 0 && static_cast<size_t>(item) < itemCount)
+                {
+                    result.item = item;
+                    result.flags = result.point.x < 20
+                        ? ListViewHitOnItemIcon
+                        : ListViewHitOnItemLabel;
+                    int right = 1;
+                    std::vector<size_t> displayColumns(widths.size());
+                    std::iota(displayColumns.begin(), displayColumns.end(), static_cast<size_t>(0));
+                    if (orders.size() == displayColumns.size())
+                    {
+                        std::stable_sort(displayColumns.begin(), displayColumns.end(),
+                            [&orders](size_t left, size_t right)
+                        {
+                            return orders[left] < orders[right];
+                        });
+                    }
+                    for (const size_t column : displayColumns)
+                    {
+                        right += (std::max)(24, widths[column]);
+                        if (result.point.x < right)
+                        {
+                            result.subItem = static_cast<int>(column);
+                            break;
+                        }
+                    }
+                }
+            }
+            if (!TryWriteGuestValue(destination, result))
+            {
+                return -1;
+            }
+            return result.item;
+        }
+        if (message == ListViewRedrawItems)
+        {
+            const int first = static_cast<int>(wParam);
+            const int last = static_cast<int>(lParam);
+            size_t itemCount = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                itemCount = window->listViewItems.size();
+            }
+            if (first < 0 || last < first || static_cast<size_t>(last) >= itemCount)
+            {
+                return FALSE;
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
         if (message == ListViewEnsureVisible)
         {
             const int requested = static_cast<int>(wParam);
@@ -4404,6 +5642,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             }
             return TRUE;
+        }
+        if (message == ListViewGetExtendedStyle)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->listViewExtendedStyle;
         }
         if (message == ListViewScroll)
         {
@@ -4457,6 +5700,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 // updates have a stable target without unbounded allocation.
                 window->listViewItems.resize(requested);
                 window->listViewItemData.resize(requested);
+                window->listViewItemStates.resize(requested);
+                window->listViewItemImages.resize(requested, -1);
                 if (window->listViewSelectedItem >= static_cast<int>(requested))
                 {
                     window->listViewSelectedItem = -1;
@@ -4473,6 +5718,109 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             return TRUE;
         }
+        if (message == ListViewSortItems)
+        {
+            const auto compare = reinterpret_cast<GuestListViewCompare>(lParam);
+            if (!compare)
+            {
+                return FALSE;
+            }
+
+            std::vector<std::vector<std::wstring>> rows;
+            std::vector<LPARAM> itemData;
+            std::vector<UINT> itemStates;
+            std::vector<int> itemImages;
+            int selectedItem = -1;
+            int selectionMark = -1;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                rows = window->listViewItems;
+                itemData = window->listViewItemData;
+                itemStates = window->listViewItemStates;
+                itemImages = window->listViewItemImages;
+                selectedItem = window->listViewSelectedItem;
+                selectionMark = window->listViewSelectionMark;
+            }
+            if (rows.size() != itemData.size() || rows.size() != itemStates.size() ||
+                rows.size() != itemImages.size())
+            {
+                return FALSE;
+            }
+
+            std::vector<size_t> order(rows.size());
+            std::iota(order.begin(), order.end(), static_cast<size_t>(0));
+            DWORD callbackException = ERROR_SUCCESS;
+            std::stable_sort(order.begin(), order.end(), [&](size_t left, size_t right)
+            {
+                if (callbackException != ERROR_SUCCESS)
+                {
+                    return false;
+                }
+                DWORD currentException = ERROR_SUCCESS;
+                const int comparison = InvokeGuestListViewCompare(
+                    compare,
+                    itemData[left],
+                    itemData[right],
+                    static_cast<LPARAM>(wParam),
+                    &currentException);
+                if (currentException != ERROR_SUCCESS)
+                {
+                    callbackException = currentException;
+                    return false;
+                }
+                return comparison < 0;
+            });
+            if (callbackException != ERROR_SUCCESS)
+            {
+                RuntimeDiagnostics::Record(
+                    L"LISTVIEW: comparison callback raised exception " +
+                    std::to_wstring(static_cast<unsigned long>(callbackException)) + L".");
+                return FALSE;
+            }
+
+            std::vector<std::vector<std::wstring>> sortedRows;
+            std::vector<LPARAM> sortedData;
+            std::vector<UINT> sortedStates;
+            std::vector<int> sortedImages;
+            sortedRows.reserve(order.size());
+            sortedData.reserve(order.size());
+            sortedStates.reserve(order.size());
+            sortedImages.reserve(order.size());
+            int sortedSelectedItem = -1;
+            int sortedSelectionMark = -1;
+            for (size_t position = 0; position < order.size(); ++position)
+            {
+                const size_t original = order[position];
+                sortedRows.push_back(std::move(rows[original]));
+                sortedData.push_back(itemData[original]);
+                sortedStates.push_back(itemStates[original]);
+                sortedImages.push_back(itemImages[original]);
+                if (static_cast<int>(original) == selectedItem)
+                {
+                    sortedSelectedItem = static_cast<int>(position);
+                }
+                if (static_cast<int>(original) == selectionMark)
+                {
+                    sortedSelectionMark = static_cast<int>(position);
+                }
+            }
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->listViewItems.size() != order.size() ||
+                    window->listViewItemData != itemData)
+                {
+                    return FALSE;
+                }
+                window->listViewItems = std::move(sortedRows);
+                window->listViewItemData = std::move(sortedData);
+                window->listViewItemStates = std::move(sortedStates);
+                window->listViewItemImages = std::move(sortedImages);
+                window->listViewSelectedItem = sortedSelectedItem;
+                window->listViewSelectionMark = sortedSelectionMark;
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
         if (message == ListViewSetItemState)
         {
             GuestListViewItemW source = {};
@@ -4480,20 +5828,38 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
                 return FALSE;
             }
-            if ((source.mask & ListViewItemState) != 0 &&
-                (source.stateMask & ListViewStateSelected) != 0)
+            const UINT stateMask = source.stateMask;
+            if (stateMask != 0)
             {
                 {
                     std::lock_guard<std::mutex> guard(window->lock);
-                    const bool selected = (source.state & ListViewStateSelected) != 0;
                     const int item = static_cast<int>(wParam);
                     if (item == -1)
                     {
-                        window->listViewSelectedItem = selected && !window->listViewItems.empty() ? 0 : -1;
+                        for (auto& state : window->listViewItemStates)
+                        {
+                            state = (state & ~stateMask) | (source.state & stateMask);
+                        }
+                        if ((stateMask & ListViewStateSelected) != 0 &&
+                            (source.state & ListViewStateSelected) == 0)
+                        {
+                            window->listViewSelectedItem = -1;
+                        }
                     }
-                    else if (item >= 0 && static_cast<size_t>(item) < window->listViewItems.size())
+                    else if (item >= 0 && static_cast<size_t>(item) < window->listViewItemStates.size())
                     {
-                        window->listViewSelectedItem = selected ? item : -1;
+                        auto& state = window->listViewItemStates[static_cast<size_t>(item)];
+                        state = (state & ~stateMask) | (source.state & stateMask);
+                        if ((stateMask & (ListViewStateSelected | ListViewStateFocused)) != 0 &&
+                            (state & (ListViewStateSelected | ListViewStateFocused)) != 0)
+                        {
+                            window->listViewSelectedItem = item;
+                            window->listViewSelectionMark = item;
+                        }
+                        else if (window->listViewSelectedItem == item)
+                        {
+                            window->listViewSelectedItem = -1;
+                        }
                     }
                     else
                     {
@@ -4503,6 +5869,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             }
             return TRUE;
+        }
+        if (message == ListViewGetItemState)
+        {
+            const int item = static_cast<int>(wParam);
+            const UINT mask = static_cast<UINT>(lParam);
+            std::lock_guard<std::mutex> guard(window->lock);
+            return item >= 0 && static_cast<size_t>(item) < window->listViewItemStates.size()
+                ? static_cast<LRESULT>(window->listViewItemStates[static_cast<size_t>(item)] & mask)
+                : 0;
         }
         if (message == ListViewSetColumnWidth)
         {
@@ -4518,6 +5893,62 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             return TRUE;
+        }
+        if (message == ListViewGetColumnWidth)
+        {
+            const int column = static_cast<int>(wParam);
+            std::lock_guard<std::mutex> guard(window->lock);
+            return column >= 0 && static_cast<size_t>(column) < window->listViewColumnWidths.size()
+                ? window->listViewColumnWidths[static_cast<size_t>(column)]
+                : 0;
+        }
+        if (message == ListViewGetColumnW)
+        {
+            auto guestColumn = reinterpret_cast<GuestListViewColumnW*>(lParam);
+            GuestListViewColumnW result = {};
+            const int column = static_cast<int>(wParam);
+            if (column < 0 || !TryReadGuestValue(guestColumn, &result))
+            {
+                return FALSE;
+            }
+
+            std::wstring caption;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const size_t index = static_cast<size_t>(column);
+                if (index >= window->listViewColumns.size())
+                {
+                    return FALSE;
+                }
+                caption = window->listViewColumns[index];
+                if ((result.mask & ListViewColumnFormat) != 0)
+                {
+                    result.format = window->listViewColumnFormats[index];
+                }
+                if ((result.mask & ListViewColumnWidth) != 0)
+                {
+                    result.width = window->listViewColumnWidths[index];
+                }
+                if ((result.mask & ListViewColumnSubItem) != 0)
+                {
+                    result.subItem = window->listViewColumnSubItems[index];
+                }
+                if ((result.mask & ListViewColumnImage) != 0)
+                {
+                    result.image = window->listViewColumnImages[index];
+                }
+                if ((result.mask & ListViewColumnOrder) != 0)
+                {
+                    result.order = window->listViewColumnOrders[index];
+                }
+            }
+            if ((result.mask & ListViewColumnText) != 0 &&
+                !TryWriteGuestWideString(result.text,
+                    static_cast<size_t>((std::max)(0, result.textCapacity)), caption, nullptr))
+            {
+                return FALSE;
+            }
+            return TryWriteGuestValue(guestColumn, result) ? TRUE : FALSE;
         }
         if (message == ListViewSetColumnW)
         {
@@ -4541,9 +5972,26 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         window->listViewColumns[static_cast<size_t>(column)] = std::move(caption);
                     }
                 }
-                if (source.width > 0 && static_cast<size_t>(column) < window->listViewColumnWidths.size())
+                const size_t index = static_cast<size_t>(column);
+                if ((source.mask & ListViewColumnFormat) != 0)
                 {
-                    window->listViewColumnWidths[static_cast<size_t>(column)] = source.width;
+                    window->listViewColumnFormats[index] = source.format;
+                }
+                if ((source.mask & ListViewColumnWidth) != 0)
+                {
+                    window->listViewColumnWidths[index] = (std::max)(0, source.width);
+                }
+                if ((source.mask & ListViewColumnSubItem) != 0)
+                {
+                    window->listViewColumnSubItems[index] = source.subItem;
+                }
+                if ((source.mask & ListViewColumnImage) != 0)
+                {
+                    window->listViewColumnImages[index] = source.image;
+                }
+                if ((source.mask & ListViewColumnOrder) != 0)
+                {
+                    window->listViewColumnOrders[index] = source.order;
                 }
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
@@ -4572,6 +6020,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     : (std::min)(static_cast<size_t>(requested), window->listViewColumns.size());
                 window->listViewColumns.insert(window->listViewColumns.begin() + position, columnText);
                 window->listViewColumnWidths.insert(window->listViewColumnWidths.begin() + position, columnWidth);
+                window->listViewColumnFormats.insert(window->listViewColumnFormats.begin() + position,
+                    (source.mask & ListViewColumnFormat) != 0 ? source.format : 0);
+                window->listViewColumnSubItems.insert(window->listViewColumnSubItems.begin() + position,
+                    (source.mask & ListViewColumnSubItem) != 0 ? source.subItem : static_cast<int>(position));
+                window->listViewColumnImages.insert(window->listViewColumnImages.begin() + position,
+                    (source.mask & ListViewColumnImage) != 0 ? source.image : -1);
+                window->listViewColumnOrders.insert(window->listViewColumnOrders.begin() + position,
+                    (source.mask & ListViewColumnOrder) != 0 ? source.order : static_cast<int>(position));
                 for (auto& row : window->listViewItems)
                 {
                     row.insert(row.begin() + (std::min)(position, row.size()), std::wstring());
@@ -4617,11 +6073,31 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         : (std::min)(static_cast<size_t>(itemIndex), window->listViewItems.size());
                     const size_t columnCount = (std::max)(
                         static_cast<size_t>(1), window->listViewColumns.size());
+                    if (window->listViewSelectedItem >= static_cast<int>(position))
+                    {
+                        ++window->listViewSelectedItem;
+                    }
+                    if (window->listViewSelectionMark >= static_cast<int>(position))
+                    {
+                        ++window->listViewSelectionMark;
+                    }
                     std::vector<std::wstring> row(columnCount);
                     row[0] = std::move(itemText);
                     window->listViewItems.insert(window->listViewItems.begin() + position, std::move(row));
                     window->listViewItemData.insert(window->listViewItemData.begin() + position,
                         (source.mask & ListViewItemParam) != 0 ? source.itemData : 0);
+                    window->listViewItemStates.insert(window->listViewItemStates.begin() + position,
+                        (source.mask & ListViewItemState) != 0
+                            ? source.state & source.stateMask
+                            : 0);
+                    window->listViewItemImages.insert(window->listViewItemImages.begin() + position,
+                        (source.mask & ListViewItemImage) != 0 ? source.image : -1);
+                    if ((window->listViewItemStates[position] &
+                        (ListViewStateSelected | ListViewStateFocused)) != 0)
+                    {
+                        window->listViewSelectedItem = static_cast<int>(position);
+                        window->listViewSelectionMark = static_cast<int>(position);
+                    }
                     itemIndex = static_cast<int>(position);
                 }
                 else if (itemIndex >= 0 && static_cast<size_t>(itemIndex) < window->listViewItems.size())
@@ -4638,6 +6114,17 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         static_cast<size_t>(itemIndex) < window->listViewItemData.size())
                     {
                         window->listViewItemData[static_cast<size_t>(itemIndex)] = source.itemData;
+                    }
+                    if ((source.mask & ListViewItemState) != 0 &&
+                        static_cast<size_t>(itemIndex) < window->listViewItemStates.size())
+                    {
+                        auto& state = window->listViewItemStates[static_cast<size_t>(itemIndex)];
+                        state = (state & ~source.stateMask) | (source.state & source.stateMask);
+                    }
+                    if ((source.mask & ListViewItemImage) != 0 &&
+                        static_cast<size_t>(itemIndex) < window->listViewItemImages.size())
+                    {
+                        window->listViewItemImages[static_cast<size_t>(itemIndex)] = source.image;
                     }
                 }
                 else
@@ -4665,6 +6152,70 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         if (message == ToolbarButtonStructSize)
         {
             return wParam == sizeof(GuestToolbarButton) ? TRUE : FALSE;
+        }
+        if (message == ToolbarEnableButton || message == ToolbarCheckButton ||
+            message == ToolbarPressButton || message == ToolbarHideButton ||
+            message == ToolbarIndeterminateButton || message == ToolbarMarkButton ||
+            message == ToolbarSetState)
+        {
+            bool updated = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const auto found = std::find(
+                    window->toolbarCommands.begin(), window->toolbarCommands.end(),
+                    static_cast<int>(wParam));
+                if (found == window->toolbarCommands.end())
+                {
+                    return FALSE;
+                }
+                const size_t index = static_cast<size_t>(found - window->toolbarCommands.begin());
+                BYTE& state = window->toolbarButtonStates[index];
+                if (message == ToolbarSetState)
+                {
+                    state = static_cast<BYTE>(LOWORD(lParam));
+                }
+                else
+                {
+                    BYTE bit = ToolbarStateEnabled;
+                    if (message == ToolbarCheckButton) bit = ToolbarStateChecked;
+                    else if (message == ToolbarPressButton) bit = ToolbarStatePressed;
+                    else if (message == ToolbarHideButton) bit = ToolbarStateHidden;
+                    else if (message == ToolbarIndeterminateButton) bit = ToolbarStateIndeterminate;
+                    else if (message == ToolbarMarkButton) bit = ToolbarStateMarked;
+                    state = LOWORD(lParam) != FALSE
+                        ? static_cast<BYTE>(state | bit)
+                        : static_cast<BYTE>(state & ~bit);
+                }
+                updated = true;
+            }
+            if (updated)
+            {
+                InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            }
+            return TRUE;
+        }
+        if (message == ToolbarGetState || message == ToolbarIsButtonEnabled ||
+            message == ToolbarIsButtonChecked || message == ToolbarIsButtonPressed ||
+            message == ToolbarIsButtonHidden || message == ToolbarIsButtonIndeterminate ||
+            message == ToolbarIsButtonHighlighted)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const auto found = std::find(
+                window->toolbarCommands.begin(), window->toolbarCommands.end(),
+                static_cast<int>(wParam));
+            if (found == window->toolbarCommands.end())
+            {
+                return message == ToolbarGetState ? -1 : FALSE;
+            }
+            const size_t index = static_cast<size_t>(found - window->toolbarCommands.begin());
+            const BYTE state = window->toolbarButtonStates[index];
+            if (message == ToolbarGetState) return state;
+            if (message == ToolbarIsButtonEnabled) return (state & ToolbarStateEnabled) != 0;
+            if (message == ToolbarIsButtonChecked) return (state & ToolbarStateChecked) != 0;
+            if (message == ToolbarIsButtonPressed) return (state & ToolbarStatePressed) != 0;
+            if (message == ToolbarIsButtonHidden) return (state & ToolbarStateHidden) != 0;
+            if (message == ToolbarIsButtonIndeterminate) return (state & ToolbarStateIndeterminate) != 0;
+            return (state & ToolbarStateMarked) != 0;
         }
         if (message == ToolbarSetButtonSize)
         {
@@ -4729,7 +6280,109 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     window->toolbarBitmaps.push_back(button.bitmap);
                     window->toolbarButtonStates.push_back(button.state);
                     window->toolbarButtonStyles.push_back(button.style);
+                    window->toolbarButtonData.push_back(button.data);
                 }
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == ToolbarInsertButtonW)
+        {
+            GuestToolbarButton button = {};
+            if (!TryReadGuestValue(reinterpret_cast<const GuestToolbarButton*>(lParam), &button))
+            {
+                return FALSE;
+            }
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const size_t position = (std::min)(
+                    static_cast<size_t>(wParam), window->toolbarCommands.size());
+                window->toolbarCommands.insert(window->toolbarCommands.begin() + position, button.command);
+                window->toolbarBitmaps.insert(window->toolbarBitmaps.begin() + position, button.bitmap);
+                window->toolbarButtonStates.insert(window->toolbarButtonStates.begin() + position, button.state);
+                window->toolbarButtonStyles.insert(window->toolbarButtonStyles.begin() + position, button.style);
+                window->toolbarButtonData.insert(window->toolbarButtonData.begin() + position, button.data);
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == ToolbarDeleteButton)
+        {
+            const size_t index = static_cast<size_t>(wParam);
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (index >= window->toolbarCommands.size())
+                {
+                    return FALSE;
+                }
+                window->toolbarCommands.erase(window->toolbarCommands.begin() + index);
+                window->toolbarBitmaps.erase(window->toolbarBitmaps.begin() + index);
+                window->toolbarButtonStates.erase(window->toolbarButtonStates.begin() + index);
+                window->toolbarButtonStyles.erase(window->toolbarButtonStyles.begin() + index);
+                window->toolbarButtonData.erase(window->toolbarButtonData.begin() + index);
+                window->toolbarPressedIndex = -1;
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == ToolbarGetButton)
+        {
+            const size_t index = static_cast<size_t>(wParam);
+            GuestToolbarButton result = {};
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (index >= window->toolbarCommands.size())
+                {
+                    return FALSE;
+                }
+                result.bitmap = window->toolbarBitmaps[index];
+                result.command = window->toolbarCommands[index];
+                result.state = window->toolbarButtonStates[index];
+                result.style = window->toolbarButtonStyles[index];
+                result.data = window->toolbarButtonData[index];
+                result.text = -1;
+            }
+            return TryWriteGuestValue(reinterpret_cast<GuestToolbarButton*>(lParam), result)
+                ? TRUE : FALSE;
+        }
+        if (message == ToolbarCommandToIndex)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const auto found = std::find(
+                window->toolbarCommands.begin(), window->toolbarCommands.end(),
+                static_cast<int>(wParam));
+            return found == window->toolbarCommands.end()
+                ? -1
+                : static_cast<LRESULT>(found - window->toolbarCommands.begin());
+        }
+        if (message == ToolbarSetCommandId)
+        {
+            const size_t index = static_cast<size_t>(wParam);
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (index >= window->toolbarCommands.size())
+            {
+                return FALSE;
+            }
+            window->toolbarCommands[index] = static_cast<int>(lParam);
+            return TRUE;
+        }
+        if (message == ToolbarChangeBitmap || message == ToolbarGetBitmap)
+        {
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const auto found = std::find(
+                    window->toolbarCommands.begin(), window->toolbarCommands.end(),
+                    static_cast<int>(wParam));
+                if (found == window->toolbarCommands.end())
+                {
+                    return message == ToolbarGetBitmap ? -1 : FALSE;
+                }
+                const size_t index = static_cast<size_t>(found - window->toolbarCommands.begin());
+                if (message == ToolbarGetBitmap)
+                {
+                    return window->toolbarBitmaps[index];
+                }
+                window->toolbarBitmaps[index] = static_cast<int>(lParam);
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             return TRUE;
@@ -4799,25 +6452,60 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             std::lock_guard<std::mutex> guard(window->lock);
             return MAKELONG(window->toolbarButtonWidth, window->toolbarButtonHeight);
         }
-        if (message == ToolbarGetItemRect)
+        if (message == ToolbarGetItemRect || message == ToolbarGetRect)
         {
             RECT result = {};
             {
                 std::lock_guard<std::mutex> guard(window->lock);
-                const int index = static_cast<int>(wParam);
+                int index = static_cast<int>(wParam);
+                if (message == ToolbarGetRect)
+                {
+                    const auto found = std::find(
+                        window->toolbarCommands.begin(), window->toolbarCommands.end(), index);
+                    index = found == window->toolbarCommands.end()
+                        ? -1
+                        : static_cast<int>(found - window->toolbarCommands.begin());
+                }
                 if (index < 0 || static_cast<size_t>(index) >= window->toolbarCommands.size())
                 {
                     return FALSE;
                 }
                 const int left = ToolbarItemLeft(window->toolbarButtonStyles, window->toolbarBitmaps,
-                    static_cast<size_t>(index), window->toolbarButtonWidth);
+                    window->toolbarButtonStates, static_cast<size_t>(index), window->toolbarButtonWidth);
                 result.left = left;
                 result.top = 1;
                 result.right = left + ToolbarItemWidth(window->toolbarButtonStyles, window->toolbarBitmaps,
-                    static_cast<size_t>(index), window->toolbarButtonWidth);
+                    window->toolbarButtonStates, static_cast<size_t>(index), window->toolbarButtonWidth);
                 result.bottom = result.top + (std::max)(16, window->toolbarButtonHeight);
             }
             return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
+        }
+        if (message == ToolbarHitTest)
+        {
+            POINT point = {};
+            if (!TryReadGuestValue(reinterpret_cast<const POINT*>(lParam), &point))
+            {
+                return -1;
+            }
+            std::lock_guard<std::mutex> guard(window->lock);
+            for (size_t index = 0; index < window->toolbarCommands.size(); ++index)
+            {
+                const BYTE state = window->toolbarButtonStates[index];
+                if ((state & ToolbarStateHidden) != 0)
+                {
+                    continue;
+                }
+                const int left = ToolbarItemLeft(window->toolbarButtonStyles, window->toolbarBitmaps,
+                    window->toolbarButtonStates, index, window->toolbarButtonWidth);
+                const int right = left + ToolbarItemWidth(window->toolbarButtonStyles,
+                    window->toolbarBitmaps, window->toolbarButtonStates, index, window->toolbarButtonWidth);
+                if (point.x >= left && point.x < right && point.y >= 0 &&
+                    point.y < window->toolbarButtonHeight + 2)
+                {
+                    return static_cast<LRESULT>(index);
+                }
+            }
+            return -1;
         }
         if (message == ToolbarSetImageList)
         {
@@ -5019,9 +6707,1315 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
     }
 
+    if (controlKind == BuiltinControlKind::StatusBar)
+    {
+        if (message == StatusBarSetParts)
+        {
+            const size_t count = static_cast<size_t>(wParam);
+            const auto source = reinterpret_cast<const int*>(lParam);
+            if (count == 0 || count > 256 || !source)
+            {
+                return FALSE;
+            }
+            std::vector<int> parts(count);
+            for (size_t index = 0; index < count; ++index)
+            {
+                if (!TryReadGuestValue(source + index, &parts[index]))
+                {
+                    return FALSE;
+                }
+            }
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                window->statusBarParts = std::move(parts);
+                window->statusBarTexts.resize(count);
+                window->statusBarTextStyles.resize(count);
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == StatusBarGetParts)
+        {
+            std::vector<int> parts;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                parts = window->statusBarParts;
+            }
+            const size_t requested = static_cast<size_t>(wParam);
+            auto destination = reinterpret_cast<int*>(lParam);
+            if (destination)
+            {
+                const size_t count = (std::min)(requested, parts.size());
+                for (size_t index = 0; index < count; ++index)
+                {
+                    if (!TryWriteGuestValue(destination + index, parts[index]))
+                    {
+                        return 0;
+                    }
+                }
+            }
+            return static_cast<LRESULT>(parts.size());
+        }
+        if (message == StatusBarSetTextW)
+        {
+            const UINT part = LOWORD(wParam);
+            const UINT style = static_cast<UINT>(wParam) & 0xff00u;
+            std::wstring text;
+            if (lParam && !TryReadGuestWideString(reinterpret_cast<LPCWSTR>(lParam), &text))
+            {
+                return FALSE;
+            }
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (part == 0xffu)
+                {
+                    window->statusBarSimpleText = std::move(text);
+                    window->statusBarSimpleStyle = style;
+                }
+                else
+                {
+                    if (part >= window->statusBarTexts.size())
+                    {
+                        return FALSE;
+                    }
+                    window->statusBarTexts[part] = std::move(text);
+                    window->statusBarTextStyles[part] = style;
+                }
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == StatusBarGetTextW || message == StatusBarGetTextLengthW)
+        {
+            const UINT part = LOWORD(wParam);
+            std::wstring text;
+            UINT style = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (part == 0xffu)
+                {
+                    text = window->statusBarSimpleText;
+                    style = window->statusBarSimpleStyle;
+                }
+                else
+                {
+                    if (part >= window->statusBarTexts.size())
+                    {
+                        return 0;
+                    }
+                    text = window->statusBarTexts[part];
+                    style = window->statusBarTextStyles[part];
+                }
+            }
+            if (message == StatusBarGetTextW &&
+                !TryWriteGuestWideString(reinterpret_cast<LPWSTR>(lParam), text.size() + 1, text, nullptr))
+            {
+                return 0;
+            }
+            return MAKELONG(static_cast<WORD>((std::min)(text.size(), static_cast<size_t>(0xffff))),
+                static_cast<WORD>(style));
+        }
+        if (message == StatusBarGetRect)
+        {
+            const size_t part = static_cast<size_t>(wParam);
+            RECT result = {};
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (part >= window->statusBarParts.size())
+                {
+                    return FALSE;
+                }
+                result.left = part == 0 ? 0 : window->statusBarParts[part - 1];
+                result.right = window->statusBarParts[part] < 0
+                    ? window->surface.Width()
+                    : window->statusBarParts[part];
+                result.top = 0;
+                result.bottom = window->surface.Height();
+            }
+            return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
+        }
+        if (message == StatusBarSetMinimumHeight)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            window->statusBarMinimumHeight = (std::max)(1, static_cast<int>(wParam));
+            return 0;
+        }
+        if (message == StatusBarSetSimple)
+        {
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                window->statusBarSimple = wParam != FALSE;
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == StatusBarIsSimple)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->statusBarSimple ? TRUE : FALSE;
+        }
+    }
+
+    if (controlKind == BuiltinControlKind::Header)
+    {
+        if (message == HeaderGetItemCount)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return static_cast<LRESULT>(window->headerItems.size());
+        }
+        if (message == HeaderSetImageList || message == HeaderGetImageList)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (message == HeaderGetImageList) return reinterpret_cast<LRESULT>(window->headerImageList);
+            const HANDLE previous = window->headerImageList;
+            window->headerImageList = reinterpret_cast<HANDLE>(lParam);
+            return reinterpret_cast<LRESULT>(previous);
+        }
+        if (message == HeaderInsertItemW || message == HeaderSetItemW || message == HeaderGetItemW)
+        {
+            auto guestItem = reinterpret_cast<GuestHeaderItemW*>(lParam);
+            GuestHeaderItemW item = {};
+            if (!TryReadGuestValue(guestItem, &item))
+                return message == HeaderInsertItemW ? -1 : FALSE;
+            const int requested = static_cast<int>(wParam);
+            if (message == HeaderGetItemW)
+            {
+                std::wstring text;
+                {
+                    std::lock_guard<std::mutex> guard(window->lock);
+                    if (requested < 0 || static_cast<size_t>(requested) >= window->headerItems.size()) return FALSE;
+                    const size_t index = static_cast<size_t>(requested);
+                    text = window->headerItems[index];
+                    if ((item.mask & HeaderItemWidth) != 0) item.width = window->headerItemWidths[index];
+                    if ((item.mask & HeaderItemFormat) != 0) item.format = window->headerItemFormats[index];
+                    if ((item.mask & HeaderItemParam) != 0) item.itemData = window->headerItemData[index];
+                    if ((item.mask & HeaderItemImage) != 0) item.image = window->headerItemImages[index];
+                    if ((item.mask & HeaderItemOrder) != 0) item.order = window->headerItemOrders[index];
+                }
+                if ((item.mask & HeaderItemText) != 0 &&
+                    !TryWriteGuestWideString(item.text,
+                        static_cast<size_t>((std::max)(0, item.textCapacity)), text, nullptr)) return FALSE;
+                return TryWriteGuestValue(guestItem, item) ? TRUE : FALSE;
+            }
+            std::wstring text;
+            if ((item.mask & HeaderItemText) != 0 && !TryReadGuestWideString(item.text, &text))
+                return message == HeaderInsertItemW ? -1 : FALSE;
+            int result = FALSE;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (message == HeaderInsertItemW)
+                {
+                    const size_t position = requested < 0 ? window->headerItems.size() :
+                        (std::min)(static_cast<size_t>(requested), window->headerItems.size());
+                    window->headerItems.insert(window->headerItems.begin() + position, std::move(text));
+                    window->headerItemWidths.insert(window->headerItemWidths.begin() + position,
+                        (item.mask & HeaderItemWidth) != 0 ? (std::max)(0, item.width) : 120);
+                    window->headerItemFormats.insert(window->headerItemFormats.begin() + position,
+                        (item.mask & HeaderItemFormat) != 0 ? item.format : 0);
+                    window->headerItemData.insert(window->headerItemData.begin() + position,
+                        (item.mask & HeaderItemParam) != 0 ? item.itemData : 0);
+                    window->headerItemImages.insert(window->headerItemImages.begin() + position,
+                        (item.mask & HeaderItemImage) != 0 ? item.image : -1);
+                    window->headerItemOrders.insert(window->headerItemOrders.begin() + position,
+                        (item.mask & HeaderItemOrder) != 0 ? item.order : static_cast<int>(position));
+                    result = static_cast<int>(position);
+                }
+                else
+                {
+                    if (requested < 0 || static_cast<size_t>(requested) >= window->headerItems.size()) return FALSE;
+                    const size_t index = static_cast<size_t>(requested);
+                    if ((item.mask & HeaderItemText) != 0) window->headerItems[index] = std::move(text);
+                    if ((item.mask & HeaderItemWidth) != 0) window->headerItemWidths[index] = (std::max)(0, item.width);
+                    if ((item.mask & HeaderItemFormat) != 0) window->headerItemFormats[index] = item.format;
+                    if ((item.mask & HeaderItemParam) != 0) window->headerItemData[index] = item.itemData;
+                    if ((item.mask & HeaderItemImage) != 0) window->headerItemImages[index] = item.image;
+                    if ((item.mask & HeaderItemOrder) != 0) window->headerItemOrders[index] = item.order;
+                    result = TRUE;
+                }
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return result;
+        }
+        if (message == HeaderDeleteItem)
+        {
+            const size_t index = static_cast<size_t>(wParam);
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (index >= window->headerItems.size()) return FALSE;
+                window->headerItems.erase(window->headerItems.begin() + index);
+                window->headerItemWidths.erase(window->headerItemWidths.begin() + index);
+                window->headerItemFormats.erase(window->headerItemFormats.begin() + index);
+                window->headerItemData.erase(window->headerItemData.begin() + index);
+                window->headerItemImages.erase(window->headerItemImages.begin() + index);
+                window->headerItemOrders.erase(window->headerItemOrders.begin() + index);
+                for (size_t item = 0; item < window->headerItemOrders.size(); ++item)
+                    window->headerItemOrders[item] = static_cast<int>(item);
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == HeaderGetItemRect || message == HeaderHitTest)
+        {
+            std::vector<int> widths;
+            std::vector<int> orders;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                widths = window->headerItemWidths;
+                orders = window->headerItemOrders;
+            }
+            std::vector<size_t> display(widths.size());
+            std::iota(display.begin(), display.end(), static_cast<size_t>(0));
+            if (orders.size() == display.size())
+                std::stable_sort(display.begin(), display.end(), [&orders](size_t left, size_t right)
+                { return orders[left] < orders[right]; });
+            int left = 0;
+            if (message == HeaderGetItemRect)
+            {
+                const size_t requested = static_cast<size_t>(wParam);
+                if (requested >= widths.size()) return FALSE;
+                for (const size_t item : display)
+                {
+                    if (item == requested) break;
+                    left += widths[item];
+                }
+                RECT result{ left, 0, left + widths[requested], 24 };
+                return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
+            }
+            auto destination = reinterpret_cast<GuestHeaderHitTestInfo*>(lParam);
+            GuestHeaderHitTestInfo hit = {};
+            if (!TryReadGuestValue(destination, &hit)) return -1;
+            hit.item = -1;
+            hit.flags = 1;
+            for (const size_t item : display)
+            {
+                const int right = left + widths[item];
+                if (hit.point.x >= left && hit.point.x < right && hit.point.y >= 0 && hit.point.y < 24)
+                {
+                    hit.item = static_cast<int>(item);
+                    hit.flags = 2;
+                    break;
+                }
+                left = right;
+            }
+            TryWriteGuestValue(destination, hit);
+            return hit.item;
+        }
+        if (message == HeaderLayout)
+        {
+            GuestHeaderLayout layout = {};
+            if (!TryReadGuestValue(reinterpret_cast<const GuestHeaderLayout*>(lParam), &layout)) return FALSE;
+            RECT available = {};
+            GuestWindowPosition position = {};
+            if (!TryReadGuestValue(layout.rect, &available) ||
+                !TryReadGuestValue(layout.windowPosition, &position)) return FALSE;
+            const int headerHeight = 24;
+            position.x = available.left;
+            position.y = available.top;
+            position.cx = (std::max)(0L, available.right - available.left);
+            position.cy = headerHeight;
+            position.flags = 0;
+            available.top = (std::min)(available.bottom, available.top + headerHeight);
+            return TryWriteGuestValue(layout.rect, available) &&
+                TryWriteGuestValue(layout.windowPosition, position) ? TRUE : FALSE;
+        }
+        if (message == HeaderOrderToIndex)
+        {
+            const int requested = static_cast<int>(wParam);
+            std::lock_guard<std::mutex> guard(window->lock);
+            const auto found = std::find(window->headerItemOrders.begin(),
+                window->headerItemOrders.end(), requested);
+            return found == window->headerItemOrders.end()
+                ? -1 : static_cast<LRESULT>(found - window->headerItemOrders.begin());
+        }
+        if (message == HeaderGetOrderArray || message == HeaderSetOrderArray)
+        {
+            const size_t count = static_cast<size_t>(wParam);
+            auto values = reinterpret_cast<int*>(lParam);
+            if (!values || count > 256) return FALSE;
+            if (message == HeaderSetOrderArray)
+            {
+                std::vector<int> display(count);
+                for (size_t position = 0; position < count; ++position)
+                    if (!TryReadGuestValue(values + position, &display[position])) return FALSE;
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (count != window->headerItems.size()) return FALSE;
+                for (size_t position = 0; position < count; ++position)
+                {
+                    const int item = display[position];
+                    if (item < 0 || static_cast<size_t>(item) >= count) return FALSE;
+                    window->headerItemOrders[static_cast<size_t>(item)] = static_cast<int>(position);
+                }
+                return TRUE;
+            }
+            std::vector<int> display(count);
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (count != window->headerItems.size()) return FALSE;
+                for (size_t item = 0; item < count; ++item)
+                    display[static_cast<size_t>(window->headerItemOrders[item])] = static_cast<int>(item);
+            }
+            for (size_t position = 0; position < count; ++position)
+                if (!TryWriteGuestValue(values + position, display[position])) return FALSE;
+            return TRUE;
+        }
+    }
+
+    if (controlKind == BuiltinControlKind::TreeView)
+    {
+        const auto treeToken = [](HANDLE item)
+        {
+            return reinterpret_cast<ULONG_PTR>(item);
+        };
+        const auto isTreeRoot = [&treeToken](HANDLE item)
+        {
+            return item == nullptr || static_cast<INT_PTR>(treeToken(item)) == -0x10000;
+        };
+
+        if (message == TreeGetCount)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return static_cast<LRESULT>(window->treeNodes.size());
+        }
+        if (message == TreeGetIndent || message == TreeSetIndent)
+        {
+            if (message == TreeGetIndent)
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                return window->treeIndent;
+            }
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                window->treeIndent = (std::max)(0, static_cast<int>(wParam));
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return 0;
+        }
+        if (message == TreeGetItemHeight || message == TreeSetItemHeight)
+        {
+            int previous = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                previous = window->treeItemHeight;
+                if (message == TreeGetItemHeight) return previous;
+                window->treeItemHeight = wParam == static_cast<WPARAM>(-1)
+                    ? 18 : (std::max)(1, static_cast<int>(wParam));
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return previous;
+        }
+        if (message == TreeGetImageList || message == TreeSetImageList)
+        {
+            const size_t imageList = static_cast<size_t>(wParam);
+            if (imageList >= 2) return 0;
+            if (message == TreeGetImageList)
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                return reinterpret_cast<LRESULT>(window->treeImageLists[imageList]);
+            }
+            HANDLE previous = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                previous = window->treeImageLists[imageList];
+                window->treeImageLists[imageList] = reinterpret_cast<HANDLE>(lParam);
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return reinterpret_cast<LRESULT>(previous);
+        }
+        if (message == TreeSetBackgroundColor || message == TreeSetTextColor ||
+            message == TreeGetBackgroundColor || message == TreeGetTextColor)
+        {
+            if (message == TreeGetBackgroundColor || message == TreeGetTextColor)
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                return message == TreeGetBackgroundColor
+                    ? window->treeBackgroundColor : window->treeTextColor;
+            }
+            COLORREF previous = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                COLORREF* target = message == TreeSetBackgroundColor
+                    ? &window->treeBackgroundColor : &window->treeTextColor;
+                previous = *target;
+                *target = static_cast<COLORREF>(lParam);
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return previous;
+        }
+        if (message == TreeInsertItemW)
+        {
+            GuestTreeInsertW insertion = {};
+            if (!TryReadGuestValue(reinterpret_cast<const GuestTreeInsertW*>(lParam), &insertion))
+                return 0;
+            std::wstring text;
+            if ((insertion.item.mask & TreeItemText) != 0 &&
+                reinterpret_cast<INT_PTR>(insertion.item.text) != -1 &&
+                !TryReadGuestWideString(insertion.item.text, &text))
+                return 0;
+
+            ULONG_PTR result = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const ULONG_PTR parent = isTreeRoot(insertion.parent) ? 0 : treeToken(insertion.parent);
+                if (parent != 0 && !FindTreeNode(window->treeNodes, parent)) return 0;
+                do
+                {
+                    result = window->nextTreeToken++;
+                } while (result == 0 || FindTreeNode(window->treeNodes, result));
+                TreeNode node;
+                node.token = result;
+                node.parent = parent;
+                node.text = std::move(text);
+                node.itemData = (insertion.item.mask & TreeItemParam) != 0
+                    ? insertion.item.itemData : 0;
+                node.state = (insertion.item.mask & TreeItemState) != 0
+                    ? insertion.item.state & insertion.item.stateMask : 0;
+                node.image = (insertion.item.mask & TreeItemImage) != 0
+                    ? insertion.item.image : -1;
+                node.selectedImage = (insertion.item.mask & TreeItemSelectedImage) != 0
+                    ? insertion.item.selectedImage : -1;
+                node.declaredChildren = (insertion.item.mask & TreeItemChildren) != 0
+                    ? insertion.item.children : 0;
+
+                const INT_PTR insertAfter = reinterpret_cast<INT_PTR>(insertion.insertAfter);
+                auto position = window->treeNodes.end();
+                if (insertAfter == -0xffff)
+                {
+                    position = std::find_if(window->treeNodes.begin(), window->treeNodes.end(),
+                        [parent](const TreeNode& candidate) { return candidate.parent == parent; });
+                }
+                else if (insertAfter == -0xfffd)
+                {
+                    position = std::find_if(window->treeNodes.begin(), window->treeNodes.end(),
+                        [&node, parent](const TreeNode& candidate)
+                        {
+                            return candidate.parent == parent && _wcsicmp(candidate.text.c_str(), node.text.c_str()) > 0;
+                        });
+                }
+                else if (insertAfter > 0)
+                {
+                    const ULONG_PTR afterToken = treeToken(insertion.insertAfter);
+                    const auto found = std::find_if(window->treeNodes.begin(), window->treeNodes.end(),
+                        [afterToken, parent](const TreeNode& candidate)
+                        {
+                            return candidate.token == afterToken && candidate.parent == parent;
+                        });
+                    if (found != window->treeNodes.end()) position = found + 1;
+                }
+                window->treeNodes.insert(position, std::move(node));
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return reinterpret_cast<LRESULT>(reinterpret_cast<HANDLE>(result));
+        }
+        if (message == TreeGetItemW || message == TreeSetItemW)
+        {
+            auto destination = reinterpret_cast<GuestTreeItemW*>(lParam);
+            GuestTreeItemW item = {};
+            if (!TryReadGuestValue(destination, &item)) return FALSE;
+            const ULONG_PTR token = treeToken(item.item);
+            if (message == TreeGetItemW)
+            {
+                std::wstring text;
+                {
+                    std::lock_guard<std::mutex> guard(window->lock);
+                    const TreeNode* node = FindTreeNode(window->treeNodes, token);
+                    if (!node) return FALSE;
+                    text = node->text;
+                    if ((item.mask & TreeItemHandle) != 0) item.item = reinterpret_cast<HANDLE>(node->token);
+                    if ((item.mask & TreeItemState) != 0) item.state = node->state & item.stateMask;
+                    if ((item.mask & TreeItemImage) != 0) item.image = node->image;
+                    if ((item.mask & TreeItemSelectedImage) != 0) item.selectedImage = node->selectedImage;
+                    if ((item.mask & TreeItemChildren) != 0)
+                    {
+                        const bool actualChildren = std::any_of(window->treeNodes.begin(), window->treeNodes.end(),
+                            [token](const TreeNode& candidate) { return candidate.parent == token; });
+                        item.children = actualChildren ? 1 : node->declaredChildren;
+                    }
+                    if ((item.mask & TreeItemParam) != 0) item.itemData = node->itemData;
+                }
+                if ((item.mask & TreeItemText) != 0 &&
+                    !TryWriteGuestWideString(item.text,
+                        static_cast<size_t>((std::max)(0, item.textCapacity)), text, nullptr)) return FALSE;
+                return TryWriteGuestValue(destination, item) ? TRUE : FALSE;
+            }
+
+            std::wstring text;
+            if ((item.mask & TreeItemText) != 0 &&
+                reinterpret_cast<INT_PTR>(item.text) != -1 &&
+                !TryReadGuestWideString(item.text, &text)) return FALSE;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                TreeNode* node = FindTreeNode(window->treeNodes, token);
+                if (!node) return FALSE;
+                if ((item.mask & TreeItemText) != 0) node->text = std::move(text);
+                if ((item.mask & TreeItemState) != 0)
+                    node->state = (node->state & ~item.stateMask) | (item.state & item.stateMask);
+                if ((item.mask & TreeItemImage) != 0) node->image = item.image;
+                if ((item.mask & TreeItemSelectedImage) != 0) node->selectedImage = item.selectedImage;
+                if ((item.mask & TreeItemChildren) != 0) node->declaredChildren = item.children;
+                if ((item.mask & TreeItemParam) != 0) node->itemData = item.itemData;
+                if ((node->state & TreeStateSelected) != 0) window->treeSelectedItem = token;
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == TreeDeleteItem)
+        {
+            const HANDLE requested = reinterpret_cast<HANDLE>(lParam);
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (isTreeRoot(requested))
+                {
+                    changed = !window->treeNodes.empty();
+                    window->treeNodes.clear();
+                    window->treeSelectedItem = 0;
+                    window->treeTopItem = 0;
+                }
+                else
+                {
+                    const ULONG_PTR token = treeToken(requested);
+                    if (!FindTreeNode(window->treeNodes, token)) return FALSE;
+                    std::vector<ULONG_PTR> removal{ token };
+                    for (size_t index = 0; index < removal.size(); ++index)
+                    {
+                        const ULONG_PTR parent = removal[index];
+                        for (const auto& node : window->treeNodes)
+                            if (node.parent == parent) removal.push_back(node.token);
+                    }
+                    window->treeNodes.erase(std::remove_if(window->treeNodes.begin(), window->treeNodes.end(),
+                        [&removal](const TreeNode& node)
+                        {
+                            return std::find(removal.begin(), removal.end(), node.token) != removal.end();
+                        }), window->treeNodes.end());
+                    if (std::find(removal.begin(), removal.end(), window->treeSelectedItem) != removal.end())
+                        window->treeSelectedItem = 0;
+                    if (std::find(removal.begin(), removal.end(), window->treeTopItem) != removal.end())
+                        window->treeTopItem = 0;
+                    changed = true;
+                }
+            }
+            if (changed) InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == TreeExpand)
+        {
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                TreeNode* node = FindTreeNode(window->treeNodes, treeToken(reinterpret_cast<HANDLE>(lParam)));
+                if (!node) return FALSE;
+                const UINT operation = static_cast<UINT>(wParam) & 0x000f;
+                const UINT previous = node->state;
+                if (operation == TreeExpandCollapse) node->state &= ~TreeStateExpanded;
+                else if (operation == TreeExpandExpand) node->state |= TreeStateExpanded;
+                else if (operation == TreeExpandToggle) node->state ^= TreeStateExpanded;
+                changed = previous != node->state;
+            }
+            if (changed) InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == TreeGetItemState)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const TreeNode* node = FindTreeNode(window->treeNodes, treeToken(reinterpret_cast<HANDLE>(wParam)));
+            return node ? node->state & static_cast<UINT>(lParam) : 0;
+        }
+        if (message == TreeGetNextItem)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const UINT relation = static_cast<UINT>(wParam);
+            const ULONG_PTR token = treeToken(reinterpret_cast<HANDLE>(lParam));
+            const auto visible = VisibleTreeNodes(window->treeNodes);
+            ULONG_PTR result = 0;
+            if (relation == TreeCaret) result = window->treeSelectedItem;
+            else if (relation == TreeFirstVisible || relation == TreeLastVisible)
+            {
+                size_t first = 0;
+                if (window->treeTopItem)
+                {
+                    const auto found = std::find_if(visible.begin(), visible.end(), [window](const VisibleTreeNode& item)
+                    { return item.token == window->treeTopItem; });
+                    if (found != visible.end()) first = static_cast<size_t>(found - visible.begin());
+                }
+                if (!visible.empty())
+                {
+                    const size_t rows = static_cast<size_t>((std::max)(1,
+                        window->surface.Height() / (std::max)(1, window->treeItemHeight)));
+                    const size_t last = (std::min)(visible.size() - 1, first + rows - 1);
+                    result = relation == TreeFirstVisible ? visible[first].token : visible[last].token;
+                }
+            }
+            else if (relation == TreeNextRoot)
+            {
+                const auto found = std::find_if(window->treeNodes.begin(), window->treeNodes.end(),
+                    [](const TreeNode& node) { return node.parent == 0; });
+                if (found != window->treeNodes.end()) result = found->token;
+            }
+            else if (relation == TreeParent)
+            {
+                const TreeNode* node = FindTreeNode(window->treeNodes, token);
+                result = node ? node->parent : 0;
+            }
+            else if (relation == TreeChild)
+            {
+                const auto found = std::find_if(window->treeNodes.begin(), window->treeNodes.end(),
+                    [token](const TreeNode& node) { return node.parent == token; });
+                if (found != window->treeNodes.end()) result = found->token;
+            }
+            else if (relation == TreeNextVisible || relation == TreePreviousVisible)
+            {
+                const auto found = std::find_if(visible.begin(), visible.end(),
+                    [token](const VisibleTreeNode& item) { return item.token == token; });
+                if (found != visible.end())
+                {
+                    if (relation == TreeNextVisible && found + 1 != visible.end()) result = (found + 1)->token;
+                    if (relation == TreePreviousVisible && found != visible.begin()) result = (found - 1)->token;
+                }
+            }
+            else if (relation == TreeNextSibling || relation == TreePreviousSibling)
+            {
+                const TreeNode* node = FindTreeNode(window->treeNodes, token);
+                if (node)
+                {
+                    std::vector<ULONG_PTR> siblings;
+                    for (const auto& candidate : window->treeNodes)
+                        if (candidate.parent == node->parent) siblings.push_back(candidate.token);
+                    const auto found = std::find(siblings.begin(), siblings.end(), token);
+                    if (found != siblings.end())
+                    {
+                        if (relation == TreeNextSibling && found + 1 != siblings.end()) result = *(found + 1);
+                        if (relation == TreePreviousSibling && found != siblings.begin()) result = *(found - 1);
+                    }
+                }
+            }
+            return reinterpret_cast<LRESULT>(reinterpret_cast<HANDLE>(result));
+        }
+        if (message == TreeSelectItem)
+        {
+            const ULONG_PTR requested = treeToken(reinterpret_cast<HANDLE>(lParam));
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (requested && !FindTreeNode(window->treeNodes, requested)) return FALSE;
+                if (wParam == TreeCaret)
+                {
+                    for (auto& node : window->treeNodes) node.state &= ~TreeStateSelected;
+                    TreeNode* node = FindTreeNode(window->treeNodes, requested);
+                    if (node) node->state |= TreeStateSelected;
+                    window->treeSelectedItem = requested;
+                }
+                else if (wParam == TreeFirstVisible)
+                {
+                    window->treeTopItem = requested;
+                }
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == TreeGetVisibleCount)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->treeItemHeight > 0
+                ? (std::max)(1, window->surface.Height() / window->treeItemHeight) : 1;
+        }
+        if (message == TreeGetItemRect)
+        {
+            HANDLE requested = nullptr;
+            if (!TryReadGuestValue(reinterpret_cast<const HANDLE*>(lParam), &requested)) return FALSE;
+            RECT result = {};
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const auto visible = VisibleTreeNodes(window->treeNodes);
+                const ULONG_PTR token = treeToken(requested);
+                const auto found = std::find_if(visible.begin(), visible.end(),
+                    [token](const VisibleTreeNode& item) { return item.token == token; });
+                if (found == visible.end()) return FALSE;
+                size_t top = 0;
+                if (window->treeTopItem)
+                {
+                    const auto topFound = std::find_if(visible.begin(), visible.end(), [window](const VisibleTreeNode& item)
+                    { return item.token == window->treeTopItem; });
+                    if (topFound != visible.end()) top = static_cast<size_t>(topFound - visible.begin());
+                }
+                const size_t itemIndex = static_cast<size_t>(found - visible.begin());
+                const size_t visibleRows = static_cast<size_t>((std::max)(1,
+                    window->surface.Height() / (std::max)(1, window->treeItemHeight)));
+                if (itemIndex < top || itemIndex >= top + visibleRows) return FALSE;
+                const int row = static_cast<int>(itemIndex - top);
+                result.left = wParam ? found->depth * window->treeIndent + window->treeIndent + 2 : 0;
+                result.top = row * window->treeItemHeight;
+                result.right = window->surface.Width();
+                result.bottom = result.top + window->treeItemHeight;
+            }
+            return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
+        }
+        if (message == TreeHitTest)
+        {
+            auto destination = reinterpret_cast<GuestTreeHitTestInfo*>(lParam);
+            GuestTreeHitTestInfo hit = {};
+            if (!TryReadGuestValue(destination, &hit)) return 0;
+            hit.flags = 1;
+            hit.item = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const auto visible = VisibleTreeNodes(window->treeNodes);
+                size_t top = 0;
+                if (window->treeTopItem)
+                {
+                    const auto topFound = std::find_if(visible.begin(), visible.end(), [window](const VisibleTreeNode& item)
+                    { return item.token == window->treeTopItem; });
+                    if (topFound != visible.end()) top = static_cast<size_t>(topFound - visible.begin());
+                }
+                const int row = hit.point.y >= 0 && window->treeItemHeight > 0
+                    ? hit.point.y / window->treeItemHeight : -1;
+                const size_t index = row < 0 ? visible.size() : top + static_cast<size_t>(row);
+                if (index < visible.size())
+                {
+                    hit.item = reinterpret_cast<HANDLE>(visible[index].token);
+                    hit.flags = 0x0046;
+                }
+            }
+            TryWriteGuestValue(destination, hit);
+            return reinterpret_cast<LRESULT>(hit.item);
+        }
+        if (message == TreeEnsureVisible)
+        {
+            const ULONG_PTR requested = treeToken(reinterpret_cast<HANDLE>(lParam));
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                TreeNode* node = FindTreeNode(window->treeNodes, requested);
+                if (!node) return FALSE;
+                ULONG_PTR parent = node->parent;
+                while (parent)
+                {
+                    TreeNode* ancestor = FindTreeNode(window->treeNodes, parent);
+                    if (!ancestor) break;
+                    ancestor->state |= TreeStateExpanded;
+                    parent = ancestor->parent;
+                }
+                window->treeTopItem = requested;
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+    }
+
+    if (controlKind == BuiltinControlKind::Progress)
+    {
+        if (message == ProgressSetRange || message == ProgressSetRange32)
+        {
+            int low = message == ProgressSetRange
+                ? static_cast<int>(LOWORD(lParam))
+                : static_cast<int>(wParam);
+            int high = message == ProgressSetRange
+                ? static_cast<int>(HIWORD(lParam))
+                : static_cast<int>(lParam);
+            LRESULT previous = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                previous = message == ProgressSetRange
+                    ? MAKELONG(LOWORD(window->progressMinimum), LOWORD(window->progressMaximum))
+                    : 0;
+                window->progressMinimum = low;
+                window->progressMaximum = high;
+                if (window->progressMinimum > window->progressMaximum)
+                {
+                    std::swap(window->progressMinimum, window->progressMaximum);
+                }
+                window->progressPosition = (std::max)(window->progressMinimum,
+                    (std::min)(window->progressMaximum, window->progressPosition));
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return previous;
+        }
+        if (message == ProgressSetPosition || message == ProgressDeltaPosition ||
+            message == ProgressStep)
+        {
+            int previous = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                previous = window->progressPosition;
+                if (message == ProgressSetPosition)
+                {
+                    window->progressPosition = static_cast<int>(wParam);
+                }
+                else
+                {
+                    const int delta = message == ProgressDeltaPosition
+                        ? static_cast<int>(wParam)
+                        : window->progressStep;
+                    window->progressPosition = SaturatingAdd(window->progressPosition, delta);
+                }
+                if (message == ProgressStep && window->progressMaximum > window->progressMinimum &&
+                    window->progressPosition > window->progressMaximum)
+                {
+                    const int span = window->progressMaximum - window->progressMinimum;
+                    window->progressPosition = window->progressMinimum +
+                        (window->progressPosition - window->progressMinimum) % span;
+                }
+                window->progressPosition = (std::max)(window->progressMinimum,
+                    (std::min)(window->progressMaximum, window->progressPosition));
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return previous;
+        }
+        if (message == ProgressSetStep)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const int previous = window->progressStep;
+            window->progressStep = static_cast<int>(wParam);
+            return previous;
+        }
+        if (message == ProgressGetStep)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->progressStep;
+        }
+        if (message == ProgressGetPosition)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->progressPosition;
+        }
+        if (message == ProgressGetRange)
+        {
+            GuestProgressRange range = {};
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                range.low = window->progressMinimum;
+                range.high = window->progressMaximum;
+            }
+            if (lParam && !TryWriteGuestValue(reinterpret_cast<GuestProgressRange*>(lParam), range))
+            {
+                return 0;
+            }
+            return wParam ? range.low : range.high;
+        }
+        if (message == ProgressSetBarColor || message == ProgressSetBackgroundColor)
+        {
+            COLORREF previous = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                COLORREF& target = message == ProgressSetBarColor
+                    ? window->progressBarColor
+                    : window->progressBackgroundColor;
+                previous = target;
+                target = static_cast<COLORREF>(lParam);
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return previous;
+        }
+        if (message == ProgressGetBarColor || message == ProgressGetBackgroundColor)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return message == ProgressGetBarColor
+                ? window->progressBarColor
+                : window->progressBackgroundColor;
+        }
+        if (message == ProgressSetState)
+        {
+            const UINT requested = static_cast<UINT>(wParam);
+            if (requested < 1 || requested > 3)
+            {
+                return 0;
+            }
+            UINT previous = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                previous = window->progressState;
+                window->progressState = requested;
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return previous;
+        }
+        if (message == ProgressGetState)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->progressState;
+        }
+        if (message == ProgressSetMarquee)
+        {
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                window->progressMarquee = wParam != FALSE;
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+    }
+
+    if (controlKind == BuiltinControlKind::Tab)
+    {
+        if (message == TabSetImageList || message == TabGetImageList)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (message == TabGetImageList)
+            {
+                return reinterpret_cast<LRESULT>(window->tabImageList);
+            }
+            const HANDLE previous = window->tabImageList;
+            window->tabImageList = reinterpret_cast<HANDLE>(lParam);
+            return reinterpret_cast<LRESULT>(previous);
+        }
+        if (message == TabGetItemCount)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return static_cast<LRESULT>(window->tabItems.size());
+        }
+        if (message == TabInsertItemW || message == TabSetItemW || message == TabGetItemW)
+        {
+            auto guestItem = reinterpret_cast<GuestTabItemW*>(lParam);
+            GuestTabItemW item = {};
+            if (!TryReadGuestValue(guestItem, &item))
+            {
+                return message == TabInsertItemW ? -1 : FALSE;
+            }
+            const int requested = static_cast<int>(wParam);
+            if (message == TabGetItemW)
+            {
+                std::wstring text;
+                {
+                    std::lock_guard<std::mutex> guard(window->lock);
+                    if (requested < 0 || static_cast<size_t>(requested) >= window->tabItems.size())
+                    {
+                        return FALSE;
+                    }
+                    const size_t index = static_cast<size_t>(requested);
+                    text = window->tabItems[index];
+                    if ((item.mask & TabItemImage) != 0) item.image = window->tabItemImages[index];
+                    if ((item.mask & TabItemParam) != 0) item.itemData = window->tabItemData[index];
+                    if ((item.mask & TabItemState) != 0)
+                        item.state = window->tabItemStates[index] & item.stateMask;
+                }
+                if ((item.mask & TabItemText) != 0 &&
+                    !TryWriteGuestWideString(item.text,
+                        static_cast<size_t>((std::max)(0, item.textCapacity)), text, nullptr))
+                {
+                    return FALSE;
+                }
+                return TryWriteGuestValue(guestItem, item) ? TRUE : FALSE;
+            }
+
+            std::wstring text;
+            if ((item.mask & TabItemText) != 0 && !TryReadGuestWideString(item.text, &text))
+            {
+                return message == TabInsertItemW ? -1 : FALSE;
+            }
+            int result = FALSE;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (message == TabInsertItemW)
+                {
+                    const size_t position = requested < 0
+                        ? window->tabItems.size()
+                        : (std::min)(static_cast<size_t>(requested), window->tabItems.size());
+                    window->tabItems.insert(window->tabItems.begin() + position, std::move(text));
+                    window->tabItemData.insert(window->tabItemData.begin() + position,
+                        (item.mask & TabItemParam) != 0 ? item.itemData : 0);
+                    window->tabItemImages.insert(window->tabItemImages.begin() + position,
+                        (item.mask & TabItemImage) != 0 ? item.image : -1);
+                    window->tabItemStates.insert(window->tabItemStates.begin() + position,
+                        (item.mask & TabItemState) != 0 ? item.state & item.stateMask : 0);
+                    if (window->tabSelectedItem < 0)
+                    {
+                        window->tabSelectedItem = 0;
+                        window->tabFocusedItem = 0;
+                    }
+                    else
+                    {
+                        if (window->tabSelectedItem >= static_cast<int>(position)) ++window->tabSelectedItem;
+                        if (window->tabFocusedItem >= static_cast<int>(position)) ++window->tabFocusedItem;
+                    }
+                    result = static_cast<int>(position);
+                }
+                else
+                {
+                    if (requested < 0 || static_cast<size_t>(requested) >= window->tabItems.size())
+                    {
+                        return FALSE;
+                    }
+                    const size_t index = static_cast<size_t>(requested);
+                    if ((item.mask & TabItemText) != 0) window->tabItems[index] = std::move(text);
+                    if ((item.mask & TabItemParam) != 0) window->tabItemData[index] = item.itemData;
+                    if ((item.mask & TabItemImage) != 0) window->tabItemImages[index] = item.image;
+                    if ((item.mask & TabItemState) != 0)
+                        window->tabItemStates[index] =
+                            (window->tabItemStates[index] & ~item.stateMask) | (item.state & item.stateMask);
+                    result = TRUE;
+                }
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return result;
+        }
+        if (message == TabDeleteItem || message == TabDeleteAllItems)
+        {
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (message == TabDeleteAllItems)
+                {
+                    window->tabItems.clear();
+                    window->tabItemData.clear();
+                    window->tabItemImages.clear();
+                    window->tabItemStates.clear();
+                    window->tabSelectedItem = -1;
+                    window->tabFocusedItem = -1;
+                }
+                else
+                {
+                    const size_t index = static_cast<size_t>(wParam);
+                    if (index >= window->tabItems.size()) return FALSE;
+                    window->tabItems.erase(window->tabItems.begin() + index);
+                    window->tabItemData.erase(window->tabItemData.begin() + index);
+                    window->tabItemImages.erase(window->tabItemImages.begin() + index);
+                    window->tabItemStates.erase(window->tabItemStates.begin() + index);
+                    if (window->tabItems.empty())
+                    {
+                        window->tabSelectedItem = -1;
+                        window->tabFocusedItem = -1;
+                    }
+                    else
+                    {
+                        if (window->tabSelectedItem >= static_cast<int>(window->tabItems.size()))
+                            window->tabSelectedItem = static_cast<int>(window->tabItems.size()) - 1;
+                        if (window->tabFocusedItem >= static_cast<int>(window->tabItems.size()))
+                            window->tabFocusedItem = window->tabSelectedItem;
+                    }
+                }
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return TRUE;
+        }
+        if (message == TabGetCurrentSelection || message == TabGetCurrentFocus)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return message == TabGetCurrentSelection
+                ? window->tabSelectedItem
+                : window->tabFocusedItem;
+        }
+        if (message == TabSetCurrentSelection || message == TabSetCurrentFocus)
+        {
+            const int requested = static_cast<int>(wParam);
+            int previous = -1;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (requested < 0 || static_cast<size_t>(requested) >= window->tabItems.size())
+                {
+                    return -1;
+                }
+                if (message == TabSetCurrentSelection)
+                {
+                    previous = window->tabSelectedItem;
+                    window->tabSelectedItem = requested;
+                }
+                else
+                {
+                    previous = window->tabFocusedItem;
+                    window->tabFocusedItem = requested;
+                }
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return previous;
+        }
+        if (message == TabSetItemSize)
+        {
+            DWORD previous = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                previous = MAKELONG(window->tabItemWidth, window->tabItemHeight);
+                window->tabItemWidth = (std::max)(1, static_cast<int>(LOWORD(lParam)));
+                window->tabItemHeight = (std::max)(1, static_cast<int>(HIWORD(lParam)));
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return previous;
+        }
+        if (message == TabSetPadding)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            window->tabHorizontalPadding = static_cast<int>(LOWORD(lParam));
+            window->tabVerticalPadding = static_cast<int>(HIWORD(lParam));
+            return 0;
+        }
+        if (message == TabGetRowCount)
+        {
+            return 1;
+        }
+        if (message == TabGetItemRect || message == TabHitTest)
+        {
+            std::vector<std::wstring> items;
+            int fixedWidth = 0;
+            int itemHeight = 24;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                items = window->tabItems;
+                fixedWidth = window->tabItemWidth;
+                itemHeight = window->tabItemHeight;
+            }
+            const auto widthFor = [fixedWidth](const std::wstring& text)
+            {
+                return fixedWidth > 0 ? fixedWidth : (std::max)(32,
+                    static_cast<int>((std::min)(text.size(), static_cast<size_t>(128))) *
+                        MiniGdi::DefaultTextGlyphWidth + 16);
+            };
+            if (message == TabGetItemRect)
+            {
+                const int requested = static_cast<int>(wParam);
+                if (requested < 0 || static_cast<size_t>(requested) >= items.size()) return FALSE;
+                RECT result{ 1, 1, 1, 1 + itemHeight };
+                for (int index = 0; index < requested; ++index)
+                    result.left += widthFor(items[static_cast<size_t>(index)]);
+                result.right = result.left + widthFor(items[static_cast<size_t>(requested)]);
+                return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
+            }
+            auto destination = reinterpret_cast<GuestTabHitTestInfo*>(lParam);
+            GuestTabHitTestInfo hit = {};
+            if (!TryReadGuestValue(destination, &hit)) return -1;
+            int left = 1;
+            int found = -1;
+            for (size_t index = 0; index < items.size(); ++index)
+            {
+                const int right = left + widthFor(items[index]);
+                if (hit.point.x >= left && hit.point.x < right &&
+                    hit.point.y >= 1 && hit.point.y < 1 + itemHeight)
+                {
+                    found = static_cast<int>(index);
+                    hit.flags = 0;
+                    break;
+                }
+                left = right;
+            }
+            if (found < 0) hit.flags = 1;
+            TryWriteGuestValue(destination, hit);
+            return found;
+        }
+        if (message == TabAdjustRect)
+        {
+            RECT result = {};
+            if (!TryReadGuestValue(reinterpret_cast<const RECT*>(lParam), &result)) return FALSE;
+            int itemHeight = 24;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                itemHeight = window->tabItemHeight;
+            }
+            if (wParam)
+            {
+                result.left -= 2; result.right += 2; result.top -= itemHeight + 2; result.bottom += 2;
+            }
+            else
+            {
+                result.left += 2; result.right -= 2; result.top += itemHeight + 2; result.bottom -= 2;
+            }
+            return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
+        }
+    }
+
+    if (controlKind == BuiltinControlKind::UpDown)
+    {
+        if (message == UpDownSetRange || message == UpDownSetRange32)
+        {
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (message == UpDownSetRange)
+                {
+                    window->upDownMaximum = static_cast<short>(LOWORD(lParam));
+                    window->upDownMinimum = static_cast<short>(HIWORD(lParam));
+                }
+                else
+                {
+                    window->upDownMinimum = static_cast<int>(wParam);
+                    window->upDownMaximum = static_cast<int>(lParam);
+                }
+                const int low = (std::min)(window->upDownMinimum, window->upDownMaximum);
+                const int high = (std::max)(window->upDownMinimum, window->upDownMaximum);
+                window->upDownPosition = (std::max)(low, (std::min)(high, window->upDownPosition));
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return 0;
+        }
+        if (message == UpDownGetRange)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return MAKELONG(static_cast<short>(window->upDownMaximum),
+                static_cast<short>(window->upDownMinimum));
+        }
+        if (message == UpDownGetRange32)
+        {
+            int minimum = 0;
+            int maximum = 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                minimum = window->upDownMinimum;
+                maximum = window->upDownMaximum;
+            }
+            if (wParam && !TryWriteGuestValue(reinterpret_cast<int*>(wParam), minimum)) return 0;
+            if (lParam && !TryWriteGuestValue(reinterpret_cast<int*>(lParam), maximum)) return 0;
+            return 0;
+        }
+        if (message == UpDownSetPosition || message == UpDownSetPosition32)
+        {
+            int previous = 0;
+            HWND buddy = nullptr;
+            int current = 0;
+            UINT numberBase = 10;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                previous = window->upDownPosition;
+                const int requested = message == UpDownSetPosition
+                    ? static_cast<short>(LOWORD(lParam)) : static_cast<int>(lParam);
+                const int low = (std::min)(window->upDownMinimum, window->upDownMaximum);
+                const int high = (std::max)(window->upDownMinimum, window->upDownMaximum);
+                window->upDownPosition = (std::max)(low, (std::min)(high, requested));
+                current = window->upDownPosition;
+                buddy = window->upDownBuddy;
+                numberBase = window->upDownBase;
+            }
+            if (buddy)
+            {
+                wchar_t buffer[40] = {};
+                if (numberBase == 16) swprintf_s(buffer, L"%X", static_cast<unsigned int>(current));
+                else swprintf_s(buffer, L"%d", current);
+                SendGuestMessage(buddy, GuestAbi::WmSetText, 0,
+                    reinterpret_cast<LPARAM>(buffer), nullptr);
+            }
+            InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
+            return message == UpDownSetPosition ? MAKELONG(static_cast<short>(previous), 0) : previous;
+        }
+        if (message == UpDownGetPosition || message == UpDownGetPosition32)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (message == UpDownGetPosition32 && lParam)
+            {
+                const BOOL success = TRUE;
+                TryWriteGuestValue(reinterpret_cast<BOOL*>(lParam), success);
+            }
+            return message == UpDownGetPosition
+                ? MAKELONG(static_cast<short>(window->upDownPosition), 0)
+                : window->upDownPosition;
+        }
+        if (message == UpDownSetBuddy || message == UpDownGetBuddy)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (message == UpDownGetBuddy) return reinterpret_cast<LRESULT>(window->upDownBuddy);
+            const HWND previous = window->upDownBuddy;
+            window->upDownBuddy = reinterpret_cast<HWND>(wParam);
+            return reinterpret_cast<LRESULT>(previous);
+        }
+        if (message == UpDownSetBase || message == UpDownGetBase)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (message == UpDownGetBase) return window->upDownBase;
+            if (wParam != 10 && wParam != 16) return 0;
+            const UINT previous = window->upDownBase;
+            window->upDownBase = static_cast<UINT>(wParam);
+            return previous;
+        }
+    }
+
     if ((controlKind == BuiltinControlKind::Toolbar ||
         controlKind == BuiltinControlKind::Rebar ||
-        controlKind == BuiltinControlKind::ListView) && message >= 0x0400)
+        controlKind == BuiltinControlKind::ListView ||
+        controlKind == BuiltinControlKind::Header ||
+        controlKind == BuiltinControlKind::Tab ||
+        controlKind == BuiltinControlKind::Progress ||
+        controlKind == BuiltinControlKind::TreeView ||
+        controlKind == BuiltinControlKind::UpDown) && message >= 0x0400)
     {
         RuntimeDiagnostics::Record(
             L"COMMON CONTROL MESSAGE: handle " +
@@ -5145,6 +8139,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
             window->title = std::move(text);
             window->editCaret = window->title.size();
+            if (controlKind == BuiltinControlKind::StatusBar && !window->statusBarTexts.empty())
+            {
+                window->statusBarTexts[0] = window->title;
+            }
         }
         invalidate();
         return TRUE;
@@ -5191,8 +8189,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         MiniGdi::ObjectHandle font = MiniGdi::InvalidObject;
         std::vector<std::wstring> listColumns;
         std::vector<int> listColumnWidths;
+        std::vector<int> listColumnOrders;
         std::vector<std::vector<std::wstring>> listItems;
         std::vector<LPARAM> listViewItemData;
+        std::vector<UINT> listViewItemStates;
+        std::vector<int> listViewItemImages;
+        HANDLE listViewImageList = nullptr;
         COLORREF listViewBackgroundColor = 0x00ffffff;
         COLORREF listViewTextColor = 0x00000000;
         COLORREF listViewTextBackgroundColor = 0x00ffffff;
@@ -5209,6 +8211,37 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         int toolbarBitmapWidth = 16;
         int toolbarBitmapHeight = 16;
         int toolbarPressedIndex = -1;
+        std::vector<int> statusBarParts;
+        std::vector<std::wstring> statusBarTexts;
+        std::wstring statusBarSimpleText;
+        bool statusBarSimple = false;
+        int progressMinimum = 0;
+        int progressMaximum = 100;
+        int progressPosition = 0;
+        UINT progressState = 1;
+        COLORREF progressBarColor = 0xffffffffu;
+        COLORREF progressBackgroundColor = 0xffffffffu;
+        bool progressMarquee = false;
+        std::vector<std::wstring> tabItems;
+        std::vector<int> tabItemImages;
+        HANDLE tabImageList = nullptr;
+        int tabSelectedItem = -1;
+        int tabItemWidth = 0;
+        int tabItemHeight = 24;
+        std::vector<std::wstring> headerItems;
+        std::vector<int> headerItemWidths;
+        std::vector<int> headerItemOrders;
+        std::vector<int> headerItemImages;
+        HANDLE headerImageList = nullptr;
+        int headerPressedItem = -1;
+        std::vector<TreeNode> treeNodes;
+        ULONG_PTR treeSelectedItem = 0;
+        ULONG_PTR treeTopItem = 0;
+        HANDLE treeImageList = nullptr;
+        int treeIndent = 16;
+        int treeItemHeight = 18;
+        COLORREF treeBackgroundColor = 0x00ffffff;
+        COLORREF treeTextColor = 0x00000000;
         bool addressBackButton = false;
         HWND handle = nullptr;
         HWND parent = nullptr;
@@ -5227,8 +8260,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             font = window->controlFont;
             listColumns = window->listViewColumns;
             listColumnWidths = window->listViewColumnWidths;
+            listColumnOrders = window->listViewColumnOrders;
             listItems = window->listViewItems;
             listViewItemData = window->listViewItemData;
+            listViewItemStates = window->listViewItemStates;
+            listViewItemImages = window->listViewItemImages;
+            listViewImageList = window->listViewImageLists[1]
+                ? window->listViewImageLists[1]
+                : window->listViewImageLists[0];
             listViewBackgroundColor = window->listViewBackgroundColor;
             listViewTextColor = window->listViewTextColor;
             listViewTextBackgroundColor = window->listViewTextBackgroundColor;
@@ -5245,10 +8284,52 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             toolbarBitmapWidth = window->toolbarBitmapWidth;
             toolbarBitmapHeight = window->toolbarBitmapHeight;
             toolbarPressedIndex = window->toolbarPressedIndex;
+            statusBarParts = window->statusBarParts;
+            statusBarTexts = window->statusBarTexts;
+            statusBarSimpleText = window->statusBarSimpleText;
+            statusBarSimple = window->statusBarSimple;
+            progressMinimum = window->progressMinimum;
+            progressMaximum = window->progressMaximum;
+            progressPosition = window->progressPosition;
+            progressState = window->progressState;
+            progressBarColor = window->progressBarColor;
+            progressBackgroundColor = window->progressBackgroundColor;
+            progressMarquee = window->progressMarquee;
+            tabItems = window->tabItems;
+            tabItemImages = window->tabItemImages;
+            tabImageList = window->tabImageList;
+            tabSelectedItem = window->tabSelectedItem;
+            tabItemWidth = window->tabItemWidth;
+            tabItemHeight = window->tabItemHeight;
+            headerItems = window->headerItems;
+            headerItemWidths = window->headerItemWidths;
+            headerItemOrders = window->headerItemOrders;
+            headerItemImages = window->headerItemImages;
+            headerImageList = window->headerImageList;
+            headerPressedItem = window->headerPressedItem;
+            treeNodes = window->treeNodes;
+            treeSelectedItem = window->treeSelectedItem;
+            treeTopItem = window->treeTopItem;
+            treeImageList = window->treeImageLists[0];
+            treeIndent = window->treeIndent;
+            treeItemHeight = window->treeItemHeight;
+            treeBackgroundColor = window->treeBackgroundColor;
+            treeTextColor = window->treeTextColor;
             addressBackButton = window->addressBackButton;
             handle = window->handle;
             parent = window->parent;
             controlId = window->controlId;
+        }
+
+        std::vector<size_t> listDisplayColumns(listColumns.size());
+        std::iota(listDisplayColumns.begin(), listDisplayColumns.end(), static_cast<size_t>(0));
+        if (listColumnOrders.size() == listDisplayColumns.size())
+        {
+            std::stable_sort(listDisplayColumns.begin(), listDisplayColumns.end(),
+                [&listColumnOrders](size_t left, size_t right)
+            {
+                return listColumnOrders[left] < listColumnOrders[right];
+            });
         }
 
         GuestAbi::PaintStruct paint = {};
@@ -5337,9 +8418,43 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         MiniGdi::MakeColor(208, 208, 208));
                 }
             }
+            else if (controlKind == BuiltinControlKind::Progress)
+            {
+                const MiniGdi::Color background = progressBackgroundColor == 0xffffffffu
+                    ? MiniGdi::MakeColor(232, 232, 232)
+                    : ColorFromGuestColorRef(progressBackgroundColor);
+                MiniGdi::DrawRectangle(*surface, fullRect, background,
+                    MiniGdi::MakeColor(128, 128, 128));
+                int fillLeft = 2;
+                int fillRight = 2;
+                if (progressMarquee)
+                {
+                    fillRight = (std::max)(fillLeft, 2 + (std::max)(0, width - 4) / 3);
+                }
+                else if (progressMaximum > progressMinimum)
+                {
+                    const std::int64_t range = static_cast<std::int64_t>(progressMaximum) - progressMinimum;
+                    const std::int64_t value = (std::max)(progressMinimum,
+                        (std::min)(progressMaximum, progressPosition)) - progressMinimum;
+                    fillRight = 2 + static_cast<int>(value * (std::max)(0, width - 4) / range);
+                }
+                MiniGdi::Color bar = progressState == 2
+                    ? MiniGdi::MakeColor(210, 45, 45)
+                    : (progressState == 3
+                        ? MiniGdi::MakeColor(225, 170, 25)
+                        : MiniGdi::MakeColor(35, 165, 70));
+                if (progressBarColor != 0xffffffffu)
+                {
+                    bar = ColorFromGuestColorRef(progressBarColor);
+                }
+                if (fillRight > fillLeft && height > 4)
+                {
+                    MiniGdi::FillRect(*surface,
+                        MiniGdi::Rect{ fillLeft, 2, (std::min)(width - 2, fillRight), height - 2 }, bar);
+                }
+            }
             else if (controlKind == BuiltinControlKind::ComboBox ||
-                controlKind == BuiltinControlKind::ScrollBar ||
-                controlKind == BuiltinControlKind::UpDown)
+                controlKind == BuiltinControlKind::ScrollBar)
             {
                 MiniGdi::DrawRectangle(
                     *surface,
@@ -5351,6 +8466,38 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     *surface,
                     MiniGdi::Rect{ (std::max)(0, width - buttonWidth), 1, (std::max)(0, width - 1), (std::max)(1, height - 1) },
                     MiniGdi::MakeColor(240, 240, 240));
+            }
+            else if (controlKind == BuiltinControlKind::UpDown)
+            {
+                MiniGdi::DrawRectangle(*surface, fullRect,
+                    MiniGdi::MakeColor(240, 240, 240), MiniGdi::MakeColor(128, 128, 128));
+                const bool horizontal = (style & 0x0040u) != 0;
+                if (horizontal)
+                {
+                    const int middle = width / 2;
+                    MiniGdi::DrawLine(*surface, MiniGdi::Point{ middle, 1 },
+                        MiniGdi::Point{ middle, (std::max)(1, height - 2) }, MiniGdi::MakeColor(160, 160, 160));
+                    DrawToolbarGlyph(*surface, MiniGdi::Rect{ 1, 1, (std::max)(2, middle - 1), height - 1 }, 0);
+                    DrawToolbarGlyph(*surface, MiniGdi::Rect{ middle + 1, 1, width - 1, height - 1 }, 4);
+                }
+                else
+                {
+                    const int middle = height / 2;
+                    MiniGdi::DrawLine(*surface, MiniGdi::Point{ 1, middle },
+                        MiniGdi::Point{ (std::max)(1, width - 2), middle }, MiniGdi::MakeColor(160, 160, 160));
+                    const MiniGdi::Color ink = MiniGdi::MakeColor(48, 48, 48);
+                    const int centerX = width / 2;
+                    const int upperY = (std::max)(2, middle / 2);
+                    const int lowerY = middle + (std::max)(2, (height - middle) / 2);
+                    MiniGdi::DrawLine(*surface, MiniGdi::Point{ centerX - 3, upperY + 2 },
+                        MiniGdi::Point{ centerX, upperY - 1 }, ink);
+                    MiniGdi::DrawLine(*surface, MiniGdi::Point{ centerX, upperY - 1 },
+                        MiniGdi::Point{ centerX + 3, upperY + 2 }, ink);
+                    MiniGdi::DrawLine(*surface, MiniGdi::Point{ centerX - 3, lowerY - 2 },
+                        MiniGdi::Point{ centerX, lowerY + 1 }, ink);
+                    MiniGdi::DrawLine(*surface, MiniGdi::Point{ centerX, lowerY + 1 },
+                        MiniGdi::Point{ centerX + 3, lowerY - 2 }, ink);
+                }
             }
             else if (controlKind == BuiltinControlKind::Header)
             {
@@ -5419,7 +8566,222 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 }
             }
 
-            m_gdi.TextOutW(guestDc, MiniGdi::Point{ textX, textY }, text.data(), text.size(), nullptr);
+            if ((controlKind != BuiltinControlKind::StatusBar ||
+                (!statusBarSimple && statusBarParts.empty())) &&
+                controlKind != BuiltinControlKind::Tab &&
+                controlKind != BuiltinControlKind::Header &&
+                controlKind != BuiltinControlKind::Progress &&
+                controlKind != BuiltinControlKind::TreeView &&
+                controlKind != BuiltinControlKind::UpDown)
+            {
+                m_gdi.TextOutW(guestDc, MiniGdi::Point{ textX, textY }, text.data(), text.size(), nullptr);
+            }
+
+            if (controlKind == BuiltinControlKind::StatusBar)
+            {
+                if (statusBarSimple)
+                {
+                    const size_t visible = (std::min)(statusBarSimpleText.size(),
+                        static_cast<size_t>((std::max)(0, width - 6) / MiniGdi::DefaultTextGlyphWidth));
+                    m_gdi.TextOutW(guestDc, MiniGdi::Point{ 3, textY },
+                        statusBarSimpleText.data(), visible, nullptr);
+                }
+                else
+                {
+                    int left = 0;
+                    for (size_t part = 0; part < statusBarParts.size(); ++part)
+                    {
+                        const int right = statusBarParts[part] < 0
+                            ? width
+                            : (std::min)(width, (std::max)(left, statusBarParts[part]));
+                        if (part != 0)
+                        {
+                            MiniGdi::DrawLine(*surface,
+                                MiniGdi::Point{ left, 1 },
+                                MiniGdi::Point{ left, (std::max)(1, height - 2) },
+                                MiniGdi::MakeColor(184, 184, 184));
+                        }
+                        if (part < statusBarTexts.size())
+                        {
+                            const size_t visible = (std::min)(statusBarTexts[part].size(),
+                                static_cast<size_t>((std::max)(0, right - left - 6) /
+                                    MiniGdi::DefaultTextGlyphWidth));
+                            m_gdi.TextOutW(guestDc, MiniGdi::Point{ left + 3, textY },
+                                statusBarTexts[part].data(), visible, nullptr);
+                        }
+                        left = right;
+                        if (left >= width)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (controlKind == BuiltinControlKind::Tab)
+            {
+                int left = 1;
+                const int itemHeight = (std::min)((std::max)(1, height - 2),
+                    (std::max)(18, tabItemHeight));
+                for (size_t index = 0; index < tabItems.size(); ++index)
+                {
+                    const int itemWidth = tabItemWidth > 0
+                        ? tabItemWidth
+                        : (std::max)(32, static_cast<int>((std::min)(
+                            tabItems[index].size(), static_cast<size_t>(128))) *
+                            MiniGdi::DefaultTextGlyphWidth + 16);
+                    const int right = (std::min)(width - 1, left + itemWidth);
+                    if (right <= left) break;
+                    const bool selected = static_cast<int>(index) == tabSelectedItem;
+                    MiniGdi::DrawRectangle(*surface,
+                        MiniGdi::Rect{ left, selected ? 1 : 3, right, itemHeight + 1 },
+                        selected ? MiniGdi::OpaqueWhite : MiniGdi::MakeColor(232, 232, 232),
+                        MiniGdi::MakeColor(144, 144, 144));
+                    int textLeft = left + 6;
+                    if (tabImageList && index < tabItemImages.size() && tabItemImages[index] >= 0)
+                    {
+                        MiniGdi::Surface image;
+                        if (CopyGuestImageListImage(tabImageList, tabItemImages[index], &image) && !image.Empty())
+                        {
+                            const int iconSize = (std::min)(14, itemHeight - 4);
+                            DrawToolbarImage(*surface,
+                                MiniGdi::Rect{ textLeft, 4, textLeft + iconSize, 4 + iconSize }, image);
+                            textLeft += iconSize + 3;
+                        }
+                    }
+                    const size_t visible = (std::min)(tabItems[index].size(),
+                        static_cast<size_t>((std::max)(0, right - textLeft - 4) /
+                            MiniGdi::DefaultTextGlyphWidth));
+                    m_gdi.TextOutW(guestDc,
+                        MiniGdi::Point{ textLeft, (std::max)(2,
+                            (itemHeight - MiniGdi::DefaultTextGlyphHeight) / 2) },
+                        tabItems[index].data(), visible, nullptr);
+                    left = right;
+                    if (left >= width - 1) break;
+                }
+            }
+
+            if (controlKind == BuiltinControlKind::Header)
+            {
+                std::vector<size_t> display(headerItems.size());
+                std::iota(display.begin(), display.end(), static_cast<size_t>(0));
+                if (headerItemOrders.size() == display.size())
+                    std::stable_sort(display.begin(), display.end(), [&headerItemOrders](size_t left, size_t right)
+                    { return headerItemOrders[left] < headerItemOrders[right]; });
+                int left = 0;
+                for (const size_t item : display)
+                {
+                    const int itemWidth = item < headerItemWidths.size()
+                        ? (std::max)(0, headerItemWidths[item]) : 120;
+                    const int right = (std::min)(width, left + itemWidth);
+                    if (right <= left) continue;
+                    MiniGdi::DrawRectangle(*surface, MiniGdi::Rect{ left, 0, right, height },
+                        static_cast<int>(item) == headerPressedItem
+                            ? MiniGdi::MakeColor(216, 216, 216)
+                            : MiniGdi::MakeColor(240, 240, 240),
+                        MiniGdi::MakeColor(160, 160, 160));
+                    int textLeft = left + 4;
+                    if (headerImageList && item < headerItemImages.size() && headerItemImages[item] >= 0)
+                    {
+                        MiniGdi::Surface image;
+                        if (CopyGuestImageListImage(headerImageList, headerItemImages[item], &image) && !image.Empty())
+                        {
+                            const int iconSize = (std::min)(14, (std::max)(1, height - 4));
+                            DrawToolbarImage(*surface,
+                                MiniGdi::Rect{ textLeft, 2, textLeft + iconSize, 2 + iconSize }, image);
+                            textLeft += iconSize + 3;
+                        }
+                    }
+                    const size_t visible = (std::min)(headerItems[item].size(),
+                        static_cast<size_t>((std::max)(0, right - textLeft - 3) /
+                            MiniGdi::DefaultTextGlyphWidth));
+                    m_gdi.TextOutW(guestDc, MiniGdi::Point{ textLeft,
+                        (std::max)(0, (height - MiniGdi::DefaultTextGlyphHeight) / 2) },
+                        headerItems[item].data(), visible, nullptr);
+                    left = right;
+                    if (left >= width) break;
+                }
+            }
+
+            if (controlKind == BuiltinControlKind::TreeView)
+            {
+                const MiniGdi::Color background = treeBackgroundColor == 0xffffffffu
+                    ? MiniGdi::OpaqueWhite : ColorFromGuestColorRef(treeBackgroundColor);
+                MiniGdi::DrawRectangle(*surface, MiniGdi::Rect{ 0, 0, width, height },
+                    background, background);
+                const auto visible = VisibleTreeNodes(treeNodes);
+                size_t first = 0;
+                if (treeTopItem)
+                {
+                    const auto found = std::find_if(visible.begin(), visible.end(), [treeTopItem](const VisibleTreeNode& item)
+                    { return item.token == treeTopItem; });
+                    if (found != visible.end()) first = static_cast<size_t>(found - visible.begin());
+                }
+                const int rowHeight = (std::max)(1, treeItemHeight);
+                for (size_t position = first; position < visible.size(); ++position)
+                {
+                    const int row = static_cast<int>(position - first);
+                    const int top = row * rowHeight;
+                    if (top >= height) break;
+                    const TreeNode* node = FindTreeNode(treeNodes, visible[position].token);
+                    if (!node) continue;
+                    const bool selected = node->token == treeSelectedItem ||
+                        (node->state & TreeStateSelected) != 0;
+                    if (selected)
+                    {
+                        MiniGdi::DrawRectangle(*surface,
+                            MiniGdi::Rect{ 0, top, width, (std::min)(height, top + rowHeight) },
+                            MiniGdi::MakeColor(0, 120, 215), MiniGdi::MakeColor(0, 120, 215));
+                    }
+                    const int branchLeft = visible[position].depth * treeIndent + 2;
+                    const bool hasChildren = node->declaredChildren != 0 ||
+                        std::any_of(treeNodes.begin(), treeNodes.end(), [node](const TreeNode& candidate)
+                        { return candidate.parent == node->token; });
+                    if (hasChildren)
+                    {
+                        const int boxSize = (std::max)(7, (std::min)(11, rowHeight - 4));
+                        const int boxTop = top + (rowHeight - boxSize) / 2;
+                        MiniGdi::DrawRectangle(*surface,
+                            MiniGdi::Rect{ branchLeft, boxTop, branchLeft + boxSize, boxTop + boxSize },
+                            MiniGdi::OpaqueWhite, MiniGdi::MakeColor(96, 96, 96));
+                        MiniGdi::DrawLine(*surface,
+                            MiniGdi::Point{ branchLeft + 2, boxTop + boxSize / 2 },
+                            MiniGdi::Point{ branchLeft + boxSize - 2, boxTop + boxSize / 2 },
+                            MiniGdi::MakeColor(64, 64, 64));
+                        if ((node->state & TreeStateExpanded) == 0)
+                        {
+                            MiniGdi::DrawLine(*surface,
+                                MiniGdi::Point{ branchLeft + boxSize / 2, boxTop + 2 },
+                                MiniGdi::Point{ branchLeft + boxSize / 2, boxTop + boxSize - 2 },
+                                MiniGdi::MakeColor(64, 64, 64));
+                        }
+                    }
+                    int textLeft = branchLeft + treeIndent;
+                    const int image = selected && node->selectedImage >= 0
+                        ? node->selectedImage : node->image;
+                    if (treeImageList && image >= 0)
+                    {
+                        MiniGdi::Surface icon;
+                        if (CopyGuestImageListImage(treeImageList, image, &icon) && !icon.Empty())
+                        {
+                            const int iconSize = (std::max)(1, (std::min)(16, rowHeight - 2));
+                            DrawToolbarImage(*surface,
+                                MiniGdi::Rect{ textLeft, top + (rowHeight - iconSize) / 2,
+                                    textLeft + iconSize, top + (rowHeight + iconSize) / 2 }, icon);
+                            textLeft += iconSize + 3;
+                        }
+                    }
+                    const size_t characters = (std::min)(node->text.size(),
+                        static_cast<size_t>((std::max)(0, width - textLeft - 2) /
+                            MiniGdi::DefaultTextGlyphWidth));
+                    const MiniGdi::Color ink = selected
+                        ? MiniGdi::OpaqueWhite : ColorFromGuestColorRef(treeTextColor);
+                    m_gdi.SetTextColor(guestDc, ink, nullptr);
+                    m_gdi.TextOutW(guestDc, MiniGdi::Point{ textLeft,
+                        top + (std::max)(0, (rowHeight - MiniGdi::DefaultTextGlyphHeight) / 2) },
+                        node->text.data(), characters, nullptr);
+                }
+            }
 
             if (controlKind == BuiltinControlKind::Static && addressBackButton)
             {
@@ -5435,8 +8797,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     const BYTE buttonStyle = index < toolbarButtonStyles.size() ? toolbarButtonStyles[index] : 0;
                     const BYTE buttonState = index < toolbarButtonStates.size() ? toolbarButtonStates[index] : ToolbarStateEnabled;
-                    const int itemWidth = ToolbarItemWidth(toolbarButtonStyles, toolbarBitmaps, index, buttonWidth);
-                    const int left = ToolbarItemLeft(toolbarButtonStyles, toolbarBitmaps, index, buttonWidth);
+                    const int itemWidth = ToolbarItemWidth(
+                        toolbarButtonStyles, toolbarBitmaps, toolbarButtonStates, index, buttonWidth);
+                    const int left = ToolbarItemLeft(
+                        toolbarButtonStyles, toolbarBitmaps, toolbarButtonStates, index, buttonWidth);
+                    if ((buttonState & ToolbarStateHidden) != 0)
+                    {
+                        continue;
+                    }
                     if (left >= width - 2)
                     {
                         break;
@@ -5451,10 +8819,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         continue;
                     }
                     const bool buttonEnabled = (buttonState & ToolbarStateEnabled) != 0;
+                    const bool buttonPressed = static_cast<int>(index) == toolbarPressedIndex ||
+                        (buttonState & (ToolbarStatePressed | ToolbarStateChecked)) != 0;
                     MiniGdi::DrawRectangle(
                         *surface,
                         MiniGdi::Rect{ left, 1, (std::min)(width - 2, left + itemWidth), 1 + buttonHeight },
-                        static_cast<int>(index) == toolbarPressedIndex
+                        buttonPressed
                             ? MiniGdi::MakeColor(214, 214, 214)
                             : (buttonEnabled ? MiniGdi::MakeColor(248, 248, 248) : MiniGdi::MakeColor(232, 232, 232)),
                         buttonEnabled ? MiniGdi::MakeColor(128, 128, 128) : MiniGdi::MakeColor(184, 184, 184));
@@ -5491,8 +8861,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             else if (controlKind == BuiltinControlKind::ListView)
             {
                 int columnLeft = 2;
-                for (size_t index = 0; index < listColumns.size(); ++index)
+                for (size_t displayIndex = 0; displayIndex < listDisplayColumns.size(); ++displayIndex)
                 {
+                    const size_t index = listDisplayColumns[displayIndex];
                     const int columnWidth = index < listColumnWidths.size()
                         ? (std::max)(24, listColumnWidths[index])
                         : 120;
@@ -5520,7 +8891,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     const size_t index = firstVisible + displayIndex;
                     const int rowTop = 24 + static_cast<int>(displayIndex) * MiniGdi::DefaultTextGlyphHeight;
-                    const bool selected = static_cast<int>(index) == listViewSelectedItem;
+                    const bool selected = index < listViewItemStates.size() &&
+                        (listViewItemStates[index] & ListViewStateSelected) != 0;
                     if (selected)
                     {
                         MiniGdi::FillRect(
@@ -5543,8 +8915,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     const size_t cellCount = (std::max)(
                         static_cast<size_t>(1),
                         (std::max)(listItems[index].size(), listColumns.size()));
-                    for (size_t subItem = 0; subItem < cellCount; ++subItem)
+                    for (size_t displayIndex = 0; displayIndex < cellCount; ++displayIndex)
                     {
+                        const size_t subItem = displayIndex < listDisplayColumns.size()
+                            ? listDisplayColumns[displayIndex]
+                            : displayIndex;
                         if (cellLeft >= width - 2)
                         {
                             break;
@@ -5554,7 +8929,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         const std::wstring* cellText = subItem < listItems[index].size()
                             ? &listItems[index][subItem]
                             : &emptyCell;
-                        if (cellText->empty() && parent)
+                        const bool needsImage = subItem == 0 && listViewImageList &&
+                            (index >= listViewItemImages.size() || listViewItemImages[index] < 0);
+                        if ((cellText->empty() || needsImage) && parent)
                         {
                             // Wine's list-view asks its owner for virtual
                             // text through LVN_GETDISPINFOW.  7-Zip uses this
@@ -5566,7 +8943,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             notification.header.from = handle;
                             notification.header.identifier = controlId;
                             notification.header.code = ListViewNotifyGetDisplayInfoW;
-                            notification.item.mask = ListViewItemText;
+                            notification.item.mask = (cellText->empty() ? ListViewItemText : 0) |
+                                (needsImage ? ListViewItemImage : 0);
                             notification.item.item = static_cast<int>(index);
                             notification.item.subItem = static_cast<int>(subItem);
                             notification.item.text = scratch;
@@ -5574,6 +8952,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             notification.item.itemData = index < listViewItemData.size()
                                 ? listViewItemData[index]
                                 : 0;
+                            notification.item.image = index < listViewItemImages.size()
+                                ? listViewItemImages[index]
+                                : -1;
                             SendGuestMessage(
                                 parent,
                                 GuestAbi::WmNotify,
@@ -5617,6 +8998,19 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                                     cellText = &listItems[index][subItem];
                                 }
                             }
+                            if (subItem == 0 && notification.item.image >= 0)
+                            {
+                                if (index >= listViewItemImages.size())
+                                {
+                                    listViewItemImages.resize(index + 1, -1);
+                                }
+                                listViewItemImages[index] = notification.item.image;
+                                std::lock_guard<std::mutex> guard(window->lock);
+                                if (!window->destroyed && index < window->listViewItemImages.size())
+                                {
+                                    window->listViewItemImages[index] = notification.item.image;
+                                }
+                            }
                             if (g_ownerDataDisplayInfoDiagnostics < 32)
                             {
                                 ++g_ownerDataDisplayInfoDiagnostics;
@@ -5630,12 +9024,27 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         const int cellWidth = subItem < listColumnWidths.size()
                             ? (std::max)(24, listColumnWidths[subItem])
                             : 120;
+                        int textInset = 2;
+                        if (subItem == 0 && listViewImageList && index < listViewItemImages.size() &&
+                            listViewItemImages[index] >= 0)
+                        {
+                            MiniGdi::Surface image;
+                            if (CopyGuestImageListImage(
+                                listViewImageList, listViewItemImages[index], &image) && !image.Empty())
+                            {
+                                const int iconSize = (std::min)(14, MiniGdi::DefaultTextGlyphHeight - 2);
+                                DrawToolbarImage(*surface,
+                                    MiniGdi::Rect{ cellLeft + 2, rowTop + 1,
+                                        cellLeft + 2 + iconSize, rowTop + 1 + iconSize }, image);
+                                textInset += iconSize + 2;
+                            }
+                        }
                         const size_t visibleCellCharacters = static_cast<size_t>((std::max)(0,
-                            (cellWidth - 4) / MiniGdi::DefaultTextGlyphWidth));
+                            (cellWidth - textInset - 2) / MiniGdi::DefaultTextGlyphWidth));
                         const size_t cellCharacters = (std::min)(cellText->size(), visibleCellCharacters);
                         m_gdi.TextOutW(
                             guestDc,
-                            MiniGdi::Point{ cellLeft + 2, rowTop },
+                            MiniGdi::Point{ cellLeft + textInset, rowTop },
                             cellText->data(),
                             cellCharacters,
                             nullptr);
@@ -5852,9 +9261,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 for (size_t index = 0; index < window->toolbarCommands.size(); ++index)
                 {
                     const int left = ToolbarItemLeft(window->toolbarButtonStyles, window->toolbarBitmaps,
-                        index, window->toolbarButtonWidth);
+                        window->toolbarButtonStates, index, window->toolbarButtonWidth);
                     const int right = left + ToolbarItemWidth(window->toolbarButtonStyles, window->toolbarBitmaps,
-                        index, window->toolbarButtonWidth);
+                        window->toolbarButtonStates, index, window->toolbarButtonWidth);
                     const BYTE style = index < window->toolbarButtonStyles.size() ? window->toolbarButtonStyles[index] : 0;
                     const BYTE state = index < window->toolbarButtonStates.size() ? window->toolbarButtonStates[index] : ToolbarStateEnabled;
                     if (x >= left && x < right && (style & ToolbarStyleSeparator) == 0 &&
@@ -5932,6 +9341,355 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         default:
             return 0;
         }
+
+    case BuiltinControlKind::Header:
+        switch (message)
+        {
+        case GuestAbi::WmLButtonDown:
+        {
+            const int x = static_cast<int>(static_cast<SHORT>(LOWORD(lParam)));
+            HWND handle = nullptr;
+            int pressed = -1;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || !window->enabled) return 0;
+                std::vector<size_t> display(window->headerItems.size());
+                std::iota(display.begin(), display.end(), static_cast<size_t>(0));
+                if (window->headerItemOrders.size() == display.size())
+                    std::stable_sort(display.begin(), display.end(), [window](size_t left, size_t right)
+                    { return window->headerItemOrders[left] < window->headerItemOrders[right]; });
+                int left = 0;
+                for (const size_t item : display)
+                {
+                    const int right = left + (item < window->headerItemWidths.size()
+                        ? (std::max)(0, window->headerItemWidths[item]) : 120);
+                    if (x >= left && x < right)
+                    {
+                        pressed = static_cast<int>(item);
+                        break;
+                    }
+                    left = right;
+                }
+                window->headerPressedItem = pressed;
+                handle = window->handle;
+            }
+            if (pressed >= 0)
+            {
+                SetGuestFocus(handle, nullptr);
+                SetGuestCapture(handle, nullptr);
+                invalidate();
+            }
+            return 0;
+        }
+        case GuestAbi::WmLButtonUp:
+        {
+            const int x = static_cast<int>(static_cast<SHORT>(LOWORD(lParam)));
+            HWND handle = nullptr;
+            HWND parent = nullptr;
+            UINT_PTR controlId = 0;
+            int clicked = -1;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed) return 0;
+                const int pressed = window->headerPressedItem;
+                window->headerPressedItem = -1;
+                std::vector<size_t> display(window->headerItems.size());
+                std::iota(display.begin(), display.end(), static_cast<size_t>(0));
+                if (window->headerItemOrders.size() == display.size())
+                    std::stable_sort(display.begin(), display.end(), [window](size_t left, size_t right)
+                    { return window->headerItemOrders[left] < window->headerItemOrders[right]; });
+                int left = 0;
+                for (const size_t item : display)
+                {
+                    const int right = left + (item < window->headerItemWidths.size()
+                        ? (std::max)(0, window->headerItemWidths[item]) : 120);
+                    if (x >= left && x < right)
+                    {
+                        if (pressed == static_cast<int>(item)) clicked = pressed;
+                        break;
+                    }
+                    left = right;
+                }
+                handle = window->handle;
+                parent = window->parent;
+                controlId = window->controlId;
+            }
+            DWORD ignored = ERROR_SUCCESS;
+            if (handle && GetGuestCapture(&ignored) == handle) ReleaseGuestCapture(&ignored);
+            invalidate();
+            if (clicked >= 0 && parent)
+            {
+                GuestHeaderNotification notification = {};
+                notification.header = GuestNotifyHeader{ handle, controlId, HeaderNotifyItemClickW };
+                notification.item = clicked;
+                notification.button = 0;
+                SendGuestMessage(parent, GuestAbi::WmNotify, static_cast<WPARAM>(controlId),
+                    reinterpret_cast<LPARAM>(&notification), nullptr);
+            }
+            return 0;
+        }
+        case GuestAbi::WmCaptureChanged:
+        {
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                changed = window->headerPressedItem >= 0;
+                window->headerPressedItem = -1;
+            }
+            if (changed) invalidate();
+            return 0;
+        }
+        default:
+            return 0;
+        }
+
+    case BuiltinControlKind::TreeView:
+    {
+        const auto notifyTreeSelection = [this, window](UINT code, ULONG_PTR oldToken, ULONG_PTR newToken, UINT action)
+        {
+            HWND parent = nullptr;
+            HWND handle = nullptr;
+            UINT_PTR controlId = 0;
+            TreeNode oldNode;
+            TreeNode newNode;
+            bool hasOld = false;
+            bool hasNew = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed) return static_cast<LRESULT>(0);
+                parent = window->parent;
+                handle = window->handle;
+                controlId = window->controlId;
+                const TreeNode* oldValue = FindTreeNode(window->treeNodes, oldToken);
+                const TreeNode* newValue = FindTreeNode(window->treeNodes, newToken);
+                if (oldValue) { oldNode = *oldValue; hasOld = true; }
+                if (newValue) { newNode = *newValue; hasNew = true; }
+            }
+            if (!parent) return static_cast<LRESULT>(0);
+            GuestTreeNotification notification = {};
+            notification.header = GuestNotifyHeader{ handle, controlId, code };
+            notification.action = action;
+            if (hasOld)
+            {
+                notification.oldItem.mask = TreeItemHandle | TreeItemState | TreeItemParam;
+                notification.oldItem.item = reinterpret_cast<HANDLE>(oldNode.token);
+                notification.oldItem.state = oldNode.state;
+                notification.oldItem.stateMask = 0xffffffffu;
+                notification.oldItem.itemData = oldNode.itemData;
+            }
+            if (hasNew)
+            {
+                notification.newItem.mask = TreeItemHandle | TreeItemState | TreeItemParam;
+                notification.newItem.item = reinterpret_cast<HANDLE>(newNode.token);
+                notification.newItem.state = newNode.state;
+                notification.newItem.stateMask = 0xffffffffu;
+                notification.newItem.itemData = newNode.itemData;
+            }
+            return SendGuestMessage(parent, GuestAbi::WmNotify, static_cast<WPARAM>(controlId),
+                reinterpret_cast<LPARAM>(&notification), nullptr);
+        };
+
+        if (message == GuestAbi::WmMouseWheel)
+        {
+            const short wheelDelta = static_cast<short>(HIWORD(wParam));
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const auto visible = VisibleTreeNodes(window->treeNodes);
+                if (visible.empty()) return 0;
+                size_t current = 0;
+                if (window->treeTopItem)
+                {
+                    const auto found = std::find_if(visible.begin(), visible.end(), [window](const VisibleTreeNode& item)
+                    { return item.token == window->treeTopItem; });
+                    if (found != visible.end()) current = static_cast<size_t>(found - visible.begin());
+                }
+                const int requested = static_cast<int>(current) +
+                    (wheelDelta > 0 ? -3 : wheelDelta < 0 ? 3 : 0);
+                const size_t next = static_cast<size_t>((std::max)(0,
+                    (std::min)(static_cast<int>(visible.size()) - 1, requested)));
+                changed = visible[next].token != window->treeTopItem;
+                window->treeTopItem = visible[next].token;
+            }
+            if (changed) invalidate();
+            return 0;
+        }
+
+        if (message == GuestAbi::WmLButtonDown || message == GuestAbi::WmKeyDown)
+        {
+            ULONG_PTR requested = 0;
+            ULONG_PTR previous = 0;
+            UINT action = message == GuestAbi::WmLButtonDown ? 1u : 2u;
+            bool toggled = false;
+            HWND handle = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || !window->enabled) return 0;
+                auto visible = VisibleTreeNodes(window->treeNodes);
+                size_t first = 0;
+                if (window->treeTopItem)
+                {
+                    const auto topFound = std::find_if(visible.begin(), visible.end(), [window](const VisibleTreeNode& item)
+                    { return item.token == window->treeTopItem; });
+                    if (topFound != visible.end()) first = static_cast<size_t>(topFound - visible.begin());
+                }
+                previous = window->treeSelectedItem;
+                if (message == GuestAbi::WmLButtonDown)
+                {
+                    const int x = static_cast<int>(static_cast<SHORT>(LOWORD(lParam)));
+                    const int y = static_cast<int>(static_cast<SHORT>(HIWORD(lParam)));
+                    const int row = y >= 0 && window->treeItemHeight > 0
+                        ? y / window->treeItemHeight : -1;
+                    const size_t index = row < 0 ? visible.size() : first + static_cast<size_t>(row);
+                    if (index >= visible.size()) return 0;
+                    requested = visible[index].token;
+                    TreeNode* node = FindTreeNode(window->treeNodes, requested);
+                    if (!node) return 0;
+                    const int branchLeft = visible[index].depth * window->treeIndent + 2;
+                    const bool hasChildren = node->declaredChildren != 0 ||
+                        std::any_of(window->treeNodes.begin(), window->treeNodes.end(), [requested](const TreeNode& candidate)
+                        { return candidate.parent == requested; });
+                    if (hasChildren && x >= branchLeft && x < branchLeft + window->treeIndent)
+                    {
+                        node->state ^= TreeStateExpanded;
+                        toggled = true;
+                    }
+                }
+                else
+                {
+                    const auto selected = std::find_if(visible.begin(), visible.end(), [previous](const VisibleTreeNode& item)
+                    { return item.token == previous; });
+                    size_t index = selected == visible.end() ? 0 : static_cast<size_t>(selected - visible.begin());
+                    if (visible.empty()) return 0;
+                    TreeNode* node = selected == visible.end() ? nullptr : FindTreeNode(window->treeNodes, previous);
+                    if (wParam == GuestAbi::VkUp)
+                        requested = visible[index == 0 ? 0 : index - 1].token;
+                    else if (wParam == GuestAbi::VkDown)
+                        requested = visible[(std::min)(visible.size() - 1, index + 1)].token;
+                    else if (wParam == GuestAbi::VkRight && node)
+                    {
+                        const auto child = std::find_if(window->treeNodes.begin(), window->treeNodes.end(),
+                            [previous](const TreeNode& candidate) { return candidate.parent == previous; });
+                        if (child != window->treeNodes.end())
+                        {
+                            if ((node->state & TreeStateExpanded) == 0)
+                            {
+                                node->state |= TreeStateExpanded;
+                                toggled = true;
+                            }
+                            else requested = child->token;
+                        }
+                    }
+                    else if (wParam == GuestAbi::VkLeft && node)
+                    {
+                        if ((node->state & TreeStateExpanded) != 0)
+                        {
+                            node->state &= ~TreeStateExpanded;
+                            toggled = true;
+                        }
+                        else requested = node->parent;
+                    }
+                    else if (wParam != GuestAbi::VkUp && wParam != GuestAbi::VkDown)
+                    {
+                        return 0;
+                    }
+                }
+                handle = window->handle;
+            }
+            if (toggled)
+            {
+                invalidate();
+                return 0;
+            }
+            if (!requested || requested == previous) return 0;
+            if (notifyTreeSelection(TreeNotifySelectionChangingW, previous, requested, action) != 0) return 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || !FindTreeNode(window->treeNodes, requested)) return 0;
+                for (auto& node : window->treeNodes) node.state &= ~TreeStateSelected;
+                TreeNode* node = FindTreeNode(window->treeNodes, requested);
+                node->state |= TreeStateSelected;
+                window->treeSelectedItem = requested;
+            }
+            SetGuestFocus(handle, nullptr);
+            invalidate();
+            notifyTreeSelection(TreeNotifySelectionChangedW, previous, requested, action);
+            return 0;
+        }
+        return 0;
+    }
+
+    case BuiltinControlKind::Tab:
+        if (message == GuestAbi::WmLButtonUp ||
+            (message == GuestAbi::WmKeyDown &&
+                (wParam == GuestAbi::VkLeft || wParam == GuestAbi::VkRight)))
+        {
+            HWND parent = nullptr;
+            HWND handle = nullptr;
+            UINT_PTR controlId = 0;
+            int requested = -1;
+            int previous = -1;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || !window->enabled || window->tabItems.empty()) return 0;
+                previous = window->tabSelectedItem;
+                if (message == GuestAbi::WmKeyDown)
+                {
+                    requested = previous < 0 ? 0 : previous +
+                        (wParam == GuestAbi::VkLeft ? -1 : 1);
+                    requested = (std::max)(0,
+                        (std::min)(static_cast<int>(window->tabItems.size()) - 1, requested));
+                }
+                else
+                {
+                    const int x = static_cast<int>(static_cast<WORD>(lParam & 0xffff));
+                    const int y = static_cast<int>(static_cast<WORD>(
+                        (static_cast<ULONG_PTR>(lParam) >> 16) & 0xffff));
+                    if (y < 1 || y >= 1 + window->tabItemHeight) return 0;
+                    int left = 1;
+                    for (size_t index = 0; index < window->tabItems.size(); ++index)
+                    {
+                        const int itemWidth = window->tabItemWidth > 0
+                            ? window->tabItemWidth
+                            : (std::max)(32, static_cast<int>((std::min)(
+                                window->tabItems[index].size(), static_cast<size_t>(128))) *
+                                MiniGdi::DefaultTextGlyphWidth + 16);
+                        if (x >= left && x < left + itemWidth)
+                        {
+                            requested = static_cast<int>(index);
+                            break;
+                        }
+                        left += itemWidth;
+                    }
+                }
+                parent = window->parent;
+                handle = window->handle;
+                controlId = window->controlId;
+            }
+            if (requested < 0 || requested == previous) return 0;
+            GuestNotifyHeader notification{ handle, controlId, TabNotifySelectionChanging };
+            if (parent && SendGuestMessage(parent, GuestAbi::WmNotify,
+                static_cast<WPARAM>(controlId), reinterpret_cast<LPARAM>(&notification), nullptr) != 0)
+            {
+                return 0;
+            }
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || static_cast<size_t>(requested) >= window->tabItems.size()) return 0;
+                window->tabSelectedItem = requested;
+                window->tabFocusedItem = requested;
+            }
+            SetGuestFocus(handle, nullptr);
+            invalidate();
+            if (parent)
+            {
+                notification.code = TabNotifySelectionChange;
+                SendGuestMessage(parent, GuestAbi::WmNotify,
+                    static_cast<WPARAM>(controlId), reinterpret_cast<LPARAM>(&notification), nullptr);
+            }
+            return 0;
+        }
+        return 0;
 
     case BuiltinControlKind::ComboBox:
         if (message == GuestAbi::WmLButtonDown)
@@ -6160,7 +9918,16 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     previousItem = window->listViewSelectedItem;
                     changed = previousItem != item;
+                    if (previousItem >= 0 &&
+                        static_cast<size_t>(previousItem) < window->listViewItemStates.size())
+                    {
+                        window->listViewItemStates[static_cast<size_t>(previousItem)] &=
+                            ~(ListViewStateSelected | ListViewStateFocused);
+                    }
+                    window->listViewItemStates[static_cast<size_t>(item)] |=
+                        ListViewStateSelected | ListViewStateFocused;
                     window->listViewSelectedItem = item;
+                    window->listViewSelectionMark = item;
                     window->listViewPressedItem = item;
                     const auto now = std::chrono::steady_clock::now();
                     activate = window->listViewLastClickItem == item &&
@@ -6239,9 +10006,27 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
             if (parent)
             {
+                LPARAM contextPosition = lParam;
+                HWND rootWindow = nullptr;
+                int rootWidth = 0;
+                int rootHeight = 0;
+                int targetWidth = 0;
+                int targetHeight = 0;
+                int targetLeft = 0;
+                int targetTop = 0;
+                if (GetGuestSurfaceGeometry(handle, &rootWindow, &rootWidth, &rootHeight,
+                    &targetWidth, &targetHeight, &targetLeft, &targetTop))
+                {
+                    const int clientX = static_cast<int>(static_cast<short>(lParam & 0xffff));
+                    const int clientY = static_cast<int>(static_cast<short>((lParam >> 16) & 0xffff));
+                    const int screenX = SaturatingAdd(targetLeft, clientX);
+                    const int screenY = SaturatingAdd(targetTop, clientY);
+                    contextPosition = GuestAbi::MakeMouseLParam(
+                        SignedCoordinateWord(screenX), SignedCoordinateWord(screenY));
+                }
                 RuntimeDiagnostics::Record(L"LISTVIEW: forwarding WM_CONTEXTMENU to its owner.");
                 SendGuestMessage(parent, GuestAbi::WmContextMenu,
-                    reinterpret_cast<WPARAM>(handle), lParam, nullptr);
+                    reinterpret_cast<WPARAM>(handle), contextPosition, nullptr);
             }
             return 0;
         }
@@ -6289,7 +10074,16 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 if (!activate)
                 {
                     changed = previousItem != item;
+                    if (previousItem >= 0 &&
+                        static_cast<size_t>(previousItem) < window->listViewItemStates.size())
+                    {
+                        window->listViewItemStates[static_cast<size_t>(previousItem)] &=
+                            ~(ListViewStateSelected | ListViewStateFocused);
+                    }
+                    window->listViewItemStates[static_cast<size_t>(item)] |=
+                        ListViewStateSelected | ListViewStateFocused;
                     window->listViewSelectedItem = item;
+                    window->listViewSelectionMark = item;
                     const int height = (std::max)(0, static_cast<int>(window->bounds.bottom - window->bounds.top));
                     const int rowsPerPage = (std::max)(1, (height - 24) / MiniGdi::DefaultTextGlyphHeight);
                     if (item < window->listViewTopItem)
@@ -6540,6 +10334,76 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         if (message == GuestAbi::WmSetFocus || message == GuestAbi::WmKillFocus || message == GuestAbi::WmEnable)
         {
             invalidate();
+        }
+        return 0;
+
+    case BuiltinControlKind::UpDown:
+        if (message == GuestAbi::WmLButtonUp ||
+            (message == GuestAbi::WmKeyDown &&
+                (wParam == GuestAbi::VkUp || wParam == GuestAbi::VkDown ||
+                    wParam == GuestAbi::VkLeft || wParam == GuestAbi::VkRight)))
+        {
+            HWND parent = nullptr;
+            HWND handle = nullptr;
+            HWND buddy = nullptr;
+            UINT_PTR controlId = 0;
+            int position = 0;
+            int delta = 0;
+            UINT numberBase = 10;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || !window->enabled) return 0;
+                const bool horizontal = (window->style & 0x0040u) != 0;
+                if (message == GuestAbi::WmKeyDown)
+                {
+                    delta = wParam == GuestAbi::VkUp || wParam == GuestAbi::VkRight ? 1 : -1;
+                }
+                else if (horizontal)
+                {
+                    const int x = static_cast<int>(static_cast<SHORT>(LOWORD(lParam)));
+                    delta = x >= window->surface.Width() / 2 ? 1 : -1;
+                }
+                else
+                {
+                    const int y = static_cast<int>(static_cast<SHORT>(HIWORD(lParam)));
+                    delta = y < window->surface.Height() / 2 ? 1 : -1;
+                }
+                parent = window->parent;
+                handle = window->handle;
+                buddy = window->upDownBuddy;
+                controlId = window->controlId;
+                position = window->upDownPosition;
+                numberBase = window->upDownBase;
+            }
+            GuestUpDownNotification notification = {};
+            notification.header = GuestNotifyHeader{ handle, controlId, UpDownNotifyDeltaPosition };
+            notification.position = position;
+            notification.delta = delta;
+            if (parent && SendGuestMessage(parent, GuestAbi::WmNotify,
+                static_cast<WPARAM>(controlId), reinterpret_cast<LPARAM>(&notification), nullptr) != 0)
+                return 0;
+            int current = position;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed) return 0;
+                const int low = (std::min)(window->upDownMinimum, window->upDownMaximum);
+                const int high = (std::max)(window->upDownMinimum, window->upDownMaximum);
+                const std::int64_t requested = static_cast<std::int64_t>(window->upDownPosition) + delta;
+                current = static_cast<int>((std::max)(static_cast<std::int64_t>(low),
+                    (std::min)(static_cast<std::int64_t>(high), requested)));
+                window->upDownPosition = current;
+            }
+            if (buddy)
+            {
+                wchar_t buffer[40] = {};
+                if (numberBase == 16) swprintf_s(buffer, L"%X", static_cast<unsigned int>(current));
+                else swprintf_s(buffer, L"%d", current);
+                SendGuestMessage(buddy, GuestAbi::WmSetText, 0,
+                    reinterpret_cast<LPARAM>(buffer), nullptr);
+            }
+            SetGuestFocus(handle, nullptr);
+            invalidate();
+            return 0;
         }
         return 0;
 
@@ -7258,10 +11122,10 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                             MiniGdi::Rect{ left, 1, (std::min)(composite.Width(), SaturatingAdd(left, itemWidth)), menuHeight - 1 },
                             MiniGdi::MakeColor(214, 226, 242));
                     }
-                    if ((item.state & 0x0002u) == 0)
-                    {
-                        m_gdi.TextOutW(menuDc, MiniGdi::Point{ left + 6, 3 }, caption.data(), caption.size(), nullptr);
-                    }
+                    m_gdi.SetTextColor(menuDc, IsMenuItemDisabled(item)
+                        ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::OpaqueBlack, nullptr);
+                    m_gdi.TextOutW(menuDc, MiniGdi::Point{ left + 6, 3 },
+                        caption.data(), caption.size(), nullptr);
                     left = SaturatingAdd(left, itemWidth);
                 }
                 m_gdi.DestroyDc(menuDc);
@@ -7317,71 +11181,25 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
         };
         composeChildren(root, 0, 0);
 
-        if (openMenuIndex >= 0 && static_cast<size_t>(openMenuIndex) < menuItems.size() &&
-            menuItems[static_cast<size_t>(openMenuIndex)].subMenu)
-        {
-            int popupLeft = 8;
-            for (int index = 0; index < openMenuIndex; ++index)
-            {
-                popupLeft = SaturatingAdd(popupLeft, MenuBarItemWidth(menuItems[static_cast<size_t>(index)]));
-            }
-            const std::vector<GuestMenuVisualItem> popupItems =
-                GetGuestMenuItems(menuItems[static_cast<size_t>(openMenuIndex)].subMenu);
-            const int rowHeight = 20;
-            const int popupHeight = (std::min)(static_cast<int>(popupItems.size()) * rowHeight,
-                (std::max)(0, composite.Height() - menuHeight));
-            const int popupRight = (std::min)(composite.Width(), SaturatingAdd(popupLeft, 220));
-            if (popupHeight > 0 && popupRight > popupLeft)
-            {
-                MiniGdi::DrawRectangle(composite,
-                    MiniGdi::Rect{ popupLeft, menuHeight, popupRight, SaturatingAdd(menuHeight, popupHeight) },
-                    MiniGdi::MakeColor(250, 250, 250), MiniGdi::MakeColor(96, 96, 96));
-                const MiniGdi::DcHandle popupDc = m_gdi.CreateDc(&composite);
-                if (popupDc != MiniGdi::InvalidDc)
-                {
-                    MiniGdi::Color ignored = MiniGdi::OpaqueBlack;
-                    m_gdi.SetTextColor(popupDc, MiniGdi::OpaqueBlack, &ignored);
-                    MiniGdi::BackgroundMode ignoredMode = MiniGdi::BackgroundMode::Opaque;
-                    m_gdi.SetBackgroundMode(popupDc, MiniGdi::BackgroundMode::Transparent, &ignoredMode);
-                    for (size_t index = 0; index < popupItems.size() &&
-                        static_cast<int>(index) * rowHeight < popupHeight; ++index)
-                    {
-                        const int top = SaturatingAdd(menuHeight, static_cast<int>(index) * rowHeight);
-                        const GuestMenuVisualItem& item = popupItems[index];
-                        if (item.identifier == 0 && item.text.empty())
-                        {
-                            MiniGdi::DrawLine(composite, MiniGdi::Point{ popupLeft + 4, top + rowHeight / 2 },
-                                MiniGdi::Point{ popupRight - 4, top + rowHeight / 2 }, MiniGdi::MakeColor(192, 192, 192));
-                        }
-                        else if ((item.state & 0x0002u) == 0)
-                        {
-                            const std::wstring caption = MenuCaptionForDisplay(item.text);
-                            m_gdi.TextOutW(popupDc, MiniGdi::Point{ popupLeft + 8, top + 2 },
-                                caption.data(), caption.size(), nullptr);
-                        }
-                    }
-                    m_gdi.DestroyDc(popupDc);
-                }
-            }
-        }
-
-        PopupMenuSession contextPopup;
+        PopupMenuSession activePopup;
         {
             std::lock_guard<std::mutex> guard(m_popupMenuLock);
-            contextPopup = m_popupMenu;
+            activePopup = m_popupMenu;
         }
-        if (contextPopup.open && contextPopup.root == snapshots[root].handle)
+        if (activePopup.open && activePopup.root == snapshots[root].handle)
         {
-            const std::vector<GuestMenuVisualItem> popupItems = GetGuestMenuItems(contextPopup.menu);
             const int rowHeight = 20;
-            const int popupHeight = (std::min)(static_cast<int>(popupItems.size()) * rowHeight,
-                (std::max)(0, composite.Height() - contextPopup.top));
-            const int popupRight = (std::min)(composite.Width(), SaturatingAdd(contextPopup.left, 220));
-            if (popupHeight > 0 && popupRight > contextPopup.left)
+            for (const PopupMenuLevel& level : activePopup.levels)
             {
+                const std::vector<GuestMenuVisualItem> popupItems = GetGuestMenuItems(level.menu);
+                const int popupWidth = PopupMenuWidth(popupItems);
+                const int popupHeight = (std::min)(static_cast<int>(popupItems.size()) * rowHeight,
+                    (std::max)(0, composite.Height() - level.top));
+                const int popupRight = (std::min)(composite.Width(), SaturatingAdd(level.left, popupWidth));
+                if (popupHeight <= 0 || popupRight <= level.left) continue;
                 MiniGdi::DrawRectangle(composite,
-                    MiniGdi::Rect{ contextPopup.left, contextPopup.top, popupRight,
-                        SaturatingAdd(contextPopup.top, popupHeight) },
+                    MiniGdi::Rect{ level.left, level.top, popupRight,
+                        SaturatingAdd(level.top, popupHeight) },
                     MiniGdi::MakeColor(250, 250, 250), MiniGdi::MakeColor(72, 72, 72));
                 const MiniGdi::DcHandle popupDc = m_gdi.CreateDc(&composite);
                 if (popupDc != MiniGdi::InvalidDc)
@@ -7394,17 +11212,63 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                         static_cast<int>(index) * rowHeight < popupHeight; ++index)
                     {
                         const GuestMenuVisualItem& item = popupItems[index];
-                        const int top = SaturatingAdd(contextPopup.top, static_cast<int>(index) * rowHeight);
-                        if (item.identifier == 0 && item.text.empty())
+                        const int top = SaturatingAdd(level.top, static_cast<int>(index) * rowHeight);
+                        if (static_cast<int>(index) == level.hotItem &&
+                            !IsMenuItemSeparator(item) && !IsMenuItemDisabled(item))
                         {
-                            MiniGdi::DrawLine(composite, MiniGdi::Point{ contextPopup.left + 4, top + rowHeight / 2 },
+                            MiniGdi::FillRect(composite,
+                                MiniGdi::Rect{ level.left + 1, top + 1, popupRight - 1, top + rowHeight - 1 },
+                                MiniGdi::MakeColor(214, 226, 242));
+                        }
+                        if (IsMenuItemSeparator(item))
+                        {
+                            MiniGdi::DrawLine(composite, MiniGdi::Point{ level.left + 4, top + rowHeight / 2 },
                                 MiniGdi::Point{ popupRight - 4, top + rowHeight / 2 }, MiniGdi::MakeColor(192, 192, 192));
                         }
-                        else if ((item.state & 0x0002u) == 0)
+                        else
                         {
-                            const std::wstring caption = MenuCaptionForDisplay(item.text);
-                            m_gdi.TextOutW(popupDc, MiniGdi::Point{ contextPopup.left + 8, top + 2 },
+                            m_gdi.SetTextColor(popupDc, IsMenuItemDisabled(item)
+                                ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::OpaqueBlack, nullptr);
+                            if ((item.state & MenuFlagChecked) != 0)
+                            {
+                                const MiniGdi::Color mark = IsMenuItemDisabled(item)
+                                    ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::MakeColor(32, 32, 32);
+                                MiniGdi::DrawLine(composite,
+                                    MiniGdi::Point{ level.left + 7, top + 10 },
+                                    MiniGdi::Point{ level.left + 10, top + 13 }, mark);
+                                MiniGdi::DrawLine(composite,
+                                    MiniGdi::Point{ level.left + 10, top + 13 },
+                                    MiniGdi::Point{ level.left + 15, top + 6 }, mark);
+                            }
+                            std::wstring caption = MenuCaptionForDisplay(item.text);
+                            std::wstring accelerator;
+                            const size_t tab = caption.find(L'\t');
+                            if (tab != std::wstring::npos)
+                            {
+                                accelerator = caption.substr(tab + 1);
+                                caption.erase(tab);
+                            }
+                            m_gdi.TextOutW(popupDc, MiniGdi::Point{ level.left + 24, top + 2 },
                                 caption.data(), caption.size(), nullptr);
+                            if (!accelerator.empty())
+                            {
+                                const int acceleratorWidth = static_cast<int>((std::min)(
+                                    accelerator.size(), static_cast<size_t>(40))) * MiniGdi::DefaultTextGlyphWidth;
+                                m_gdi.TextOutW(popupDc,
+                                    MiniGdi::Point{ (std::max)(level.left + 24,
+                                        popupRight - acceleratorWidth - (item.subMenu ? 20 : 8)), top + 2 },
+                                    accelerator.data(), accelerator.size(), nullptr);
+                            }
+                            if (item.subMenu)
+                            {
+                                const MiniGdi::Color arrow = IsMenuItemDisabled(item)
+                                    ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::MakeColor(48, 48, 48);
+                                const int arrowX = popupRight - 10;
+                                MiniGdi::DrawLine(composite, MiniGdi::Point{ arrowX - 2, top + 6 },
+                                    MiniGdi::Point{ arrowX + 2, top + 10 }, arrow);
+                                MiniGdi::DrawLine(composite, MiniGdi::Point{ arrowX + 2, top + 10 },
+                                    MiniGdi::Point{ arrowX - 2, top + 14 }, arrow);
+                            }
                         }
                     }
                     m_gdi.DestroyDc(popupDc);
@@ -7467,6 +11331,42 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
     }
 }
 
+DWORD GuestWindowManager::InvokePointerInput(GuestWindowManager* manager, PointerEventArgs^ args, UINT message)
+{
+    PointerInputCall call{ manager, args, message };
+    return InvokeSehProtected(&GuestWindowManager::InvokePointerInputThunk, &call);
+}
+
+DWORD GuestWindowManager::InvokeWheelInput(GuestWindowManager* manager, PointerEventArgs^ args)
+{
+    WheelInputCall call{ manager, args };
+    return InvokeSehProtected(&GuestWindowManager::InvokeWheelInputThunk, &call);
+}
+
+DWORD GuestWindowManager::InvokeKeyInput(GuestWindowManager* manager, KeyEventArgs^ args, UINT message)
+{
+    KeyInputCall call{ manager, args, message };
+    return InvokeSehProtected(&GuestWindowManager::InvokeKeyInputThunk, &call);
+}
+
+void GuestWindowManager::InvokePointerInputThunk(void* context)
+{
+    const auto* call = static_cast<PointerInputCall*>(context);
+    call->manager->HandlePointer(call->args, call->message);
+}
+
+void GuestWindowManager::InvokeWheelInputThunk(void* context)
+{
+    const auto* call = static_cast<WheelInputCall*>(context);
+    call->manager->HandleWheel(call->args);
+}
+
+void GuestWindowManager::InvokeKeyInputThunk(void* context)
+{
+    const auto* call = static_cast<KeyInputCall*>(context);
+    call->manager->HandleKey(call->args, call->message);
+}
+
 void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMessage)
 {
     try
@@ -7490,10 +11390,19 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         {
         case PointerUpdateKind::LeftButtonPressed: menuMessage = GuestAbi::WmLButtonDown; break;
         case PointerUpdateKind::LeftButtonReleased: menuMessage = GuestAbi::WmLButtonUp; break;
+        case PointerUpdateKind::RightButtonPressed: menuMessage = GuestAbi::WmRButtonDown; break;
+        case PointerUpdateKind::RightButtonReleased: menuMessage = GuestAbi::WmRButtonUp; break;
+        case PointerUpdateKind::MiddleButtonPressed: menuMessage = GuestAbi::WmMButtonDown; break;
+        case PointerUpdateKind::MiddleButtonReleased: menuMessage = GuestAbi::WmMButtonUp; break;
         default: menuMessage = GuestAbi::WmMouseMove; break;
         }
     }
-    const HWND menuForeground = reinterpret_cast<HWND>(m_foregroundWindow.load());
+    HWND menuForeground = reinterpret_cast<HWND>(m_foregroundWindow.load());
+    {
+        std::lock_guard<std::mutex> guard(m_popupMenuLock);
+        if (m_popupMenu.open && m_popupMenu.root)
+            menuForeground = m_popupMenu.root;
+    }
     HWND menuRoot = nullptr;
     int menuRootWidth = 0;
     int menuRootHeight = 0;
@@ -7502,10 +11411,10 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         &ignoredDimension, &ignoredDimension, &ignoredDimension, &ignoredDimension))
     {
         const LPARAM menuPosition = MousePosition(menuRootWidth, menuRootHeight, menuRootWidth,
-            menuRootHeight, 0, 0, point->Position, m_surfaceImage.Get());
+            menuRootHeight, 0, 0, point->Position, m_surfaceImage.Get(), false);
         if (HandleGuestMenuPointer(menuRoot,
-            static_cast<int>(static_cast<WORD>(menuPosition & 0xffff)),
-            static_cast<int>(static_cast<WORD>((menuPosition >> 16) & 0xffff)), menuMessage))
+            static_cast<int>(static_cast<short>(menuPosition & 0xffff)),
+            static_cast<int>(static_cast<short>((menuPosition >> 16) & 0xffff)), menuMessage))
         {
             return;
         }
@@ -7530,6 +11439,10 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
             {
             case PointerUpdateKind::LeftButtonPressed: menuMessage = GuestAbi::WmLButtonDown; break;
             case PointerUpdateKind::LeftButtonReleased: menuMessage = GuestAbi::WmLButtonUp; break;
+            case PointerUpdateKind::RightButtonPressed: menuMessage = GuestAbi::WmRButtonDown; break;
+            case PointerUpdateKind::RightButtonReleased: menuMessage = GuestAbi::WmRButtonUp; break;
+            case PointerUpdateKind::MiddleButtonPressed: menuMessage = GuestAbi::WmMButtonDown; break;
+            case PointerUpdateKind::MiddleButtonReleased: menuMessage = GuestAbi::WmMButtonUp; break;
             default: menuMessage = GuestAbi::WmMouseMove; break;
             }
         }
@@ -7752,6 +11665,51 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
     if (!m_active.load() || !m_inputEnabled.load() || !args)
     {
         return;
+    }
+    if (message == GuestAbi::WmKeyDown &&
+        static_cast<WPARAM>(args->VirtualKey) == GuestAbi::VkEscape)
+    {
+        PopupMenuSession popup;
+        bool closed = false;
+        bool collapsedSubMenu = false;
+        {
+            std::lock_guard<std::mutex> guard(m_popupMenuLock);
+            if (m_popupMenu.open)
+            {
+                if (m_popupMenu.levels.size() > 1)
+                {
+                    m_popupMenu.levels.pop_back();
+                    collapsedSubMenu = true;
+                }
+                else
+                {
+                    m_popupMenu.selectedCommand = 0;
+                    m_popupMenu.open = false;
+                    closed = true;
+                }
+                popup = m_popupMenu;
+            }
+        }
+        if (closed || collapsedSubMenu)
+        {
+            if (closed)
+            {
+                const auto root = FindWindow(popup.root);
+                if (root)
+                {
+                    std::lock_guard<std::mutex> guard(root->lock);
+                    if (!root->destroyed) root->openMenuIndex = -1;
+                }
+                if (popup.owner)
+                {
+                    SendGuestMessage(popup.owner, GuestAbi::WmMenuSelect,
+                        GuestAbi::MakeCommandWParam(0, 0xffff), 0, nullptr);
+                }
+                m_popupMenuChanged.notify_all();
+            }
+            InvalidateGuestRect(popup.root, nullptr, FALSE, nullptr);
+            return;
+        }
     }
     HWND target = reinterpret_cast<HWND>(m_focusWindow.load());
     if (!target)

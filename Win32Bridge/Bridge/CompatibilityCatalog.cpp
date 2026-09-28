@@ -190,7 +190,7 @@ ImportResolution CompatibilityCatalog::Resolve(const ImportedSymbol& symbol)
     const std::wstring name = Lowercase(symbol.name);
     if (IsUserFamily(library) && name == L"messageboxw")
     {
-        return { ImportDisposition::NeedsBridge, L"UI adapter: translate to a UWP ContentDialog on the host UI thread." };
+        return { ImportDisposition::NeedsBridge, L"UI adapter: create a native guest dialog on the MiniGDI surface." };
     }
 
     if (IsUserFamily(library) && name == L"getcursorpos")

@@ -179,6 +179,7 @@ namespace GuestAbi
     constexpr UINT WmTimer = 0x0113;
     constexpr UINT WmInitMenu = 0x0116;
     constexpr UINT WmInitMenuPopup = 0x0117;
+    constexpr UINT WmMenuSelect = 0x011F;
     constexpr UINT WmMouseMove = 0x0200;
     constexpr UINT WmLButtonDown = 0x0201;
     constexpr UINT WmLButtonUp = 0x0202;
@@ -241,6 +242,7 @@ namespace GuestAbi
     constexpr WORD EnChange = 0x0300;
 
     constexpr WPARAM VkBack = 0x08;
+    constexpr WPARAM VkEscape = 0x1b;
     constexpr WPARAM VkReturn = 0x0d;
     constexpr WPARAM VkSpace = 0x20;
     constexpr WPARAM VkEnd = 0x23;

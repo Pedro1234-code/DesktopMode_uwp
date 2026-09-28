@@ -9,8 +9,8 @@ namespace Win32Bridge
 {
 namespace Bridge
 {
-    // A synchronous Win32 ABI adapter. Guest execution must occur on a worker
-    // thread, while the adapter marshals presentation onto the UWP UI thread.
+    // A synchronous Win32 ABI adapter. Message boxes are instantiated as
+    // ordinary guest dialog/control records and rendered by MiniGDI.
     int WINAPI BridgeMessageBoxW(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type);
     BOOL WINAPI BridgeGetCursorPos(LPPOINT point);
     SHORT WINAPI BridgeGetAsyncKeyState(int virtualKey);

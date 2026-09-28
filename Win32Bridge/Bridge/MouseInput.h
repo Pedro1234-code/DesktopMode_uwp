@@ -56,6 +56,8 @@ namespace Bridge
         // removal has UI-thread affinity, so this snapshots the old
         // attachment and dispatches removal when the caller is a worker.
         void DetachLocked();
+        static DWORD InvokeUpdate(MouseInputBridge* bridge, Windows::UI::Input::PointerPoint^ point, int wheelDelta);
+        static void InvokeUpdateThunk(void* context);
         void Update(Windows::UI::Input::PointerPoint^ point, int wheelDelta);
         static unsigned int ButtonMaskForVirtualKey(int virtualKey);
 

@@ -141,17 +141,60 @@ bool Win32Bridge::Bridge::CopyGuestImageListImage(GuestImageList imageList, int 
     *destination = found->second.images[static_cast<size_t>(index)];
     return true;
 }
-HWND WINAPI Win32Bridge::Bridge::BridgeCreateToolbarEx(HWND parent, DWORD style, UINT identifier, int, HINSTANCE instance, UINT_PTR, const void*, int, int, int, int, int, UINT)
+HWND WINAPI Win32Bridge::Bridge::BridgeCreateToolbarEx(
+    HWND parent,
+    DWORD style,
+    UINT identifier,
+    int,
+    HINSTANCE instance,
+    UINT_PTR,
+    const void* buttons,
+    int buttonCount,
+    int buttonWidth,
+    int buttonHeight,
+    int bitmapWidth,
+    int bitmapHeight,
+    UINT structureSize)
 {
     GuestWindowManager* manager = CurrentGuestWindowManager();
     DWORD error = ERROR_SUCCESS;
-    return manager ? manager->CreateGuestWindow(0, L"static", L"", style | WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, parent, reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(identifier)), instance, nullptr, &error) : nullptr;
+    if (!manager)
+    {
+        return nullptr;
+    }
+    const HWND toolbar = manager->CreateGuestWindow(0, L"ToolbarWindow32", L"",
+        style | WS_CHILD | WS_VISIBLE, 0, 0, 100, 26, parent,
+        reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(identifier)), instance, nullptr, &error);
+    if (!toolbar)
+    {
+        return nullptr;
+    }
+    manager->SendGuestMessage(toolbar, 0x041e, structureSize, 0, nullptr); // TB_BUTTONSTRUCTSIZE
+    if (buttonWidth > 0 && buttonHeight > 0)
+    {
+        manager->SendGuestMessage(toolbar, 0x041f, 0,
+            MAKELPARAM(buttonWidth, buttonHeight), nullptr); // TB_SETBUTTONSIZE
+    }
+    if (bitmapWidth > 0 && bitmapHeight > 0)
+    {
+        manager->SendGuestMessage(toolbar, 0x0420, 0,
+            MAKELPARAM(bitmapWidth, bitmapHeight), nullptr); // TB_SETBITMAPSIZE
+    }
+    if (buttons && buttonCount > 0)
+    {
+        manager->SendGuestMessage(toolbar, 0x0444,
+            static_cast<WPARAM>(buttonCount), reinterpret_cast<LPARAM>(buttons), nullptr); // TB_ADDBUTTONSW
+    }
+    manager->SendGuestMessage(toolbar, 0x0421, 0, 0, nullptr); // TB_AUTOSIZE
+    return toolbar;
 }
 HWND WINAPI Win32Bridge::Bridge::BridgeCreateStatusWindowW(LONG style, LPCWSTR text, HWND parent, UINT identifier)
 {
     GuestWindowManager* manager = CurrentGuestWindowManager();
     DWORD error = ERROR_SUCCESS;
-    return manager ? manager->CreateGuestWindow(0, L"static", text ? text : L"", static_cast<DWORD>(style) | WS_CHILD | WS_VISIBLE, 0, 0, 1, 1, parent, reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(identifier)), nullptr, nullptr, &error) : nullptr;
+    return manager ? manager->CreateGuestWindow(0, L"msctls_statusbar32", text ? text : L"",
+        static_cast<DWORD>(style) | WS_CHILD | WS_VISIBLE, 0, 0, 100, 22, parent,
+        reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(identifier)), nullptr, nullptr, &error) : nullptr;
 }
 INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void*) { return -1; }
 HRESULT WINAPI Win32Bridge::Bridge::BridgeDllGetVersion(GuestDllVersionInfo* versionInfo)

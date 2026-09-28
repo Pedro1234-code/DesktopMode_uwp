@@ -10,6 +10,7 @@
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
@@ -55,6 +56,51 @@ namespace
             return MiniGdi::InvalidObject;
         }
         return static_cast<MiniGdi::ObjectHandle>(raw);
+    }
+
+    // CallWindowProcW is also a guest-to-guest callback. Keep the SEH scope
+    // free of C++ objects so a broken subclass procedure cannot terminate the
+    // UWP host while handling a navigation/control notification.
+    LRESULT InvokeGuestSubclassProcedure(
+        GuestAbi::WndProc procedure,
+        HWND window,
+        UINT message,
+        WPARAM wParam,
+        LPARAM lParam,
+        DWORD* exceptionCode)
+    {
+        if (exceptionCode)
+        {
+            *exceptionCode = ERROR_SUCCESS;
+        }
+        __try
+        {
+            return procedure(window, message, wParam, lParam);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (exceptionCode)
+            {
+                *exceptionCode = GetExceptionCode();
+            }
+            return 0;
+        }
+    }
+
+    bool ReadGuestMessageValue(
+        const GuestAbi::Message* source,
+        GuestAbi::Message* destination)
+    {
+        if (!source || !destination) return false;
+        __try
+        {
+            *destination = *source;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 
     bool IsGuestSystemColor(int color)
@@ -251,6 +297,42 @@ namespace
         HBITMAP hbmpItem;
     };
 
+    constexpr size_t GuestMenuItemInfoLegacySize = offsetof(GuestMenuItemInfoW, hbmpItem);
+
+    bool ReadGuestMenuItemInfo(const void* source, GuestMenuItemInfoW* destination)
+    {
+        if (!source || !destination || reinterpret_cast<ULONG_PTR>(source) <= 0xffff) return false;
+        __try
+        {
+            const UINT size = *static_cast<const UINT*>(source);
+            if (size < GuestMenuItemInfoLegacySize) return false;
+            memset(destination, 0, sizeof(*destination));
+            memcpy(destination, source, (std::min)(static_cast<size_t>(size), sizeof(*destination)));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    bool WriteGuestMenuItemInfo(void* destination, const GuestMenuItemInfoW& source)
+    {
+        if (!destination || reinterpret_cast<ULONG_PTR>(destination) <= 0xffff) return false;
+        __try
+        {
+            const UINT size = *static_cast<const UINT*>(destination);
+            if (size < GuestMenuItemInfoLegacySize) return false;
+            memcpy(destination, &source,
+                (std::min)(static_cast<size_t>(size), sizeof(source)));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        return true;
+    }
+
     struct GuestWindowPlacement
     {
         UINT length;
@@ -277,8 +359,12 @@ namespace
 
     constexpr UINT kMfByPosition = 0x0400;
     constexpr UINT kMfPopup = 0x0010;
+    constexpr UINT kMfGrayed = 0x0001;
     constexpr UINT kMfChecked = 0x0008;
     constexpr UINT kMfDisabled = 0x0002;
+    constexpr UINT kMfHighlighted = 0x0080;
+    constexpr UINT kMfDefault = 0x1000;
+    constexpr UINT kMfSeparator = 0x0800;
     constexpr UINT kMiimState = 0x0001;
     constexpr UINT kMiimId = 0x0002;
     constexpr UINT kMiimSubmenu = 0x0004;
@@ -287,6 +373,65 @@ namespace
     constexpr UINT kMiimType = 0x0010;
     constexpr UINT kMiimFtype = 0x0100;
     constexpr UINT kMiimString = 0x0040;
+
+    bool ProbeGuestMenuText(LPCWSTR source, size_t maximum, size_t* length)
+    {
+        if (!length)
+        {
+            return false;
+        }
+        *length = 0;
+        if (!source || reinterpret_cast<ULONG_PTR>(source) <= 0xffff)
+        {
+            return source == nullptr;
+        }
+        __try
+        {
+            while (*length < maximum && source[*length] != L'\0') ++*length;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            *length = 0;
+            return false;
+        }
+        return *length < maximum;
+    }
+
+    bool CopyGuestMenuText(LPWSTR destination, size_t capacity, const std::wstring& source)
+    {
+        if (!destination || capacity == 0 || reinterpret_cast<ULONG_PTR>(destination) <= 0xffff)
+        {
+            return false;
+        }
+        const size_t count = (std::min)(source.size(), capacity - 1);
+        __try
+        {
+            if (count) memcpy(destination, source.data(), count * sizeof(wchar_t));
+            destination[count] = L'\0';
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        return true;
+    }
+
+    bool CopyGuestMenuCharacters(LPCWSTR source, wchar_t* destination, size_t count)
+    {
+        if (!source || !destination || reinterpret_cast<ULONG_PTR>(source) <= 0xffff)
+        {
+            return false;
+        }
+        __try
+        {
+            if (count) memcpy(destination, source, count * sizeof(wchar_t));
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+        return true;
+    }
 
     std::wstring ReadGuestMenuText(const GuestMenuItemInfoW& source)
     {
@@ -298,8 +443,23 @@ namespace
         // cch is a retrieval-buffer size in several otherwise-valid menu
         // construction paths.  A zero value therefore means that dwTypeData
         // is the usual NUL-terminated menu caption, not an empty caption.
-        return source.cch ? std::wstring(source.dwTypeData, source.cch) :
-            std::wstring(source.dwTypeData);
+        constexpr size_t MaximumMenuTextLength = 32768;
+        const size_t requested = source.cch
+            ? (std::min)(static_cast<size_t>(source.cch), MaximumMenuTextLength)
+            : MaximumMenuTextLength;
+        size_t length = 0;
+        if (!ProbeGuestMenuText(source.dwTypeData, requested, &length))
+        {
+            // MIIM_STRING setters may provide cch without a trailing NUL. In
+            // that form the explicit count is authoritative, but the memory
+            // still has to be readable before it enters std::wstring.
+            if (!source.cch || length != requested)
+                return {};
+        }
+        std::vector<wchar_t> characters(length);
+        if (characters.empty()) return {};
+        if (length && !CopyGuestMenuCharacters(source.dwTypeData, characters.data(), length)) return {};
+        return std::wstring(characters.data(), characters.size());
     }
 
     std::mutex g_menuLock;
@@ -1629,9 +1789,9 @@ int WINAPI Win32Bridge::Bridge::BridgeDrawTextW(HDC dc, LPWSTR text, int charact
     return extent.height;
 }
 
-int WINAPI Win32Bridge::Bridge::BridgeLoadStringW(HINSTANCE, UINT identifier, LPWSTR buffer, int bufferCount)
+int WINAPI Win32Bridge::Bridge::BridgeLoadStringW(HINSTANCE instance, UINT identifier, LPWSTR buffer, int bufferCount)
 {
-    const int result = LoadGuestStringResource(identifier, buffer, bufferCount);
+    const int result = LoadGuestStringResource(instance, identifier, buffer, bufferCount);
     BridgeSetLastError(result >= 0 ? ERROR_SUCCESS : ERROR_RESOURCE_NAME_NOT_FOUND);
     return result;
 }
@@ -1692,12 +1852,11 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeMapDialogRect(HWND dialog, LPRECT rect)
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    // Standard dialog units are based on a 4x8 base unit.  MiniGDI currently
-    // uses that stable baseline until font-specific dialog metrics are added.
-    rect->left = (rect->left * 4) / 4;
-    rect->right = (rect->right * 4) / 4;
-    rect->top = (rect->top * 8) / 8;
-    rect->bottom = (rect->bottom * 8) / 8;
+    if (!MapGuestDialogRect(dialog, rect))
+    {
+        BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -1817,14 +1976,26 @@ HMENU WINAPI Win32Bridge::Bridge::BridgeCreatePopupMenu()
 BOOL WINAPI Win32Bridge::Bridge::BridgeDestroyMenu(HMENU menu)
 {
     std::lock_guard<std::mutex> guard(g_menuLock);
-    if (g_menus.erase(reinterpret_cast<ULONG_PTR>(menu)) == 0)
+    VirtualMenu* root = FindMenuLocked(menu);
+    if (!root)
     {
         BridgeSetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
+    std::vector<HMENU> pending{ menu };
+    for (size_t index = 0; index < pending.size(); ++index)
+    {
+        VirtualMenu* current = FindMenuLocked(pending[index]);
+        if (!current) continue;
+        for (const auto& item : current->items)
+            if (item.subMenu && std::find(pending.begin(), pending.end(), item.subMenu) == pending.end())
+                pending.push_back(item.subMenu);
+    }
+    for (HMENU current : pending) g_menus.erase(reinterpret_cast<ULONG_PTR>(current));
     for (auto iterator = g_windowMenus.begin(); iterator != g_windowMenus.end();)
     {
-        if (iterator->second == menu) iterator = g_windowMenus.erase(iterator);
+        if (std::find(pending.begin(), pending.end(), iterator->second) != pending.end())
+            iterator = g_windowMenus.erase(iterator);
         else ++iterator;
     }
     BridgeSetLastError(ERROR_SUCCESS);
@@ -1841,11 +2012,16 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeAppendMenuW(HMENU menu, UINT flags, UINT_
         return FALSE;
     }
     VirtualMenuItem item;
-    item.identifier = static_cast<UINT>(identifier);
+    item.identifier = (flags & kMfPopup) ? 0 : static_cast<UINT>(identifier);
     item.type = flags;
-    item.state = flags & (kMfChecked | kMfDisabled);
+    item.state = flags & (kMfGrayed | kMfDisabled | kMfChecked | kMfHighlighted | kMfDefault);
     item.subMenu = (flags & kMfPopup) ? reinterpret_cast<HMENU>(identifier) : nullptr;
-    if (text) item.text = text;
+    if (text)
+    {
+        GuestMenuItemInfoW source = {};
+        source.dwTypeData = const_cast<LPWSTR>(text);
+        item.text = ReadGuestMenuText(source);
+    }
     destination->items.push_back(std::move(item));
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
@@ -1853,12 +2029,14 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeAppendMenuW(HMENU menu, UINT flags, UINT_
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeInsertMenuItemW(HMENU menu, UINT item, BOOL byPosition, const void* itemInfo)
 {
-    const auto* source = static_cast<const GuestMenuItemInfoW*>(itemInfo);
-    if (!source || source->cbSize < sizeof(GuestMenuItemInfoW))
+    GuestMenuItemInfoW sourceValue = {};
+    if (!ReadGuestMenuItemInfo(itemInfo, &sourceValue) ||
+        sourceValue.cbSize < GuestMenuItemInfoLegacySize)
     {
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    const auto* source = &sourceValue;
     std::lock_guard<std::mutex> guard(g_menuLock);
     VirtualMenu* destination = FindMenuLocked(menu);
     if (!destination)
@@ -1872,7 +2050,18 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeInsertMenuItemW(HMENU menu, UINT item, BO
     entry.state = source->fState;
     entry.subMenu = source->hSubMenu;
     if (source->fMask & (kMiimString | kMiimType)) entry.text = ReadGuestMenuText(*source);
-    const size_t insertion = byPosition ? (std::min)(static_cast<size_t>(item), destination->items.size()) : destination->items.size();
+    size_t insertion = destination->items.size();
+    if (byPosition)
+    {
+        insertion = (std::min)(static_cast<size_t>(item), destination->items.size());
+    }
+    else if (item != static_cast<UINT>(-1))
+    {
+        const auto before = std::find_if(destination->items.begin(), destination->items.end(),
+            [item](const VirtualMenuItem& candidate) { return candidate.identifier == item; });
+        if (before == destination->items.end()) return FALSE;
+        insertion = static_cast<size_t>(before - destination->items.begin());
+    }
     destination->items.insert(destination->items.begin() + insertion, std::move(entry));
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
@@ -1888,8 +2077,10 @@ int WINAPI Win32Bridge::Bridge::BridgeGetMenuItemCount(HMENU menu)
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetMenuItemInfoW(HMENU menu, UINT item, BOOL byPosition, void* itemInfo)
 {
-    auto* result = static_cast<GuestMenuItemInfoW*>(itemInfo);
-    if (!result || result->cbSize < sizeof(GuestMenuItemInfoW)) return FALSE;
+    GuestMenuItemInfoW resultValue = {};
+    if (!ReadGuestMenuItemInfo(itemInfo, &resultValue) ||
+        resultValue.cbSize < GuestMenuItemInfoLegacySize) return FALSE;
+    auto* result = &resultValue;
     std::lock_guard<std::mutex> guard(g_menuLock);
     VirtualMenu* source = FindMenuLocked(menu);
     VirtualMenuItem* entry = source ? FindMenuItemLocked(*source, item, byPosition) : nullptr;
@@ -1897,24 +2088,24 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetMenuItemInfoW(HMENU menu, UINT item, B
     if (result->fMask & kMiimState) result->fState = entry->state;
     if (result->fMask & kMiimId) result->wID = entry->identifier;
     if (result->fMask & kMiimSubmenu) result->hSubMenu = entry->subMenu;
-    if (result->fMask & kMiimFtype) result->fType = entry->type;
+    if (result->fMask & (kMiimFtype | kMiimType)) result->fType = entry->type;
     if (result->fMask & (kMiimString | kMiimType))
     {
         if (result->dwTypeData && result->cch)
         {
-            const size_t copyCount = (std::min)(entry->text.size(), static_cast<size_t>(result->cch - 1));
-            memcpy(result->dwTypeData, entry->text.data(), copyCount * sizeof(wchar_t));
-            result->dwTypeData[copyCount] = L'\0';
+            if (!CopyGuestMenuText(result->dwTypeData, result->cch, entry->text)) return FALSE;
         }
         result->cch = static_cast<UINT>(entry->text.size());
     }
-    return TRUE;
+    return WriteGuestMenuItemInfo(itemInfo, resultValue) ? TRUE : FALSE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeSetMenuItemInfoW(HMENU menu, UINT item, BOOL byPosition, const void* itemInfo)
 {
-    const auto* update = static_cast<const GuestMenuItemInfoW*>(itemInfo);
-    if (!update || update->cbSize < sizeof(GuestMenuItemInfoW)) return FALSE;
+    GuestMenuItemInfoW updateValue = {};
+    if (!ReadGuestMenuItemInfo(itemInfo, &updateValue) ||
+        updateValue.cbSize < GuestMenuItemInfoLegacySize) return FALSE;
+    const auto* update = &updateValue;
     std::lock_guard<std::mutex> guard(g_menuLock);
     VirtualMenu* destination = FindMenuLocked(menu);
     VirtualMenuItem* entry = destination ? FindMenuItemLocked(*destination, item, byPosition) : nullptr;
@@ -1922,7 +2113,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeSetMenuItemInfoW(HMENU menu, UINT item, B
     if (update->fMask & kMiimState) entry->state = update->fState;
     if (update->fMask & kMiimId) entry->identifier = update->wID;
     if (update->fMask & kMiimSubmenu) entry->subMenu = update->hSubMenu;
-    if (update->fMask & kMiimFtype) entry->type = update->fType;
+    if (update->fMask & (kMiimFtype | kMiimType)) entry->type = update->fType;
     if (update->fMask & (kMiimString | kMiimType)) entry->text = ReadGuestMenuText(*update);
     return TRUE;
 }
@@ -1934,7 +2125,8 @@ UINT WINAPI Win32Bridge::Bridge::BridgeEnableMenuItem(HMENU menu, UINT item, UIN
     VirtualMenuItem* entry = destination ? FindMenuItemLocked(*destination, item, (flags & kMfByPosition) != 0) : nullptr;
     if (!entry) return static_cast<UINT>(-1);
     const UINT previous = entry->state;
-    entry->state = (entry->state & ~kMfDisabled) | (flags & kMfDisabled);
+    entry->state = (entry->state & ~(kMfGrayed | kMfDisabled)) |
+        (flags & (kMfGrayed | kMfDisabled));
     return previous;
 }
 
@@ -2021,6 +2213,7 @@ Win32Bridge::Bridge::GetGuestMenuItems(HMENU menuHandle)
     {
         GuestMenuVisualItem visual;
         visual.identifier = item.identifier;
+        visual.type = item.type;
         visual.state = item.state;
         visual.subMenu = item.subMenu;
         visual.text = item.text;
@@ -2160,12 +2353,52 @@ HBITMAP WINAPI Win32Bridge::Bridge::BridgeLoadBitmapW(HINSTANCE, LPCWSTR resourc
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetClassInfoW(HINSTANCE, LPCWSTR, GuestAbi::WndClassW*) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
 LRESULT WINAPI Win32Bridge::Bridge::BridgeCallWindowProcW(GuestAbi::WndProc procedure, HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
-    return procedure ? procedure(window, message, wParam, lParam) : 0;
+    if (!procedure)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    DWORD guestException = ERROR_SUCCESS;
+    const LRESULT result = InvokeGuestSubclassProcedure(
+        procedure,
+        window,
+        message,
+        wParam,
+        lParam,
+        &guestException);
+    if (guestException != ERROR_SUCCESS)
+    {
+        RuntimeDiagnostics::Record(
+            L"GUEST SUBCLASS EXCEPTION: code " +
+            std::to_wstring(static_cast<unsigned long>(guestException)) +
+            L", message " + std::to_wstring(message) +
+            L", window " + std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) + L".");
+        BridgeSetLastError(ERROR_EXCEPTION_IN_SERVICE);
+        return 0;
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return result;
 }
 
 INT_PTR WINAPI Win32Bridge::Bridge::BridgeDialogBoxParamW(HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC dialogProcedure, LPARAM initParameter)
 {
     return ShowGuestDialogFromResource(instance, templateName, parent, dialogProcedure, initParameter);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeIsDialogMessageW(
+    HWND dialog,
+    const GuestAbi::Message* message)
+{
+    if (!message) return FALSE;
+    GuestAbi::Message copy{};
+    if (!ReadGuestMessageValue(message, &copy)) return FALSE;
+    MSG native{};
+    native.hwnd = copy.hwnd;
+    native.message = copy.message;
+    native.wParam = copy.wParam;
+    native.lParam = copy.lParam;
+    return HandleGuestDialogMessage(dialog, &native);
 }
 
 ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& symbol)
@@ -2394,6 +2627,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCallWindowProcW);
     else if (_wcsicmp(symbol.name.c_str(), L"dialogboxparamw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDialogBoxParamW);
+    else if (_wcsicmp(symbol.name.c_str(), L"isdialogmessagew") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsDialogMessageW);
 
     if (resolution.targetAddress != 0)
     {

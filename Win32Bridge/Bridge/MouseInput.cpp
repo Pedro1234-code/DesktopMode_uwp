@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge\\MouseInput.h"
+#include "Bridge/RuntimeDiagnostics.h"
 
 #include <cmath>
 
@@ -13,6 +14,28 @@ using namespace Windows::UI::Input;
 
 namespace
 {
+    using SehInvocation = void(*)(void*);
+
+    DWORD InvokeSehProtected(SehInvocation invocation, void* context)
+    {
+        __try
+        {
+            invocation(context);
+            return ERROR_SUCCESS;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return GetExceptionCode();
+        }
+    }
+
+    struct MouseUpdateCall final
+    {
+        MouseInputBridge* bridge;
+        PointerPoint^ point;
+        int wheelDelta;
+    };
+
     void RemoveMouseHandlers(
         CoreWindow^ window,
         Windows::Foundation::EventRegistrationToken moved,
@@ -30,6 +53,18 @@ namespace
         window->PointerReleased -= released;
         window->PointerWheelChanged -= wheel;
     }
+}
+
+DWORD MouseInputBridge::InvokeUpdate(MouseInputBridge* bridge, PointerPoint^ point, int wheelDelta)
+{
+    MouseUpdateCall call{ bridge, point, wheelDelta };
+    return InvokeSehProtected(&MouseInputBridge::InvokeUpdateThunk, &call);
+}
+
+void MouseInputBridge::InvokeUpdateThunk(void* context)
+{
+    const auto* call = static_cast<MouseUpdateCall*>(context);
+    call->bridge->Update(call->point, call->wheelDelta);
 }
 
 void MouseInputBridge::Attach(CoreWindow^ window)
@@ -50,17 +85,50 @@ void MouseInputBridge::Attach(CoreWindow^ window)
         return;
     }
     m_movedToken = attached->PointerMoved += ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(
-        [this](CoreWindow^, PointerEventArgs^ args) { Update(args->CurrentPoint, 0); });
+        [this](CoreWindow^, PointerEventArgs^ args)
+    {
+        try
+        {
+            const DWORD exceptionCode = InvokeUpdate(this, args ? args->CurrentPoint : nullptr, 0);
+            if (exceptionCode != ERROR_SUCCESS) RuntimeDiagnostics::Record(L"MOUSE INPUT SEH: PointerMoved code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+        }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"MOUSE INPUT EXCEPTION: PointerMoved HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"MOUSE INPUT EXCEPTION: PointerMoved raised an unknown exception."); }
+    });
     m_pressedToken = attached->PointerPressed += ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(
-        [this](CoreWindow^, PointerEventArgs^ args) { Update(args->CurrentPoint, 0); });
+        [this](CoreWindow^, PointerEventArgs^ args)
+    {
+        try
+        {
+            const DWORD exceptionCode = InvokeUpdate(this, args ? args->CurrentPoint : nullptr, 0);
+            if (exceptionCode != ERROR_SUCCESS) RuntimeDiagnostics::Record(L"MOUSE INPUT SEH: PointerPressed code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+        }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"MOUSE INPUT EXCEPTION: PointerPressed HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"MOUSE INPUT EXCEPTION: PointerPressed raised an unknown exception."); }
+    });
     m_releasedToken = attached->PointerReleased += ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(
-        [this](CoreWindow^, PointerEventArgs^ args) { Update(args->CurrentPoint, 0); });
+        [this](CoreWindow^, PointerEventArgs^ args)
+    {
+        try
+        {
+            const DWORD exceptionCode = InvokeUpdate(this, args ? args->CurrentPoint : nullptr, 0);
+            if (exceptionCode != ERROR_SUCCESS) RuntimeDiagnostics::Record(L"MOUSE INPUT SEH: PointerReleased code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+        }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"MOUSE INPUT EXCEPTION: PointerReleased HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"MOUSE INPUT EXCEPTION: PointerReleased raised an unknown exception."); }
+    });
     m_wheelToken = attached->PointerWheelChanged += ref new TypedEventHandler<CoreWindow^, PointerEventArgs^>(
         [this](CoreWindow^, PointerEventArgs^ args)
+    {
+        try
         {
-            auto point = args->CurrentPoint;
-            Update(point, point->Properties->MouseWheelDelta);
-        });
+            auto point = args ? args->CurrentPoint : nullptr;
+            const DWORD exceptionCode = InvokeUpdate(this, point, point && point->Properties ? point->Properties->MouseWheelDelta : 0);
+            if (exceptionCode != ERROR_SUCCESS) RuntimeDiagnostics::Record(L"MOUSE INPUT SEH: PointerWheelChanged code " + std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+        }
+        catch (Exception^ error) { RuntimeDiagnostics::Record(L"MOUSE INPUT EXCEPTION: PointerWheelChanged HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
+        catch (...) { RuntimeDiagnostics::Record(L"MOUSE INPUT EXCEPTION: PointerWheelChanged raised an unknown exception."); }
+    });
 }
 
 void MouseInputBridge::Detach()

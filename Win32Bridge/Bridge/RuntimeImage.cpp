@@ -130,11 +130,66 @@ bool RuntimeImage::FinalizeProtections(const MappedPeImage& image, std::wstring*
     }
 
     FlushInstructionCache(GetCurrentProcess(), m_base, m_size);
+    return RegisterUnwindMetadata(error);
+}
+
+bool RuntimeImage::RegisterUnwindMetadata(std::wstring* error)
+{
+    if (!m_base || m_size < sizeof(IMAGE_DOS_HEADER))
+    {
+        SetError(error, L"The runtime image is unavailable for unwind registration.");
+        return false;
+    }
+
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m_base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+        !Contains(m_size, static_cast<size_t>(dos->e_lfanew), sizeof(IMAGE_NT_HEADERS64)))
+    {
+        SetError(error, L"The mapped PE headers are invalid for unwind registration.");
+        return false;
+    }
+
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m_base + dos->e_lfanew);
+    if (headers->Signature != IMAGE_NT_SIGNATURE || headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        SetError(error, L"The mapped image is not a PE32+ image.");
+        return false;
+    }
+
+    const IMAGE_DATA_DIRECTORY directory =
+        headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (directory.VirtualAddress == 0 || directory.Size == 0)
+    {
+        return true;
+    }
+    if (directory.Size % sizeof(RUNTIME_FUNCTION) != 0 ||
+        !Contains(m_size, directory.VirtualAddress, directory.Size))
+    {
+        SetError(error, L"The PE exception directory is malformed.");
+        return false;
+    }
+
+    auto* table = reinterpret_cast<PRUNTIME_FUNCTION>(m_base + directory.VirtualAddress);
+    const DWORD entryCount = directory.Size / sizeof(RUNTIME_FUNCTION);
+    if (entryCount == 0 || !RtlAddFunctionTable(table, entryCount, reinterpret_cast<DWORD64>(m_base)))
+    {
+        SetError(error, L"RtlAddFunctionTable failed for the mapped guest image.");
+        return false;
+    }
+
+    m_functionTable = table;
+    m_functionEntryCount = entryCount;
     return true;
 }
 
 void RuntimeImage::Release()
 {
+    if (m_functionTable)
+    {
+        RtlDeleteFunctionTable(m_functionTable);
+        m_functionTable = nullptr;
+        m_functionEntryCount = 0;
+    }
     if (m_base)
     {
         VirtualFree(m_base, 0, MEM_RELEASE);

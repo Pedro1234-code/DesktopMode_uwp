@@ -26,8 +26,11 @@ namespace Bridge
         void Release();
 
     private:
+        bool RegisterUnwindMetadata(std::wstring* error);
         BYTE* m_base = nullptr;
         size_t m_size = 0;
+        PRUNTIME_FUNCTION m_functionTable = nullptr;
+        DWORD m_functionEntryCount = 0;
     };
 }
 }

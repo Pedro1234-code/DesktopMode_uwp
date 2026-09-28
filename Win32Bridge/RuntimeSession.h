@@ -4,6 +4,8 @@
 #include <windows.storage.h>
 #include <windows.ui.xaml.controls.h>
 
+#include <memory>
+
 namespace Win32Bridge
 {
     struct RuntimeSessionState;
@@ -52,7 +54,10 @@ namespace Win32Bridge
         }
 
     private:
-        RuntimeSessionState* m_state;
+        // Async prepare/run continuations retain this shared state directly.
+        // The C++/CX wrapper may be released as soon as CoreShell closes a
+        // window, while the guest worker is still unwinding its message loop.
+        std::shared_ptr<RuntimeSessionState> m_state;
         void PersistDiagnostics();
     };
 }

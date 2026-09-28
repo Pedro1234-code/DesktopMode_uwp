@@ -19,6 +19,7 @@ namespace Bridge
     struct GuestMenuVisualItem final
     {
         UINT identifier = 0;
+        UINT type = 0;
         UINT state = 0;
         HMENU subMenu = nullptr;
         std::wstring text;
@@ -117,6 +118,7 @@ namespace Bridge
     BOOL WINAPI BridgeEmptyClipboard();
     HANDLE WINAPI BridgeSetClipboardData(UINT format, HANDLE memory);
     INT_PTR WINAPI BridgeDialogBoxParamW(HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC dialogProcedure, LPARAM initParameter);
+    BOOL WINAPI BridgeIsDialogMessageW(HWND dialog, const GuestAbi::Message* message);
     UINT WINAPI BridgeRegisterClipboardFormatW(LPCWSTR formatName);
     HMENU WINAPI BridgeCreatePopupMenu();
     BOOL WINAPI BridgeDestroyMenu(HMENU menu);

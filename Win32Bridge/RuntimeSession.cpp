@@ -166,14 +166,14 @@ struct Win32Bridge::RuntimeSessionState final
 };
 
 Win32Bridge::RuntimeSession::RuntimeSession(Panel^ surfaceHost)
-    : m_state(nullptr)
+    : m_state()
 {
     if (!surfaceHost)
     {
         throw ref new InvalidArgumentException(L"A XAML surface host is required.");
     }
 
-    auto state = std::unique_ptr<RuntimeSessionState>(new RuntimeSessionState());
+    auto state = std::make_shared<RuntimeSessionState>();
     state->windows = std::make_shared<GuestWindowManager>(Window::Current->CoreWindow, surfaceHost);
     state->windows->Activate();
     state->windows->SetInputEnabled(false);
@@ -184,17 +184,15 @@ Win32Bridge::RuntimeSession::RuntimeSession(Panel^ surfaceHost)
         MouseInput().Attach(Window::Current->CoreWindow);
     });
 
-    m_state = state.release();
+    m_state = std::move(state);
 }
 
 Win32Bridge::RuntimeSession::~RuntimeSession()
 {
     Close();
-    if (m_state && !m_state->running.load())
-    {
-        delete m_state;
-        m_state = nullptr;
-    }
+    // Outstanding async operations retain their own shared_ptr copy.  This
+    // deliberately releases only the CoreShell-facing reference here.
+    m_state.reset();
 }
 
 IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
@@ -206,7 +204,7 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
         throw ref new InvalidArgumentException(L"The executable and its authorized source folder are required.");
     }
 
-    RuntimeSessionState* state = m_state;
+    const std::shared_ptr<RuntimeSessionState> state = m_state;
     state->prepared.store(false);
     state->closeRequested.store(false);
     state->executable = executable;
@@ -217,16 +215,16 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
     RuntimeDiagnostics::Reset(L"CoreShell: " + state->executableName);
     RuntimeDiagnostics::Record(L"HOST: preparing an executable selected through CoreShell Files.");
 
-    return create_async([this, state, executable, moduleSourceFolder]()
+    return create_async([state, executable, moduleSourceFolder]()
     {
         return create_task(FileIO::ReadBufferAsync(executable)).then(
-            [this, state, moduleSourceFolder](IBuffer^ buffer) -> bool
+            [state, moduleSourceFolder](IBuffer^ buffer) -> bool
         {
             if (!buffer || buffer->Length == 0)
             {
                 state->lastError = L"The selected executable is empty.";
                 RuntimeDiagnostics::Record(L"PREPARE FAILED: empty executable file.");
-                PersistDiagnostics();
+                PersistReport(RuntimeDiagnostics::Snapshot());
                 return false;
             }
 
@@ -259,7 +257,7 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
             {
                 state->lastError = error.empty() ? L"The runtime could not prepare this executable." : error;
             }
-            PersistDiagnostics();
+            PersistReport(RuntimeDiagnostics::Snapshot());
             return prepared;
         });
     });
@@ -276,8 +274,8 @@ IAsyncOperation<int>^ Win32Bridge::RuntimeSession::RunAsync()
         throw ref new OperationCanceledException(L"The runtime session was closed before execution began.");
     }
 
-    RuntimeSessionState* state = m_state;
-    return create_async([this, state]() -> int
+    const std::shared_ptr<RuntimeSessionState> state = m_state;
+    return create_async([state]() -> int
     {
         state->running.store(true);
         state->windows->SetInputEnabled(true);
@@ -291,7 +289,7 @@ IAsyncOperation<int>^ Win32Bridge::RuntimeSession::RunAsync()
             state->lastError = error.empty() ? L"The guest executable stopped unexpectedly." : error;
             exitCode = -1;
         }
-        PersistDiagnostics();
+        PersistReport(RuntimeDiagnostics::Snapshot());
         return exitCode;
     });
 }
