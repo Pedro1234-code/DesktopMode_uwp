@@ -270,20 +270,38 @@ namespace factoryos_10x_shell.Views
                     Tag = window,
                     Style = (Style)Application.Current.Resources["TaskbarButtonStyle"],
                     Background = new SolidColorBrush(Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180)),
-                    Content = new TextBlock
-                    {
-                        Text = "\uE7C3",
-                        FontFamily = new FontFamily("Segoe MDL2 Assets"),
-                        FontSize = 23,
-                        HorizontalAlignment = HorizontalAlignment.Center,
-                        VerticalAlignment = VerticalAlignment.Center
-                    }
+                    Content = CreateWin32AppIcon(window)
                 };
                 ToolTipService.SetToolTip(button, window.DisplayName);
                 button.Click += (sender, args) =>
                     _nativeWindowManager.ToggleFromTaskbar((Win32WindowModel)((Button)sender).Tag);
                 OpenWin32AppsPanel.Children.Add(button);
             }
+        }
+
+        private static UIElement CreateWin32AppIcon(Win32WindowModel window)
+        {
+            if (window.IconSource != null)
+            {
+                return new Image
+                {
+                    Width = 26,
+                    Height = 26,
+                    Source = window.IconSource,
+                    Stretch = Stretch.Uniform,
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+            }
+
+            return new TextBlock
+            {
+                Text = "\uE7C3",
+                FontFamily = new FontFamily("Segoe MDL2 Assets"),
+                FontSize = 23,
+                HorizontalAlignment = HorizontalAlignment.Center,
+                VerticalAlignment = VerticalAlignment.Center
+            };
         }
 
         private void AddWebAppTaskbarMenu(Button button, WebAppDefinition app)

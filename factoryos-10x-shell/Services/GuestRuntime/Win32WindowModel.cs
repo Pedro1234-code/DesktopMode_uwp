@@ -3,6 +3,7 @@ using System.ComponentModel;
 using System.Runtime.CompilerServices;
 using Windows.Storage;
 using Windows.UI.Xaml;
+using Windows.UI.Xaml.Media;
 
 namespace factoryos_10x_shell.Services.Win32
 {
@@ -17,6 +18,7 @@ namespace factoryos_10x_shell.Services.Win32
         private bool m_isMaximized;
         private bool m_isActive;
         private string m_status = "Preparing runtime…";
+        private ImageSource m_iconSource;
 
         public Guid Id { get; } = Guid.NewGuid();
         public StorageFile Executable { get; set; }
@@ -36,6 +38,7 @@ namespace factoryos_10x_shell.Services.Win32
         public bool IsMaximized { get => m_isMaximized; set => Set(ref m_isMaximized, value); }
         public bool IsActive { get => m_isActive; set => Set(ref m_isActive, value); }
         public string Status { get => m_status; set => Set(ref m_status, value); }
+        public ImageSource IconSource { get => m_iconSource; set => Set(ref m_iconSource, value); }
 
         public event PropertyChangedEventHandler PropertyChanged;
 

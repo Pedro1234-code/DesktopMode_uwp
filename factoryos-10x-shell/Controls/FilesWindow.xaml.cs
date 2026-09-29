@@ -1,16 +1,19 @@
 using System;
 using System.Collections.ObjectModel;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Threading.Tasks;
 using factoryos_10x_shell.Services.Win32;
 using Windows.Storage;
 using Windows.Storage.AccessCache;
+using Windows.Storage.FileProperties;
 using Windows.Storage.Pickers;
 using Windows.System;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Input;
 using Windows.UI.Xaml.Media;
+using Windows.UI.Xaml.Media.Imaging;
 using Windows.Foundation;
 using factoryos_10x_shell.Services.Helpers;
 using factoryos_10x_shell;
@@ -199,7 +202,21 @@ namespace factoryos_10x_shell.Controls
                 foreach (StorageFolder child in await folder.GetFoldersAsync())
                     m_items.Add(new FileEntry { Name = child.Name, Kind = "Folder", Glyph = "\uE8B7", Folder = child });
                 foreach (StorageFile child in await folder.GetFilesAsync())
-                    m_items.Add(new FileEntry { Name = child.Name, Kind = child.FileType, Glyph = "\uE8A5", File = child });
+                {
+                    bool isExecutable = string.Equals(child.FileType, ".exe", StringComparison.OrdinalIgnoreCase);
+                    var entry = new FileEntry
+                    {
+                        Name = child.Name,
+                        Kind = child.FileType,
+                        // Do not represent executables as documents while their shell icon is loading
+                        // (or when the package does not supply an icon resource).
+                        Glyph = isExecutable ? "\uE7C3" : "\uE8A5",
+                        File = child
+                    };
+                    m_items.Add(entry);
+                    if (isExecutable)
+                        _ = LoadExecutableThumbnailAsync(entry);
+                }
             }
             catch (Exception)
             {
@@ -212,7 +229,11 @@ namespace factoryos_10x_shell.Controls
             if (!(e.ClickedItem is FileEntry entry)) return;
             if (entry.Folder != null) await OpenFolderAsync(entry.Folder, entry.Folder.Name, true);
             else if (entry.File != null && string.Equals(entry.File.FileType, ".exe", StringComparison.OrdinalIgnoreCase))
-                Win32WindowManagerService.Instance.Open(entry.File, m_currentFolder);
+            {
+                if (entry.Thumbnail == null)
+                    await LoadExecutableThumbnailAsync(entry);
+                Win32WindowManagerService.Instance.Open(entry.File, m_currentFolder, entry.Thumbnail);
+            }
             else if (entry.File != null && string.Equals(entry.File.FileType, ".txt", StringComparison.OrdinalIgnoreCase))
                 AppState.Instance.RequestNotepadOpen(entry.File);
             else if (entry.File != null) await Launcher.LaunchFileAsync(entry.File);
@@ -228,6 +249,33 @@ namespace factoryos_10x_shell.Controls
         // The folders exposed by UWP are permission roots, so "Up" safely follows
         // the navigation path rather than attempting to access an unapproved parent.
         private void Up_Click(object sender, RoutedEventArgs e) => Back_Click(sender, e);
+
+        private static async Task LoadExecutableThumbnailAsync(FileEntry entry)
+        {
+            if (entry?.File == null || entry.Thumbnail != null) return;
+
+            try
+            {
+                using (StorageItemThumbnail thumbnail = await entry.File.GetThumbnailAsync(
+                    // ListView asks the shell for a generic list representation.  SingleItem asks
+                    // for the executable's own associated icon, which is what we need here.
+                    ThumbnailMode.SingleItem,
+                    64,
+                    ThumbnailOptions.UseCurrentScale | ThumbnailOptions.ResizeThumbnail))
+                {
+                    if (thumbnail == null) return;
+
+                    var image = new BitmapImage();
+                    await image.SetSourceAsync(thumbnail);
+                    entry.Thumbnail = image;
+                }
+            }
+            catch
+            {
+                // Some file providers and executables have no shell thumbnail.
+                // The Files template leaves the existing placeholder visible.
+            }
+        }
 
         private async void Refresh_Click(object sender, RoutedEventArgs e)
         {
@@ -403,13 +451,25 @@ namespace factoryos_10x_shell.Controls
             public string DisplayName { get; set; }
         }
 
-        private sealed class FileEntry
+        private sealed class FileEntry : INotifyPropertyChanged
         {
             public string Name { get; set; }
             public string Kind { get; set; }
             public string Glyph { get; set; }
             public StorageFolder Folder { get; set; }
             public StorageFile File { get; set; }
+            private ImageSource m_thumbnail;
+            public ImageSource Thumbnail
+            {
+                get => m_thumbnail;
+                set
+                {
+                    if (ReferenceEquals(m_thumbnail, value)) return;
+                    m_thumbnail = value;
+                    PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Thumbnail)));
+                }
+            }
+            public event PropertyChangedEventHandler PropertyChanged;
         }
     }
 }

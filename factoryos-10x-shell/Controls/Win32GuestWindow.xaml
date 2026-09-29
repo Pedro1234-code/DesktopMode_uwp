@@ -45,7 +45,10 @@
             <Grid x:Name="TitleBar" Background="#FF303030" PointerPressed="TitleBar_PointerPressed" PointerMoved="TitleBar_PointerMoved" PointerReleased="TitleBar_PointerReleased" PointerCaptureLost="TitleBar_PointerCaptureLost">
                 <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="46" /><ColumnDefinition Width="46" /><ColumnDefinition Width="46" /></Grid.ColumnDefinitions>
                 <StackPanel Margin="12,0" VerticalAlignment="Center" Orientation="Horizontal" Spacing="8">
-                    <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE7C3;" />
+                    <Grid Width="16" Height="16">
+                        <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="15" Text="&#xE7C3;" />
+                        <Image Width="16" Height="16" Source="{Binding IconSource}" Stretch="Uniform" />
+                    </Grid>
                     <TextBlock VerticalAlignment="Center" Text="{Binding DisplayName}" TextTrimming="CharacterEllipsis" />
                 </StackPanel>
                 <Button Grid.Column="1" Style="{StaticResource WindowCaptionButtonStyle}" Click="Minimize_Click" ToolTipService.ToolTip="Minimize"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Text="&#xE921;" /></Button>

@@ -4,6 +4,7 @@ using System.ComponentModel;
 using System.Linq;
 using Windows.Storage;
 using Windows.UI.Xaml;
+using Windows.UI.Xaml.Media;
 
 namespace factoryos_10x_shell.Services.Win32
 {
@@ -35,7 +36,7 @@ namespace factoryos_10x_shell.Services.Win32
             set => ApplicationData.Current.LocalSettings.Values[AppSupportEnabledSettingKey] = value;
         }
 
-        public Win32WindowModel Open(StorageFile executable, StorageFolder sourceFolder)
+        public Win32WindowModel Open(StorageFile executable, StorageFolder sourceFolder, ImageSource iconSource = null)
         {
             if (!IsAppSupportEnabled || executable == null || sourceFolder == null) return null;
             Win32WindowModel existing = Windows.FirstOrDefault(item =>
@@ -43,6 +44,7 @@ namespace factoryos_10x_shell.Services.Win32
                 !string.IsNullOrWhiteSpace(executable.Path));
             if (existing != null)
             {
+                if (iconSource != null) existing.IconSource = iconSource;
                 Activate(existing);
                 return existing;
             }
@@ -50,6 +52,7 @@ namespace factoryos_10x_shell.Services.Win32
             {
                 Executable = executable,
                 ModuleSourceFolder = sourceFolder,
+                IconSource = iconSource,
                 Left = 92 + Windows.Count * 28,
                 Top = 58 + Windows.Count * 28
             };
@@ -158,7 +161,8 @@ namespace factoryos_10x_shell.Services.Win32
         {
             if (e.PropertyName == nameof(Win32WindowModel.IsActive) ||
                 e.PropertyName == nameof(Win32WindowModel.Visibility) ||
-                e.PropertyName == nameof(Win32WindowModel.Status))
+                e.PropertyName == nameof(Win32WindowModel.Status) ||
+                e.PropertyName == nameof(Win32WindowModel.IconSource))
                 WindowsChanged?.Invoke(this, EventArgs.Empty);
         }
     }

@@ -88,7 +88,10 @@
                                         <ColumnDefinition Width="*" />
                                         <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
-                                    <TextBlock VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="18" Foreground="#FF3C78D8" Text="{Binding Glyph}" />
+                                    <Grid Width="24" Height="24" VerticalAlignment="Center">
+                                        <TextBlock VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="18" Foreground="#FF3C78D8" Text="{Binding Glyph}" />
+                                        <Image Width="22" Height="22" HorizontalAlignment="Center" VerticalAlignment="Center" Source="{Binding Thumbnail}" Stretch="Uniform" />
+                                    </Grid>
                                     <TextBlock Grid.Column="1" VerticalAlignment="Center" Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
                                     <TextBlock Grid.Column="2" Margin="20,0,0,0" VerticalAlignment="Center" Foreground="#FF777777" FontSize="12" Text="{Binding Kind}" />
                                 </Grid>
