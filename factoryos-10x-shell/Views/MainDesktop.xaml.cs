@@ -87,6 +87,8 @@ namespace factoryos_10x_shell.Views
             InitActionOpen();
             InitActionClose();
 
+            App.MediaPlayer.Source = MediaSource.CreateFromUri(new Uri("ms-appx:///Assets/Sounds/BootUp.wav"));
+            App.MediaPlayer.Play();
 
             AppState.Instance.OnBgChangeButtonVisibilityChanged += UpdateBgChangeButtonVisibility;
             AppState.Instance.OnFilesRequested += FilesRequested;
