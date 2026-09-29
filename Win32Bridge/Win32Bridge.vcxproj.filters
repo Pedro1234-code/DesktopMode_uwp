@@ -14,18 +14,6 @@
       <UniqueIdentifier>f252954d-63a7-4198-b832-98b5d8715de6</UniqueIdentifier>
       <Extensions>bmp;fbx;gif;jpg;jpeg;tga;tiff;tif;png</Extensions>
     </Filter>
-    <Image Include="Assets\Logo.scale-100.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\SmallLogo.scale-100.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\StoreLogo.scale-100.png">
-      <Filter>Assets</Filter>
-    </Image>
-    <Image Include="Assets\SplashScreen.scale-100.png">
-      <Filter>Assets</Filter>
-    </Image>
     <ClInclude Include="Bridge\CompatibilityCatalog.h">
       <Filter>Bridge</Filter>
     </ClInclude>
@@ -133,5 +121,31 @@
     <ClCompile Include="Bridge\User32Shims.cpp">
       <Filter>Bridge</Filter>
     </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="Bridge\Advapi32Shims.cpp" />
+    <ClCompile Include="Bridge\CommonControlsShims.cpp" />
+    <ClCompile Include="Bridge\Comdlg32Shims.cpp" />
+    <ClCompile Include="Bridge\DialogResources.cpp" />
+    <ClCompile Include="Bridge\GuestRegistry.cpp" />
+    <ClCompile Include="Bridge\GuestResources.cpp" />
+    <ClCompile Include="Bridge\MsvcrtShims.cpp" />
+    <ClCompile Include="Bridge\OleShims.cpp" />
+    <ClCompile Include="Bridge\Shell32Shims.cpp" />
+    <ClCompile Include="Bridge\GuestModule.cpp" />
+    <ClCompile Include="pch.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="Bridge\Advapi32Shims.h" />
+    <ClInclude Include="Bridge\CommonControlsShims.h" />
+    <ClInclude Include="Bridge\Comdlg32Shims.h" />
+    <ClInclude Include="Bridge\DialogResources.h" />
+    <ClInclude Include="Bridge\GuestRegistry.h" />
+    <ClInclude Include="Bridge\GuestResources.h" />
+    <ClInclude Include="Bridge\MsvcrtShims.h" />
+    <ClInclude Include="Bridge\OleShims.h" />
+    <ClInclude Include="Bridge\Shell32Shims.h" />
+    <ClInclude Include="Bridge\GuestModule.h" />
   </ItemGroup>
 </Project>
