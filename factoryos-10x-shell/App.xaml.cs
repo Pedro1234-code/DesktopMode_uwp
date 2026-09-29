@@ -53,6 +53,7 @@ namespace factoryos_10x_shell
             this.InitializeComponent();
             this.Suspending += OnSuspending;
             this.Resuming += OnResuming;
+            ApplicationView.PreferredLaunchWindowingMode = ApplicationViewWindowingMode.FullScreen;
             if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey("IsSearchButtonVisible"))
             {
                 AppState.Instance.IsSearchButtonVisible = (bool)Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsSearchButtonVisible"];
@@ -65,6 +66,8 @@ namespace factoryos_10x_shell
             {
                 AppState.Instance.IsBgChangeButtonVisible = (bool)Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsBgChangeButtonVisible"];
             }
+
+            MediaPlayer = BackgroundMediaPlayer.Current;
 
         }
 
