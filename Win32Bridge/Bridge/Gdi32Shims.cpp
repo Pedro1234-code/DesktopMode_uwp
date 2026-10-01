@@ -487,19 +487,16 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetTextMetricsW(HDC dc, GuestAbi::TextMet
         return FALSE;
     }
 
-    // TextOutW currently has one deterministic 8x16 software raster.  Keep
-    // the geometric metrics faithful to that renderer, while exposing the
-    // selected HFONT's non-geometric retained attributes below.  A future
-    // scalable glyph adapter can replace these fixed dimensions without
-    // changing the guest ABI or object ownership model.
+    const MiniGdi::Size cell = MiniGdi::FontCellSize(font);
     GuestAbi::TextMetricW result = {};
-    result.tmHeight = MiniGdi::DefaultTextGlyphHeight;
-    result.tmAscent = MiniGdi::DefaultTextGlyphAscent;
-    result.tmDescent = MiniGdi::DefaultTextGlyphDescent;
+    result.tmHeight = cell.height;
+    result.tmAscent = (std::max)(1, cell.height * MiniGdi::DefaultTextGlyphAscent /
+        MiniGdi::DefaultTextGlyphHeight);
+    result.tmDescent = cell.height - result.tmAscent;
     result.tmInternalLeading = 0;
     result.tmExternalLeading = 0;
-    result.tmAveCharWidth = MiniGdi::DefaultTextGlyphWidth;
-    result.tmMaxCharWidth = MiniGdi::DefaultTextGlyphWidth;
+    result.tmAveCharWidth = cell.width;
+    result.tmMaxCharWidth = cell.width;
     result.tmWeight = font.weight;
     result.tmOverhang = 0;
     result.tmDigitizedAspectX = 1;
@@ -1029,7 +1026,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetTextExtentPoint32W(
     }
 
     MiniGdi::Size measured;
-    if (!manager->Gdi().GetTextExtentW(static_cast<std::size_t>(characterCount), &measured))
+    if (!manager->Gdi().GetTextExtentW(resolvedDc,
+        static_cast<std::size_t>(characterCount), &measured))
     {
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;

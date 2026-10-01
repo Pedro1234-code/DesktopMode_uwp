@@ -169,16 +169,12 @@ namespace MiniGdi
         const Rect* sourceClip = nullptr,
         const Rect* destinationClip = nullptr);
 
-    // The initial raster font is intentionally fixed-width.  HFONT objects
-    // are nevertheless tracked below so ordinary CreateFont/SelectObject
-    // code can keep its GDI ownership and selection semantics.  A later
-    // glyph adapter can consume the retained Font attributes without making
-    // this software core depend on a host font API.
+    // The fallback raster font is fixed-width within each selected HFONT cell.
+    // HFONT objects are tracked so CreateFont/SelectObject and geometric text
+    // queries share the same dimensions without depending on a host font API.
     constexpr int DefaultTextGlyphWidth = 8;
     constexpr int DefaultTextGlyphHeight = 16;
-    // The fallback glyph cells are not scalable yet.  Keep the baseline
-    // split visible to the GDI query shim so GetTextMetricsW reports the
-    // same dimensions that TextOutW actually rasterizes.
+    // Baseline proportions used when scaling the compact fallback glyphs.
     constexpr int DefaultTextGlyphAscent = 12;
     constexpr int DefaultTextGlyphDescent =
         DefaultTextGlyphHeight - DefaultTextGlyphAscent;
@@ -242,6 +238,11 @@ namespace MiniGdi
         // from an invalid/empty result while remaining within LF_FACESIZE.
         wchar_t faceName[FontFaceNameCapacity] = L"Win32Bridge Fixed";
     };
+
+    // Resolves the logical cell used by the software fallback rasterizer.
+    // Negative LOGFONT heights describe character height on Win32; the
+    // rasterizer only needs the resulting positive pixel extent.
+    Size FontCellSize(const Font& font);
 
     // This is an in-process model of the small part of GDI object selection we
     // need.  A USER32 bridge can map guest HDC/HBRUSH/HPEN/HFONT values to
@@ -343,8 +344,9 @@ namespace MiniGdi
             BackgroundMode* previous = nullptr);
         bool GetBackgroundMode(DcHandle dc, BackgroundMode* mode) const;
 
-        // Renders the fixed 8x16 ASCII fallback font.  Printable ASCII is
-        // supported and all non-ASCII code points become '?'.  The result
+        // Renders a scalable-cell ASCII fallback font using the selected
+        // HFONT dimensions. Printable ASCII is supported and all non-ASCII
+        // code points become '?'. The result
         // is true for a valid, fully clipped draw just like TextOutW; false
         // denotes invalid input or an invalid DC.
         bool TextOutW(
@@ -353,7 +355,7 @@ namespace MiniGdi
             const wchar_t* text,
             std::size_t characterCount,
             Size* extent = nullptr);
-        bool GetTextExtentW(std::size_t characterCount, Size* extent) const;
+        bool GetTextExtentW(DcHandle dc, std::size_t characterCount, Size* extent) const;
 
     private:
         struct GdiObject

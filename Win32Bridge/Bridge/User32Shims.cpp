@@ -5,6 +5,7 @@
 #include "Bridge\\GuestWindow.h"
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge\\MiniGdi.h"
+#include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestResources.h"
 #include "Bridge/DialogResources.h"
 #include "Bridge/RuntimeDiagnostics.h"
@@ -349,6 +350,10 @@ namespace
         UINT type = 0;
         UINT state = 0;
         HMENU subMenu = nullptr;
+        HBITMAP checkedBitmap = nullptr;
+        HBITMAP uncheckedBitmap = nullptr;
+        HBITMAP itemBitmap = nullptr;
+        ULONG_PTR itemData = 0;
         std::wstring text;
     };
 
@@ -365,14 +370,18 @@ namespace
     constexpr UINT kMfHighlighted = 0x0080;
     constexpr UINT kMfDefault = 0x1000;
     constexpr UINT kMfSeparator = 0x0800;
+    constexpr UINT kMftRadioCheck = 0x0200;
     constexpr UINT kMiimState = 0x0001;
     constexpr UINT kMiimId = 0x0002;
     constexpr UINT kMiimSubmenu = 0x0004;
+    constexpr UINT kMiimCheckmarks = 0x0008;
     // Older callers commonly use MIIM_TYPE together with MFT_STRING instead
     // of the newer MIIM_STRING spelling.  Both describe dwTypeData.
     constexpr UINT kMiimType = 0x0010;
     constexpr UINT kMiimFtype = 0x0100;
     constexpr UINT kMiimString = 0x0040;
+    constexpr UINT kMiimData = 0x0020;
+    constexpr UINT kMiimBitmap = 0x0080;
 
     bool ProbeGuestMenuText(LPCWSTR source, size_t maximum, size_t* length)
     {
@@ -839,58 +848,8 @@ int WINAPI Win32Bridge::Bridge::BridgeGetSystemMetrics(int index)
     // The values describe the bridge's virtual desktop rather than the UWP
     // host monitor. Keep common Win32 layout calculations deterministic.
     int value = 0;
-    switch (index)
+    if (!GuestMetrics::TryGetSystemMetric(index, &value))
     {
-    case 0:  // SM_CXSCREEN
-    case 16: // SM_CXFULLSCREEN
-    case 78: // SM_CXVIRTUALSCREEN
-        value = 800;
-        break;
-    case 1:  // SM_CYSCREEN
-    case 17: // SM_CYFULLSCREEN
-    case 79: // SM_CYVIRTUALSCREEN
-        value = 480;
-        break;
-    case 2:  // SM_CXVSCROLL
-    case 3:  // SM_CYHSCROLL
-    case 20: // SM_CYVSCROLL
-    case 21: // SM_CXHSCROLL
-        value = 17;
-        break;
-    case 4:  // SM_CYCAPTION
-        value = 23;
-        break;
-    case 5:  // SM_CXBORDER
-    case 6:  // SM_CYBORDER
-        value = 1;
-        break;
-    case 7:  // SM_CXDLGFRAME / SM_CXFIXEDFRAME
-    case 8:  // SM_CYDLGFRAME / SM_CYFIXEDFRAME
-    case 32: // SM_CXFRAME / SM_CXSIZEFRAME
-    case 33: // SM_CYFRAME / SM_CYSIZEFRAME
-        value = 4;
-        break;
-    case 11: // SM_CXICON
-    case 12: // SM_CYICON
-    case 13: // SM_CXCURSOR
-    case 14: // SM_CYCURSOR
-        value = 32;
-        break;
-    case 15: // SM_CYMENU
-        value = 20;
-        break;
-    case 19: // SM_MOUSEPRESENT
-    case 80: // SM_CMONITORS
-        value = 1;
-        break;
-    case 36: // SM_CXDOUBLECLK
-    case 37: // SM_CYDOUBLECLK
-        value = 4;
-        break;
-    case 43: // SM_CMOUSEBUTTONS
-        value = 5;
-        break;
-    default:
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -937,7 +896,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeAdjustWindowRect(LPRECT rect, DWORD, BOOL
     BridgeSetLastError(ERROR_SUCCESS);
     if (hasMenu)
     {
-        rect->bottom += 22;
+        rect->bottom += GuestMetrics::MenuHeight;
     }
     return TRUE;
 }
@@ -953,7 +912,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeAdjustWindowRectEx(LPRECT rect, DWORD, BO
     BridgeSetLastError(ERROR_SUCCESS);
     if (hasMenu)
     {
-        rect->bottom += 22;
+        rect->bottom += GuestMetrics::MenuHeight;
     }
     return TRUE;
 }
@@ -1746,7 +1705,7 @@ int WINAPI Win32Bridge::Bridge::BridgeDrawTextW(HDC dc, LPWSTR text, int charact
     }
 
     MiniGdi::Size extent;
-    if (!manager->Gdi().GetTextExtentW(count, &extent))
+    if (!manager->Gdi().GetTextExtentW(guestDc, count, &extent))
     {
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return 0;
@@ -1798,16 +1757,23 @@ int WINAPI Win32Bridge::Bridge::BridgeLoadStringW(HINSTANCE instance, UINT ident
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeScreenToClient(HWND window, LPPOINT point)
 {
-    if (!point || !BridgeIsWindow(window))
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager || !point)
     {
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    RECT bounds{};
-    if (!BridgeGetWindowRect(window, &bounds)) return FALSE;
-    point->x -= bounds.left;
-    point->y -= bounds.top;
-    BridgeSetLastError(ERROR_SUCCESS);
+
+    POINT origin{};
+    DWORD error = ERROR_SUCCESS;
+    if (!manager->GetGuestClientOrigin(window, &origin, &error))
+    {
+        BridgeSetLastError(error);
+        return FALSE;
+    }
+    point->x -= origin.x;
+    point->y -= origin.y;
+    BridgeSetLastError(error);
     return TRUE;
 }
 
@@ -1964,13 +1930,18 @@ UINT WINAPI Win32Bridge::Bridge::BridgeRegisterClipboardFormatW(LPCWSTR)
     return g_nextClipboardFormat++;
 }
 
-HMENU WINAPI Win32Bridge::Bridge::BridgeCreatePopupMenu()
+HMENU WINAPI Win32Bridge::Bridge::BridgeCreateMenu()
 {
     std::lock_guard<std::mutex> guard(g_menuLock);
     const ULONG_PTR handle = g_nextMenu++;
     g_menus.emplace(handle, VirtualMenu{});
     BridgeSetLastError(ERROR_SUCCESS);
     return reinterpret_cast<HMENU>(handle);
+}
+
+HMENU WINAPI Win32Bridge::Bridge::BridgeCreatePopupMenu()
+{
+    return BridgeCreateMenu();
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeDestroyMenu(HMENU menu)
@@ -2045,10 +2016,17 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeInsertMenuItemW(HMENU menu, UINT item, BO
         return FALSE;
     }
     VirtualMenuItem entry;
-    entry.identifier = source->wID;
-    entry.type = source->fType;
-    entry.state = source->fState;
-    entry.subMenu = source->hSubMenu;
+    if (source->fMask & kMiimId) entry.identifier = source->wID;
+    if (source->fMask & (kMiimFtype | kMiimType)) entry.type = source->fType;
+    if (source->fMask & kMiimState) entry.state = source->fState;
+    if (source->fMask & kMiimSubmenu) entry.subMenu = source->hSubMenu;
+    if (source->fMask & kMiimCheckmarks)
+    {
+        entry.checkedBitmap = source->hbmpChecked;
+        entry.uncheckedBitmap = source->hbmpUnchecked;
+    }
+    if (source->fMask & kMiimBitmap) entry.itemBitmap = source->hbmpItem;
+    if (source->fMask & kMiimData) entry.itemData = source->dwItemData;
     if (source->fMask & (kMiimString | kMiimType)) entry.text = ReadGuestMenuText(*source);
     size_t insertion = destination->items.size();
     if (byPosition)
@@ -2088,6 +2066,13 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetMenuItemInfoW(HMENU menu, UINT item, B
     if (result->fMask & kMiimState) result->fState = entry->state;
     if (result->fMask & kMiimId) result->wID = entry->identifier;
     if (result->fMask & kMiimSubmenu) result->hSubMenu = entry->subMenu;
+    if (result->fMask & kMiimCheckmarks)
+    {
+        result->hbmpChecked = entry->checkedBitmap;
+        result->hbmpUnchecked = entry->uncheckedBitmap;
+    }
+    if (result->fMask & kMiimBitmap) result->hbmpItem = entry->itemBitmap;
+    if (result->fMask & kMiimData) result->dwItemData = entry->itemData;
     if (result->fMask & (kMiimFtype | kMiimType)) result->fType = entry->type;
     if (result->fMask & (kMiimString | kMiimType))
     {
@@ -2113,6 +2098,13 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeSetMenuItemInfoW(HMENU menu, UINT item, B
     if (update->fMask & kMiimState) entry->state = update->fState;
     if (update->fMask & kMiimId) entry->identifier = update->wID;
     if (update->fMask & kMiimSubmenu) entry->subMenu = update->hSubMenu;
+    if (update->fMask & kMiimCheckmarks)
+    {
+        entry->checkedBitmap = update->hbmpChecked;
+        entry->uncheckedBitmap = update->hbmpUnchecked;
+    }
+    if (update->fMask & kMiimBitmap) entry->itemBitmap = update->hbmpItem;
+    if (update->fMask & kMiimData) entry->itemData = update->dwItemData;
     if (update->fMask & (kMiimFtype | kMiimType)) entry->type = update->fType;
     if (update->fMask & (kMiimString | kMiimType)) entry->text = ReadGuestMenuText(*update);
     return TRUE;
@@ -2149,7 +2141,11 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCheckMenuRadioItem(HMENU menu, UINT first
     for (UINT index = first; index <= last; ++index)
     {
         VirtualMenuItem* entry = FindMenuItemLocked(*destination, index, (flags & kMfByPosition) != 0);
-        if (entry) entry->state = (entry->state & ~kMfChecked) | (index == selected ? kMfChecked : 0);
+        if (entry)
+        {
+            entry->type |= kMftRadioCheck;
+            entry->state = (entry->state & ~kMfChecked) | (index == selected ? kMfChecked : 0);
+        }
     }
     return TRUE;
 }
@@ -2165,6 +2161,106 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeRemoveMenu(HMENU menu, UINT item, UINT fl
         if (match) { destination->items.erase(iterator); return TRUE; }
     }
     return FALSE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeDeleteMenu(HMENU menu, UINT item, UINT flags)
+{
+    HMENU child = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_menuLock);
+        VirtualMenu* destination = FindMenuLocked(menu);
+        VirtualMenuItem* entry = destination ? FindMenuItemLocked(
+            *destination, item, (flags & kMfByPosition) != 0) : nullptr;
+        if (!entry) return FALSE;
+        child = entry->subMenu;
+    }
+    if (!BridgeRemoveMenu(menu, item, flags)) return FALSE;
+    return !child || BridgeDestroyMenu(child);
+}
+
+UINT WINAPI Win32Bridge::Bridge::BridgeGetMenuItemID(HMENU menu, int position)
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    VirtualMenu* source = FindMenuLocked(menu);
+    if (!source || position < 0 || static_cast<size_t>(position) >= source->items.size())
+        return static_cast<UINT>(-1);
+    const VirtualMenuItem& entry = source->items[static_cast<size_t>(position)];
+    return entry.subMenu ? static_cast<UINT>(-1) : entry.identifier;
+}
+
+UINT WINAPI Win32Bridge::Bridge::BridgeGetMenuState(HMENU menu, UINT item, UINT flags)
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    VirtualMenu* source = FindMenuLocked(menu);
+    VirtualMenuItem* entry = source ? FindMenuItemLocked(
+        *source, item, (flags & kMfByPosition) != 0) : nullptr;
+    if (!entry) return static_cast<UINT>(-1);
+    UINT result = entry->type | entry->state | (entry->subMenu ? kMfPopup : 0);
+    if (entry->subMenu)
+    {
+        const VirtualMenu* child = FindMenuLocked(entry->subMenu);
+        if (child) result |= (static_cast<UINT>((std::min)(child->items.size(),
+            static_cast<size_t>(0xff))) << 8);
+    }
+    return result;
+}
+
+int WINAPI Win32Bridge::Bridge::BridgeGetMenuStringW(
+    HMENU menu, UINT item, LPWSTR text, int count, UINT flags)
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    VirtualMenu* source = FindMenuLocked(menu);
+    VirtualMenuItem* entry = source ? FindMenuItemLocked(
+        *source, item, (flags & kMfByPosition) != 0) : nullptr;
+    if (!entry) return 0;
+    if (!text || count <= 0) return static_cast<int>(entry->text.size());
+    if (!CopyGuestMenuText(text, static_cast<size_t>(count), entry->text)) return 0;
+    return static_cast<int>((std::min)(entry->text.size(), static_cast<size_t>(count - 1)));
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeSetMenuDefaultItem(HMENU menu, UINT item, UINT byPosition)
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    VirtualMenu* destination = FindMenuLocked(menu);
+    if (!destination) return FALSE;
+    for (auto& entry : destination->items) entry.state &= ~kMfDefault;
+    if (item == static_cast<UINT>(-1)) return TRUE;
+    VirtualMenuItem* selected = FindMenuItemLocked(*destination, item, byPosition != FALSE);
+    if (!selected) return FALSE;
+    selected->state |= kMfDefault;
+    return TRUE;
+}
+
+UINT WINAPI Win32Bridge::Bridge::BridgeGetMenuDefaultItem(HMENU menu, UINT byPosition, UINT)
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    VirtualMenu* source = FindMenuLocked(menu);
+    if (!source) return static_cast<UINT>(-1);
+    for (size_t index = 0; index < source->items.size(); ++index)
+        if (source->items[index].state & kMfDefault)
+            return byPosition ? static_cast<UINT>(index) : source->items[index].identifier;
+    return static_cast<UINT>(-1);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeIsMenu(HMENU menu)
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    return FindMenuLocked(menu) ? TRUE : FALSE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeHiliteMenuItem(HWND window, HMENU menu, UINT item, UINT flags)
+{
+    {
+        std::lock_guard<std::mutex> guard(g_menuLock);
+        VirtualMenu* destination = FindMenuLocked(menu);
+        VirtualMenuItem* entry = destination ? FindMenuItemLocked(
+            *destination, item, (flags & kMfByPosition) != 0) : nullptr;
+        if (!entry) return FALSE;
+        entry->state = (entry->state & ~kMfHighlighted) | (flags & kMfHighlighted);
+    }
+    if (GuestWindowManager* manager = CurrentGuestWindowManager())
+        manager->InvalidateGuestRect(window, nullptr, FALSE, nullptr);
+    return TRUE;
 }
 
 HMENU WINAPI Win32Bridge::Bridge::BridgeGetSubMenu(HMENU menu, int position)
@@ -2216,6 +2312,10 @@ Win32Bridge::Bridge::GetGuestMenuItems(HMENU menuHandle)
         visual.type = item.type;
         visual.state = item.state;
         visual.subMenu = item.subMenu;
+        visual.checkedBitmap = item.checkedBitmap;
+        visual.uncheckedBitmap = item.uncheckedBitmap;
+        visual.itemBitmap = item.itemBitmap;
+        visual.itemData = item.itemData;
         visual.text = item.text;
         result.push_back(std::move(visual));
     }
@@ -2263,7 +2363,7 @@ HMENU WINAPI Win32Bridge::Bridge::BridgeLoadMenuW(HINSTANCE, LPCWSTR resource)
     }
     return menu;
 }
-UINT WINAPI Win32Bridge::Bridge::BridgeTrackPopupMenuEx(HMENU menu, UINT flags, int x, int y, HWND owner, const RECT*)
+UINT WINAPI Win32Bridge::Bridge::BridgeTrackPopupMenuEx(HMENU menu, UINT flags, int x, int y, HWND owner, const RECT* excludeRect)
 {
     {
         std::lock_guard<std::mutex> guard(g_menuLock);
@@ -2280,24 +2380,119 @@ UINT WINAPI Win32Bridge::Bridge::BridgeTrackPopupMenuEx(HMENU menu, UINT flags, 
         return 0;
     }
     DWORD error = ERROR_SUCCESS;
-    const UINT result = manager->TrackGuestPopupMenu(menu, flags, x, y, owner, &error);
+    const UINT result = manager->TrackGuestPopupMenu(menu, flags, x, y, owner, excludeRect, &error);
     BridgeSetLastError(error);
     return result;
 }
 HANDLE WINAPI Win32Bridge::Bridge::BridgeLoadAcceleratorsW(HINSTANCE, LPCWSTR) { return reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(1)); }
 int WINAPI Win32Bridge::Bridge::BridgeTranslateAcceleratorW(HWND, HANDLE, const GuestAbi::Message*) { return 0; }
-UINT WINAPI Win32Bridge::Bridge::BridgeGetDialogBaseUnits() { return 8u | (16u << 16); }
-HWND WINAPI Win32Bridge::Bridge::BridgeChildWindowFromPointEx(HWND parent, POINT, UINT) { return parent; }
-HWND WINAPI Win32Bridge::Bridge::BridgeWindowFromPoint(POINT) { return BridgeGetFocus(); }
+UINT WINAPI Win32Bridge::Bridge::BridgeGetDialogBaseUnits()
+{
+    return static_cast<UINT>(GuestMetrics::TextWidth) |
+        (static_cast<UINT>(GuestMetrics::TextHeight) << 16);
+}
+
+HWND WINAPI Win32Bridge::Bridge::BridgeChildWindowFromPointEx(HWND parent, POINT point, UINT flags)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return nullptr;
+    DWORD error = ERROR_SUCCESS;
+    const HWND result = manager->ChildGuestWindowFromPoint(parent, point, flags, &error);
+    BridgeSetLastError(error);
+    return result;
+}
+BOOL WINAPI Win32Bridge::Bridge::BridgeTrackPopupMenu(
+    HMENU menu, UINT flags, int x, int y, int, HWND owner, const RECT*)
+{
+    return static_cast<BOOL>(BridgeTrackPopupMenuEx(menu, flags, x, y, owner, nullptr));
+}
+BOOL WINAPI Win32Bridge::Bridge::BridgeEndMenu()
+{
+    GuestWindowManager* manager = CurrentGuestWindowManager();
+    if (!manager) return FALSE;
+    DWORD error = ERROR_SUCCESS;
+    const BOOL result = manager->EndGuestMenu(&error);
+    BridgeSetLastError(error);
+    return result;
+}
+
+HWND WINAPI Win32Bridge::Bridge::BridgeWindowFromPoint(POINT point)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return nullptr;
+    DWORD error = ERROR_SUCCESS;
+    const HWND result = manager->GuestWindowFromPoint(point, &error);
+    BridgeSetLastError(error);
+    return result;
+}
 UINT WINAPI Win32Bridge::Bridge::BridgeMapVirtualKeyW(UINT code, UINT) { return code; }
-BOOL WINAPI Win32Bridge::Bridge::BridgeClientToScreen(HWND window, LPPOINT point) { return BridgeIsWindow(window) && point ? TRUE : FALSE; }
+int WINAPI Win32Bridge::Bridge::BridgeMapWindowPoints(
+    HWND from,
+    HWND to,
+    LPPOINT points,
+    UINT count)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager || (count != 0 && !points))
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+
+    POINT fromOrigin{};
+    POINT toOrigin{};
+    DWORD error = ERROR_SUCCESS;
+    if (from && !manager->GetGuestClientOrigin(from, &fromOrigin, &error))
+    {
+        BridgeSetLastError(error);
+        return 0;
+    }
+    if (to && !manager->GetGuestClientOrigin(to, &toOrigin, &error))
+    {
+        BridgeSetLastError(error);
+        return 0;
+    }
+
+    const int deltaX = fromOrigin.x - toOrigin.x;
+    const int deltaY = fromOrigin.y - toOrigin.y;
+    for (UINT index = 0; index < count; ++index)
+    {
+        points[index].x += deltaX;
+        points[index].y += deltaY;
+    }
+
+    BridgeSetLastError(ERROR_SUCCESS);
+    return static_cast<int>(MAKELONG(LOWORD(deltaX), LOWORD(deltaY)));
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeClientToScreen(HWND window, LPPOINT point)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager || !point)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    POINT origin{};
+    DWORD error = ERROR_SUCCESS;
+    if (!manager->GetGuestClientOrigin(window, &origin, &error))
+    {
+        BridgeSetLastError(error);
+        return FALSE;
+    }
+    point->x += origin.x;
+    point->y += origin.y;
+    BridgeSetLastError(error);
+    return TRUE;
+}
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetWindowPlacement(HWND window, void* placement)
 {
     auto* result = static_cast<GuestWindowPlacement*>(placement);
     if (!result || result->length < sizeof(GuestWindowPlacement) || !BridgeGetWindowRect(window, &result->normalPosition)) return FALSE;
     result->flags = 0;
-    // A number of conventional desktop applications (including 7-Zip) use
+    // A number of conventional desktop applications use
     // GetWindowPlacement/SetWindowPlacement instead of ShowWindow during
     // their first startup. Preserve the current visibility so their later
     // showCmd update can make a newly-created top-level guest visible.
@@ -2531,6 +2726,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadStringW);
     else if (_wcsicmp(symbol.name.c_str(), L"screentoclient") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeScreenToClient);
+    else if (_wcsicmp(symbol.name.c_str(), L"mapwindowpoints") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMapWindowPoints);
     else if (_wcsicmp(symbol.name.c_str(), L"movewindow") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMoveWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"charupperw") == 0)
@@ -2567,6 +2764,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetClipboardData);
     else if (_wcsicmp(symbol.name.c_str(), L"registerclipboardformatw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterClipboardFormatW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createmenu") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateMenu);
     else if (_wcsicmp(symbol.name.c_str(), L"createpopupmenu") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePopupMenu);
     else if (_wcsicmp(symbol.name.c_str(), L"destroymenu") == 0)
@@ -2589,6 +2788,22 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCheckMenuRadioItem);
     else if (_wcsicmp(symbol.name.c_str(), L"removemenu") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRemoveMenu);
+    else if (_wcsicmp(symbol.name.c_str(), L"deletemenu") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDeleteMenu);
+    else if (_wcsicmp(symbol.name.c_str(), L"getmenuitemid") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMenuItemID);
+    else if (_wcsicmp(symbol.name.c_str(), L"getmenustate") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMenuState);
+    else if (_wcsicmp(symbol.name.c_str(), L"getmenustringw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMenuStringW);
+    else if (_wcsicmp(symbol.name.c_str(), L"setmenudefaultitem") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetMenuDefaultItem);
+    else if (_wcsicmp(symbol.name.c_str(), L"getmenudefaultitem") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMenuDefaultItem);
+    else if (_wcsicmp(symbol.name.c_str(), L"ismenu") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsMenu);
+    else if (_wcsicmp(symbol.name.c_str(), L"hilitemenuitem") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeHiliteMenuItem);
     else if (_wcsicmp(symbol.name.c_str(), L"getsubmenu") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetSubMenu);
     else if (_wcsicmp(symbol.name.c_str(), L"getmenu") == 0)
@@ -2601,6 +2816,10 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadMenuW);
     else if (_wcsicmp(symbol.name.c_str(), L"trackpopupmenuex") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTrackPopupMenuEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"trackpopupmenu") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTrackPopupMenu);
+    else if (_wcsicmp(symbol.name.c_str(), L"endmenu") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndMenu);
     if (_wcsicmp(symbol.name.c_str(), L"loadacceleratorsw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadAcceleratorsW);
     else if (_wcsicmp(symbol.name.c_str(), L"translateacceleratorw") == 0)

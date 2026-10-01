@@ -16,8 +16,8 @@ namespace MiniGdi
 namespace
 {
     // Hand-authored 5x7 source glyphs.  Each low five bits is one row, from
-    // left to right (bit 4 through bit 0).  RasterGlyph expands the rows into
-    // the public 8x16 cell with margins and doubled scan lines.
+    // left to right (bit 4 through bit 0). RasterGlyph expands the rows into
+    // the selected font cell while retaining a small inter-character margin.
     struct GlyphRows
     {
         std::uint8_t rows[7];
@@ -138,6 +138,35 @@ namespace
 
     const GlyphRows& GlyphForCharacter(wchar_t character)
     {
+        // The compact fallback has no combining-mark rasterizer. Preserve
+        // legibility for the Latin scripts commonly found in localized Win32
+        // resources by mapping precomposed letters to their base glyph.
+        switch (character)
+        {
+        case 0x00c0: case 0x00c1: case 0x00c2: case 0x00c3: case 0x00c4: case 0x00c5: character = L'A'; break;
+        case 0x00c6: character = L'A'; break;
+        case 0x00c7: character = L'C'; break;
+        case 0x00c8: case 0x00c9: case 0x00ca: case 0x00cb: character = L'E'; break;
+        case 0x00cc: case 0x00cd: case 0x00ce: case 0x00cf: character = L'I'; break;
+        case 0x00d1: character = L'N'; break;
+        case 0x00d2: case 0x00d3: case 0x00d4: case 0x00d5: case 0x00d6: case 0x00d8: character = L'O'; break;
+        case 0x00d9: case 0x00da: case 0x00db: case 0x00dc: character = L'U'; break;
+        case 0x00dd: character = L'Y'; break;
+        case 0x00e0: case 0x00e1: case 0x00e2: case 0x00e3: case 0x00e4: case 0x00e5: character = L'a'; break;
+        case 0x00e6: character = L'a'; break;
+        case 0x00e7: character = L'c'; break;
+        case 0x00e8: case 0x00e9: case 0x00ea: case 0x00eb: character = L'e'; break;
+        case 0x00ec: case 0x00ed: case 0x00ee: case 0x00ef: character = L'i'; break;
+        case 0x00f1: character = L'n'; break;
+        case 0x00f2: case 0x00f3: case 0x00f4: case 0x00f5: case 0x00f6: case 0x00f8: character = L'o'; break;
+        case 0x00f9: case 0x00fa: case 0x00fb: case 0x00fc: character = L'u'; break;
+        case 0x00fd: case 0x00ff: character = L'y'; break;
+        case 0x2013: case 0x2014: character = L'-'; break;
+        case 0x201c: case 0x201d: character = L'"'; break;
+        case 0x2018: case 0x2019: character = L'\''; break;
+        default: break;
+        }
+
         if (character >= L'a' && character <= L'z')
         {
             return kLowercaseGlyphs[character - L'a'];
@@ -159,13 +188,13 @@ namespace
         }
     }
 
-    Size TextExtentForCount(std::size_t characterCount)
+    Size TextExtentForCount(std::size_t characterCount, const Size& cell)
     {
         const std::size_t maximumWidth = static_cast<std::size_t>(std::numeric_limits<int>::max());
-        const int width = characterCount > maximumWidth / DefaultTextGlyphWidth
+        const int width = characterCount > maximumWidth / static_cast<std::size_t>(cell.width)
             ? std::numeric_limits<int>::max()
-            : static_cast<int>(characterCount * DefaultTextGlyphWidth);
-        return Size{ width, characterCount == 0 ? 0 : DefaultTextGlyphHeight };
+            : static_cast<int>(characterCount * static_cast<std::size_t>(cell.width));
+        return Size{ width, characterCount == 0 ? 0 : cell.height };
     }
 
     bool RasterGlyph(
@@ -174,7 +203,8 @@ namespace
         int cellTop,
         const GlyphRows& glyph,
         Color color,
-        const Rect& clip)
+        const Rect& clip,
+        const Size& cell)
     {
         if (Alpha(color) == 0)
         {
@@ -192,10 +222,18 @@ namespace
                     continue;
                 }
 
-                const int left = SaturateToInt(static_cast<std::int64_t>(cellLeft) + 1 + column);
-                const int top = SaturateToInt(static_cast<std::int64_t>(cellTop) + 1 + row * 2);
-                const int right = SaturateToInt(static_cast<std::int64_t>(left) + 1);
-                const int bottom = SaturateToInt(static_cast<std::int64_t>(top) + 2);
+                const int inkLeft = (std::max)(1, cell.width / 8);
+                const int inkTop = (std::max)(1, cell.height / 16);
+                const int inkWidth = (std::max)(1, cell.width - 2 * inkLeft);
+                const int inkHeight = (std::max)(1, cell.height - 2 * inkTop);
+                const int left = SaturateToInt(static_cast<std::int64_t>(cellLeft) + inkLeft +
+                    static_cast<std::int64_t>(column) * inkWidth / 5);
+                const int top = SaturateToInt(static_cast<std::int64_t>(cellTop) + inkTop +
+                    static_cast<std::int64_t>(row) * inkHeight / 7);
+                const int right = SaturateToInt(static_cast<std::int64_t>(cellLeft) + inkLeft +
+                    static_cast<std::int64_t>(column + 1) * inkWidth / 5);
+                const int bottom = SaturateToInt(static_cast<std::int64_t>(cellTop) + inkTop +
+                    static_cast<std::int64_t>(row + 1) * inkHeight / 7);
                 drawn = FillRect(surface, Rect{ left, top, right, bottom }, color, &clip) || drawn;
             }
         }
@@ -372,6 +410,26 @@ namespace
         // rather than risk a non-terminating guest-triggered draw operation.
         return false;
     }
+}
+
+Size FontCellSize(const Font& font)
+{
+    constexpr std::int64_t minimumCell = 1;
+    constexpr std::int64_t maximumCell = 512;
+    const std::int64_t requestedHeight = font.height < 0
+        ? -static_cast<std::int64_t>(font.height)
+        : static_cast<std::int64_t>(font.height);
+    const int height = static_cast<int>((std::max)(minimumCell,
+        (std::min)(requestedHeight == 0 ? static_cast<std::int64_t>(DefaultTextGlyphHeight) : requestedHeight,
+            maximumCell)));
+    const std::int64_t requestedWidth = font.width < 0
+        ? -static_cast<std::int64_t>(font.width)
+        : static_cast<std::int64_t>(font.width);
+    const int width = requestedWidth == 0
+        ? (std::max)(1, (height * DefaultTextGlyphWidth + DefaultTextGlyphHeight / 2) /
+            DefaultTextGlyphHeight)
+        : static_cast<int>((std::max)(minimumCell, (std::min)(requestedWidth, maximumCell)));
+    return Size{ width, height };
 }
 
 bool Rect::Empty() const
@@ -1535,9 +1593,11 @@ bool GdiContext::TextOutW(
         return false;
     }
 
+    const Font selectedFont = ResolveFont(context->font);
+    const Size cell = FontCellSize(selectedFont);
     if (extent != nullptr)
     {
-        *extent = TextExtentForCount(characterCount);
+        *extent = TextExtentForCount(characterCount, cell);
     }
 
     if (characterCount == 0)
@@ -1552,7 +1612,7 @@ bool GdiContext::TextOutW(
     }
 
     const std::int64_t glyphTop = origin.y;
-    const std::int64_t glyphBottom = glyphTop + DefaultTextGlyphHeight;
+    const std::int64_t glyphBottom = glyphTop + cell.height;
     if (glyphBottom <= outputClip.top || glyphTop >= outputClip.bottom)
     {
         return true;
@@ -1564,7 +1624,7 @@ bool GdiContext::TextOutW(
     {
         const std::int64_t hiddenPixels = static_cast<std::int64_t>(outputClip.left) - originX;
         const std::int64_t hiddenCharacters =
-            (hiddenPixels + DefaultTextGlyphWidth - 1) / DefaultTextGlyphWidth;
+            (hiddenPixels + cell.width - 1) / cell.width;
         if (static_cast<std::size_t>(hiddenCharacters) >= characterCount)
         {
             return true;
@@ -1577,7 +1637,7 @@ bool GdiContext::TextOutW(
     {
         const std::int64_t visiblePixels = static_cast<std::int64_t>(outputClip.right) - originX;
         const std::int64_t visibleCharacters =
-            (visiblePixels + DefaultTextGlyphWidth - 1) / DefaultTextGlyphWidth;
+            (visiblePixels + cell.width - 1) / cell.width;
         if (visibleCharacters > 0)
         {
             endCharacter = std::min(
@@ -1594,9 +1654,9 @@ bool GdiContext::TextOutW(
     const int top = SaturateToInt(glyphTop);
     const int bottom = SaturateToInt(glyphBottom);
     const int firstLeft = SaturateToInt(
-        originX + static_cast<std::int64_t>(firstCharacter) * DefaultTextGlyphWidth);
+        originX + static_cast<std::int64_t>(firstCharacter) * cell.width);
     const int lastRight = SaturateToInt(
-        originX + static_cast<std::int64_t>(endCharacter) * DefaultTextGlyphWidth);
+        originX + static_cast<std::int64_t>(endCharacter) * cell.width);
 
     if (context->backgroundMode == BackgroundMode::Opaque)
     {
@@ -1610,27 +1670,43 @@ bool GdiContext::TextOutW(
     for (std::size_t index = firstCharacter; index < endCharacter; ++index)
     {
         const int cellLeft = SaturateToInt(
-            originX + static_cast<std::int64_t>(index) * DefaultTextGlyphWidth);
+            originX + static_cast<std::int64_t>(index) * cell.width);
         RasterGlyph(
             *context->surface,
             cellLeft,
             top,
             GlyphForCharacter(text[index]),
             context->textColor,
-            outputClip);
+            outputClip,
+            cell);
+    }
+
+    if (selectedFont.underline)
+    {
+        MiniGdi::FillRect(*context->surface,
+            Rect{ firstLeft, (std::max)(top, bottom - 2), lastRight, bottom - 1 },
+            context->textColor, &outputClip);
+    }
+    if (selectedFont.strikeOut)
+    {
+        const int strikeY = top + cell.height / 2;
+        MiniGdi::FillRect(*context->surface,
+            Rect{ firstLeft, strikeY, lastRight, strikeY + 1 },
+            context->textColor, &outputClip);
     }
 
     return true;
 }
 
-bool GdiContext::GetTextExtentW(std::size_t characterCount, Size* extent) const
+bool GdiContext::GetTextExtentW(DcHandle dc, std::size_t characterCount, Size* extent) const
 {
-    if (extent == nullptr)
+    const DeviceContext* context = FindDc(dc);
+    if (context == nullptr || extent == nullptr)
     {
         return false;
     }
 
-    *extent = TextExtentForCount(characterCount);
+    *extent = TextExtentForCount(characterCount, FontCellSize(ResolveFont(context->font)));
     return true;
 }
 

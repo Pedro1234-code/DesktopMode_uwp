@@ -1994,7 +1994,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCopyFileExW(
     }
 
     // Copy through the bridge's file handles rather than a host path.  This
-    // keeps the operation inside LocalFolder\drive_c and gives 7-Zip the
+    // keeps the operation inside LocalFolder\drive_c and gives applications the
     // normal CopyFileExW behavior it uses for basic file management.
     constexpr DWORD CopyFileFailIfExists = 0x00000001;
     const HANDLE source = BridgeCreateFileW(
@@ -2105,7 +2105,7 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeFindFirstChangeNotificationW(LPCWSTR pa
         return INVALID_HANDLE_VALUE;
     }
 
-    // 7-Zip registers a directory watcher whenever it enters a panel. UWP's
+    // File managers commonly register a directory watcher for each panel. UWP's
     // LocalFolder does not expose the desktop notification primitive, but an
     // unsignalled guest-local event has the same non-error, waitable contract.
     // File operations performed through the bridge explicitly refresh their

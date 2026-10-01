@@ -63,9 +63,12 @@ namespace Bridge
         BOOL DestroyGuestWindow(HWND window, DWORD* win32Error);
         BOOL ShowGuestWindow(HWND window, int command, DWORD* win32Error);
         BOOL SetGuestWindowMenuBar(HWND window, BOOL visible, DWORD* win32Error);
-        UINT TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int y, HWND owner, DWORD* win32Error);
+        UINT TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int y, HWND owner,
+            const RECT* excludeRect, DWORD* win32Error);
+        BOOL EndGuestMenu(DWORD* win32Error);
         BOOL GetGuestClientRect(HWND window, LPRECT rect, DWORD* win32Error) const;
         BOOL GetGuestWindowRect(HWND window, LPRECT rect, DWORD* win32Error) const;
+        BOOL GetGuestClientOrigin(HWND window, LPPOINT point, DWORD* win32Error) const;
         BOOL SetGuestWindowText(HWND window, LPCWSTR text, DWORD* win32Error);
         int GetGuestWindowText(HWND window, LPWSTR buffer, int count, DWORD* win32Error) const;
         int GetGuestWindowTextLength(HWND window, DWORD* win32Error) const;
@@ -79,6 +82,8 @@ namespace Bridge
         BOOL ReleaseGuestCapture(DWORD* win32Error);
         HWND GetGuestCapture(DWORD* win32Error);
         HWND GetGuestParent(HWND window, DWORD* win32Error) const;
+        HWND ChildGuestWindowFromPoint(HWND parent, POINT point, UINT flags, DWORD* win32Error) const;
+        HWND GuestWindowFromPoint(POINT point, DWORD* win32Error) const;
         HWND GetGuestDlgItem(HWND parent, int identifier, DWORD* win32Error) const;
         LONG GetGuestWindowLong(HWND window, int index, DWORD* win32Error) const;
         LONG SetGuestWindowLong(HWND window, int index, LONG value, DWORD* win32Error);
@@ -162,6 +167,7 @@ namespace Bridge
 
         std::shared_ptr<WindowRecord> FindWindow(HWND window) const;
         std::shared_ptr<WindowClass> FindClass(LPCWSTR className) const;
+        void LayoutGuestRebar(HWND rebar);
         bool IsGuestWindowVisibleInternal(HWND window) const;
         bool IsGuestWindowEnabledInternal(HWND window) const;
         bool IsGuestWindowDescendantOrSelf(HWND candidate, HWND ancestor) const;
@@ -200,10 +206,12 @@ namespace Bridge
         void HandlePointer(Windows::UI::Core::PointerEventArgs^ args, UINT message);
         void HandleWheel(Windows::UI::Core::PointerEventArgs^ args);
         void HandleKey(Windows::UI::Core::KeyEventArgs^ args, UINT message);
+        void HandleHostSizeChanged(int width, int height);
         void DetachHostEvents();
 
         Platform::Agile<Windows::UI::Core::CoreWindow^> m_coreWindow;
         Platform::Agile<Windows::UI::Core::CoreDispatcher^> m_dispatcher;
+        Platform::Agile<Windows::UI::Xaml::Controls::Panel^> m_surfaceHost;
         Platform::Agile<Windows::UI::Xaml::Controls::Image^> m_surfaceImage;
         std::shared_ptr<GuestPresentationState> m_presentation;
         std::shared_ptr<GuestInputCallbackState> m_inputCallbacks;
@@ -214,6 +222,10 @@ namespace Bridge
         Windows::Foundation::EventRegistrationToken m_pointerWheelToken{};
         Windows::Foundation::EventRegistrationToken m_keyDownToken{};
         Windows::Foundation::EventRegistrationToken m_keyUpToken{};
+        Windows::Foundation::EventRegistrationToken m_sizeChangedToken{};
+        Windows::Foundation::EventRegistrationToken m_surfaceSizeChangedToken{};
+        std::atomic<int> m_viewportWidth{ 800 };
+        std::atomic<int> m_viewportHeight{ 480 };
 
         mutable std::mutex m_classesLock;
         std::unordered_map<std::wstring, std::shared_ptr<WindowClass>> m_classes;

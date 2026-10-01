@@ -145,7 +145,8 @@ namespace
             name == L"getdc" ||
             name == L"releasedc" ||
             name == L"fillrect" ||
-            name == L"drawtextw";
+            name == L"drawtextw" ||
+            name == L"mapwindowpoints";
     }
 
     bool IsMiniGdiImport(const std::wstring& name)

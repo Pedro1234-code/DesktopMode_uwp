@@ -68,6 +68,9 @@
     <ClInclude Include="Bridge\GuestWindow.h">
       <Filter>Bridge</Filter>
     </ClInclude>
+    <ClInclude Include="Bridge\GuestMetrics.h">
+      <Filter>Bridge</Filter>
+    </ClInclude>
     <ClCompile Include="RuntimeHost.cpp" />
     <ClCompile Include="RuntimeSession.cpp" />
     <ClCompile Include="Bridge\CompatibilityCatalog.cpp">

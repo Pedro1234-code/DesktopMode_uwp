@@ -153,6 +153,7 @@ namespace GuestAbi
 
     constexpr UINT WmCreate = 0x0001;
     constexpr UINT WmDestroy = 0x0002;
+    constexpr UINT WmMove = 0x0003;
     constexpr UINT WmSize = 0x0005;
     constexpr UINT WmSetFocus = 0x0007;
     constexpr UINT WmKillFocus = 0x0008;
@@ -167,6 +168,8 @@ namespace GuestAbi
     constexpr UINT WmShowWindow = 0x0018;
     constexpr UINT WmSetFont = 0x0030;
     constexpr UINT WmGetFont = 0x0031;
+    constexpr UINT WmWindowPosChanging = 0x0046;
+    constexpr UINT WmWindowPosChanged = 0x0047;
     constexpr UINT WmNotify = 0x004e;
     constexpr UINT WmContextMenu = 0x007b;
     constexpr UINT WmNcCreate = 0x0081;
@@ -180,6 +183,9 @@ namespace GuestAbi
     constexpr UINT WmInitMenu = 0x0116;
     constexpr UINT WmInitMenuPopup = 0x0117;
     constexpr UINT WmMenuSelect = 0x011F;
+    constexpr UINT WmEnterMenuLoop = 0x0211;
+    constexpr UINT WmExitMenuLoop = 0x0212;
+    constexpr UINT WmUninitMenuPopup = 0x0125;
     constexpr UINT WmMouseMove = 0x0200;
     constexpr UINT WmLButtonDown = 0x0201;
     constexpr UINT WmLButtonUp = 0x0202;
@@ -243,7 +249,9 @@ namespace GuestAbi
 
     constexpr WPARAM VkBack = 0x08;
     constexpr WPARAM VkEscape = 0x1b;
+    constexpr WPARAM VkMenu = 0x12;
     constexpr WPARAM VkReturn = 0x0d;
+    constexpr WPARAM VkF10 = 0x79;
     constexpr WPARAM VkSpace = 0x20;
     constexpr WPARAM VkEnd = 0x23;
     constexpr WPARAM VkHome = 0x24;

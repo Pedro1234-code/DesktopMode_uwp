@@ -153,6 +153,7 @@
     <ClInclude Include="Bridge\GuestKernel.h" />
     <ClInclude Include="Bridge\GuestModule.h" />
     <ClInclude Include="Bridge\GuestMessageQueue.h" />
+    <ClInclude Include="Bridge\GuestMetrics.h" />
     <ClInclude Include="Bridge\GuestWin32Abi.h" />
     <ClInclude Include="Bridge\GuestRuntime.h" />
     <ClInclude Include="Bridge\ImportBinder.h" />

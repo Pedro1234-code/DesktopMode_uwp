@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge/CommonControlsShims.h"
+#include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestWindow.h"
 #include "Bridge/User32Shims.h"
 #include "Bridge/RuntimeDiagnostics.h"
@@ -145,9 +146,9 @@ HWND WINAPI Win32Bridge::Bridge::BridgeCreateToolbarEx(
     HWND parent,
     DWORD style,
     UINT identifier,
-    int,
+    int bitmapCount,
     HINSTANCE instance,
-    UINT_PTR,
+    UINT_PTR bitmapId,
     const void* buttons,
     int buttonCount,
     int buttonWidth,
@@ -163,7 +164,7 @@ HWND WINAPI Win32Bridge::Bridge::BridgeCreateToolbarEx(
         return nullptr;
     }
     const HWND toolbar = manager->CreateGuestWindow(0, L"ToolbarWindow32", L"",
-        style | WS_CHILD | WS_VISIBLE, 0, 0, 100, 26, parent,
+        style | WS_CHILD, 0, 0, 100, GuestMetrics::ToolbarHeight, parent,
         reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(identifier)), instance, nullptr, &error);
     if (!toolbar)
     {
@@ -180,6 +181,39 @@ HWND WINAPI Win32Bridge::Bridge::BridgeCreateToolbarEx(
         manager->SendGuestMessage(toolbar, 0x0420, 0,
             MAKELPARAM(bitmapWidth, bitmapHeight), nullptr); // TB_SETBITMAPSIZE
     }
+    // CreateToolbarEx is also responsible for loading the caller's bitmap
+    // strip.  Keeping only the button records leaves a correctly-sized but
+    // visually empty toolbar, even though every command is present.  Model
+    // the native TB_ADDBITMAP path with a bridge-owned image list so this
+    // remains useful for any guest that uses the legacy helper.
+    if (bitmapCount > 0 && bitmapId != 0)
+    {
+        const int imageWidth = bitmapWidth > 0
+            ? bitmapWidth : GuestMetrics::DefaultBitmapExtent;
+        const int imageHeight = bitmapHeight > 0
+            ? bitmapHeight : GuestMetrics::DefaultBitmapExtent;
+        const HBITMAP bitmap = BridgeLoadBitmapW(
+            instance, reinterpret_cast<LPCWSTR>(bitmapId));
+        if (bitmap)
+        {
+            const GuestImageList imageList = BridgeImageListCreate(
+                imageWidth, imageHeight, 0, bitmapCount, 1);
+            const int firstImage = imageList
+                ? BridgeImageListAddMasked(imageList, bitmap, RGB(192, 192, 192))
+                : -1;
+            manager->Gdi().DeleteObject(
+                static_cast<MiniGdi::ObjectHandle>(reinterpret_cast<ULONG_PTR>(bitmap)));
+            if (firstImage >= 0)
+            {
+                manager->SendGuestMessage(toolbar, 0x0430, 0,
+                    reinterpret_cast<LPARAM>(imageList), nullptr); // TB_SETIMAGELIST
+            }
+            else if (imageList)
+            {
+                BridgeImageListDestroy(imageList);
+            }
+        }
+    }
     if (buttons && buttonCount > 0)
     {
         manager->SendGuestMessage(toolbar, 0x0444,
@@ -193,7 +227,8 @@ HWND WINAPI Win32Bridge::Bridge::BridgeCreateStatusWindowW(LONG style, LPCWSTR t
     GuestWindowManager* manager = CurrentGuestWindowManager();
     DWORD error = ERROR_SUCCESS;
     return manager ? manager->CreateGuestWindow(0, L"msctls_statusbar32", text ? text : L"",
-        static_cast<DWORD>(style) | WS_CHILD | WS_VISIBLE, 0, 0, 100, 22, parent,
+        static_cast<DWORD>(style) | WS_CHILD | WS_VISIBLE,
+        0, 0, 100, GuestMetrics::StatusBarHeight, parent,
         reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(identifier)), nullptr, nullptr, &error) : nullptr;
 }
 INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void*) { return -1; }

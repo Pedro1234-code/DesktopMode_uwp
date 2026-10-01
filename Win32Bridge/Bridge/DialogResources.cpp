@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge/DialogResources.h"
+#include "Bridge/GuestMetrics.h"
 
 #include "Bridge/GuestResources.h"
 #include "Bridge/GuestWindow.h"
@@ -183,8 +184,8 @@ namespace
         std::vector<HWND> tabControls;
         UINT defaultButton = IDOK;
         HFONT font = nullptr;
-        int baseUnitX = 8;
-        int baseUnitY = 16;
+        int baseUnitX = GuestMetrics::TextWidth;
+        int baseUnitY = GuestMetrics::TextHeight;
     };
 
     thread_local ModalDialogState* g_activeModalDialog = nullptr;
@@ -420,8 +421,8 @@ namespace
 
     struct DialogBaseUnits final
     {
-        int x = 8;
-        int y = 16;
+        int x = GuestMetrics::TextWidth;
+        int y = GuestMetrics::TextHeight;
     };
 
     int ScaleDialogUnit(int value, int numerator, int denominator)
@@ -441,9 +442,11 @@ namespace
         // MiniGDI backend is deterministic, so derive the same pair from the
         // requested point height instead of consulting a host XAML font.
         DialogBaseUnits units;
-        units.y = (std::max)(8,
-            ScaleDialogUnit(static_cast<int>(dialog.font.pointSize), 96, 72) + 3);
-        units.x = (std::max)(4, (units.y * 7 + 8) / 16);
+        units.y = (std::max)(GuestMetrics::TextWidth,
+            ScaleDialogUnit(static_cast<int>(dialog.font.pointSize),
+                GuestMetrics::LogicalDpi, 72) + GuestMetrics::DialogExternalLeading);
+        units.x = (std::max)(GuestMetrics::ControlHorizontalPadding,
+            (units.y * 7 + GuestMetrics::TextWidth) / GuestMetrics::TextHeight);
         return units;
     }
 
@@ -832,9 +835,25 @@ namespace
             reinterpret_cast<WPARAM>(initialFocus), initParameter, &error);
         if (!modal.ended && manager->IsGuestWindow(root))
         {
+            // Resource dialogs are assembled hidden. Paint their complete
+            // visible subtree while it is still off-screen, then expose the
+            // already-populated surfaces in one composed frame. The queued
+            // WM_PAINT notifications become harmless stale notifications once
+            // UpdateWindow consumes each invalid region.
+            manager->UpdateGuestWindow(root, nullptr);
+            for (const HWND control : runtime->controls)
+            {
+                if (manager->IsGuestWindow(control))
+                {
+                    manager->UpdateGuestWindow(control, nullptr);
+                }
+            }
+            manager->ShowGuestWindow(root, SW_SHOW, &error);
+            // SetFocus rejects effectively hidden descendants, as Win32 does.
+            // Apply the dialog manager's requested initial control only after
+            // the dialog itself has become visible.
             if (initializeFocus != FALSE && initialFocus)
                 manager->SetGuestFocus(initialFocus, nullptr);
-            manager->ShowGuestWindow(root, SW_SHOW, &error);
         }
 
         RuntimeDiagnostics::Record(L"DIALOG: instantiated " +

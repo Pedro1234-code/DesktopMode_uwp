@@ -22,6 +22,10 @@ namespace Bridge
         UINT type = 0;
         UINT state = 0;
         HMENU subMenu = nullptr;
+        HBITMAP checkedBitmap = nullptr;
+        HBITMAP uncheckedBitmap = nullptr;
+        HBITMAP itemBitmap = nullptr;
+        ULONG_PTR itemData = 0;
         std::wstring text;
     };
 
@@ -100,6 +104,7 @@ namespace Bridge
     int WINAPI BridgeFillRect(HDC dc, const RECT* rect, HBRUSH brush);
     int WINAPI BridgeDrawTextW(HDC dc, LPWSTR text, int characterCount, LPRECT rect, UINT format);
     int WINAPI BridgeLoadStringW(HINSTANCE instance, UINT identifier, LPWSTR buffer, int bufferCount);
+    int WINAPI BridgeMapWindowPoints(HWND from, HWND to, LPPOINT points, UINT count);
     BOOL WINAPI BridgeScreenToClient(HWND window, LPPOINT point);
     BOOL WINAPI BridgeMoveWindow(HWND window, int x, int y, int width, int height, BOOL repaint);
     LPWSTR WINAPI BridgeCharUpperW(LPWSTR text);
@@ -120,6 +125,7 @@ namespace Bridge
     INT_PTR WINAPI BridgeDialogBoxParamW(HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC dialogProcedure, LPARAM initParameter);
     BOOL WINAPI BridgeIsDialogMessageW(HWND dialog, const GuestAbi::Message* message);
     UINT WINAPI BridgeRegisterClipboardFormatW(LPCWSTR formatName);
+    HMENU WINAPI BridgeCreateMenu();
     HMENU WINAPI BridgeCreatePopupMenu();
     BOOL WINAPI BridgeDestroyMenu(HMENU menu);
     BOOL WINAPI BridgeAppendMenuW(HMENU menu, UINT flags, UINT_PTR identifier, LPCWSTR text);
@@ -131,12 +137,22 @@ namespace Bridge
     DWORD WINAPI BridgeCheckMenuItem(HMENU menu, UINT item, UINT flags);
     BOOL WINAPI BridgeCheckMenuRadioItem(HMENU menu, UINT first, UINT last, UINT selected, UINT flags);
     BOOL WINAPI BridgeRemoveMenu(HMENU menu, UINT item, UINT flags);
+    BOOL WINAPI BridgeDeleteMenu(HMENU menu, UINT item, UINT flags);
+    UINT WINAPI BridgeGetMenuItemID(HMENU menu, int position);
+    UINT WINAPI BridgeGetMenuState(HMENU menu, UINT item, UINT flags);
+    int WINAPI BridgeGetMenuStringW(HMENU menu, UINT item, LPWSTR text, int count, UINT flags);
+    BOOL WINAPI BridgeSetMenuDefaultItem(HMENU menu, UINT item, UINT byPosition);
+    UINT WINAPI BridgeGetMenuDefaultItem(HMENU menu, UINT byPosition, UINT flags);
+    BOOL WINAPI BridgeIsMenu(HMENU menu);
+    BOOL WINAPI BridgeHiliteMenuItem(HWND window, HMENU menu, UINT item, UINT flags);
     HMENU WINAPI BridgeGetSubMenu(HMENU menu, int position);
     HMENU WINAPI BridgeGetMenu(HWND window);
     BOOL WINAPI BridgeSetMenu(HWND window, HMENU menu);
     BOOL WINAPI BridgeDrawMenuBar(HWND window);
     HMENU WINAPI BridgeLoadMenuW(HINSTANCE instance, LPCWSTR resource);
     UINT WINAPI BridgeTrackPopupMenuEx(HMENU menu, UINT flags, int x, int y, HWND owner, const RECT* excludeRect);
+    BOOL WINAPI BridgeTrackPopupMenu(HMENU menu, UINT flags, int x, int y, int reserved, HWND owner, const RECT* rect);
+    BOOL WINAPI BridgeEndMenu();
     HANDLE WINAPI BridgeLoadAcceleratorsW(HINSTANCE instance, LPCWSTR resource);
     int WINAPI BridgeTranslateAcceleratorW(HWND window, HANDLE accelerators, const GuestAbi::Message* message);
     UINT WINAPI BridgeGetDialogBaseUnits();

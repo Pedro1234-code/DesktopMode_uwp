@@ -1,7 +1,9 @@
 #include "pch.h"
 #include "Bridge\\CommonControlsShims.h"
+#include "Bridge\\DialogResources.h"
 #include "Bridge\\GuestWindow.h"
 #include "Bridge\\User32Shims.h"
+#include "Bridge/GuestMetrics.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <wrl.h>
@@ -10,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -206,10 +209,8 @@ namespace
             return BuiltinControlKind::ScrollBar;
         }
         // Common-controls window classes are pre-registered by comctl32 on
-        // desktop Windows.  7-Zip creates these directly (rather than only
-        // through the legacy CreateToolbarEx helper), so rejecting them here
-        // causes its panel creation to collapse into the generic E_FAIL
-        // reported by the application.  They stay guest-owned virtual
+        // desktop Windows. Applications may create these directly rather
+        // than through legacy helper functions, so they stay guest-owned virtual
         // controls; no desktop HWND or host common-control DLL is exposed.
         if (_wcsicmp(className, L"syslistview32") == 0)
         {
@@ -316,7 +317,9 @@ namespace
     constexpr UINT MenuFlagChecked = 0x0008;
     constexpr UINT MenuFlagPopup = 0x0010;
     constexpr UINT MenuFlagHighlighted = 0x0080;
+    constexpr UINT MenuFlagRadioCheck = 0x0200;
     constexpr UINT MenuFlagSeparator = 0x0800;
+    constexpr UINT MenuFlagDefault = 0x1000;
     constexpr UINT MenuFlagMouseSelect = 0x8000;
 
     bool IsMenuItemDisabled(const GuestMenuVisualItem& item)
@@ -332,12 +335,87 @@ namespace
 
     int PopupMenuWidth(const std::vector<GuestMenuVisualItem>& items)
     {
-        size_t characters = 0;
+        size_t captionCharacters = 0;
+        size_t shortcutCharacters = 0;
         for (const auto& item : items)
-            characters = (std::max)(characters, MenuCaptionForDisplay(item.text).size());
-        const size_t bounded = (std::min)(characters, static_cast<size_t>(40));
-        return (std::max)(140, (std::min)(360,
-            static_cast<int>(bounded) * MiniGdi::DefaultTextGlyphWidth + 56));
+        {
+            const std::wstring display = MenuCaptionForDisplay(item.text);
+            const size_t tab = display.find(L'\t');
+            captionCharacters = (std::max)(captionCharacters,
+                tab == std::wstring::npos ? display.size() : tab);
+            if (tab != std::wstring::npos)
+                shortcutCharacters = (std::max)(shortcutCharacters, display.size() - tab - 1);
+        }
+        const size_t maximumCharacters = static_cast<size_t>(
+            ((std::numeric_limits<int>::max)() - 72) / MiniGdi::DefaultTextGlyphWidth);
+        const size_t characters = (std::min)(maximumCharacters,
+            captionCharacters + (shortcutCharacters ? shortcutCharacters + 3 : 0));
+        return (std::max)(96, static_cast<int>(characters) *
+            MiniGdi::DefaultTextGlyphWidth + 56);
+    }
+
+    int PopupMenuItemHeight(const GuestMenuVisualItem& item)
+    {
+        return IsMenuItemSeparator(item) ? (std::max)(5, GuestMetrics::MenuHeight / 3) :
+            GuestMetrics::MenuHeight;
+    }
+
+    int PopupMenuHeight(const std::vector<GuestMenuVisualItem>& items)
+    {
+        int result = 0;
+        for (const auto& item : items)
+            result = SaturatingAdd(result, PopupMenuItemHeight(item));
+        return result;
+    }
+
+    int PopupMenuItemTop(const std::vector<GuestMenuVisualItem>& items, size_t index)
+    {
+        int result = 0;
+        for (size_t current = 0; current < index && current < items.size(); ++current)
+            result = SaturatingAdd(result, PopupMenuItemHeight(items[current]));
+        return result;
+    }
+
+    int PopupMenuItemAt(const std::vector<GuestMenuVisualItem>& items, int y)
+    {
+        if (y < 0) return -1;
+        int top = 0;
+        for (size_t index = 0; index < items.size(); ++index)
+        {
+            const int bottom = SaturatingAdd(top, PopupMenuItemHeight(items[index]));
+            if (y < bottom) return static_cast<int>(index);
+            top = bottom;
+        }
+        return -1;
+    }
+
+    wchar_t MenuMnemonic(const std::wstring& source)
+    {
+        for (size_t index = 0; index + 1 < source.size(); ++index)
+        {
+            if (source[index] != L'&') continue;
+            if (source[index + 1] == L'&') { ++index; continue; }
+            return static_cast<wchar_t>(towupper(source[index + 1]));
+        }
+        return 0;
+    }
+
+    int MenuMnemonicDisplayIndex(const std::wstring& source)
+    {
+        int displayIndex = 0;
+        for (size_t index = 0; index < source.size(); ++index)
+        {
+            if (source[index] == L'\t') break;
+            if (source[index] != L'&') { ++displayIndex; continue; }
+            if (index + 1 < source.size() && source[index + 1] == L'&')
+            {
+                ++displayIndex;
+                ++index;
+                continue;
+            }
+            return index + 1 < source.size() ? displayIndex : -1;
+        }
+        return -1;
     }
 
     UINT MenuSelectFlags(const GuestMenuVisualItem& item, bool mouseSelection)
@@ -399,7 +477,8 @@ namespace
         const std::vector<int>& bitmaps,
         const std::vector<BYTE>& states,
         size_t index,
-        int buttonWidth)
+        int buttonWidth,
+        const std::vector<std::wstring>* texts = nullptr)
     {
         if (index < states.size() && (states[index] & 0x08) != 0) // TBSTATE_HIDDEN
         {
@@ -408,12 +487,20 @@ namespace
         const BYTE style = index < styles.size() ? styles[index] : 0;
         if ((style & ToolbarStyleSeparator) != 0)
         {
-            // For a separator iBitmap is its requested width; Windows uses a
-            // small fixed gap when the caller supplies zero or a sentinel.
             const int requested = index < bitmaps.size() ? bitmaps[index] : 0;
             return requested > 0 ? (std::min)(requested, 128) : 8;
         }
-        return (std::max)(16, buttonWidth);
+        int width = (std::max)(GuestMetrics::DefaultBitmapExtent, buttonWidth);
+        if (texts && index < texts->size() && !(*texts)[index].empty())
+        {
+            const size_t boundedLength = (std::min)((*texts)[index].size(),
+                static_cast<size_t>((std::numeric_limits<int>::max)() /
+                    GuestMetrics::TextWidth));
+            const int textWidth = static_cast<int>(boundedLength) * GuestMetrics::TextWidth;
+            width = (std::max)(width,
+                textWidth + 2 * GuestMetrics::ControlHorizontalPadding);
+        }
+        return width;
     }
 
     int ToolbarItemLeft(
@@ -421,18 +508,42 @@ namespace
         const std::vector<int>& bitmaps,
         const std::vector<BYTE>& states,
         size_t index,
-        int buttonWidth)
+        int buttonWidth,
+        const std::vector<std::wstring>* texts = nullptr)
     {
         int left = 2;
         for (size_t previous = 0; previous < index; ++previous)
         {
-            const int width = ToolbarItemWidth(styles, bitmaps, states, previous, buttonWidth);
+            const int width = ToolbarItemWidth(styles, bitmaps, states,
+                previous, buttonWidth, texts);
             if (width != 0)
             {
                 left += width + 1;
             }
         }
         return left;
+    }
+
+    int ToolbarContentWidth(
+        const std::vector<BYTE>& styles,
+        const std::vector<int>& bitmaps,
+        const std::vector<BYTE>& states,
+        size_t itemCount,
+        int buttonWidth,
+        const std::vector<std::wstring>* texts = nullptr)
+    {
+        int right = 0;
+        for (size_t index = 0; index < itemCount; ++index)
+        {
+            const int width = ToolbarItemWidth(styles, bitmaps, states,
+                index, buttonWidth, texts);
+            if (width > 0)
+            {
+                right = ToolbarItemLeft(styles, bitmaps, states,
+                    index, buttonWidth, texts) + width;
+            }
+        }
+        return right > 0 ? right + 2 : 0;
     }
 
     void DrawToolbarImage(MiniGdi::Surface& destination, const MiniGdi::Rect& destinationRect, const MiniGdi::Surface& source)
@@ -467,6 +578,7 @@ namespace
     constexpr UINT GuestSwpFrameChanged = 0x0020;
     constexpr UINT GuestSwpShowWindow = 0x0040;
     constexpr UINT GuestSwpHideWindow = 0x0080;
+    constexpr UINT GuestSwpNoSendChanging = 0x0400;
     constexpr int MaximumWindowExtraBytes = 64 * 1024;
     constexpr DWORD GuestWsVisible = 0x10000000u;
     constexpr DWORD GuestWsDisabled = 0x08000000u;
@@ -485,7 +597,15 @@ namespace
     constexpr UINT ComboBoxGetText = 0x0148;
     constexpr UINT ComboBoxResetContent = 0x014b;
     constexpr UINT ComboBoxSetCurrentSelection = 0x014e;
+    constexpr UINT ComboBoxShowDropDown = 0x014f;
+    constexpr UINT ComboBoxGetDroppedControlRect = 0x0152;
+    constexpr UINT ComboBoxGetDroppedState = 0x0157;
+    constexpr UINT ComboBoxSetDroppedWidth = 0x0160;
     constexpr UINT ComboBoxGetCount = 0x0146;
+    constexpr UINT ComboNotificationSelectionChange = 1;
+    constexpr UINT ComboNotificationDropDown = 7;
+    constexpr UINT ComboNotificationCloseUp = 8;
+    constexpr DWORD ComboBoxStyleSimple = 0x0001;
     constexpr UINT ComboBoxExSetImageList = 0x0402;
     constexpr UINT ComboBoxExGetImageList = 0x0403;
     constexpr UINT ComboBoxExGetComboControl = 0x0406;
@@ -566,6 +686,8 @@ namespace
     constexpr UINT ToolbarSetBitmapSize = 0x0420;
     constexpr UINT ToolbarAutoSize = 0x0421;
     constexpr UINT ToolbarAddButtonsW = 0x0444;
+    constexpr UINT ToolbarGetButtonTextW = 0x044b;
+    constexpr UINT ToolbarAddStringW = 0x044d;
     constexpr UINT ToolbarGetButtonCount = 0x0418;
     constexpr UINT ToolbarGetRows = 0x0428;
     constexpr UINT ToolbarGetButtonSize = 0x043a;
@@ -586,6 +708,13 @@ namespace
     constexpr UINT RebarGetBandCount = 0x040c;
     constexpr UINT RebarGetBarHeight = 0x041b;
     constexpr UINT RebarGetRowHeight = 0x041c;
+    constexpr UINT RebarBandMaskStyle = 0x00000001;
+    constexpr UINT RebarBandMaskChild = 0x00000010;
+    constexpr UINT RebarBandMaskChildSize = 0x00000020;
+    constexpr UINT RebarBandMaskSize = 0x00000040;
+    constexpr UINT RebarBandStyleBreak = 0x00000001;
+    constexpr UINT RebarBandStyleFixedSize = 0x00000002;
+    constexpr UINT RebarBandStyleHidden = 0x00000008;
     constexpr UINT StatusBarSetTextW = 0x040b;
     constexpr UINT StatusBarGetTextLengthW = 0x040c;
     constexpr UINT StatusBarGetTextW = 0x040d;
@@ -781,8 +910,8 @@ namespace
         LPARAM itemData;
     };
 
-    // COMBOBOXEXITEMW through lParam.  The address control in 7-Zip uses the
-    // text field to publish its current shell location.
+    // COMBOBOXEXITEMW through lParam. ComboBoxEx clients use the text field
+    // to publish each item's current caption.
     struct GuestComboBoxExItemW final
     {
         UINT mask;
@@ -895,10 +1024,97 @@ namespace
     {
         HWND child = nullptr;
         UINT style = 0;
-        int minimumWidth = 24;
-        int minimumHeight = 24;
+        int minimumWidth = GuestMetrics::ToolbarButtonExtent;
+        int minimumHeight = GuestMetrics::ToolbarHeight;
         int width = 0;
+        int naturalWidth = 0;
+        int naturalHeight = 0;
     };
+
+    int SetWindowPosExtent(int value);
+    int SaturatingAdd(int value, int delta);
+
+    bool IsRebarBandHidden(const RebarBand& band)
+    {
+        return (band.style & RebarBandStyleHidden) != 0;
+    }
+
+    int RebarBandPreferredWidth(const RebarBand& band)
+    {
+        return (std::max)(band.minimumWidth,
+            band.width > 0 ? band.width : band.naturalWidth);
+    }
+
+    int RebarBandHeight(const RebarBand& band)
+    {
+        // REBARBANDINFO permits a zero child height. In that case the common
+        // control uses its normal control-strip height rather than collapsing
+        // the row to a single pixel.
+        if (band.minimumHeight > 0) return band.minimumHeight;
+        if (band.naturalHeight > 0) return band.naturalHeight;
+        return GuestMetrics::ToolbarHeight;
+    }
+
+    int ValidatedRebarDimension(UINT value)
+    {
+        // Match comctl32's defensive validation. Applications commonly leave
+        // unused trailing REBARBANDINFO members uninitialized; Wine and native
+        // comctl32 reject implausible values instead of turning them into a
+        // gigantic band. Validate before applying the bridge surface limit.
+        if (value > 65535u)
+        {
+            return 0;
+        }
+        return SetWindowPosExtent(static_cast<int>(value));
+    }
+
+    int ValidatedRebarChildHeight(UINT value)
+    {
+        const int height = ValidatedRebarDimension(value);
+        // A horizontal rebar row cannot have a useful minimum taller than the
+        // guest desktop. Values such as a ComboBox's requested drop-list
+        // height belong to its popup, not to the closed band.
+        return height > GuestMetrics::CurrentScreenHeight() ? 0 : height;
+    }
+
+    std::vector<int> RebarRowHeights(const std::vector<RebarBand>& bands, int availableWidth)
+    {
+        const int width = (std::max)(1, availableWidth);
+        std::vector<int> heights;
+        int rowWidth = 0;
+        int rowHeight = 0;
+        bool rowHasBand = false;
+        for (const auto& band : bands)
+        {
+            if (IsRebarBandHidden(band) || !band.child) continue;
+            const int desiredWidth = (std::min)(width,
+                (std::max)(0, band.minimumWidth));
+            const bool startsRow = rowHasBand &&
+                (((band.style & RebarBandStyleBreak) != 0) || rowWidth + desiredWidth > width);
+            if (startsRow)
+            {
+                heights.push_back(rowHeight);
+                rowWidth = 0;
+                rowHeight = 0;
+                rowHasBand = false;
+            }
+            rowWidth = SaturatingAdd(rowWidth, desiredWidth);
+            rowHeight = (std::max)(rowHeight, RebarBandHeight(band));
+            rowHasBand = true;
+        }
+        if (rowHasBand) heights.push_back(rowHeight);
+        return heights;
+    }
+
+    int RequiredRebarHeight(const std::vector<RebarBand>& bands, int availableWidth)
+    {
+        int totalHeight = 0;
+        for (const int rowHeight : RebarRowHeights(bands, availableWidth))
+        {
+            totalHeight = SaturatingAdd(totalHeight, rowHeight);
+        }
+        return totalHeight > 0 ? totalHeight : GuestMetrics::ToolbarHeight;
+    }
 
     struct GuestProgressRange final
     {
@@ -1212,7 +1428,10 @@ namespace
         // The first surface is deliberately bounded to keep an untrusted PE
         // from turning one SetWindowPos call into a huge allocation.  Zero is
         // valid (unlike the CreateWindow default sizing rule).
-        return (std::max)(0, (std::min)(value, 2048));
+        const int viewportLimit = (std::max)(GuestMetrics::CurrentScreenWidth(),
+            GuestMetrics::CurrentScreenHeight());
+        const int maximum = (std::min)(8192, (std::max)(2048, viewportLimit));
+        return (std::max)(0, (std::min)(value, maximum));
     }
 
     bool HasArea(const RECT& rect)
@@ -1856,12 +2075,18 @@ struct GuestWindowManager::WindowRecord final
     UINT_PTR controlId = 0;
     std::vector<BYTE> extraBytes;
     MiniGdi::ObjectHandle controlFont = MiniGdi::InvalidObject;
+    int controlTextWidth = GuestMetrics::TextWidth;
+    int controlTextHeight = GuestMetrics::TextHeight;
+    int listViewHeaderHeight = GuestMetrics::ListViewHeaderHeight;
+    int listViewRowHeight = GuestMetrics::TextHeight;
     size_t editCaret = 0;
     bool buttonPressed = false;
     bool buttonKeyboardPressed = false;
     std::vector<std::wstring> choiceItems;
     HANDLE comboBoxExImageList = nullptr;
     int selectedChoice = -1;
+    bool comboDropped = false;
+    int comboDroppedWidth = 0;
     int scrollPosition = 0;
     std::vector<std::wstring> listViewColumns;
     std::vector<int> listViewColumnWidths;
@@ -1893,10 +2118,13 @@ struct GuestWindowManager::WindowRecord final
     std::vector<BYTE> toolbarButtonStates;
     std::vector<BYTE> toolbarButtonStyles;
     std::vector<UINT_PTR> toolbarButtonData;
-    int toolbarButtonWidth = 24;
-    int toolbarButtonHeight = 24;
-    int toolbarBitmapWidth = 16;
-    int toolbarBitmapHeight = 16;
+    std::vector<std::wstring> toolbarStrings;
+    std::vector<std::wstring> toolbarButtonTexts;
+    std::vector<INT_PTR> toolbarButtonStringRefs;
+    int toolbarButtonWidth = GuestMetrics::ToolbarButtonExtent;
+    int toolbarButtonHeight = GuestMetrics::ToolbarButtonExtent;
+    int toolbarBitmapWidth = GuestMetrics::DefaultBitmapExtent;
+    int toolbarBitmapHeight = GuestMetrics::DefaultBitmapExtent;
     int toolbarPressedIndex = -1;
     HANDLE toolbarImageList = nullptr;
     bool commonControlUnicode = true;
@@ -1906,7 +2134,7 @@ struct GuestWindowManager::WindowRecord final
     std::vector<UINT> statusBarTextStyles;
     std::wstring statusBarSimpleText;
     UINT statusBarSimpleStyle = 0;
-    int statusBarMinimumHeight = 18;
+    int statusBarMinimumHeight = GuestMetrics::StatusBarMinimumHeight;
     bool statusBarSimple = false;
     int progressMinimum = 0;
     int progressMaximum = 100;
@@ -1924,7 +2152,7 @@ struct GuestWindowManager::WindowRecord final
     int tabSelectedItem = -1;
     int tabFocusedItem = -1;
     int tabItemWidth = 0;
-    int tabItemHeight = 24;
+    int tabItemHeight = GuestMetrics::TabItemHeight;
     int tabHorizontalPadding = 6;
     int tabVerticalPadding = 3;
     std::vector<std::wstring> headerItems;
@@ -1949,7 +2177,6 @@ struct GuestWindowManager::WindowRecord final
     int upDownPosition = 0;
     UINT upDownBase = 10;
     HWND upDownBuddy = nullptr;
-    bool addressBackButton = false;
     bool menuBar = false;
     int openMenuIndex = -1;
     bool visible = false;
@@ -1975,11 +2202,23 @@ GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHos
         return;
     }
 
+    const auto hostBounds = coreWindow->Bounds;
+    const double availableWidth = surfaceHost->ActualWidth > 0.0
+        ? surfaceHost->ActualWidth : hostBounds.Width;
+    const double availableHeight = surfaceHost->ActualHeight > 0.0
+        ? surfaceHost->ActualHeight : hostBounds.Height;
+    const int initialWidth = (std::max)(1, static_cast<int>(std::lround(availableWidth)));
+    const int initialHeight = (std::max)(1, static_cast<int>(std::lround(availableHeight)));
+    m_viewportWidth.store(initialWidth);
+    m_viewportHeight.store(initialHeight);
+    GuestMetrics::SetCurrentScreenSize(initialWidth, initialHeight);
+
     auto image = ref new Image();
     image->Stretch = Stretch::Uniform;
     image->HorizontalAlignment = HorizontalAlignment::Stretch;
     image->VerticalAlignment = VerticalAlignment::Stretch;
     surfaceHost->Children->Append(image);
+    m_surfaceHost = Platform::Agile<Panel^>(surfaceHost);
     m_surfaceImage = Platform::Agile<Image^>(image);
     m_presentation = std::make_shared<GuestPresentationState>();
     m_presentation->dispatcher = Platform::Agile<CoreDispatcher^>(coreWindow->Dispatcher);
@@ -2083,6 +2322,48 @@ GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHos
         }
         catch (Exception^ error) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: KeyUp HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
         catch (...) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: KeyUp raised an unknown exception."); }
+    });
+    m_sizeChangedToken = coreWindow->SizeChanged +=
+        ref new TypedEventHandler<CoreWindow^, WindowSizeChangedEventArgs^>(
+        [callbacks](CoreWindow^, WindowSizeChangedEventArgs^ args)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner && args)
+            {
+                callbacks->owner->HandleHostSizeChanged(
+                    (std::max)(1, static_cast<int>(std::lround(args->Size.Width))),
+                    (std::max)(1, static_cast<int>(std::lround(args->Size.Height))));
+            }
+        }
+        catch (Exception^ error)
+        {
+            RuntimeDiagnostics::Record(L"HOST SIZE EXCEPTION: HRESULT " +
+                std::to_wstring(static_cast<unsigned long>(error->HResult)) + L".");
+        }
+        catch (...)
+        {
+            RuntimeDiagnostics::Record(L"HOST SIZE EXCEPTION: unknown exception.");
+        }
+    });
+    m_surfaceSizeChangedToken = surfaceHost->SizeChanged += ref new SizeChangedEventHandler(
+        [callbacks](Platform::Object^, SizeChangedEventArgs^ args)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner && args)
+            {
+                callbacks->owner->HandleHostSizeChanged(
+                    (std::max)(1, static_cast<int>(std::lround(args->NewSize.Width))),
+                    (std::max)(1, static_cast<int>(std::lround(args->NewSize.Height))));
+            }
+        }
+        catch (...)
+        {
+            RuntimeDiagnostics::Record(L"HOST SURFACE SIZE EXCEPTION.");
+        }
     });
     m_eventsAttached.store(true);
 }
@@ -2367,26 +2648,32 @@ HWND GuestWindowManager::CreateGuestWindow(
         return nullptr;
     }
     // CW_USEDEFAULT has a different meaning for a stock control than for a
-    // top-level desktop. Giving a toolbar/ReBar a 480-pixel default height
-    // makes well-behaved clients (including 7-Zip) conclude that no client
-    // area remains for their panel. Keep the generic top-level fallback, but
-    // use normal control-strip dimensions for controls that participate in
-    // vertical layout before their parent performs its first resize.
+    // top-level desktop. Use the virtual desktop for top-level defaults and
+    // control metrics for child strips before their parent performs layout.
     const BuiltinControlKind builtinKind = registered->builtinKind;
-    const int defaultWidth = 800;
-    const int defaultHeight = builtinKind == BuiltinControlKind::Toolbar ||
-        builtinKind == BuiltinControlKind::Rebar ||
-        builtinKind == BuiltinControlKind::StatusBar ||
-        builtinKind == BuiltinControlKind::Header ||
-        builtinKind == BuiltinControlKind::Progress ||
+    const int defaultWidth = GuestMetrics::CurrentScreenWidth();
+    int defaultHeight = GuestMetrics::CurrentScreenHeight();
+    if (builtinKind == BuiltinControlKind::Toolbar ||
+        builtinKind == BuiltinControlKind::Rebar)
+        defaultHeight = GuestMetrics::ToolbarHeight;
+    else if (builtinKind == BuiltinControlKind::StatusBar)
+        defaultHeight = GuestMetrics::StatusBarHeight;
+    else if (builtinKind == BuiltinControlKind::Header)
+        defaultHeight = GuestMetrics::ListViewHeaderHeight;
+    else if (builtinKind == BuiltinControlKind::Progress ||
         builtinKind == BuiltinControlKind::UpDown ||
-        builtinKind == BuiltinControlKind::ToolTip
-        ? 24
-        : 480;
+        builtinKind == BuiltinControlKind::ToolTip)
+        defaultHeight = GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight);
     window->bounds.left = DefaultCoordinate(x);
     window->bounds.top = DefaultCoordinate(y);
-    window->bounds.right = window->bounds.left + DefaultExtent(width, defaultWidth);
-    window->bounds.bottom = window->bounds.top + DefaultExtent(height, defaultHeight);
+    const int initialWindowWidth = parent
+        ? DefaultExtent(width, defaultWidth)
+        : (std::max)(1, m_viewportWidth.load());
+    const int initialWindowHeight = parent
+        ? DefaultExtent(height, defaultHeight)
+        : (std::max)(1, m_viewportHeight.load());
+    window->bounds.right = window->bounds.left + initialWindowWidth;
+    window->bounds.bottom = window->bounds.top + initialWindowHeight;
     if (!window->surface.Resize(window->bounds.right - window->bounds.left, window->bounds.bottom - window->bounds.top, MiniGdi::OpaqueWhite))
     {
         SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY);
@@ -2408,8 +2695,8 @@ HWND GuestWindowManager::CreateGuestWindow(
 
     // CreateWindowEx associates a top-level window with either the supplied
     // menu handle or the menu resource declared in its WNDCLASS.  The old
-    // bridge retained neither relationship, so 7-Zip could create and query
-    // its menus but never receive a visible, interactive menu bar.
+    // bridge retained neither relationship, so applications could create and
+    // query menus but never receive a visible, interactive menu bar.
     if (!parent)
     {
         HMENU effectiveMenu = menu;
@@ -2503,6 +2790,173 @@ std::shared_ptr<GuestWindowManager::WindowRecord> GuestWindowManager::FindWindow
     std::lock_guard<std::mutex> guard(m_windowsLock);
     const auto found = m_windows.find(token);
     return found == m_windows.end() ? nullptr : found->second;
+}
+
+void GuestWindowManager::LayoutGuestRebar(HWND rebar)
+{
+    const auto record = FindWindow(rebar);
+    if (!record)
+    {
+        return;
+    }
+
+    std::vector<RebarBand> bands;
+    int availableWidth = 0;
+    int availableHeight = 0;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed || !record->windowClass ||
+            record->windowClass->builtinKind != BuiltinControlKind::Rebar)
+        {
+            return;
+        }
+        bands = record->rebarBands;
+        availableWidth = record->surface.Width();
+        availableHeight = record->surface.Height();
+    }
+
+    availableWidth = (std::max)(1, availableWidth);
+    availableHeight = (std::max)(1, availableHeight);
+
+    for (auto& band : bands)
+    {
+        if (!band.child)
+        {
+            continue;
+        }
+        const auto child = FindWindow(band.child);
+        if (child)
+        {
+            std::lock_guard<std::mutex> childGuard(child->lock);
+            child->parent = rebar;
+            band.naturalWidth = child->surface.Width();
+            band.naturalHeight = child->surface.Height();
+            if (child->windowClass &&
+                child->windowClass->builtinKind == BuiltinControlKind::Toolbar)
+            {
+                const int contentWidth = ToolbarContentWidth(
+                    child->toolbarButtonStyles,
+                    child->toolbarBitmaps,
+                    child->toolbarButtonStates,
+                    child->toolbarCommands.size(),
+                    child->toolbarButtonWidth,
+                    &child->toolbarButtonTexts);
+                if (contentWidth > 0) band.naturalWidth = contentWidth;
+            }
+            else if (child->windowClass &&
+                child->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
+                (child->style & 0x0003u) != ComboBoxStyleSimple)
+            {
+                band.naturalHeight = (std::min)(band.naturalHeight,
+                    GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight));
+            }
+        }
+        if (IsRebarBandHidden(band))
+        {
+            DWORD ignored = ERROR_SUCCESS;
+            SetGuestWindowPos(band.child, nullptr, 0, 0, 0, 0,
+                GuestSwpNoMove | GuestSwpNoSize | GuestSwpNoZOrder | GuestSwpHideWindow,
+                &ignored);
+        }
+    }
+
+    int rowTop = 0;
+    size_t first = 0;
+    std::vector<HWND> laidOutChildren;
+    while (first < bands.size() && rowTop < availableHeight)
+    {
+        while (first < bands.size() &&
+            (IsRebarBandHidden(bands[first]) || !bands[first].child))
+        {
+            ++first;
+        }
+        if (first >= bands.size())
+        {
+            break;
+        }
+
+        std::vector<size_t> row;
+        int preferredTotal = 0;
+        int minimumTotal = 0;
+        int rowHeight = 1;
+        size_t next = first;
+        for (; next < bands.size(); ++next)
+        {
+            const auto& band = bands[next];
+            if (IsRebarBandHidden(band) || !band.child)
+            {
+                continue;
+            }
+            const int preferred = (std::min)(availableWidth, RebarBandPreferredWidth(band));
+            const int minimum = (std::min)(availableWidth,
+                (std::max)(0, band.minimumWidth));
+            if (!row.empty() && (((band.style & RebarBandStyleBreak) != 0) ||
+                SaturatingAdd(minimumTotal, minimum) > availableWidth))
+            {
+                break;
+            }
+            row.push_back(next);
+            preferredTotal = SaturatingAdd(preferredTotal, preferred);
+            minimumTotal = SaturatingAdd(minimumTotal, minimum);
+            rowHeight = (std::max)(rowHeight, RebarBandHeight(band));
+        }
+
+        rowHeight = (std::min)(rowHeight, availableHeight - rowTop);
+        int flexible = -1;
+        for (size_t position = 0; position < row.size(); ++position)
+        {
+            if ((bands[row[position]].style & RebarBandStyleFixedSize) == 0)
+            {
+                flexible = static_cast<int>(position);
+            }
+        }
+
+        int cursor = 0;
+        for (size_t position = 0; position < row.size(); ++position)
+        {
+            const auto& band = bands[row[position]];
+            const int remaining = (std::max)(0, availableWidth - cursor);
+            int laterMinimum = 0;
+            for (size_t later = position + 1; later < row.size(); ++later)
+            {
+                laterMinimum = SaturatingAdd(laterMinimum,
+                    (std::max)(0, bands[row[later]].minimumWidth));
+            }
+            const int maximumHere = (std::max)(0, remaining - laterMinimum);
+            int childWidth = (std::min)(maximumHere, RebarBandPreferredWidth(band));
+            childWidth = (std::max)(childWidth,
+                (std::min)(remaining, (std::max)(0, band.minimumWidth)));
+            if (static_cast<int>(position) == flexible && preferredTotal < availableWidth)
+            {
+                childWidth = SaturatingAdd(childWidth, availableWidth - preferredTotal);
+            }
+            DWORD ignored = ERROR_SUCCESS;
+            SetGuestWindowPos(band.child, nullptr, cursor, rowTop, childWidth, rowHeight,
+                GuestSwpNoZOrder | GuestSwpShowWindow, &ignored);
+            laidOutChildren.push_back(band.child);
+            cursor = SaturatingAdd(cursor, childWidth);
+        }
+
+        rowTop = SaturatingAdd(rowTop, rowHeight);
+        first = next;
+    }
+
+    // SetWindowPos invalidates resized children, but its immediate retained
+    // composition can briefly expose the freshly cleared white surface before
+    // the queued WM_PAINT runs. Common controls normally redraw as part of the
+    // completed rebar layout, so consume those invalid regions now.
+    for (const HWND child : laidOutChildren)
+    {
+        DWORD ignored = ERROR_SUCCESS;
+        UpdateGuestWindow(child, &ignored);
+    }
+    DWORD ignored = ERROR_SUCCESS;
+    InvalidateGuestRect(rebar, nullptr, TRUE, &ignored);
+    UpdateGuestWindow(rebar, &ignored);
+
+    RuntimeDiagnostics::Record(L"REBAR: laid out " + std::to_wstring(bands.size()) +
+        L" band(s) in " + std::to_wstring(availableWidth) + L"x" +
+        std::to_wstring(availableHeight) + L".");
 }
 
 bool GuestWindowManager::IsGuestWindowVisibleInternal(HWND window) const
@@ -2947,6 +3401,7 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
 
     if (show && !wasVisible)
     {
+        const bool effectivelyVisible = IsGuestWindowVisibleInternal(window);
         // Showing a child must not make it a new top-level foreground window.
         // Its parent is composed into the same guest desktop and hit-testing
         // selects the child under the pointer.
@@ -2955,7 +3410,7 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
             m_foregroundWindow.store(reinterpret_cast<ULONG_PTR>(window));
         }
         CallWindowProcedure(record, GuestAbi::WmShowWindow, TRUE, 0);
-        if (enabled)
+        if (enabled && effectivelyVisible)
         {
             DWORD ignored = ERROR_SUCCESS;
             SetGuestFocus(window, &ignored);
@@ -2963,7 +3418,15 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
         PostGuestMessage(window, GuestAbi::WmSize, GuestAbi::SizeRestored,
             GuestAbi::MakeMouseLParam(static_cast<WORD>(width), static_cast<WORD>(height)), nullptr);
         InvalidateGuestRect(window, nullptr, TRUE, nullptr);
-        Present(record);
+        // WS_VISIBLE on a child does not make it screen-visible while one of
+        // its ancestors is hidden.  Dialog templates create all visible
+        // controls before showing the dialog itself; presenting each child at
+        // that point uploaded the unchanged owner frame repeatedly and later
+        // exposed the dialog one control at a time as queued paints ran.
+        if (effectivelyVisible)
+        {
+            Present(record);
+        }
         RuntimeDiagnostics::Record(
             L"WINDOW SHOW: handle " + std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) +
             (parent ? L" (child)." : L" (top-level)."));
@@ -2996,7 +3459,7 @@ BOOL GuestWindowManager::GetGuestClientRect(HWND window, LPRECT rect, DWORD* win
     rect->top = 0;
     rect->right = record->surface.Width();
     rect->bottom = (std::max)(0, record->surface.Height() -
-        ((!record->parent && record->menuBar) ? 22 : 0));
+        ((!record->parent && record->menuBar) ? GuestMetrics::MenuHeight : 0));
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
@@ -3021,7 +3484,8 @@ BOOL GuestWindowManager::SetGuestWindowMenuBar(HWND window, BOOL visible, DWORD*
         changed = topLevel && record->menuBar != requested;
         record->menuBar = topLevel && requested;
         width = record->surface.Width();
-        height = (std::max)(0, record->surface.Height() - (record->menuBar ? 22 : 0));
+        height = (std::max)(0, record->surface.Height() -
+            (record->menuBar ? GuestMetrics::MenuHeight : 0));
     }
     if (changed)
     {
@@ -3037,7 +3501,8 @@ BOOL GuestWindowManager::SetGuestWindowMenuBar(HWND window, BOOL visible, DWORD*
     return TRUE;
 }
 
-UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int y, HWND owner, DWORD* win32Error)
+UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int y,
+    HWND owner, const RECT* excludeRect, DWORD* win32Error)
 {
     HWND root = nullptr;
     int rootWidth = 0;
@@ -3057,19 +3522,56 @@ UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int 
     constexpr UINT TpmReturnCommand = 0x0100;
     constexpr UINT TpmNoNotify = 0x0080;
     constexpr UINT TpmRightButton = 0x0002;
+    constexpr UINT TpmCenterAlign = 0x0004;
+    constexpr UINT TpmRightAlign = 0x0008;
+    constexpr UINT TpmVCenterAlign = 0x0010;
+    constexpr UINT TpmBottomAlign = 0x0020;
+    SendGuestMessage(owner, GuestAbi::WmEnterMenuLoop, TRUE, 0, nullptr);
+    SendGuestMessage(owner, GuestAbi::WmInitMenu,
+        reinterpret_cast<WPARAM>(menu), 0, nullptr);
     SendGuestMessage(owner, GuestAbi::WmInitMenuPopup,
         reinterpret_cast<WPARAM>(menu), 0, nullptr);
     const std::vector<GuestMenuVisualItem> popupItems = GetGuestMenuItems(menu);
     if (popupItems.empty())
     {
+        SendGuestMessage(owner, GuestAbi::WmExitMenuLoop, TRUE, 0, nullptr);
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return 0;
     }
+    // TrackPopupMenuEx receives screen coordinates.  The retained popup is
+    // composed in the complete root surface (including its menu strip), so
+    // translate against the root window origin rather than its client origin.
+    RECT rootRect{};
+    if (!GetGuestWindowRect(root, &rootRect, win32Error))
+    {
+        return 0;
+    }
+    int rootX = x - rootRect.left;
+    int rootY = y - rootRect.top;
     const int popupWidth = PopupMenuWidth(popupItems);
-    const int popupLeft = (std::max)(0, (std::min)(x,
+    const int popupHeight = PopupMenuHeight(popupItems);
+    if (flags & TpmRightAlign) rootX -= popupWidth;
+    else if (flags & TpmCenterAlign) rootX -= popupWidth / 2;
+    if (flags & TpmBottomAlign) rootY -= popupHeight;
+    else if (flags & TpmVCenterAlign) rootY -= popupHeight / 2;
+    if (excludeRect)
+    {
+        const RECT local{ excludeRect->left - rootRect.left, excludeRect->top - rootRect.top,
+            excludeRect->right - rootRect.left, excludeRect->bottom - rootRect.top };
+        const bool overlaps = rootX < local.right && rootX + popupWidth > local.left &&
+            rootY < local.bottom && rootY + popupHeight > local.top;
+        if (overlaps)
+        {
+            if (local.bottom + popupHeight <= rootHeight) rootY = local.bottom;
+            else if (local.top >= popupHeight) rootY = local.top - popupHeight;
+            else if (local.right + popupWidth <= rootWidth) rootX = local.right;
+            else rootX = local.left - popupWidth;
+        }
+    }
+    const int popupLeft = (std::max)(0, (std::min)(rootX,
         (std::max)(0, rootWidth - popupWidth)));
-    const int popupTop = (std::max)(0, (std::min)(y,
-        (std::max)(0, rootHeight - 20)));
+    const int popupTop = (std::max)(0, (std::min)(rootY,
+        (std::max)(0, rootHeight - popupHeight)));
     {
         std::lock_guard<std::mutex> guard(m_popupMenuLock);
         m_popupMenu = PopupMenuSession{};
@@ -3101,6 +3603,7 @@ UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int 
     const UINT command = m_popupMenu.selectedCommand;
     const bool returnCommand = m_popupMenu.returnCommand;
     const bool notifyOwner = m_popupMenu.notifyOwner;
+    const std::vector<PopupMenuLevel> closedLevels = m_popupMenu.levels;
     m_popupMenu = PopupMenuSession{};
     lock.unlock();
     if (command && !returnCommand && notifyOwner)
@@ -3112,17 +3615,163 @@ UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int 
     return returnCommand ? command : (command ? TRUE : FALSE);
 }
 
+BOOL GuestWindowManager::EndGuestMenu(DWORD* win32Error)
+{
+    PopupMenuSession closing;
+    {
+        std::lock_guard<std::mutex> guard(m_popupMenuLock);
+        if (!m_popupMenu.open)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_MENU_HANDLE);
+            return FALSE;
+        }
+        m_popupMenu.selectedCommand = 0;
+        m_popupMenu.open = false;
+        closing = m_popupMenu;
+    }
+    if (const auto root = FindWindow(closing.root))
+    {
+        std::lock_guard<std::mutex> guard(root->lock);
+        if (!root->destroyed) root->openMenuIndex = -1;
+    }
+    if (closing.owner)
+    {
+        SendGuestMessage(closing.owner, GuestAbi::WmMenuSelect,
+            GuestAbi::MakeCommandWParam(0, 0xffff), 0, nullptr);
+        if (closing.menuBar)
+        {
+            for (auto iterator = closing.levels.rbegin(); iterator != closing.levels.rend(); ++iterator)
+                SendGuestMessage(closing.owner, GuestAbi::WmUninitMenuPopup,
+                    reinterpret_cast<WPARAM>(iterator->menu), 0, nullptr);
+            SendGuestMessage(closing.owner, GuestAbi::WmExitMenuLoop, FALSE, 0, nullptr);
+        }
+    }
+    m_popupMenuChanged.notify_all();
+    InvalidateGuestRect(closing.root, nullptr, FALSE, nullptr);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
 BOOL GuestWindowManager::GetGuestWindowRect(HWND window, LPRECT rect, DWORD* win32Error) const
 {
-    const auto record = FindWindow(window);
-    if (!record || !rect)
+    if (!rect)
     {
-        SetWin32Error(win32Error, !rect ? ERROR_INVALID_PARAMETER : ERROR_INVALID_WINDOW_HANDLE);
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    for (auto iterator = closedLevels.rbegin(); iterator != closedLevels.rend(); ++iterator)
+        SendGuestMessage(owner, GuestAbi::WmUninitMenuPopup,
+            reinterpret_cast<WPARAM>(iterator->menu), 0, nullptr);
+    SendGuestMessage(owner, GuestAbi::WmExitMenuLoop, TRUE, 0, nullptr);
+
+    // Win32 GetWindowRect always returns screen coordinates, including for
+    // child windows.  WindowRecord::bounds is deliberately parent-client
+    // relative because the compositor consumes it that way, so accumulate
+    // the complete parent chain here instead of exposing the retained-model
+    // representation to guest applications.
+    std::unordered_set<ULONG_PTR> visited;
+    HWND current = window;
+    bool first = true;
+    int left = 0;
+    int top = 0;
+    int width = 0;
+    int height = 0;
+    while (current)
+    {
+        const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(current);
+        if (token == 0 || !visited.emplace(token).second)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return FALSE;
+        }
+
+        const auto record = FindWindow(current);
+        if (!record)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return FALSE;
+        }
+
+        HWND parent = nullptr;
+        RECT bounds{};
+        bool menuBar = false;
+        {
+            std::lock_guard<std::mutex> guard(record->lock);
+            if (record->destroyed)
+            {
+                SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+                return FALSE;
+            }
+            parent = record->parent;
+            bounds = record->bounds;
+            menuBar = record->menuBar;
+        }
+
+        if (first)
+        {
+            width = bounds.right - bounds.left;
+            height = bounds.bottom - bounds.top;
+            first = false;
+        }
+        left = SaturatingAdd(left, bounds.left);
+        top = SaturatingAdd(top, bounds.top);
+
+        // Child coordinates are relative to the parent's client origin.  The
+        // bridge models the root menu as non-client chrome, so descendants of
+        // that root begin below it on the composed guest screen.
+        if (!parent && menuBar && current != window)
+        {
+            top = SaturatingAdd(top, GuestMetrics::MenuHeight);
+        }
+        current = parent;
+    }
+
+    rect->left = left;
+    rect->top = top;
+    rect->right = SaturatingAdd(left, width);
+    rect->bottom = SaturatingAdd(top, height);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL GuestWindowManager::GetGuestClientOrigin(HWND window, LPPOINT point, DWORD* win32Error) const
+{
+    if (!point)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
         return FALSE;
     }
 
-    std::lock_guard<std::mutex> guard(record->lock);
-    *rect = record->bounds;
+    RECT windowRect{};
+    if (!GetGuestWindowRect(window, &windowRect, win32Error))
+    {
+        return FALSE;
+    }
+
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+
+    bool rootMenuBar = false;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return FALSE;
+        }
+        // Descendant window rectangles already include the root's client
+        // offset while walking their parent chain.  Only the root itself
+        // still needs its non-client menu height applied here.
+        rootMenuBar = !record->parent && record->menuBar;
+    }
+
+    point->x = windowRect.left;
+    point->y = SaturatingAdd(windowRect.top,
+        rootMenuBar ? GuestMetrics::MenuHeight : 0);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
@@ -3577,7 +4226,7 @@ bool GuestWindowManager::GetGuestSurfaceGeometry(
             *rootHeight = height;
             *targetLeft = accumulatedLeft;
             *targetTop = SaturatingAdd(accumulatedTop,
-                rootMenuBar && window != current ? 22 : 0);
+                rootMenuBar && window != current ? GuestMetrics::MenuHeight : 0);
             return width > 0 && height > 0 && *targetWidth > 0 && *targetHeight > 0;
         }
 
@@ -3602,6 +4251,7 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
         RECT bounds = {};
         bool visible = false;
         bool menuBar = false;
+        bool topMost = false;
     };
 
     std::vector<std::shared_ptr<WindowRecord>> records;
@@ -3628,8 +4278,20 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
             snapshot.handle = record->handle;
             snapshot.parent = record->parent;
             snapshot.bounds = record->bounds;
+            if (record->windowClass &&
+                record->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
+                !record->comboDropped &&
+                (record->style & 0x0003u) != ComboBoxStyleSimple)
+            {
+                snapshot.bounds.bottom = (std::min<LONG>)(snapshot.bounds.bottom,
+                    static_cast<LONG>(SaturatingAdd(snapshot.bounds.top,
+                        GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight))));
+            }
             snapshot.visible = record->visible;
             snapshot.menuBar = record->menuBar;
+            snapshot.topMost = record->windowClass &&
+                record->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
+                record->comboDropped;
         }
         windows.push_back(snapshot);
     }
@@ -3639,6 +4301,7 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
         windows.end(),
         [](const HitTestSnapshot& left, const HitTestSnapshot& right)
         {
+            if (left.topMost != right.topMost) return !left.topMost;
             return reinterpret_cast<ULONG_PTR>(left.handle) <
                 reinterpret_cast<ULONG_PTR>(right.handle);
         });
@@ -3693,13 +4356,13 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
 
     if (root->menuBar)
     {
-        if (rootY < 22)
+        if (rootY < GuestMetrics::MenuHeight)
         {
             // Menu handling owns this non-client strip. Returning the root
             // prevents its toolbar from receiving clicks shifted by the menu.
             return rootWindow;
         }
-        rootY -= 22;
+        rootY -= GuestMetrics::MenuHeight;
     }
 
     const HWND child = hitTestChildren(rootWindow, rootX, rootY);
@@ -3721,7 +4384,6 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
         return false;
     }
 
-    constexpr int popupRowHeight = 20;
     const auto notifyMenuClosed = [this](HWND owner)
     {
         if (owner)
@@ -3753,6 +4415,13 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
             if (!root->destroyed) root->openMenuIndex = -1;
         }
         notifyMenuClosed(closing.owner);
+        if (closing.menuBar && closing.owner)
+        {
+            for (auto iterator = closing.levels.rbegin(); iterator != closing.levels.rend(); ++iterator)
+                SendGuestMessage(closing.owner, GuestAbi::WmUninitMenuPopup,
+                    reinterpret_cast<WPARAM>(iterator->menu), 0, nullptr);
+            SendGuestMessage(closing.owner, GuestAbi::WmExitMenuLoop, FALSE, 0, nullptr);
+        }
         RuntimeDiagnostics::Record(command
             ? L"MENU: selected command " + std::to_wstring(command) + L"."
             : L"MENU: dismissed without a command.");
@@ -3775,7 +4444,8 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
         // While a menu-bar popup is active, clicking another top-level caption
         // switches menus without first delivering the click to the guest
         // client area.
-        if (popup.menuBar && rootY >= 0 && rootY < 22 && message == GuestAbi::WmLButtonDown)
+        if (popup.menuBar && rootY >= 0 && rootY < GuestMetrics::MenuHeight &&
+            (message == GuestAbi::WmLButtonDown || message == GuestAbi::WmMouseMove))
         {
             std::vector<GuestMenuVisualItem> barItems = GetGuestMenuBarItems(rootWindow);
             int selected = -1;
@@ -3790,11 +4460,11 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                 }
                 left = SaturatingAdd(left, width);
             }
-            if (selected < 0 || selected == popup.topMenuIndex ||
-                !barItems[static_cast<size_t>(selected)].subMenu ||
+            if (selected == popup.topMenuIndex) return true;
+            if (selected < 0 || !barItems[static_cast<size_t>(selected)].subMenu ||
                 IsMenuItemDisabled(barItems[static_cast<size_t>(selected)]))
             {
-                dismissPopup(0);
+                if (message == GuestAbi::WmLButtonDown) dismissPopup(0);
                 return true;
             }
             const HMENU child = barItems[static_cast<size_t>(selected)].subMenu;
@@ -3824,11 +4494,11 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                 {
                     m_popupMenu.menu = barItems[static_cast<size_t>(selected)].subMenu;
                     m_popupMenu.left = left;
-                    m_popupMenu.top = 22;
+                    m_popupMenu.top = GuestMetrics::MenuHeight;
                     m_popupMenu.topMenuIndex = selected;
                     m_popupMenu.levels.clear();
                     m_popupMenu.levels.push_back(PopupMenuLevel{
-                        m_popupMenu.menu, left, 22, selected, -1 });
+                        m_popupMenu.menu, left, GuestMetrics::MenuHeight, selected, -1 });
                 }
             }
             {
@@ -3840,7 +4510,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
             InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
             return true;
         }
-        if (popup.menuBar && rootY >= 0 && rootY < 22)
+        if (popup.menuBar && rootY >= 0 && rootY < GuestMetrics::MenuHeight)
         {
             // Releasing the click that opened the menu must not immediately
             // close it merely because the pointer is still over its caption.
@@ -3856,12 +4526,12 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
             const PopupMenuLevel& level = popup.levels[levelIndex];
             std::vector<GuestMenuVisualItem> items = GetGuestMenuItems(level.menu);
             const int width = PopupMenuWidth(items);
-            const int height = static_cast<int>((std::min)(items.size(), static_cast<size_t>(32))) * popupRowHeight;
+            const int height = PopupMenuHeight(items);
             if (rootX >= level.left && rootX < SaturatingAdd(level.left, width) &&
                 rootY >= level.top && rootY < SaturatingAdd(level.top, height))
             {
                 hitLevel = static_cast<int>(levelIndex);
-                hitItem = (rootY - level.top) / popupRowHeight;
+                hitItem = PopupMenuItemAt(items, rootY - level.top);
                 hitItems = std::move(items);
                 break;
             }
@@ -3931,10 +4601,10 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                     int childLeft = SaturatingAdd(hitGeometry.left, PopupMenuWidth(refreshed) - 2);
                     if (childLeft + childWidth > rootWidth)
                         childLeft = (std::max)(0, hitGeometry.left - childWidth + 2);
-                    const int childHeight = static_cast<int>((std::min)(
-                        childItems.size(), static_cast<size_t>(32))) * popupRowHeight;
+                    const int childHeight = PopupMenuHeight(childItems);
                     const int childTop = (std::max)(0, (std::min)(
-                        SaturatingAdd(hitGeometry.top, hitItem * popupRowHeight),
+                        SaturatingAdd(hitGeometry.top, PopupMenuItemTop(
+                            refreshed, static_cast<size_t>(hitItem))),
                         (std::max)(0, rootHeight - childHeight)));
                     std::lock_guard<std::mutex> guard(m_popupMenuLock);
                     if (m_popupMenu.open && m_popupMenu.root == rootWindow)
@@ -3973,7 +4643,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
     }
 
     int menuLeft = 8;
-    if (rootY >= 0 && rootY < 22)
+    if (rootY >= 0 && rootY < GuestMetrics::MenuHeight)
     {
         int selected = -1;
         for (size_t index = 0; index < menuItems.size(); ++index)
@@ -3985,6 +4655,17 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                 break;
             }
             menuLeft = SaturatingAdd(menuLeft, width);
+        }
+        if (message == GuestAbi::WmLButtonUp && selected >= 0)
+        {
+            const GuestMenuVisualItem& item = menuItems[static_cast<size_t>(selected)];
+            if (!item.subMenu && !IsMenuItemDisabled(item) && !IsMenuItemSeparator(item) &&
+                item.identifier)
+            {
+                SendGuestMessage(rootWindow, GuestAbi::WmCommand,
+                    GuestAbi::MakeCommandWParam(static_cast<WORD>(item.identifier), 0), 0, nullptr);
+            }
+            return true;
         }
         if (message == GuestAbi::WmLButtonDown)
         {
@@ -3999,6 +4680,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                 const HMENU rootMenu = BridgeGetMenu(rootWindow);
                 if (rootMenu)
                 {
+                    SendGuestMessage(rootWindow, GuestAbi::WmEnterMenuLoop, FALSE, 0, nullptr);
                     SendGuestMessage(rootWindow, GuestAbi::WmInitMenu,
                         reinterpret_cast<WPARAM>(rootMenu), 0, nullptr);
                 }
@@ -4028,13 +4710,13 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                     m_popupMenu.owner = rootWindow;
                     m_popupMenu.root = rootWindow;
                     m_popupMenu.left = menuLeft;
-                    m_popupMenu.top = 22;
+                    m_popupMenu.top = GuestMetrics::MenuHeight;
                     m_popupMenu.open = true;
                     m_popupMenu.menuBar = true;
                     m_popupMenu.notifyOwner = true;
                     m_popupMenu.topMenuIndex = selected;
                     m_popupMenu.levels.push_back(PopupMenuLevel{
-                        openedSubMenu, menuLeft, 22, selected, -1 });
+                        openedSubMenu, menuLeft, GuestMetrics::MenuHeight, selected, -1 });
                 }
                 {
                     std::lock_guard<std::mutex> guard(root->lock);
@@ -4070,6 +4752,133 @@ HWND GuestWindowManager::GetGuestParent(HWND window, DWORD* win32Error) const
     }
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return record->parent;
+}
+
+HWND GuestWindowManager::ChildGuestWindowFromPoint(
+    HWND parent,
+    POINT point,
+    UINT flags,
+    DWORD* win32Error) const
+{
+    const auto parentRecord = FindWindow(parent);
+    if (!parentRecord)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return nullptr;
+    }
+
+    constexpr UINT SkipInvisible = 0x0001;
+    constexpr UINT SkipDisabled = 0x0002;
+    constexpr UINT SkipTransparent = 0x0004;
+    constexpr DWORD ExTransparent = 0x00000020;
+
+    struct Candidate final
+    {
+        HWND handle = nullptr;
+        RECT bounds{};
+        bool visible = false;
+        bool enabled = false;
+        bool transparent = false;
+    };
+    std::vector<Candidate> candidates;
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        candidates.reserve(m_windows.size());
+        for (const auto& item : m_windows)
+        {
+            const auto& record = item.second;
+            std::lock_guard<std::mutex> recordGuard(record->lock);
+            if (record->destroyed || record->parent != parent) continue;
+            RECT bounds = record->bounds;
+            if (record->windowClass &&
+                record->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
+                !record->comboDropped &&
+                (record->style & 0x0003u) != ComboBoxStyleSimple)
+            {
+                bounds.bottom = (std::min<LONG>)(bounds.bottom,
+                    static_cast<LONG>(SaturatingAdd(bounds.top,
+                        GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight))));
+            }
+            candidates.push_back(Candidate{
+                record->handle,
+                bounds,
+                record->visible,
+                record->enabled,
+                (record->extendedStyle & ExTransparent) != 0 });
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+        [](const Candidate& left, const Candidate& right)
+        {
+            return reinterpret_cast<ULONG_PTR>(left.handle) >
+                reinterpret_cast<ULONG_PTR>(right.handle);
+        });
+
+    for (const auto& candidate : candidates)
+    {
+        if ((flags & SkipInvisible) != 0 && !candidate.visible) continue;
+        if ((flags & SkipDisabled) != 0 && !candidate.enabled) continue;
+        if ((flags & SkipTransparent) != 0 && candidate.transparent) continue;
+        if (point.x >= candidate.bounds.left && point.y >= candidate.bounds.top &&
+            point.x < candidate.bounds.right && point.y < candidate.bounds.bottom)
+        {
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return candidate.handle;
+        }
+    }
+
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return parent;
+}
+
+HWND GuestWindowManager::GuestWindowFromPoint(POINT point, DWORD* win32Error) const
+{
+    struct RootCandidate final
+    {
+        HWND handle = nullptr;
+        RECT bounds{};
+        bool visible = false;
+        bool enabled = false;
+    };
+    std::vector<RootCandidate> roots;
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        roots.reserve(m_windows.size());
+        for (const auto& item : m_windows)
+        {
+            const auto& record = item.second;
+            std::lock_guard<std::mutex> recordGuard(record->lock);
+            if (record->destroyed || record->parent) continue;
+            roots.push_back(RootCandidate{
+                record->handle, record->bounds, record->visible, record->enabled });
+        }
+    }
+    std::sort(roots.begin(), roots.end(),
+        [](const RootCandidate& left, const RootCandidate& right)
+        {
+            return reinterpret_cast<ULONG_PTR>(left.handle) >
+                reinterpret_cast<ULONG_PTR>(right.handle);
+        });
+
+    for (const auto& root : roots)
+    {
+        if (!root.visible || !root.enabled ||
+            point.x < root.bounds.left || point.y < root.bounds.top ||
+            point.x >= root.bounds.right || point.y >= root.bounds.bottom)
+        {
+            continue;
+        }
+        const HWND hit = HitTestGuestWindow(
+            root.handle, point.x - root.bounds.left, point.y - root.bounds.top);
+        if (hit && IsGuestWindowVisibleInternal(hit) && IsGuestWindowEnabledInternal(hit))
+        {
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return hit;
+        }
+    }
+
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return nullptr;
 }
 
 HWND GuestWindowManager::GetGuestDlgItem(HWND parent, int identifier, DWORD* win32Error) const
@@ -4370,7 +5179,10 @@ LONG_PTR GuestWindowManager::SetGuestWindowLongPtr(HWND window, int index, LONG_
         if (becameVisible)
         {
             InvalidateGuestRect(window, nullptr, TRUE, nullptr);
-            Present(record);
+            if (IsGuestWindowVisibleInternal(window))
+            {
+                Present(record);
+            }
         }
     }
 
@@ -4402,6 +5214,20 @@ BOOL GuestWindowManager::SetGuestWindowPos(
         return FALSE;
     }
 
+    GuestWindowPosition requested{
+        window, insertAfter, x, y, width, height, flags };
+    if ((flags & GuestSwpNoSendChanging) == 0)
+    {
+        CallWindowProcedure(record, GuestAbi::WmWindowPosChanging, 0,
+            reinterpret_cast<LPARAM>(&requested));
+    }
+
+    insertAfter = requested.insertAfter;
+    x = requested.x;
+    y = requested.y;
+    width = requested.cx;
+    height = requested.cy;
+    flags = requested.flags;
     const bool resize = (flags & GuestSwpNoSize) == 0;
     const bool move = (flags & GuestSwpNoMove) == 0;
     if (resize && (width < 0 || height < 0))
@@ -4426,8 +5252,12 @@ BOOL GuestWindowManager::SetGuestWindowPos(
     int currentHeight = 0;
     int currentLeft = 0;
     int currentTop = 0;
+    int previousWidth = 0;
+    int previousHeight = 0;
+    int previousLeft = 0;
+    int previousTop = 0;
+    std::wstring className;
     bool resizedRebar = false;
-    std::vector<RebarBand> rebarBandsToLayout;
 
     {
         std::lock_guard<std::mutex> guard(record->lock);
@@ -4439,25 +5269,26 @@ BOOL GuestWindowManager::SetGuestWindowPos(
 
         const int oldWidth = record->surface.Width();
         const int oldHeight = record->surface.Height();
-        const int newWidth = resize ? SetWindowPosExtent(width) : oldWidth;
-        int newHeight = resize ? SetWindowPosExtent(height) : oldHeight;
+        previousWidth = oldWidth;
+        previousHeight = oldHeight;
+        previousLeft = record->bounds.left;
+        previousTop = record->bounds.top;
+        className = record->windowClass ? record->windowClass->name : L"<unknown>";
+        const bool hostedRoot = record->parent == nullptr;
+        const int newWidth = hostedRoot
+            ? (std::max)(1, m_viewportWidth.load())
+            : (resize ? SetWindowPosExtent(width) : oldWidth);
+        int newHeight = hostedRoot
+            ? (std::max)(1, m_viewportHeight.load())
+            : (resize ? SetWindowPosExtent(height) : oldHeight);
         if (resize && record->windowClass &&
             record->windowClass->builtinKind == BuiltinControlKind::Rebar &&
             !record->rebarBands.empty())
         {
-            int bandHeight = 18;
-            for (const auto& band : record->rebarBands)
-            {
-                bandHeight = (std::max)(bandHeight, band.minimumHeight);
-            }
-            // A rebar is a control strip, not the file-panel client area.
-            // Native clients can briefly pass an obsolete, full-panel height
-            // during negotiation; retain the normalized band height rather
-            // than covering the ListView or accepting zero.
-            newHeight = (std::min)(64, (std::max)(18, bandHeight));
+            newHeight = RequiredRebarHeight(record->rebarBands, newWidth);
         }
-        const int newLeft = move ? x : record->bounds.left;
-        const int newTop = move ? y : record->bounds.top;
+        const int newLeft = hostedRoot ? 0 : (move ? x : record->bounds.left);
+        const int newTop = hostedRoot ? 0 : (move ? y : record->bounds.top);
 
         if (resize && (newWidth != oldWidth || newHeight != oldHeight))
         {
@@ -4506,67 +5337,11 @@ BOOL GuestWindowManager::SetGuestWindowPos(
         currentTop = record->bounds.top;
         resizedRebar = changedSize && record->windowClass &&
             record->windowClass->builtinKind == BuiltinControlKind::Rebar;
-        if (resizedRebar)
-        {
-            rebarBandsToLayout = record->rebarBands;
-        }
     }
 
-    if (resizedRebar && !rebarBandsToLayout.empty())
+    if (resizedRebar)
     {
-        size_t comboBand = rebarBandsToLayout.size();
-        bool addressOnlyBands = true;
-        for (size_t index = 0; index < rebarBandsToLayout.size(); ++index)
-        {
-            const auto child = FindWindow(rebarBandsToLayout[index].child);
-            BuiltinControlKind childKind = BuiltinControlKind::None;
-            if (child)
-            {
-                std::lock_guard<std::mutex> childGuard(child->lock);
-                childKind = child->windowClass ? child->windowClass->builtinKind : BuiltinControlKind::None;
-            }
-            if (childKind == BuiltinControlKind::ComboBox)
-            {
-                comboBand = index;
-            }
-            else if (childKind != BuiltinControlKind::Static)
-            {
-                addressOnlyBands = false;
-            }
-        }
-        addressOnlyBands = addressOnlyBands && comboBand < rebarBandsToLayout.size();
-        for (size_t index = 0; index < rebarBandsToLayout.size(); ++index)
-        {
-            const auto child = FindWindow(rebarBandsToLayout[index].child);
-            if (child)
-            {
-                std::lock_guard<std::mutex> childGuard(child->lock);
-                const bool staticChild = child->windowClass &&
-                    child->windowClass->builtinKind == BuiltinControlKind::Static;
-                child->addressBackButton = addressOnlyBands && staticChild && index != comboBand;
-            }
-        }
-        int cursor = 0;
-        for (size_t index = 0; index < rebarBandsToLayout.size(); ++index)
-        {
-            const RebarBand& band = rebarBandsToLayout[index];
-            const int remaining = (std::max)(0, currentWidth - cursor);
-            const size_t remainingBands = rebarBandsToLayout.size() - index;
-            const int rowShare = remainingBands == 0 ? remaining : remaining / static_cast<int>(remainingBands);
-            const int preferredWidth = band.width == 0 ? band.minimumWidth : band.width;
-            const int childWidth = addressOnlyBands
-                ? (index == comboBand ? remaining : (std::min)(26, remaining))
-                : (index + 1 == rebarBandsToLayout.size()
-                    ? remaining
-                    : (std::min)(preferredWidth, (std::max)(24, rowShare)));
-            DWORD ignored = ERROR_SUCCESS;
-            SetGuestWindowPos(band.child, nullptr, cursor, 0, childWidth,
-                currentHeight, GuestSwpNoZOrder, &ignored);
-            cursor += (std::max)(0, childWidth);
-        }
-        RuntimeDiagnostics::Record(L"REBAR: relaid out " +
-            std::to_wstring(rebarBandsToLayout.size()) + L" band(s) at " +
-            std::to_wstring(currentWidth) + L"x" + std::to_wstring(currentHeight) + L".");
+        LayoutGuestRebar(window);
     }
 
     if (becameVisible)
@@ -4594,25 +5369,45 @@ BOOL GuestWindowManager::SetGuestWindowPos(
     {
         RuntimeDiagnostics::Record(
             L"WINDOW LAYOUT: handle " + std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) +
+            L" (" + className + L", parent " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(parent)) + L", flags 0x" +
+            [&flags]()
+            {
+                wchar_t buffer[16]{};
+                swprintf_s(buffer, L"%08X", flags);
+                return std::wstring(buffer);
+            }() + L") " +
+            std::to_wstring(previousWidth) + L"x" + std::to_wstring(previousHeight) +
+            L" at " + std::to_wstring(previousLeft) + L"," + std::to_wstring(previousTop) +
             L" -> " + std::to_wstring(currentWidth) + L"x" + std::to_wstring(currentHeight) +
             L" at " + std::to_wstring(currentLeft) + L"," + std::to_wstring(currentTop) + L".");
     }
 
-    if (changedSize)
+    const bool changedPosition = move &&
+        (currentLeft != previousLeft || currentTop != previousTop);
+    if (changedSize || changedPosition || becameVisible || becameHidden ||
+        (flags & GuestSwpFrameChanged) != 0)
     {
-        PostGuestMessage(
+        GuestWindowPosition completed{
             window,
-            GuestAbi::WmSize,
-            GuestAbi::SizeRestored,
-            GuestAbi::MakeMouseLParam(static_cast<WORD>(currentWidth), static_cast<WORD>(currentHeight)),
-            nullptr);
+            insertAfter,
+            currentLeft,
+            currentTop,
+            currentWidth,
+            currentHeight,
+            flags };
+        CallWindowProcedure(record, GuestAbi::WmWindowPosChanged, 0,
+            reinterpret_cast<LPARAM>(&completed));
     }
 
     if ((changedSize || becameVisible || (flags & GuestSwpFrameChanged) != 0) &&
         (flags & GuestSwpNoRedraw) == 0)
     {
         InvalidateGuestRect(window, nullptr, TRUE, nullptr);
-        Present(record);
+        if (IsGuestWindowVisibleInternal(window))
+        {
+            Present(record);
+        }
     }
     else if (becameHidden && (flags & GuestSwpNoRedraw) == 0)
     {
@@ -4839,6 +5634,39 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         return 0;
     }
 
+    // Snapshot parent-notification data before calling guest code because a
+    // WM_COMMAND handler may destroy or reparent this control.
+    const auto notifyParent = [this, window](WORD notification)
+    {
+        HWND parent = nullptr;
+        HWND handle = nullptr;
+        UINT_PTR identifier = 0;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed) return;
+            parent = window->parent;
+            handle = window->handle;
+            identifier = window->controlId;
+        }
+        if (parent)
+        {
+            SendGuestMessage(parent, GuestAbi::WmCommand,
+                GuestAbi::MakeCommandWParam(static_cast<WORD>(identifier), notification),
+                reinterpret_cast<LPARAM>(handle), nullptr);
+        }
+    };
+
+    const auto invalidate = [this, window]()
+    {
+        HWND handle = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed) return;
+            handle = window->handle;
+        }
+        InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
+    };
+
     if (message == CommonControlSetUnicodeFormat)
     {
         std::lock_guard<std::mutex> guard(window->lock);
@@ -4875,6 +5703,49 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     const bool comboBox = controlKind == BuiltinControlKind::ComboBox;
     if (choiceControl)
     {
+        if (comboBox && message == ComboBoxShowDropDown)
+        {
+            const bool requested = wParam != 0;
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed) return FALSE;
+                changed = window->comboDropped != requested;
+                window->comboDropped = requested;
+            }
+            if (changed)
+            {
+                invalidate();
+                notifyParent(requested ? ComboNotificationDropDown : ComboNotificationCloseUp);
+            }
+            return TRUE;
+        }
+        if (comboBox && message == ComboBoxGetDroppedState)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->comboDropped ? TRUE : FALSE;
+        }
+        if (comboBox && message == ComboBoxSetDroppedWidth)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const int previous = window->comboDroppedWidth;
+            window->comboDroppedWidth = SetWindowPosExtent(static_cast<int>((std::min)(wParam,
+                static_cast<WPARAM>((std::numeric_limits<int>::max)()))));
+            return previous;
+        }
+        if (comboBox && message == ComboBoxGetDroppedControlRect)
+        {
+            RECT rect = {};
+            if (!GetGuestWindowRect(window->handle, &rect, nullptr)) return FALSE;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->comboDroppedWidth > rect.right - rect.left)
+                {
+                    rect.right = SaturatingAdd(rect.left, window->comboDroppedWidth);
+                }
+            }
+            return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), rect) ? TRUE : FALSE;
+        }
         if (comboBox && (message == ComboBoxExInsertItemW || message == ComboBoxExSetItemW ||
             message == ComboBoxExGetItemW || message == ComboBoxExSetImageList ||
             message == ComboBoxExGetImageList || message == ComboBoxExGetComboControl ||
@@ -5423,7 +6294,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
             std::lock_guard<std::mutex> guard(window->lock);
             const int height = (std::max)(0, static_cast<int>(window->bounds.bottom - window->bounds.top));
-            return (std::max)(0, (height - 24) / MiniGdi::DefaultTextGlyphHeight);
+            return (std::max)(0,
+                (height - window->listViewHeaderHeight) /
+                    window->listViewRowHeight);
         }
         if (message == ListViewGetStringWidthW)
         {
@@ -5432,10 +6305,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
                 return 0;
             }
+            int textWidth = GuestMetrics::TextWidth;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                textWidth = window->controlTextWidth;
+            }
             const size_t maximumCharacters = static_cast<size_t>(
-                (std::numeric_limits<int>::max)() / MiniGdi::DefaultTextGlyphWidth);
+                (std::numeric_limits<int>::max)() / textWidth);
             return static_cast<LRESULT>((std::min)(text.size(), maximumCharacters) *
-                MiniGdi::DefaultTextGlyphWidth);
+                textWidth);
         }
         if (message == ListViewGetItemRect || message == ListViewGetSubItemRect)
         {
@@ -5447,6 +6325,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             const int item = static_cast<int>(wParam);
             int topItem = 0;
             int clientWidth = 0;
+            int headerHeight = GuestMetrics::ListViewHeaderHeight;
+            int rowHeight = GuestMetrics::TextHeight;
             size_t itemCount = 0;
             std::vector<int> widths;
             std::vector<int> orders;
@@ -5454,6 +6334,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 std::lock_guard<std::mutex> guard(window->lock);
                 topItem = window->listViewTopItem;
                 clientWidth = window->surface.Width();
+                headerHeight = window->listViewHeaderHeight;
+                rowHeight = window->listViewRowHeight;
                 itemCount = window->listViewItems.size();
                 widths = window->listViewColumnWidths;
                 orders = window->listViewColumnOrders;
@@ -5463,7 +6345,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return FALSE;
             }
 
-            const int rowTop = 24 + (item - topItem) * MiniGdi::DefaultTextGlyphHeight;
+            const int rowTop = headerHeight + (item - topItem) * rowHeight;
             int column = 0;
             const int portion = result.left;
             if (message == ListViewGetSubItemRect)
@@ -5497,7 +6379,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 : (std::max)(1, clientWidth - columnLeft - 1);
 
             result.top = rowTop;
-            result.bottom = rowTop + MiniGdi::DefaultTextGlyphHeight;
+            result.bottom = rowTop + rowHeight;
             if (portion == 0) // LVIR_BOUNDS
             {
                 result.left = message == ListViewGetSubItemRect ? columnLeft : 1;
@@ -5528,7 +6410,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return FALSE;
                 }
                 result.x = 1;
-                result.y = 24 + (item - window->listViewTopItem) * MiniGdi::DefaultTextGlyphHeight;
+                result.y = window->listViewHeaderHeight +
+                    (item - window->listViewTopItem) * window->listViewRowHeight;
             }
             return TryWriteGuestValue(reinterpret_cast<POINT*>(lParam), result) ? TRUE : FALSE;
         }
@@ -5543,6 +6426,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             int topItem = 0;
             int clientWidth = 0;
             int clientHeight = 0;
+            int headerHeight = GuestMetrics::ListViewHeaderHeight;
+            int rowHeight = GuestMetrics::TextHeight;
             size_t itemCount = 0;
             std::vector<int> widths;
             std::vector<int> orders;
@@ -5551,6 +6436,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 topItem = window->listViewTopItem;
                 clientWidth = window->surface.Width();
                 clientHeight = window->surface.Height();
+                headerHeight = window->listViewHeaderHeight;
+                rowHeight = window->listViewRowHeight;
                 itemCount = window->listViewItems.size();
                 widths = window->listViewColumnWidths;
                 orders = window->listViewColumnOrders;
@@ -5560,10 +6447,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             result.subItem = 0;
             result.group = -1;
             if (result.point.x >= 0 && result.point.x < clientWidth &&
-                result.point.y >= 24 && result.point.y < clientHeight)
+                result.point.y >= headerHeight &&
+                result.point.y < clientHeight)
             {
                 const int item = topItem +
-                    (result.point.y - 24) / MiniGdi::DefaultTextGlyphHeight;
+                    (result.point.y - headerHeight) / rowHeight;
                 if (item >= 0 && static_cast<size_t>(item) < itemCount)
                 {
                     result.item = item;
@@ -5625,7 +6513,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return FALSE;
                 }
                 const int height = (std::max)(0, static_cast<int>(window->bounds.bottom - window->bounds.top));
-                const int rowsPerPage = (std::max)(1, (height - 24) / MiniGdi::DefaultTextGlyphHeight);
+                const int rowsPerPage = (std::max)(1,
+                    (height - window->listViewHeaderHeight) /
+                        window->listViewRowHeight);
                 const int previous = window->listViewTopItem;
                 if (requested < window->listViewTopItem)
                 {
@@ -5655,14 +6545,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             // delta into the smallest whole-row movement that preserves the
             // visible ordering.
             const int verticalPixels = static_cast<int>(lParam);
-            int delta = verticalPixels / MiniGdi::DefaultTextGlyphHeight;
-            if (verticalPixels != 0 && verticalPixels % MiniGdi::DefaultTextGlyphHeight != 0)
-            {
-                delta += verticalPixels > 0 ? 1 : -1;
-            }
             bool changed = false;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
+                int delta = verticalPixels / window->listViewRowHeight;
+                if (verticalPixels != 0 && verticalPixels % window->listViewRowHeight != 0)
+                {
+                    delta += verticalPixels > 0 ? 1 : -1;
+                }
                 const int maximumTop = (std::max)(0, static_cast<int>(window->listViewItems.size()) - 1);
                 const int next = (std::max)(0, (std::min)(maximumTop, window->listViewTopItem + delta));
                 changed = next != window->listViewTopItem;
@@ -6153,6 +7043,86 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
             return wParam == sizeof(GuestToolbarButton) ? TRUE : FALSE;
         }
+        if (message == ToolbarAddStringW)
+        {
+            std::vector<std::wstring> strings;
+            if ((static_cast<ULONG_PTR>(lParam) >> 16) == 0)
+            {
+                wchar_t resource[512] = {};
+                const int length = LoadGuestStringResource(
+                    reinterpret_cast<HINSTANCE>(wParam), static_cast<UINT>(lParam),
+                    resource, static_cast<int>(_countof(resource)));
+                if (length > 1)
+                {
+                    const wchar_t delimiter = resource[0];
+                    const wchar_t* begin = resource + 1;
+                    const wchar_t* end = resource + length;
+                    while (begin < end)
+                    {
+                        const wchar_t* next = std::find(begin, end, delimiter);
+                        if (next == end) break;
+                        strings.emplace_back(begin, next);
+                        begin = next + 1;
+                    }
+                }
+                else if (length == 0)
+                {
+                    return -1;
+                }
+            }
+            else
+            {
+                const wchar_t* source = reinterpret_cast<const wchar_t*>(lParam);
+                if (!source) return -1;
+                size_t offset = 0;
+                for (size_t count = 0; count < 256; ++count)
+                {
+                    std::wstring value;
+                    if (!TryReadGuestWideString(source + offset, &value)) return -1;
+                    if (value.empty()) break;
+                    offset += value.size() + 1;
+                    strings.push_back(std::move(value));
+                }
+            }
+            std::lock_guard<std::mutex> guard(window->lock);
+            const LRESULT first = static_cast<LRESULT>(window->toolbarStrings.size());
+            window->toolbarStrings.insert(window->toolbarStrings.end(),
+                strings.begin(), strings.end());
+            for (size_t index = 0; index < window->toolbarButtonStringRefs.size() &&
+                index < window->toolbarButtonTexts.size(); ++index)
+            {
+                const INT_PTR reference = window->toolbarButtonStringRefs[index];
+                if (reference >= 0 && static_cast<size_t>(reference) < window->toolbarStrings.size())
+                {
+                    window->toolbarButtonTexts[index] =
+                        window->toolbarStrings[static_cast<size_t>(reference)];
+                }
+            }
+            if (std::any_of(window->toolbarButtonTexts.begin(), window->toolbarButtonTexts.end(),
+                [](const std::wstring& value) { return !value.empty(); }))
+            {
+                window->toolbarButtonHeight = (std::max)(window->toolbarButtonHeight,
+                    window->toolbarBitmapHeight + GuestMetrics::TextHeight +
+                    3 * GuestMetrics::ControlVerticalPadding);
+            }
+            return first;
+        }
+        if (message == ToolbarGetButtonTextW)
+        {
+            std::wstring text;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const auto found = std::find(window->toolbarCommands.begin(),
+                    window->toolbarCommands.end(), static_cast<int>(wParam));
+                if (found == window->toolbarCommands.end()) return -1;
+                const size_t index = static_cast<size_t>(found - window->toolbarCommands.begin());
+                if (index < window->toolbarButtonTexts.size())
+                    text = window->toolbarButtonTexts[index];
+            }
+            if (lParam && !TryWriteGuestWideString(reinterpret_cast<wchar_t*>(lParam),
+                text.size() + 1, text, nullptr)) return -1;
+            return static_cast<LRESULT>(text.size());
+        }
         if (message == ToolbarEnableButton || message == ToolbarCheckButton ||
             message == ToolbarPressButton || message == ToolbarHideButton ||
             message == ToolbarIndeterminateButton || message == ToolbarMarkButton ||
@@ -6221,8 +7191,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
             {
                 std::lock_guard<std::mutex> guard(window->lock);
-                window->toolbarButtonWidth = (std::max)(16, static_cast<int>(LOWORD(lParam)));
-                window->toolbarButtonHeight = (std::max)(16, static_cast<int>(HIWORD(lParam)));
+                window->toolbarButtonWidth = (std::max)(
+                    GuestMetrics::DefaultBitmapExtent, static_cast<int>(LOWORD(lParam)));
+                window->toolbarButtonHeight = (std::max)(
+                    GuestMetrics::DefaultBitmapExtent, static_cast<int>(HIWORD(lParam)));
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             return TRUE;
@@ -6243,7 +7215,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             const int maximum = static_cast<int>(HIWORD(lParam));
             {
                 std::lock_guard<std::mutex> guard(window->lock);
-                int requested = (std::max)(window->toolbarButtonWidth, (std::max)(16, minimum));
+                int requested = (std::max)(window->toolbarButtonWidth,
+                    (std::max)(GuestMetrics::DefaultBitmapExtent, minimum));
                 if (maximum > 0)
                 {
                     requested = (std::min)(requested, maximum);
@@ -6262,7 +7235,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return FALSE;
             }
             std::vector<GuestToolbarButton> copiedButtons;
+            std::vector<std::wstring> knownStrings;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                knownStrings = window->toolbarStrings;
+            }
+            std::vector<std::wstring> copiedTexts;
             copiedButtons.reserve(count);
+            copiedTexts.reserve(count);
             for (size_t index = 0; index < count; ++index)
             {
                 GuestToolbarButton button = {};
@@ -6271,16 +7251,36 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return FALSE;
                 }
                 copiedButtons.push_back(button);
+                std::wstring buttonText;
+                if (button.text >= 0 && static_cast<size_t>(button.text) < knownStrings.size())
+                {
+                    buttonText = knownStrings[static_cast<size_t>(button.text)];
+                }
+                else if (button.text > 0xffff)
+                {
+                    TryReadGuestWideString(reinterpret_cast<LPCWSTR>(button.text), &buttonText);
+                }
+                copiedTexts.push_back(std::move(buttonText));
             }
             {
                 std::lock_guard<std::mutex> guard(window->lock);
-                for (const auto& button : copiedButtons)
+                for (size_t index = 0; index < copiedButtons.size(); ++index)
                 {
+                    const auto& button = copiedButtons[index];
                     window->toolbarCommands.push_back(button.command);
                     window->toolbarBitmaps.push_back(button.bitmap);
                     window->toolbarButtonStates.push_back(button.state);
                     window->toolbarButtonStyles.push_back(button.style);
                     window->toolbarButtonData.push_back(button.data);
+                    window->toolbarButtonTexts.push_back(copiedTexts[index]);
+                    window->toolbarButtonStringRefs.push_back(button.text);
+                }
+                if (std::any_of(copiedTexts.begin(), copiedTexts.end(),
+                    [](const std::wstring& value) { return !value.empty(); }))
+                {
+                    window->toolbarButtonHeight = (std::max)(window->toolbarButtonHeight,
+                        window->toolbarBitmapHeight + GuestMetrics::TextHeight +
+                        3 * GuestMetrics::ControlVerticalPadding);
                 }
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
@@ -6293,6 +7293,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
                 return FALSE;
             }
+            std::wstring buttonText;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (button.text >= 0 && static_cast<size_t>(button.text) < window->toolbarStrings.size())
+                    buttonText = window->toolbarStrings[static_cast<size_t>(button.text)];
+            }
+            if (buttonText.empty() && button.text > 0xffff)
+                TryReadGuestWideString(reinterpret_cast<LPCWSTR>(button.text), &buttonText);
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 const size_t position = (std::min)(
@@ -6302,6 +7310,16 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 window->toolbarButtonStates.insert(window->toolbarButtonStates.begin() + position, button.state);
                 window->toolbarButtonStyles.insert(window->toolbarButtonStyles.begin() + position, button.style);
                 window->toolbarButtonData.insert(window->toolbarButtonData.begin() + position, button.data);
+                window->toolbarButtonTexts.insert(window->toolbarButtonTexts.begin() + position,
+                    std::move(buttonText));
+                window->toolbarButtonStringRefs.insert(
+                    window->toolbarButtonStringRefs.begin() + position, button.text);
+                if (!window->toolbarButtonTexts[position].empty())
+                {
+                    window->toolbarButtonHeight = (std::max)(window->toolbarButtonHeight,
+                        window->toolbarBitmapHeight + GuestMetrics::TextHeight +
+                        3 * GuestMetrics::ControlVerticalPadding);
+                }
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             return TRUE;
@@ -6320,6 +7338,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 window->toolbarButtonStates.erase(window->toolbarButtonStates.begin() + index);
                 window->toolbarButtonStyles.erase(window->toolbarButtonStyles.begin() + index);
                 window->toolbarButtonData.erase(window->toolbarButtonData.begin() + index);
+                if (index < window->toolbarButtonTexts.size())
+                    window->toolbarButtonTexts.erase(window->toolbarButtonTexts.begin() + index);
+                if (index < window->toolbarButtonStringRefs.size())
+                    window->toolbarButtonStringRefs.erase(window->toolbarButtonStringRefs.begin() + index);
                 window->toolbarPressedIndex = -1;
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
@@ -6340,7 +7362,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 result.state = window->toolbarButtonStates[index];
                 result.style = window->toolbarButtonStyles[index];
                 result.data = window->toolbarButtonData[index];
-                result.text = -1;
+                result.text = index < window->toolbarButtonStringRefs.size()
+                    ? window->toolbarButtonStringRefs[index] : -1;
             }
             return TryWriteGuestValue(reinterpret_cast<GuestToolbarButton*>(lParam), result)
                 ? TRUE : FALSE;
@@ -6398,7 +7421,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 toolbar = window->handle;
                 parent = window->parent;
                 toolbarWidth = (std::max)(1, window->surface.Width());
-                desiredHeight = (std::min)(96, (std::max)(18, window->toolbarButtonHeight + 2));
+                desiredHeight = (std::min)(GuestMetrics::MaximumControlStripHeight,
+                    (std::max)(GuestMetrics::StatusBarMinimumHeight,
+                        window->toolbarButtonHeight + 2 * GuestMetrics::Border));
             }
             const auto parentWindow = FindWindow(parent);
             if (parentWindow)
@@ -6407,6 +7432,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 bool rebarParent = false;
                 {
                     std::lock_guard<std::mutex> parentGuard(parentWindow->lock);
+                    parentWidth = (std::max)(1, parentWindow->surface.Width());
                     rebarParent = parentWindow->windowClass &&
                         parentWindow->windowClass->builtinKind == BuiltinControlKind::Rebar;
                     if (rebarParent)
@@ -6418,13 +7444,21 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                                 band.minimumHeight = desiredHeight;
                             }
                         }
-                        parentWidth = (std::max)(1, parentWindow->surface.Width());
                     }
                 }
+                DWORD ignored = ERROR_SUCCESS;
                 if (rebarParent)
                 {
-                    DWORD ignored = ERROR_SUCCESS;
                     SetGuestWindowPos(parent, nullptr, 0, 0, parentWidth, desiredHeight,
+                        GuestSwpNoMove | GuestSwpNoZOrder, &ignored);
+                }
+                else
+                {
+                    // A standalone toolbar is a horizontal control strip.
+                    // TB_AUTOSIZE uses its parent's current client width and
+                    // the button-derived height; this also keeps it aligned
+                    // when the host viewport changes.
+                    SetGuestWindowPos(toolbar, nullptr, 0, 0, parentWidth, desiredHeight,
                         GuestSwpNoMove | GuestSwpNoZOrder, &ignored);
                 }
             }
@@ -6471,12 +7505,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return FALSE;
                 }
                 const int left = ToolbarItemLeft(window->toolbarButtonStyles, window->toolbarBitmaps,
-                    window->toolbarButtonStates, static_cast<size_t>(index), window->toolbarButtonWidth);
+                    window->toolbarButtonStates, static_cast<size_t>(index), window->toolbarButtonWidth,
+                    &window->toolbarButtonTexts);
                 result.left = left;
                 result.top = 1;
                 result.right = left + ToolbarItemWidth(window->toolbarButtonStyles, window->toolbarBitmaps,
-                    window->toolbarButtonStates, static_cast<size_t>(index), window->toolbarButtonWidth);
-                result.bottom = result.top + (std::max)(16, window->toolbarButtonHeight);
+                    window->toolbarButtonStates, static_cast<size_t>(index), window->toolbarButtonWidth,
+                    &window->toolbarButtonTexts);
+                result.bottom = result.top + (std::max)(
+                    GuestMetrics::DefaultBitmapExtent, window->toolbarButtonHeight);
             }
             return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
         }
@@ -6496,11 +7533,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     continue;
                 }
                 const int left = ToolbarItemLeft(window->toolbarButtonStyles, window->toolbarBitmaps,
-                    window->toolbarButtonStates, index, window->toolbarButtonWidth);
+                    window->toolbarButtonStates, index, window->toolbarButtonWidth,
+                    &window->toolbarButtonTexts);
                 const int right = left + ToolbarItemWidth(window->toolbarButtonStyles,
-                    window->toolbarBitmaps, window->toolbarButtonStates, index, window->toolbarButtonWidth);
+                    window->toolbarBitmaps, window->toolbarButtonStates, index, window->toolbarButtonWidth,
+                    &window->toolbarButtonTexts);
                 if (point.x >= left && point.x < right && point.y >= 0 &&
-                    point.y < window->toolbarButtonHeight + 2)
+                    point.y < window->toolbarButtonHeight + 2 * GuestMetrics::Border)
                 {
                     return static_cast<LRESULT>(index);
                 }
@@ -6528,39 +7567,45 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     if (controlKind == BuiltinControlKind::Rebar &&
         (message == RebarInsertBandW || message == RebarSetBandInfoW))
     {
-        const auto band = reinterpret_cast<const GuestRebarBandInfoW*>(lParam);
-        if (!band || band->size < offsetof(GuestRebarBandInfoW, width) + sizeof(band->width))
+        GuestRebarBandInfoW source = {};
+        if (!TryReadGuestValue(reinterpret_cast<const GuestRebarBandInfoW*>(lParam), &source) ||
+            source.size < offsetof(GuestRebarBandInfoW, width) + sizeof(source.width))
         {
             return FALSE;
         }
 
-        RebarBand updated;
-        updated.child = band->child;
-        updated.style = band->style;
-        // 7-Zip's rebar setup can carry stale pre-layout dimensions from a
-        // native HWND (for example 2048x398) while the guest root is only
-        // 800x480. They are preferences, not permission to consume the panel.
-        // Keep a conservative, control-strip-sized minimum and resolve widths
-        // against the actual composed rebar below.
-        updated.minimumWidth = (std::min)(1024, (std::max)(24, static_cast<int>(band->minimumChildWidth)));
-        // cyMinChild can be a stale full-panel value while the control is
-        // being constructed. This bridge renders rebars as a single address
-        // strip, so normalize the height instead of trusting that transient
-        // native layout value.
-        updated.minimumHeight = 26;
-        updated.width = band->width == 0 ? 0 : (std::min)(2048,
-            (std::max)(updated.minimumWidth, static_cast<int>(band->width)));
-        std::vector<RebarBand> bands;
-        int rebarWidth = 800;
-        int rebarHeight = updated.minimumHeight;
+        RuntimeDiagnostics::Record(L"REBAR BAND INFO: mask " +
+            std::to_wstring(source.mask) + L", style " +
+            std::to_wstring(source.style) + L", minimum " +
+            std::to_wstring(source.minimumChildWidth) + L"x" +
+            std::to_wstring(source.minimumChildHeight) + L", width " +
+            std::to_wstring(source.width) + L".");
+        int rebarWidth = GuestMetrics::CurrentScreenWidth();
+        int rebarHeight = GuestMetrics::ToolbarHeight;
         HWND rebar = nullptr;
+        HWND hostedChild = nullptr;
+        size_t affectedIndex = 0;
         {
             std::lock_guard<std::mutex> guard(window->lock);
             const size_t requestedIndex = static_cast<size_t>(wParam);
             if (message == RebarInsertBandW)
             {
+                RebarBand inserted;
+                if ((source.mask & RebarBandMaskChild) != 0) inserted.child = source.child;
+                if ((source.mask & RebarBandMaskStyle) != 0) inserted.style = source.style;
+                if ((source.mask & RebarBandMaskChildSize) != 0)
+                {
+                    inserted.minimumWidth = ValidatedRebarDimension(source.minimumChildWidth);
+                    inserted.minimumHeight = ValidatedRebarChildHeight(source.minimumChildHeight);
+                }
+                if ((source.mask & RebarBandMaskSize) != 0)
+                {
+                    inserted.width = ValidatedRebarDimension(source.width);
+                }
                 const size_t insertion = (std::min)(requestedIndex, window->rebarBands.size());
-                window->rebarBands.insert(window->rebarBands.begin() + insertion, updated);
+                window->rebarBands.insert(window->rebarBands.begin() + insertion, inserted);
+                hostedChild = inserted.child;
+                affectedIndex = insertion;
             }
             else
             {
@@ -6568,97 +7613,76 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     return FALSE;
                 }
-                // RB_SETBANDINFOW can update only a subset of the members.
-                // Keep the already hosted child when the caller only changes
-                // width or style metadata.
                 RebarBand& existing = window->rebarBands[requestedIndex];
-                if (updated.child)
+                if ((source.mask & RebarBandMaskChild) != 0)
                 {
-                    existing.child = updated.child;
+                    existing.child = source.child;
                 }
-                existing.style = updated.style;
-                existing.minimumWidth = updated.minimumWidth;
-                existing.minimumHeight = updated.minimumHeight;
-                existing.width = updated.width;
+                if ((source.mask & RebarBandMaskStyle) != 0)
+                {
+                    existing.style = source.style;
+                }
+                if ((source.mask & RebarBandMaskChildSize) != 0)
+                {
+                    existing.minimumWidth = ValidatedRebarDimension(source.minimumChildWidth);
+                    existing.minimumHeight = ValidatedRebarChildHeight(source.minimumChildHeight);
+                }
+                if ((source.mask & RebarBandMaskSize) != 0)
+                {
+                    existing.width = ValidatedRebarDimension(source.width);
+                }
+                hostedChild = existing.child;
+                affectedIndex = requestedIndex;
             }
-            bands = window->rebarBands;
-            rebarWidth = (std::max)(24, window->surface.Width());
-            for (const auto& current : bands)
-            {
-                rebarHeight = (std::max)(rebarHeight, current.minimumHeight);
-            }
-            rebarHeight = (std::min)(64, (std::max)(18, rebarHeight));
+            rebarWidth = (std::max)(1, window->surface.Width());
             rebar = window->handle;
         }
-        size_t comboBand = bands.size();
-        bool addressOnlyBands = !bands.empty();
-        for (size_t index = 0; index < bands.size(); ++index)
+
+        int naturalWidth = 0;
+        int naturalHeight = 0;
+        if (const auto child = FindWindow(hostedChild))
         {
-            const auto child = FindWindow(bands[index].child);
-            BuiltinControlKind childKind = BuiltinControlKind::None;
-            if (child)
+            std::lock_guard<std::mutex> childGuard(child->lock);
+            if (!child->destroyed)
             {
-                std::lock_guard<std::mutex> childGuard(child->lock);
-                childKind = child->windowClass ? child->windowClass->builtinKind : BuiltinControlKind::None;
-            }
-            if (childKind == BuiltinControlKind::ComboBox)
-            {
-                comboBand = index;
-            }
-            else if (childKind != BuiltinControlKind::Static)
-            {
-                addressOnlyBands = false;
+                naturalWidth = child->surface.Width();
+                naturalHeight = child->surface.Height();
+                if (child->windowClass &&
+                    child->windowClass->builtinKind == BuiltinControlKind::Toolbar)
+                {
+                    const int contentWidth = ToolbarContentWidth(
+                        child->toolbarButtonStyles,
+                        child->toolbarBitmaps,
+                        child->toolbarButtonStates,
+                        child->toolbarCommands.size(),
+                        child->toolbarButtonWidth,
+                        &child->toolbarButtonTexts);
+                    if (contentWidth > 0) naturalWidth = contentWidth;
+                }
+                else if (child->windowClass &&
+                    child->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
+                    (child->style & 0x0003u) != ComboBoxStyleSimple)
+                {
+                    naturalHeight = (std::min)(naturalHeight,
+                        GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight));
+                }
             }
         }
-        addressOnlyBands = addressOnlyBands && comboBand < bands.size();
-        for (size_t index = 0; index < bands.size(); ++index)
         {
-            const auto child = FindWindow(bands[index].child);
-            if (child)
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (affectedIndex < window->rebarBands.size() &&
+                window->rebarBands[affectedIndex].child == hostedChild)
             {
-                std::lock_guard<std::mutex> childGuard(child->lock);
-                const bool staticChild = child->windowClass &&
-                    child->windowClass->builtinKind == BuiltinControlKind::Static;
-                child->addressBackButton = addressOnlyBands && staticChild && index != comboBand;
+                window->rebarBands[affectedIndex].naturalWidth = naturalWidth;
+                window->rebarBands[affectedIndex].naturalHeight = naturalHeight;
             }
-        }
-        int cursor = 0;
-        for (size_t index = 0; index < bands.size(); ++index)
-        {
-            const RebarBand& current = bands[index];
-            const int remaining = (std::max)(0, rebarWidth - cursor);
-            const size_t remainingBands = bands.size() - index;
-            const int rowShare = remainingBands == 0 ? remaining : remaining / static_cast<int>(remainingBands);
-            const int preferredWidth = current.width == 0 ? current.minimumWidth : current.width;
-            // Keep every band on the one supported row. In particular, this
-            // reserves the trailing space for the ComboBoxEx address field
-            // instead of allowing an earlier helper/static band to push it
-            // thousands of pixels beyond the visible rebar.
-            const int childWidth = addressOnlyBands
-                ? (index == comboBand ? remaining : (std::min)(26, remaining))
-                : (index + 1 == bands.size()
-                    ? remaining
-                    : (std::min)(preferredWidth, (std::max)(24, rowShare)));
-            const auto child = FindWindow(current.child);
-            if (child)
-            {
-                // A rebar owns the hosted child. Reparent it in the virtual
-                // tree so software composition composites every band above
-                // the rebar background in its documented order.
-                std::lock_guard<std::mutex> childGuard(child->lock);
-                child->parent = rebar;
-            }
-            DWORD ignored = ERROR_SUCCESS;
-            if (current.child)
-            {
-                SetGuestWindowPos(current.child, nullptr, cursor, 0, childWidth,
-                    rebarHeight, GuestSwpNoZOrder, &ignored);
-            }
-            cursor += (std::max)(0, childWidth);
+            rebarHeight = RequiredRebarHeight(window->rebarBands, rebarWidth);
         }
         DWORD ignored = ERROR_SUCCESS;
         SetGuestWindowPos(rebar, nullptr, 0, 0, rebarWidth, rebarHeight, GuestSwpNoZOrder, &ignored);
-        RuntimeDiagnostics::Record(L"REBAR: inserted or updated " + std::to_wstring(bands.size()) + L" band(s).");
+        LayoutGuestRebar(rebar);
+        RuntimeDiagnostics::Record(L"REBAR: inserted or updated a band" +
+            std::wstring(hostedChild ? L" with a hosted child." : L"."));
         InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
         return TRUE;
     }
@@ -6677,15 +7701,17 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             std::lock_guard<std::mutex> guard(window->lock);
             return static_cast<LRESULT>(window->rebarBands.size());
         }
-        if (message == RebarGetBarHeight || message == RebarGetRowHeight)
+        if (message == RebarGetBarHeight)
         {
             std::lock_guard<std::mutex> guard(window->lock);
-            int height = 24;
-            for (const auto& band : window->rebarBands)
-            {
-                height = (std::max)(height, band.minimumHeight);
-            }
-            return height;
+            return RequiredRebarHeight(window->rebarBands, window->surface.Width());
+        }
+        if (message == RebarGetRowHeight)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const auto heights = RebarRowHeights(window->rebarBands, window->surface.Width());
+            const size_t row = static_cast<size_t>(wParam);
+            return row < heights.size() ? heights[row] : 0;
         }
         if (message == RebarSizeToRect)
         {
@@ -6694,13 +7720,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
                 return FALSE;
             }
-            int height = 24;
+            int height = GuestMetrics::ToolbarHeight;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
-                for (const auto& band : window->rebarBands)
-                {
-                    height = (std::max)(height, band.minimumHeight);
-                }
+                height = RequiredRebarHeight(window->rebarBands,
+                    (std::max)(1L, requested.right - requested.left));
             }
             requested.top += height;
             return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), requested) ? TRUE : FALSE;
@@ -6958,10 +7982,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
             std::vector<int> widths;
             std::vector<int> orders;
+            int headerHeight = GuestMetrics::ListViewHeaderHeight;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 widths = window->headerItemWidths;
                 orders = window->headerItemOrders;
+                headerHeight = window->listViewHeaderHeight;
             }
             std::vector<size_t> display(widths.size());
             std::iota(display.begin(), display.end(), static_cast<size_t>(0));
@@ -6978,7 +8004,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     if (item == requested) break;
                     left += widths[item];
                 }
-                RECT result{ left, 0, left + widths[requested], 24 };
+                RECT result{ left, 0, left + widths[requested], headerHeight };
                 return TryWriteGuestValue(reinterpret_cast<RECT*>(lParam), result) ? TRUE : FALSE;
             }
             auto destination = reinterpret_cast<GuestHeaderHitTestInfo*>(lParam);
@@ -6989,7 +8015,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             for (const size_t item : display)
             {
                 const int right = left + widths[item];
-                if (hit.point.x >= left && hit.point.x < right && hit.point.y >= 0 && hit.point.y < 24)
+                if (hit.point.x >= left && hit.point.x < right && hit.point.y >= 0 &&
+                    hit.point.y < headerHeight)
                 {
                     hit.item = static_cast<int>(item);
                     hit.flags = 2;
@@ -7008,7 +8035,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             GuestWindowPosition position = {};
             if (!TryReadGuestValue(layout.rect, &available) ||
                 !TryReadGuestValue(layout.windowPosition, &position)) return FALSE;
-            const int headerHeight = 24;
+            int headerHeight = GuestMetrics::ListViewHeaderHeight;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                headerHeight = window->listViewHeaderHeight;
+            }
             position.x = available.left;
             position.y = available.top;
             position.cx = (std::max)(0L, available.right - available.left);
@@ -7841,7 +8872,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
             std::vector<std::wstring> items;
             int fixedWidth = 0;
-            int itemHeight = 24;
+            int itemHeight = GuestMetrics::TabItemHeight;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 items = window->tabItems;
@@ -7889,7 +8920,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
             RECT result = {};
             if (!TryReadGuestValue(reinterpret_cast<const RECT*>(lParam), &result)) return FALSE;
-            int itemHeight = 24;
+            int itemHeight = GuestMetrics::TabItemHeight;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 itemHeight = window->tabItemHeight;
@@ -8023,57 +9054,36 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             std::to_wstring(message) + L".");
     }
 
-    // Parent notifications intentionally snapshot their values before calling
-    // into guest code. WM_COMMAND can destroy or reparent this control, so no
-    // WindowRecord field may be touched after SendGuestMessage returns.
-    const auto notifyParent = [this, window](WORD notification)
-    {
-        HWND parent = nullptr;
-        HWND handle = nullptr;
-        UINT_PTR identifier = 0;
-        {
-            std::lock_guard<std::mutex> guard(window->lock);
-            if (window->destroyed)
-            {
-                return;
-            }
-            parent = window->parent;
-            handle = window->handle;
-            identifier = window->controlId;
-        }
-        if (parent)
-        {
-            SendGuestMessage(
-                parent,
-                GuestAbi::WmCommand,
-                GuestAbi::MakeCommandWParam(
-                    static_cast<WORD>(identifier),
-                    notification),
-                reinterpret_cast<LPARAM>(handle),
-                nullptr);
-        }
-    };
-
-    const auto invalidate = [this, window]()
-    {
-        HWND handle = nullptr;
-        {
-            std::lock_guard<std::mutex> guard(window->lock);
-            if (window->destroyed)
-            {
-                return;
-            }
-            handle = window->handle;
-        }
-        InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
-    };
-
     switch (message)
     {
     case GuestAbi::WmNcCreate:
         return TRUE;
     case GuestAbi::WmNcHitTest:
         return GuestAbi::HtClient;
+    case GuestAbi::WmWindowPosChanged:
+    {
+        GuestWindowPosition position{};
+        if (!TryReadGuestValue(
+            reinterpret_cast<const GuestWindowPosition*>(lParam), &position))
+        {
+            return 0;
+        }
+        if ((position.flags & GuestSwpNoMove) == 0)
+        {
+            CallWindowProcedure(window, GuestAbi::WmMove, 0,
+                GuestAbi::MakeMouseLParam(
+                    SignedCoordinateWord(position.x),
+                    SignedCoordinateWord(position.y)));
+        }
+        if ((position.flags & GuestSwpNoSize) == 0)
+        {
+            CallWindowProcedure(window, GuestAbi::WmSize, GuestAbi::SizeRestored,
+                GuestAbi::MakeMouseLParam(
+                    static_cast<WORD>((std::min)(position.cx, 0xffff)),
+                    static_cast<WORD>((std::min)(position.cy, 0xffff))));
+        }
+        return 0;
+    }
     case GuestAbi::WmEraseBkgnd:
         // BeginPaint owns the class-brush fallback. Returning zero gives it
         // the same negotiation as DefWindowProc without double-erasing.
@@ -8160,6 +9170,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return 0;
             }
         }
+        MiniGdi::Font fontMetrics{};
+        if (requested != MiniGdi::InvalidObject)
+        {
+            m_gdi.GetFont(requested, &fontMetrics);
+        }
+        const MiniGdi::Size fontCell = MiniGdi::FontCellSize(fontMetrics);
         {
             std::lock_guard<std::mutex> guard(window->lock);
             if (window->destroyed)
@@ -8167,6 +9183,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return 0;
             }
             window->controlFont = requested;
+            window->controlTextWidth = fontCell.width;
+            window->controlTextHeight = fontCell.height;
+            window->listViewHeaderHeight = GuestMetrics::ControlHeightForText(fontCell.height);
+            window->listViewRowHeight = (std::max)(GuestMetrics::TextHeight, fontCell.height);
         }
         if (lParam != 0)
         {
@@ -8187,6 +9207,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         bool pressed = false;
         size_t caret = 0;
         MiniGdi::ObjectHandle font = MiniGdi::InvalidObject;
+        std::vector<std::wstring> choiceItems;
+        int selectedChoice = -1;
+        bool comboDropped = false;
         std::vector<std::wstring> listColumns;
         std::vector<int> listColumnWidths;
         std::vector<int> listColumnOrders;
@@ -8201,15 +9224,20 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         UINT listViewExtendedStyle = 0;
         int listViewSelectedItem = -1;
         int listViewTopItem = 0;
+        int controlTextWidth = GuestMetrics::TextWidth;
+        int controlTextHeight = GuestMetrics::TextHeight;
+        int listViewHeaderHeight = GuestMetrics::ListViewHeaderHeight;
+        int listViewRowHeight = GuestMetrics::TextHeight;
         std::vector<int> toolbarCommands;
         std::vector<int> toolbarBitmaps;
         std::vector<BYTE> toolbarButtonStates;
         std::vector<BYTE> toolbarButtonStyles;
+        std::vector<std::wstring> toolbarButtonTexts;
         HANDLE toolbarImageList = nullptr;
-        int toolbarButtonWidth = 24;
-        int toolbarButtonHeight = 24;
-        int toolbarBitmapWidth = 16;
-        int toolbarBitmapHeight = 16;
+        int toolbarButtonWidth = GuestMetrics::ToolbarButtonExtent;
+        int toolbarButtonHeight = GuestMetrics::ToolbarButtonExtent;
+        int toolbarBitmapWidth = GuestMetrics::DefaultBitmapExtent;
+        int toolbarBitmapHeight = GuestMetrics::DefaultBitmapExtent;
         int toolbarPressedIndex = -1;
         std::vector<int> statusBarParts;
         std::vector<std::wstring> statusBarTexts;
@@ -8227,7 +9255,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         HANDLE tabImageList = nullptr;
         int tabSelectedItem = -1;
         int tabItemWidth = 0;
-        int tabItemHeight = 24;
+        int tabItemHeight = GuestMetrics::TabItemHeight;
         std::vector<std::wstring> headerItems;
         std::vector<int> headerItemWidths;
         std::vector<int> headerItemOrders;
@@ -8242,7 +9270,6 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         int treeItemHeight = 18;
         COLORREF treeBackgroundColor = 0x00ffffff;
         COLORREF treeTextColor = 0x00000000;
-        bool addressBackButton = false;
         HWND handle = nullptr;
         HWND parent = nullptr;
         UINT_PTR controlId = 0;
@@ -8258,6 +9285,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             pressed = window->buttonPressed || window->buttonKeyboardPressed;
             caret = window->editCaret;
             font = window->controlFont;
+            choiceItems = window->choiceItems;
+            selectedChoice = window->selectedChoice;
+            comboDropped = window->comboDropped ||
+                ((window->style & 0x0003u) == ComboBoxStyleSimple);
             listColumns = window->listViewColumns;
             listColumnWidths = window->listViewColumnWidths;
             listColumnOrders = window->listViewColumnOrders;
@@ -8274,10 +9305,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             listViewExtendedStyle = window->listViewExtendedStyle;
             listViewSelectedItem = window->listViewSelectedItem;
             listViewTopItem = window->listViewTopItem;
+            controlTextWidth = window->controlTextWidth;
+            controlTextHeight = window->controlTextHeight;
+            listViewHeaderHeight = window->listViewHeaderHeight;
+            listViewRowHeight = window->listViewRowHeight;
             toolbarCommands = window->toolbarCommands;
             toolbarBitmaps = window->toolbarBitmaps;
             toolbarButtonStates = window->toolbarButtonStates;
             toolbarButtonStyles = window->toolbarButtonStyles;
+            toolbarButtonTexts = window->toolbarButtonTexts;
             toolbarImageList = window->toolbarImageList;
             toolbarButtonWidth = window->toolbarButtonWidth;
             toolbarButtonHeight = window->toolbarButtonHeight;
@@ -8315,7 +9351,6 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             treeItemHeight = window->treeItemHeight;
             treeBackgroundColor = window->treeBackgroundColor;
             treeTextColor = window->treeTextColor;
-            addressBackButton = window->addressBackButton;
             handle = window->handle;
             parent = window->parent;
             controlId = window->controlId;
@@ -8364,14 +9399,6 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     fill,
                     focused ? MiniGdi::MakeColor(0, 120, 215) : MiniGdi::MakeColor(96, 96, 96));
             }
-            else if (controlKind == BuiltinControlKind::Static && addressBackButton)
-            {
-                MiniGdi::DrawRectangle(
-                    *surface,
-                    fullRect,
-                    focused ? MiniGdi::MakeColor(225, 235, 245) : MiniGdi::MakeColor(240, 240, 240),
-                    MiniGdi::MakeColor(128, 128, 128));
-            }
             else if (controlKind == BuiltinControlKind::Edit)
             {
                 MiniGdi::DrawRectangle(
@@ -8395,7 +9422,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     MiniGdi::FillRect(
                         *surface,
-                        MiniGdi::Rect{ 1, 1, (std::max)(1, width - 1), (std::min)(22, (std::max)(1, height - 1)) },
+                        MiniGdi::Rect{ 1, 1, (std::max)(1, width - 1),
+                            (std::min)(listViewHeaderHeight,
+                                (std::max)(1, height - 1)) },
                         MiniGdi::MakeColor(240, 240, 240));
                 }
             }
@@ -8456,16 +9485,34 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             else if (controlKind == BuiltinControlKind::ComboBox ||
                 controlKind == BuiltinControlKind::ScrollBar)
             {
+                // For CBS_DROPDOWN/CBS_DROPDOWNLIST the CreateWindow height
+                // includes the future drop-list.  Only the selection field is
+                // visible while the list is closed.  Centering the caption in
+                // the complete requested height can put it underneath later
+                // dialog controls (a common resource-dialog layout).
+                const int fieldHeight = controlKind == BuiltinControlKind::ComboBox
+                    ? (std::min)(height,
+                        GuestMetrics::ControlHeightForText(controlTextHeight))
+                    : height;
                 MiniGdi::DrawRectangle(
                     *surface,
-                    fullRect,
+                    MiniGdi::Rect{ 0, 0, width, fieldHeight },
                     MiniGdi::OpaqueWhite,
                     MiniGdi::MakeColor(128, 128, 128));
-                const int buttonWidth = (std::min)(20, (std::max)(1, width / 3));
+                const int buttonWidth = (std::min)(GuestMetrics::ScrollBarExtent,
+                    (std::max)(1, width / 3));
                 MiniGdi::FillRect(
                     *surface,
-                    MiniGdi::Rect{ (std::max)(0, width - buttonWidth), 1, (std::max)(0, width - 1), (std::max)(1, height - 1) },
+                    MiniGdi::Rect{ (std::max)(0, width - buttonWidth), 1,
+                        (std::max)(0, width - 1), (std::max)(1, fieldHeight - 1) },
                     MiniGdi::MakeColor(240, 240, 240));
+                if (controlKind == BuiltinControlKind::ComboBox && comboDropped &&
+                    fieldHeight < height)
+                {
+                    MiniGdi::DrawRectangle(*surface,
+                        MiniGdi::Rect{ 0, fieldHeight, width, height },
+                        MiniGdi::OpaqueWhite, MiniGdi::MakeColor(128, 128, 128));
+                }
             }
             else if (controlKind == BuiltinControlKind::UpDown)
             {
@@ -8527,11 +9574,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             const bool fontSelected = font != MiniGdi::InvalidObject &&
                 m_gdi.SelectFont(guestDc, font, &previousFont);
 
-            const size_t visibleCharacters = static_cast<size_t>((std::max)(0, width / MiniGdi::DefaultTextGlyphWidth));
+            const size_t visibleCharacters = static_cast<size_t>((std::max)(0, width / controlTextWidth));
             const int visibleTextWidth = static_cast<int>(
-                (std::min)(text.size(), visibleCharacters) * MiniGdi::DefaultTextGlyphWidth);
+                (std::min)(text.size(), visibleCharacters) * controlTextWidth);
             int textX = 2;
-            int textY = (std::max)(0, (height - MiniGdi::DefaultTextGlyphHeight) / 2);
+            int textY = (std::max)(0,
+                (height - GuestMetrics::TextHeight) / 2);
             if (controlKind == BuiltinControlKind::Static)
             {
                 const DWORD alignment = style & 0x00000003u;
@@ -8565,6 +9613,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     textX = (std::max)(2, width - visibleTextWidth - 2);
                 }
             }
+            else if (controlKind == BuiltinControlKind::ComboBox)
+            {
+                const int fieldHeight = (std::min)(height,
+                    GuestMetrics::ControlHeightForText(controlTextHeight));
+                textY = (std::max)(0,
+                    (fieldHeight - GuestMetrics::TextHeight) / 2);
+            }
 
             if ((controlKind != BuiltinControlKind::StatusBar ||
                 (!statusBarSimple && statusBarParts.empty())) &&
@@ -8577,12 +9632,40 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 m_gdi.TextOutW(guestDc, MiniGdi::Point{ textX, textY }, text.data(), text.size(), nullptr);
             }
 
+            if (controlKind == BuiltinControlKind::ComboBox && comboDropped)
+            {
+                const int fieldHeight = (std::min)(height,
+                    GuestMetrics::ControlHeightForText(controlTextHeight));
+                const int rowHeight = (std::max)(GuestMetrics::TextHeight + 4,
+                    GuestMetrics::ControlHeightForText(controlTextHeight));
+                int rowTop = fieldHeight;
+                for (size_t index = 0; index < choiceItems.size() && rowTop < height; ++index)
+                {
+                    const int rowBottom = (std::min)(height, SaturatingAdd(rowTop, rowHeight));
+                    const bool selected = static_cast<int>(index) == selectedChoice;
+                    if (selected)
+                    {
+                        MiniGdi::FillRect(*surface,
+                            MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowBottom },
+                            MiniGdi::MakeColor(0, 120, 215));
+                    }
+                    m_gdi.SetTextColor(guestDc,
+                        selected ? MiniGdi::OpaqueWhite : MiniGdi::OpaqueBlack, nullptr);
+                    const size_t visible = (std::min)(choiceItems[index].size(),
+                        static_cast<size_t>((std::max)(0, width - 6) /
+                            controlTextWidth));
+                    m_gdi.TextOutW(guestDc, MiniGdi::Point{ 3, rowTop + 2 },
+                        choiceItems[index].data(), visible, nullptr);
+                    rowTop = rowBottom;
+                }
+            }
+
             if (controlKind == BuiltinControlKind::StatusBar)
             {
                 if (statusBarSimple)
                 {
                     const size_t visible = (std::min)(statusBarSimpleText.size(),
-                        static_cast<size_t>((std::max)(0, width - 6) / MiniGdi::DefaultTextGlyphWidth));
+                        static_cast<size_t>((std::max)(0, width - 6) / controlTextWidth));
                     m_gdi.TextOutW(guestDc, MiniGdi::Point{ 3, textY },
                         statusBarSimpleText.data(), visible, nullptr);
                 }
@@ -8605,7 +9688,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         {
                             const size_t visible = (std::min)(statusBarTexts[part].size(),
                                 static_cast<size_t>((std::max)(0, right - left - 6) /
-                                    MiniGdi::DefaultTextGlyphWidth));
+                                    controlTextWidth));
                             m_gdi.TextOutW(guestDc, MiniGdi::Point{ left + 3, textY },
                                 statusBarTexts[part].data(), visible, nullptr);
                         }
@@ -8629,7 +9712,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         ? tabItemWidth
                         : (std::max)(32, static_cast<int>((std::min)(
                             tabItems[index].size(), static_cast<size_t>(128))) *
-                            MiniGdi::DefaultTextGlyphWidth + 16);
+                            controlTextWidth + 16);
                     const int right = (std::min)(width - 1, left + itemWidth);
                     if (right <= left) break;
                     const bool selected = static_cast<int>(index) == tabSelectedItem;
@@ -8651,10 +9734,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     }
                     const size_t visible = (std::min)(tabItems[index].size(),
                         static_cast<size_t>((std::max)(0, right - textLeft - 4) /
-                            MiniGdi::DefaultTextGlyphWidth));
+                            controlTextWidth));
                     m_gdi.TextOutW(guestDc,
                         MiniGdi::Point{ textLeft, (std::max)(2,
-                            (itemHeight - MiniGdi::DefaultTextGlyphHeight) / 2) },
+                            (itemHeight - controlTextHeight) / 2) },
                         tabItems[index].data(), visible, nullptr);
                     left = right;
                     if (left >= width - 1) break;
@@ -8694,9 +9777,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     }
                     const size_t visible = (std::min)(headerItems[item].size(),
                         static_cast<size_t>((std::max)(0, right - textLeft - 3) /
-                            MiniGdi::DefaultTextGlyphWidth));
+                            controlTextWidth));
                     m_gdi.TextOutW(guestDc, MiniGdi::Point{ textLeft,
-                        (std::max)(0, (height - MiniGdi::DefaultTextGlyphHeight) / 2) },
+                        (std::max)(0, (height - controlTextHeight) / 2) },
                         headerItems[item].data(), visible, nullptr);
                     left = right;
                     if (left >= width) break;
@@ -8773,34 +9856,32 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     }
                     const size_t characters = (std::min)(node->text.size(),
                         static_cast<size_t>((std::max)(0, width - textLeft - 2) /
-                            MiniGdi::DefaultTextGlyphWidth));
+                            controlTextWidth));
                     const MiniGdi::Color ink = selected
                         ? MiniGdi::OpaqueWhite : ColorFromGuestColorRef(treeTextColor);
                     m_gdi.SetTextColor(guestDc, ink, nullptr);
                     m_gdi.TextOutW(guestDc, MiniGdi::Point{ textLeft,
-                        top + (std::max)(0, (rowHeight - MiniGdi::DefaultTextGlyphHeight) / 2) },
+                        top + (std::max)(0, (rowHeight - controlTextHeight) / 2) },
                         node->text.data(), characters, nullptr);
                 }
             }
 
-            if (controlKind == BuiltinControlKind::Static && addressBackButton)
-            {
-                DrawToolbarGlyph(*surface, MiniGdi::Rect{ 3, 3, (std::max)(4, width - 3),
-                    (std::max)(4, height - 3) }, 0);
-            }
-
             if (controlKind == BuiltinControlKind::Toolbar && !toolbarCommands.empty())
             {
-                const int buttonWidth = (std::max)(16, toolbarButtonWidth);
-                const int buttonHeight = (std::min)(height - 2, (std::max)(16, toolbarButtonHeight));
+                const int buttonWidth = (std::max)(
+                    GuestMetrics::DefaultBitmapExtent, toolbarButtonWidth);
+                const int buttonHeight = (std::min)(height - 2 * GuestMetrics::Border,
+                    (std::max)(GuestMetrics::DefaultBitmapExtent, toolbarButtonHeight));
                 for (size_t index = 0; index < toolbarCommands.size(); ++index)
                 {
                     const BYTE buttonStyle = index < toolbarButtonStyles.size() ? toolbarButtonStyles[index] : 0;
                     const BYTE buttonState = index < toolbarButtonStates.size() ? toolbarButtonStates[index] : ToolbarStateEnabled;
                     const int itemWidth = ToolbarItemWidth(
-                        toolbarButtonStyles, toolbarBitmaps, toolbarButtonStates, index, buttonWidth);
+                        toolbarButtonStyles, toolbarBitmaps, toolbarButtonStates, index,
+                        buttonWidth, &toolbarButtonTexts);
                     const int left = ToolbarItemLeft(
-                        toolbarButtonStyles, toolbarBitmaps, toolbarButtonStates, index, buttonWidth);
+                        toolbarButtonStyles, toolbarBitmaps, toolbarButtonStates, index,
+                        buttonWidth, &toolbarButtonTexts);
                     if ((buttonState & ToolbarStateHidden) != 0)
                     {
                         continue;
@@ -8833,8 +9914,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         ? toolbarBitmaps[index] : static_cast<int>(index);
                     const int iconWidth = (std::min)(itemWidth - 4, (std::max)(1, toolbarBitmapWidth));
                     const int iconHeight = (std::min)(buttonHeight - 4, (std::max)(1, toolbarBitmapHeight));
-                    const MiniGdi::Rect iconRect{ left + (itemWidth - iconWidth) / 2, 1 + (buttonHeight - iconHeight) / 2,
-                        left + (itemWidth - iconWidth) / 2 + iconWidth, 1 + (buttonHeight - iconHeight) / 2 + iconHeight };
+                    const bool hasText = index < toolbarButtonTexts.size() &&
+                        !toolbarButtonTexts[index].empty();
+                    const int iconTop = hasText
+                        ? 1 + GuestMetrics::ControlVerticalPadding
+                        : 1 + (buttonHeight - iconHeight) / 2;
+                    const MiniGdi::Rect iconRect{ left + (itemWidth - iconWidth) / 2, iconTop,
+                        left + (itemWidth - iconWidth) / 2 + iconWidth, iconTop + iconHeight };
                     if (toolbarImageList && bitmapIndex >= 0 &&
                         CopyGuestImageListImage(toolbarImageList, bitmapIndex, &image) && !image.Empty())
                     {
@@ -8843,6 +9929,21 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     else
                     {
                         DrawToolbarGlyph(*surface, iconRect, bitmapIndex);
+                    }
+                    if (hasText)
+                    {
+                        const auto& label = toolbarButtonTexts[index];
+                        const size_t visible = (std::min)(label.size(),
+                            static_cast<size_t>((std::max)(0, itemWidth - 4) /
+                                GuestMetrics::TextWidth));
+                        const int labelWidth = static_cast<int>(visible) * GuestMetrics::TextWidth;
+                        m_gdi.SetTextColor(guestDc, buttonEnabled
+                            ? MiniGdi::OpaqueBlack : MiniGdi::MakeColor(144, 144, 144), nullptr);
+                        m_gdi.TextOutW(guestDc,
+                            MiniGdi::Point{ left + (itemWidth - labelWidth) / 2,
+                                (std::max)(iconTop + iconHeight + 1,
+                                    1 + buttonHeight - GuestMetrics::TextHeight - 1) },
+                            label.data(), visible, nullptr);
                     }
                     if ((buttonStyle & ToolbarStyleDropDown) != 0 && itemWidth >= 14)
                     {
@@ -8868,7 +9969,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         ? (std::max)(24, listColumnWidths[index])
                         : 120;
                     const size_t visibleColumnCharacters = static_cast<size_t>((std::max)(0,
-                        (columnWidth - 4) / MiniGdi::DefaultTextGlyphWidth));
+                        (columnWidth - 4) / controlTextWidth));
                     const size_t columnCharacters = (std::min)(
                         listColumns[index].size(), visibleColumnCharacters);
                     m_gdi.TextOutW(guestDc, MiniGdi::Point{ columnLeft + 2, 3 }, listColumns[index].data(), columnCharacters, nullptr);
@@ -8883,21 +9984,23 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         break;
                     }
                 }
-                const size_t visibleRows = static_cast<size_t>((std::max)(0, (height - 24) / MiniGdi::DefaultTextGlyphHeight));
+                const size_t visibleRows = static_cast<size_t>((std::max)(0,
+                    (height - listViewHeaderHeight) / listViewRowHeight));
                 const size_t firstVisible = static_cast<size_t>((std::max)(0, listViewTopItem));
                 for (size_t displayIndex = 0;
                     firstVisible + displayIndex < listItems.size() && displayIndex < visibleRows;
                     ++displayIndex)
                 {
                     const size_t index = firstVisible + displayIndex;
-                    const int rowTop = 24 + static_cast<int>(displayIndex) * MiniGdi::DefaultTextGlyphHeight;
+                    const int rowTop = listViewHeaderHeight +
+                        static_cast<int>(displayIndex) * listViewRowHeight;
                     const bool selected = index < listViewItemStates.size() &&
                         (listViewItemStates[index] & ListViewStateSelected) != 0;
                     if (selected)
                     {
                         MiniGdi::FillRect(
                             *surface,
-                            MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + MiniGdi::DefaultTextGlyphHeight },
+                            MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + listViewRowHeight },
                             MiniGdi::MakeColor(0, 120, 215));
                         m_gdi.SetTextColor(guestDc, MiniGdi::OpaqueWhite, nullptr);
                     }
@@ -8905,10 +10008,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     {
                         // Separate text-background color is a real ListView
                         // setting; respecting it avoids white text artefacts
-                        // when 7-Zip switches views or high-contrast colors.
+                        // when an application switches views or high-contrast colors.
                         MiniGdi::FillRect(
                             *surface,
-                            MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + MiniGdi::DefaultTextGlyphHeight },
+                            MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + listViewRowHeight },
                             ColorFromGuestColorRef(listViewTextBackgroundColor));
                     }
                     int cellLeft = 2;
@@ -8934,8 +10037,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         if ((cellText->empty() || needsImage) && parent)
                         {
                             // Wine's list-view asks its owner for virtual
-                            // text through LVN_GETDISPINFOW.  7-Zip uses this
-                            // owner-data path instead of inserting a string
+                            // text through LVN_GETDISPINFOW. Virtual list views use
+                            // this owner-data path instead of inserting a string
                             // for every file, so without this request the
                             // report view has rows but no captions.
                             wchar_t scratch[260] = {};
@@ -9032,7 +10135,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             if (CopyGuestImageListImage(
                                 listViewImageList, listViewItemImages[index], &image) && !image.Empty())
                             {
-                                const int iconSize = (std::min)(14, MiniGdi::DefaultTextGlyphHeight - 2);
+                                const int iconSize = (std::min)(14, listViewRowHeight - 2);
                                 DrawToolbarImage(*surface,
                                     MiniGdi::Rect{ cellLeft + 2, rowTop + 1,
                                         cellLeft + 2 + iconSize, rowTop + 1 + iconSize }, image);
@@ -9040,7 +10143,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             }
                         }
                         const size_t visibleCellCharacters = static_cast<size_t>((std::max)(0,
-                            (cellWidth - textInset - 2) / MiniGdi::DefaultTextGlyphWidth));
+                            (cellWidth - textInset - 2) / controlTextWidth));
                         const size_t cellCharacters = (std::min)(cellText->size(), visibleCellCharacters);
                         m_gdi.TextOutW(
                             guestDc,
@@ -9058,8 +10161,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     {
                         MiniGdi::DrawLine(
                             *surface,
-                            MiniGdi::Point{ 1, rowTop + MiniGdi::DefaultTextGlyphHeight - 1 },
-                            MiniGdi::Point{ (std::max)(1, width - 2), rowTop + MiniGdi::DefaultTextGlyphHeight - 1 },
+                            MiniGdi::Point{ 1, rowTop + listViewRowHeight - 1 },
+                            MiniGdi::Point{ (std::max)(1, width - 2), rowTop + listViewRowHeight - 1 },
                             MiniGdi::MakeColor(208, 208, 208));
                     }
                 }
@@ -9072,8 +10175,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     (std::max)(1, width - 2),
                     textX + static_cast<int>((std::min)(
                         clampedCaret,
-                        static_cast<size_t>((std::numeric_limits<int>::max)() / MiniGdi::DefaultTextGlyphWidth)) *
-                        MiniGdi::DefaultTextGlyphWidth));
+                        static_cast<size_t>((std::numeric_limits<int>::max)() / controlTextWidth)) *
+                        controlTextWidth));
                 MiniGdi::FillRect(
                     *surface,
                     MiniGdi::Rect{ caretX, 2, caretX + 1, (std::max)(2, height - 2) },
@@ -9261,9 +10364,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 for (size_t index = 0; index < window->toolbarCommands.size(); ++index)
                 {
                     const int left = ToolbarItemLeft(window->toolbarButtonStyles, window->toolbarBitmaps,
-                        window->toolbarButtonStates, index, window->toolbarButtonWidth);
+                        window->toolbarButtonStates, index, window->toolbarButtonWidth,
+                        &window->toolbarButtonTexts);
                     const int right = left + ToolbarItemWidth(window->toolbarButtonStyles, window->toolbarBitmaps,
-                        window->toolbarButtonStates, index, window->toolbarButtonWidth);
+                        window->toolbarButtonStates, index, window->toolbarButtonWidth,
+                        &window->toolbarButtonTexts);
                     const BYTE style = index < window->toolbarButtonStyles.size() ? window->toolbarButtonStyles[index] : 0;
                     const BYTE state = index < window->toolbarButtonStates.size() ? window->toolbarButtonStates[index] : ToolbarStateEnabled;
                     if (x >= left && x < right && (style & ToolbarStyleSeparator) == 0 &&
@@ -9313,8 +10418,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             if (command >= 0 && parent)
             {
                 // Toolbar buttons notify their owner with the button command,
-                // not the toolbar's child identifier. This is how 7-Zip maps
-                // its navigation and file-operation buttons.
+                // not the toolbar's child identifier, so owners can map each
+                // button to its corresponding command.
                 SendGuestMessage(
                     parent,
                     GuestAbi::WmCommand,
@@ -9653,7 +10758,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             ? window->tabItemWidth
                             : (std::max)(32, static_cast<int>((std::min)(
                                 window->tabItems[index].size(), static_cast<size_t>(128))) *
-                                MiniGdi::DefaultTextGlyphWidth + 16);
+                                window->controlTextWidth + 16);
                         if (x >= left && x < left + itemWidth)
                         {
                             requested = static_cast<int>(index);
@@ -9692,6 +10797,23 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         return 0;
 
     case BuiltinControlKind::ComboBox:
+        if (message == GuestAbi::WmKillFocus)
+        {
+            bool closed = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                closed = !window->destroyed && window->comboDropped;
+                window->comboDropped = false;
+            }
+            invalidate();
+            if (closed) notifyParent(ComboNotificationCloseUp);
+            return 0;
+        }
+        if (message == GuestAbi::WmSetFocus || message == GuestAbi::WmEnable)
+        {
+            invalidate();
+            return 0;
+        }
         if (message == GuestAbi::WmLButtonDown)
         {
             const int x = static_cast<int>(static_cast<WORD>(lParam & 0xffff));
@@ -9704,8 +10826,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 }
                 const size_t requested = x <= 3
                     ? 0
-                    : static_cast<size_t>((x - 2 + MiniGdi::DefaultTextGlyphWidth / 2) /
-                        MiniGdi::DefaultTextGlyphWidth);
+                    : static_cast<size_t>((x - 2 + window->controlTextWidth / 2) /
+                        window->controlTextWidth);
                 window->editCaret = (std::min)(requested, window->title.size());
                 handle = window->handle;
             }
@@ -9713,15 +10835,60 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             invalidate();
             return 0;
         }
-        if ((message == GuestAbi::WmLButtonUp &&
-                [&]()
+        if (message == GuestAbi::WmLButtonUp)
+        {
+            const int x = static_cast<int>(static_cast<SHORT>(lParam & 0xffff));
+            const int y = static_cast<int>(static_cast<SHORT>((lParam >> 16) & 0xffff));
+            bool changed = false;
+            bool dropChanged = false;
+            bool dropped = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || !window->enabled) return 0;
+                const int fieldHeight = (std::min)(window->surface.Height(),
+                    GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight));
+                if (window->comboDropped && y >= fieldHeight)
                 {
-                    std::lock_guard<std::mutex> guard(window->lock);
-                    const int x = static_cast<int>(static_cast<WORD>(lParam & 0xffff));
-                    return x >= (std::max)(0, window->surface.Width() - 20);
-                }()) ||
-            (message == GuestAbi::WmKeyDown &&
-                (wParam == GuestAbi::VkUp || wParam == GuestAbi::VkDown)))
+                    const int rowHeight = GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight);
+                    const int requested = (y - fieldHeight) / (std::max)(1, rowHeight);
+                    if (requested >= 0 && static_cast<size_t>(requested) < window->choiceItems.size())
+                    {
+                        changed = requested != window->selectedChoice;
+                        window->selectedChoice = requested;
+                        window->title = window->choiceItems[static_cast<size_t>(requested)];
+                    }
+                    window->comboDropped = false;
+                    dropChanged = true;
+                }
+                else if (x >= (std::max)(0,
+                    window->surface.Width() - GuestMetrics::ScrollBarExtent))
+                {
+                    window->comboDropped = !window->comboDropped;
+                    dropChanged = true;
+                }
+                dropped = window->comboDropped;
+            }
+            if (changed || dropChanged) invalidate();
+            if (changed) notifyParent(ComboNotificationSelectionChange);
+            if (dropChanged) notifyParent(dropped
+                ? ComboNotificationDropDown : ComboNotificationCloseUp);
+            return 0;
+        }
+        if (message == GuestAbi::WmKeyDown && wParam == 0x73)
+        {
+            bool dropped = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || !window->enabled) return 0;
+                window->comboDropped = !window->comboDropped;
+                dropped = window->comboDropped;
+            }
+            invalidate();
+            notifyParent(dropped ? ComboNotificationDropDown : ComboNotificationCloseUp);
+            return 0;
+        }
+        if (message == GuestAbi::WmKeyDown &&
+            (wParam == GuestAbi::VkUp || wParam == GuestAbi::VkDown))
         {
             bool changed = false;
             {
@@ -9753,7 +10920,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 // CBN_SELCHANGE. Returning the ComboBoxEx itself from
                 // CBEM_GETCOMBOCONTROL makes this equally useful to clients
                 // that wire the address bar through the inner combo handle.
-                notifyParent(1);
+                notifyParent(ComboNotificationSelectionChange);
             }
             return 0;
         }
@@ -9912,8 +11079,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     return 0;
                 }
-                item = y < 24 ? -1 : window->listViewTopItem +
-                    (y - 24) / MiniGdi::DefaultTextGlyphHeight;
+                item = y < window->listViewHeaderHeight ? -1 :
+                    window->listViewTopItem +
+                    (y - window->listViewHeaderHeight) / window->listViewRowHeight;
                 if (item >= 0 && static_cast<size_t>(item) < window->listViewItems.size())
                 {
                     previousItem = window->listViewSelectedItem;
@@ -9976,8 +11144,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             bool clicked = false;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
-                item = y < 24 ? -1 : window->listViewTopItem +
-                    (y - 24) / MiniGdi::DefaultTextGlyphHeight;
+                item = y < window->listViewHeaderHeight ? -1 :
+                    window->listViewTopItem +
+                    (y - window->listViewHeaderHeight) / window->listViewRowHeight;
                 clicked = item >= 0 && static_cast<size_t>(item) < window->listViewItems.size() &&
                     item == window->listViewPressedItem;
                 window->listViewPressedItem = -1;
@@ -9991,8 +11160,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         case GuestAbi::WmRButtonUp:
         {
             // Native list-view forwards a context-menu request to its owner.
-            // 7-Zip builds its file/folder menu from WM_CONTEXTMENU; merely
-            // forwarding WM_RBUTTONUP leaves that entire path dormant.
+            // Owners commonly build their item menu from WM_CONTEXTMENU;
+            // merely forwarding WM_RBUTTONUP leaves that path dormant.
             HWND parent = nullptr;
             HWND handle = nullptr;
             {
@@ -10085,7 +11254,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     window->listViewSelectedItem = item;
                     window->listViewSelectionMark = item;
                     const int height = (std::max)(0, static_cast<int>(window->bounds.bottom - window->bounds.top));
-                    const int rowsPerPage = (std::max)(1, (height - 24) / MiniGdi::DefaultTextGlyphHeight);
+                    const int rowsPerPage = (std::max)(1,
+                        (height - window->listViewHeaderHeight) /
+                            window->listViewRowHeight);
                     if (item < window->listViewTopItem)
                         window->listViewTopItem = item;
                     else if (item >= window->listViewTopItem + rowsPerPage)
@@ -10134,11 +11305,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     return 0;
                 }
-                const int firstCharacterCenter = 2 + MiniGdi::DefaultTextGlyphWidth / 2;
+                const int firstCharacterCenter = 2 + window->controlTextWidth / 2;
                 const size_t requested = x <= firstCharacterCenter
                     ? 0
-                    : static_cast<size_t>((x - 2 + MiniGdi::DefaultTextGlyphWidth / 2) /
-                        MiniGdi::DefaultTextGlyphWidth);
+                    : static_cast<size_t>((x - 2 + window->controlTextWidth / 2) /
+                        window->controlTextWidth);
                 window->editCaret = (std::min)(requested, window->title.size());
                 handle = window->handle;
             }
@@ -10262,75 +11433,6 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
 
     case BuiltinControlKind::Static:
-        if (message == GuestAbi::WmLButtonDown)
-        {
-            HWND handle = nullptr;
-            bool backButton = false;
-            {
-                std::lock_guard<std::mutex> guard(window->lock);
-                backButton = !window->destroyed && window->enabled && window->addressBackButton;
-                if (backButton)
-                {
-                    window->buttonPressed = true;
-                    handle = window->handle;
-                }
-            }
-            if (backButton)
-            {
-                // Preserve focus in the report view: 7-Zip's keyboard Back
-                // is processed by the active view rather than by this static
-                // ReBar child.
-                SetGuestCapture(handle, nullptr);
-                invalidate();
-            }
-            return 0;
-        }
-        if (message == GuestAbi::WmLButtonUp)
-        {
-            HWND handle = nullptr;
-            bool clicked = false;
-            {
-                std::lock_guard<std::mutex> guard(window->lock);
-                if (!window->destroyed && window->addressBackButton)
-                {
-                    clicked = window->buttonPressed;
-                    window->buttonPressed = false;
-                    handle = window->handle;
-                }
-            }
-            if (handle)
-            {
-                DWORD ignored = ERROR_SUCCESS;
-                if (GetGuestCapture(&ignored) == handle)
-                {
-                    ReleaseGuestCapture(&ignored);
-                }
-                invalidate();
-            }
-            if (clicked)
-            {
-                // A static has no intrinsic action. Preserve the standard
-                // BUTTON-like notification and let the owning guest decide
-                // what this affordance means; no application command IDs are
-                // embedded in the generic window layer.
-                notifyParent(GuestAbi::BnClicked);
-            }
-            return 0;
-        }
-        if (message == GuestAbi::WmCaptureChanged)
-        {
-            bool changed = false;
-            {
-                std::lock_guard<std::mutex> guard(window->lock);
-                changed = !window->destroyed && window->buttonPressed;
-                window->buttonPressed = false;
-            }
-            if (changed)
-            {
-                invalidate();
-            }
-            return 0;
-        }
         if (message == GuestAbi::WmSetFocus || message == GuestAbi::WmKillFocus || message == GuestAbi::WmEnable)
         {
             invalidate();
@@ -10441,6 +11543,30 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
         return TRUE;
     case GuestAbi::WmNcHitTest:
         return GuestAbi::HtClient;
+    case GuestAbi::WmWindowPosChanged:
+    {
+        GuestWindowPosition position{};
+        if (!TryReadGuestValue(
+            reinterpret_cast<const GuestWindowPosition*>(lParam), &position))
+        {
+            return 0;
+        }
+        if ((position.flags & GuestSwpNoMove) == 0)
+        {
+            CallWindowProcedure(record, GuestAbi::WmMove, 0,
+                GuestAbi::MakeMouseLParam(
+                    SignedCoordinateWord(position.x),
+                    SignedCoordinateWord(position.y)));
+        }
+        if ((position.flags & GuestSwpNoSize) == 0)
+        {
+            CallWindowProcedure(record, GuestAbi::WmSize, GuestAbi::SizeRestored,
+                GuestAbi::MakeMouseLParam(
+                    static_cast<WORD>((std::min)(position.cx, 0xffff)),
+                    static_cast<WORD>((std::min)(position.cy, 0xffff))));
+        }
+        return 0;
+    }
     case GuestAbi::WmEraseBkgnd:
         // BeginPaint performs the class-brush fallback after the guest gets a
         // chance to handle WM_ERASEBKGND. Returning zero here preserves that
@@ -10864,10 +11990,13 @@ BOOL GuestWindowManager::EndGuestPaint(HWND window, const GuestAbi::PaintStruct*
         }
         record->paintActive = false;
     }
-    Present(record);
-    RuntimeDiagnostics::Record(
-        L"PAINT PRESENTED: handle " +
-        std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) + L".");
+    if (IsGuestWindowVisibleInternal(window))
+    {
+        Present(record);
+        RuntimeDiagnostics::Record(
+            L"PAINT PRESENTED: handle " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) + L".");
+    }
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
@@ -10892,7 +12021,10 @@ int GuestWindowManager::ReleaseGuestDC(HWND window, HDC dc, DWORD* win32Error)
         SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
         return 0;
     }
-    Present(record);
+    if (IsGuestWindowVisibleInternal(window))
+    {
+        Present(record);
+    }
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return 1;
 }
@@ -10952,6 +12084,8 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             HWND parent = nullptr;
             RECT bounds = {};
             bool visible = false;
+            int compositionHeight = 0;
+            bool topMost = false;
             std::shared_ptr<WindowRecord> record;
         };
 
@@ -10980,6 +12114,18 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                 snapshot.parent = candidate->parent;
                 snapshot.bounds = candidate->bounds;
                 snapshot.visible = candidate->visible;
+                snapshot.compositionHeight = candidate->surface.Height();
+                snapshot.topMost = candidate->windowClass &&
+                    candidate->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
+                    candidate->comboDropped;
+                if (candidate->windowClass &&
+                    candidate->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
+                    !candidate->comboDropped &&
+                    (candidate->style & 0x0003u) != ComboBoxStyleSimple)
+                {
+                    snapshot.compositionHeight = (std::min)(snapshot.compositionHeight,
+                        GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight));
+                }
                 snapshot.record = candidate;
             }
             snapshots.push_back(std::move(snapshot));
@@ -10997,6 +12143,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             snapshots.end(),
             [](const WindowSnapshot& left, const WindowSnapshot& right)
             {
+                if (left.topMost != right.topMost) return !left.topMost;
                 return reinterpret_cast<ULONG_PTR>(left.handle) <
                     reinterpret_cast<ULONG_PTR>(right.handle);
             });
@@ -11081,7 +12228,8 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
         // in the guest compositor rather than introducing a host XAML menu.
         const std::vector<GuestMenuVisualItem> menuItems =
             GetGuestMenuBarItems(snapshots[root].handle);
-        const int menuHeight = menuItems.empty() ? 0 : (std::min)(22, composite.Height());
+        const int menuHeight = menuItems.empty() ? 0 :
+            (std::min)(GuestMetrics::MenuHeight, composite.Height());
         int openMenuIndex = -1;
         if (menuHeight > 0)
         {
@@ -11116,7 +12264,8 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     {
                         break;
                     }
-                    if (static_cast<int>(&item - menuItems.data()) == openMenuIndex)
+                    if (static_cast<int>(&item - menuItems.data()) == openMenuIndex ||
+                        (item.state & MenuFlagHighlighted) != 0)
                     {
                         MiniGdi::FillRect(composite,
                             MiniGdi::Rect{ left, 1, (std::min)(composite.Width(), SaturatingAdd(left, itemWidth)), menuHeight - 1 },
@@ -11124,8 +12273,20 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     }
                     m_gdi.SetTextColor(menuDc, IsMenuItemDisabled(item)
                         ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::OpaqueBlack, nullptr);
-                    m_gdi.TextOutW(menuDc, MiniGdi::Point{ left + 6, 3 },
+                    m_gdi.TextOutW(menuDc,
+                        MiniGdi::Point{ left + 6, GuestMetrics::MenuTextTop },
                         caption.data(), caption.size(), nullptr);
+                    const int mnemonic = MenuMnemonicDisplayIndex(item.text);
+                    if (mnemonic >= 0)
+                    {
+                        const int underlineLeft = left + 6 + mnemonic * MiniGdi::DefaultTextGlyphWidth;
+                        MiniGdi::DrawLine(composite,
+                            MiniGdi::Point{ underlineLeft,
+                                GuestMetrics::MenuTextTop + MiniGdi::DefaultTextGlyphHeight - 2 },
+                            MiniGdi::Point{ underlineLeft + MiniGdi::DefaultTextGlyphWidth - 2,
+                                GuestMetrics::MenuTextTop + MiniGdi::DefaultTextGlyphHeight - 2 },
+                            IsMenuItemDisabled(item) ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::OpaqueBlack);
+                    }
                     left = SaturatingAdd(left, itemWidth);
                 }
                 m_gdi.DestroyDc(menuDc);
@@ -11170,7 +12331,9 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                             composite,
                             MiniGdi::Point{ childX, childY },
                             child.record->surface,
-                            child.record->surface.Bounds());
+                            MiniGdi::Rect{ 0, 0, child.record->surface.Width(),
+                                (std::min)(child.compositionHeight,
+                                    child.record->surface.Height()) });
                     }
                 }
                 if (copied)
@@ -11188,12 +12351,11 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
         }
         if (activePopup.open && activePopup.root == snapshots[root].handle)
         {
-            const int rowHeight = 20;
             for (const PopupMenuLevel& level : activePopup.levels)
             {
                 const std::vector<GuestMenuVisualItem> popupItems = GetGuestMenuItems(level.menu);
                 const int popupWidth = PopupMenuWidth(popupItems);
-                const int popupHeight = (std::min)(static_cast<int>(popupItems.size()) * rowHeight,
+                const int popupHeight = (std::min)(PopupMenuHeight(popupItems),
                     (std::max)(0, composite.Height() - level.top));
                 const int popupRight = (std::min)(composite.Width(), SaturatingAdd(level.left, popupWidth));
                 if (popupHeight <= 0 || popupRight <= level.left) continue;
@@ -11208,12 +12370,14 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     m_gdi.SetTextColor(popupDc, MiniGdi::OpaqueBlack, &ignored);
                     MiniGdi::BackgroundMode ignoredMode = MiniGdi::BackgroundMode::Opaque;
                     m_gdi.SetBackgroundMode(popupDc, MiniGdi::BackgroundMode::Transparent, &ignoredMode);
-                    for (size_t index = 0; index < popupItems.size() &&
-                        static_cast<int>(index) * rowHeight < popupHeight; ++index)
+                    int itemOffset = 0;
+                    for (size_t index = 0; index < popupItems.size() && itemOffset < popupHeight; ++index)
                     {
                         const GuestMenuVisualItem& item = popupItems[index];
-                        const int top = SaturatingAdd(level.top, static_cast<int>(index) * rowHeight);
-                        if (static_cast<int>(index) == level.hotItem &&
+                        const int rowHeight = PopupMenuItemHeight(item);
+                        const int top = SaturatingAdd(level.top, itemOffset);
+                        if ((static_cast<int>(index) == level.hotItem ||
+                            (item.state & MenuFlagHighlighted) != 0) &&
                             !IsMenuItemSeparator(item) && !IsMenuItemDisabled(item))
                         {
                             MiniGdi::FillRect(composite,
@@ -11229,16 +12393,42 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                         {
                             m_gdi.SetTextColor(popupDc, IsMenuItemDisabled(item)
                                 ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::OpaqueBlack, nullptr);
-                            if ((item.state & MenuFlagChecked) != 0)
+                            HBITMAP displayedBitmap = item.itemBitmap;
+                            if (!displayedBitmap)
+                                displayedBitmap = (item.state & MenuFlagChecked) != 0
+                                    ? item.checkedBitmap : item.uncheckedBitmap;
+                            const MiniGdi::Surface* bitmap = displayedBitmap
+                                ? m_gdi.GetBitmapSurface(static_cast<MiniGdi::BitmapHandle>(
+                                    reinterpret_cast<ULONG_PTR>(displayedBitmap))) : nullptr;
+                            if (bitmap)
+                            {
+                                const int copyWidth = (std::min)(bitmap->Width(),
+                                    GuestMetrics::MenuCheckColumnWidth - 4);
+                                const int copyHeight = (std::min)(bitmap->Height(), rowHeight - 4);
+                                MiniGdi::CopyRect(composite,
+                                    MiniGdi::Point{ level.left + 2,
+                                        top + (rowHeight - copyHeight) / 2 }, *bitmap,
+                                    MiniGdi::Rect{ 0, 0, copyWidth, copyHeight });
+                            }
+                            else if ((item.state & MenuFlagChecked) != 0)
                             {
                                 const MiniGdi::Color mark = IsMenuItemDisabled(item)
                                     ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::MakeColor(32, 32, 32);
-                                MiniGdi::DrawLine(composite,
-                                    MiniGdi::Point{ level.left + 7, top + 10 },
-                                    MiniGdi::Point{ level.left + 10, top + 13 }, mark);
-                                MiniGdi::DrawLine(composite,
-                                    MiniGdi::Point{ level.left + 10, top + 13 },
-                                    MiniGdi::Point{ level.left + 15, top + 6 }, mark);
+                                if (item.type & MenuFlagRadioCheck)
+                                {
+                                    MiniGdi::FillRect(composite,
+                                        MiniGdi::Rect{ level.left + 8, top + rowHeight / 2 - 2,
+                                            level.left + 13, top + rowHeight / 2 + 3 }, mark);
+                                }
+                                else
+                                {
+                                    MiniGdi::DrawLine(composite,
+                                        MiniGdi::Point{ level.left + 7, top + rowHeight / 2 },
+                                        MiniGdi::Point{ level.left + 10, top + rowHeight / 2 + 3 }, mark);
+                                    MiniGdi::DrawLine(composite,
+                                        MiniGdi::Point{ level.left + 10, top + rowHeight / 2 + 3 },
+                                        MiniGdi::Point{ level.left + 15, top + rowHeight / 2 - 4 }, mark);
+                                }
                             }
                             std::wstring caption = MenuCaptionForDisplay(item.text);
                             std::wstring accelerator;
@@ -11248,15 +12438,41 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                                 accelerator = caption.substr(tab + 1);
                                 caption.erase(tab);
                             }
-                            m_gdi.TextOutW(popupDc, MiniGdi::Point{ level.left + 24, top + 2 },
+                            m_gdi.TextOutW(popupDc,
+                                MiniGdi::Point{ level.left + GuestMetrics::MenuCheckColumnWidth,
+                                    top + GuestMetrics::MenuTextTop },
                                 caption.data(), caption.size(), nullptr);
+                            if (item.state & MenuFlagDefault)
+                            {
+                                m_gdi.TextOutW(popupDc,
+                                    MiniGdi::Point{ level.left + GuestMetrics::MenuCheckColumnWidth + 1,
+                                        top + GuestMetrics::MenuTextTop },
+                                    caption.data(), caption.size(), nullptr);
+                            }
+                            const int mnemonic = MenuMnemonicDisplayIndex(item.text);
+                            if (mnemonic >= 0)
+                            {
+                                const int underlineLeft = level.left + GuestMetrics::MenuCheckColumnWidth +
+                                    mnemonic * MiniGdi::DefaultTextGlyphWidth;
+                                const MiniGdi::Color underline = IsMenuItemDisabled(item)
+                                    ? MiniGdi::MakeColor(144, 144, 144) : MiniGdi::OpaqueBlack;
+                                MiniGdi::DrawLine(composite,
+                                    MiniGdi::Point{ underlineLeft,
+                                        top + GuestMetrics::MenuTextTop + MiniGdi::DefaultTextGlyphHeight - 2 },
+                                    MiniGdi::Point{ underlineLeft + MiniGdi::DefaultTextGlyphWidth - 2,
+                                        top + GuestMetrics::MenuTextTop + MiniGdi::DefaultTextGlyphHeight - 2 },
+                                    underline);
+                            }
                             if (!accelerator.empty())
                             {
                                 const int acceleratorWidth = static_cast<int>((std::min)(
                                     accelerator.size(), static_cast<size_t>(40))) * MiniGdi::DefaultTextGlyphWidth;
                                 m_gdi.TextOutW(popupDc,
-                                    MiniGdi::Point{ (std::max)(level.left + 24,
-                                        popupRight - acceleratorWidth - (item.subMenu ? 20 : 8)), top + 2 },
+                                    MiniGdi::Point{ (std::max)(
+                                        level.left + GuestMetrics::MenuCheckColumnWidth,
+                                        popupRight - acceleratorWidth -
+                                            (item.subMenu ? GuestMetrics::MenuHeight : 8)),
+                                        top + GuestMetrics::MenuTextTop },
                                     accelerator.data(), accelerator.size(), nullptr);
                             }
                             if (item.subMenu)
@@ -11270,6 +12486,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                                     MiniGdi::Point{ arrowX - 2, top + 14 }, arrow);
                             }
                         }
+                        itemOffset = SaturatingAdd(itemOffset, rowHeight);
                     }
                     m_gdi.DestroyDc(popupDc);
                 }
@@ -11666,33 +12883,240 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
     {
         return;
     }
-    if (message == GuestAbi::WmKeyDown &&
-        static_cast<WPARAM>(args->VirtualKey) == GuestAbi::VkEscape)
+    const WPARAM key = static_cast<WPARAM>(args->VirtualKey);
+    if (message == GuestAbi::WmKeyDown)
     {
         PopupMenuSession popup;
-        bool closed = false;
-        bool collapsedSubMenu = false;
         {
             std::lock_guard<std::mutex> guard(m_popupMenuLock);
-            if (m_popupMenu.open)
-            {
-                if (m_popupMenu.levels.size() > 1)
-                {
-                    m_popupMenu.levels.pop_back();
-                    collapsedSubMenu = true;
-                }
-                else
-                {
-                    m_popupMenu.selectedCommand = 0;
-                    m_popupMenu.open = false;
-                    closed = true;
-                }
-                popup = m_popupMenu;
-            }
+            popup = m_popupMenu;
         }
-        if (closed || collapsedSubMenu)
+        if (popup.open)
         {
-            if (closed)
+            if (popup.menuBar && args->KeyStatus.IsMenuKeyDown && key >= L'0' && key <= L'Z')
+            {
+                const wchar_t wanted = static_cast<wchar_t>(towupper(static_cast<wchar_t>(key)));
+                const std::vector<GuestMenuVisualItem> bar = GetGuestMenuBarItems(popup.root);
+                for (size_t index = 0; index < bar.size(); ++index)
+                {
+                    if (MenuMnemonic(bar[index].text) != wanted || !bar[index].subMenu ||
+                        IsMenuItemDisabled(bar[index])) continue;
+                    if (static_cast<int>(index) != popup.topMenuIndex)
+                    {
+                        int x = 8;
+                        for (size_t before = 0; before < index; ++before)
+                            x = SaturatingAdd(x, MenuBarItemWidth(bar[before]));
+                        HandleGuestMenuPointer(popup.root, x + 1, 1, GuestAbi::WmLButtonDown);
+                    }
+                    return;
+                }
+            }
+            bool repaint = false;
+            bool close = false;
+            bool activate = false;
+            bool switchTop = false;
+            int switchDirection = 0;
+            UINT command = 0;
+            HMENU openedChild = nullptr;
+            HMENU closedChild = nullptr;
+            int openedFrom = -1;
+            int openedLevel = -1;
+            {
+                std::lock_guard<std::mutex> guard(m_popupMenuLock);
+                if (!m_popupMenu.open || m_popupMenu.levels.empty()) return;
+                PopupMenuLevel& level = m_popupMenu.levels.back();
+                std::vector<GuestMenuVisualItem> items = GetGuestMenuItems(level.menu);
+                const auto selectable = [&items](int index)
+                {
+                    return index >= 0 && static_cast<size_t>(index) < items.size() &&
+                        !IsMenuItemSeparator(items[static_cast<size_t>(index)]) &&
+                        !IsMenuItemDisabled(items[static_cast<size_t>(index)]);
+                };
+                const auto nextSelectable = [&items, &selectable](int current, int direction)
+                {
+                    if (items.empty()) return -1;
+                    for (size_t count = 0; count < items.size(); ++count)
+                    {
+                        current = (current + direction + static_cast<int>(items.size())) %
+                            static_cast<int>(items.size());
+                        if (selectable(current)) return current;
+                    }
+                    return -1;
+                };
+                if (key == GuestAbi::VkEscape)
+                {
+                    if (m_popupMenu.levels.size() > 1)
+                    {
+                        closedChild = m_popupMenu.levels.back().menu;
+                        m_popupMenu.levels.pop_back();
+                        repaint = true;
+                    }
+                    else close = true;
+                }
+                else if (key == GuestAbi::VkDown || key == GuestAbi::VkUp)
+                {
+                    level.hotItem = nextSelectable(level.hotItem,
+                        key == GuestAbi::VkDown ? 1 : -1);
+                    if (level.hotItem >= 0)
+                        m_popupMenu.levels.resize(m_popupMenu.levels.size());
+                    repaint = true;
+                }
+                else if (key == GuestAbi::VkLeft)
+                {
+                    if (m_popupMenu.levels.size() > 1)
+                    {
+                        closedChild = m_popupMenu.levels.back().menu;
+                        m_popupMenu.levels.pop_back();
+                        repaint = true;
+                    }
+                    else if (m_popupMenu.menuBar)
+                    {
+                        switchTop = true;
+                        switchDirection = -1;
+                    }
+                }
+                else if (key == GuestAbi::VkRight || key == GuestAbi::VkReturn)
+                {
+                    if (!selectable(level.hotItem))
+                        level.hotItem = nextSelectable(-1, 1);
+                    if (selectable(level.hotItem))
+                    {
+                        const GuestMenuVisualItem& item = items[static_cast<size_t>(level.hotItem)];
+                        if (item.subMenu)
+                        {
+                            openedChild = item.subMenu;
+                            openedFrom = level.hotItem;
+                            openedLevel = static_cast<int>(m_popupMenu.levels.size() - 1);
+                        }
+                        else if (key == GuestAbi::VkReturn && item.identifier)
+                        {
+                            command = item.identifier;
+                            activate = true;
+                        }
+                        else if (key == GuestAbi::VkRight && m_popupMenu.menuBar &&
+                            m_popupMenu.levels.size() == 1)
+                        {
+                            switchTop = true;
+                            switchDirection = 1;
+                        }
+                    }
+                    else if (key == GuestAbi::VkRight && m_popupMenu.menuBar)
+                    {
+                        switchTop = true;
+                        switchDirection = 1;
+                    }
+                }
+                else if (key >= L'0' && key <= L'Z')
+                {
+                    const wchar_t wanted = static_cast<wchar_t>(towupper(static_cast<wchar_t>(key)));
+                    for (size_t index = 0; index < items.size(); ++index)
+                    {
+                        if (MenuMnemonic(items[index].text) != wanted || !selectable(static_cast<int>(index)))
+                            continue;
+                        level.hotItem = static_cast<int>(index);
+                        if (items[index].subMenu)
+                        {
+                            openedChild = items[index].subMenu;
+                            openedFrom = static_cast<int>(index);
+                            openedLevel = static_cast<int>(m_popupMenu.levels.size() - 1);
+                        }
+                        else
+                        {
+                            command = items[index].identifier;
+                            activate = command != 0;
+                        }
+                        repaint = true;
+                        break;
+                    }
+                }
+                if (close || activate)
+                {
+                    m_popupMenu.selectedCommand = activate ? command : 0;
+                    m_popupMenu.open = false;
+                    popup = m_popupMenu;
+                }
+            }
+
+            if (closedChild)
+                SendGuestMessage(popup.owner, GuestAbi::WmUninitMenuPopup,
+                    reinterpret_cast<WPARAM>(closedChild), 0, nullptr);
+
+            if (repaint && !close && !activate)
+            {
+                HMENU selectedMenu = nullptr;
+                int selectedIndex = -1;
+                {
+                    std::lock_guard<std::mutex> guard(m_popupMenuLock);
+                    if (m_popupMenu.open && !m_popupMenu.levels.empty())
+                    {
+                        selectedMenu = m_popupMenu.levels.back().menu;
+                        selectedIndex = m_popupMenu.levels.back().hotItem;
+                    }
+                }
+                const std::vector<GuestMenuVisualItem> selectedItems =
+                    GetGuestMenuItems(selectedMenu);
+                if (selectedIndex >= 0 && static_cast<size_t>(selectedIndex) < selectedItems.size())
+                {
+                    const GuestMenuVisualItem& selectedItem =
+                        selectedItems[static_cast<size_t>(selectedIndex)];
+                    const UINT selectedValue = selectedItem.subMenu
+                        ? static_cast<UINT>(selectedIndex) : selectedItem.identifier;
+                    SendGuestMessage(popup.owner, GuestAbi::WmMenuSelect,
+                        GuestAbi::MakeCommandWParam(static_cast<WORD>(selectedValue),
+                            static_cast<WORD>(MenuSelectFlags(selectedItem, false))),
+                        reinterpret_cast<LPARAM>(selectedMenu), nullptr);
+                }
+            }
+
+            if (switchTop)
+            {
+                const std::vector<GuestMenuVisualItem> bar = GetGuestMenuBarItems(popup.root);
+                if (!bar.empty())
+                {
+                    int candidate = popup.topMenuIndex;
+                    for (size_t count = 0; count < bar.size(); ++count)
+                    {
+                        candidate = (candidate + switchDirection + static_cast<int>(bar.size())) %
+                            static_cast<int>(bar.size());
+                        if (bar[static_cast<size_t>(candidate)].subMenu &&
+                            !IsMenuItemDisabled(bar[static_cast<size_t>(candidate)])) break;
+                    }
+                    int x = 8;
+                    for (int index = 0; index < candidate; ++index)
+                        x = SaturatingAdd(x, MenuBarItemWidth(bar[static_cast<size_t>(index)]));
+                    HandleGuestMenuPointer(popup.root, x + 1, 1, GuestAbi::WmLButtonDown);
+                }
+                return;
+            }
+            if (openedChild)
+            {
+                SendGuestMessage(popup.owner, GuestAbi::WmInitMenuPopup,
+                    reinterpret_cast<WPARAM>(openedChild),
+                    GuestAbi::MakeCommandWParam(static_cast<WORD>(openedFrom), 0), nullptr);
+                const std::vector<GuestMenuVisualItem> childItems = GetGuestMenuItems(openedChild);
+                std::lock_guard<std::mutex> guard(m_popupMenuLock);
+                if (m_popupMenu.open && openedLevel >= 0 &&
+                    static_cast<size_t>(openedLevel) < m_popupMenu.levels.size() && !childItems.empty())
+                {
+                    const PopupMenuLevel parent = m_popupMenu.levels[static_cast<size_t>(openedLevel)];
+                    const std::vector<GuestMenuVisualItem> parentItems = GetGuestMenuItems(parent.menu);
+                    const int childWidth = PopupMenuWidth(childItems);
+                    int childLeft = parent.left + PopupMenuWidth(parentItems) - 2;
+                    int width = 0, height = 0, ignored = 0;
+                    HWND ignoredRoot = nullptr;
+                    GetGuestSurfaceGeometry(popup.root, &ignoredRoot, &width, &height,
+                        &ignored, &ignored, &ignored, &ignored);
+                    if (childLeft + childWidth > width) childLeft = (std::max)(0, parent.left - childWidth + 2);
+                    const int childTop = (std::max)(0, (std::min)(parent.top +
+                        PopupMenuItemTop(parentItems, static_cast<size_t>(openedFrom)),
+                        (std::max)(0, height - PopupMenuHeight(childItems))));
+                    m_popupMenu.levels.resize(static_cast<size_t>(openedLevel + 1));
+                    m_popupMenu.levels.push_back(PopupMenuLevel{
+                        openedChild, childLeft, childTop, openedFrom, -1 });
+                    repaint = true;
+                }
+            }
+            if (close || activate)
             {
                 const auto root = FindWindow(popup.root);
                 if (root)
@@ -11704,10 +13128,45 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
                 {
                     SendGuestMessage(popup.owner, GuestAbi::WmMenuSelect,
                         GuestAbi::MakeCommandWParam(0, 0xffff), 0, nullptr);
+                    if (popup.menuBar)
+                    {
+                        for (auto iterator = popup.levels.rbegin(); iterator != popup.levels.rend(); ++iterator)
+                            SendGuestMessage(popup.owner, GuestAbi::WmUninitMenuPopup,
+                                reinterpret_cast<WPARAM>(iterator->menu), 0, nullptr);
+                        SendGuestMessage(popup.owner, GuestAbi::WmExitMenuLoop, FALSE, 0, nullptr);
+                        if (activate && popup.notifyOwner)
+                            SendGuestMessage(popup.owner, GuestAbi::WmCommand,
+                                GuestAbi::MakeCommandWParam(static_cast<WORD>(command), 0), 0, nullptr);
+                    }
                 }
                 m_popupMenuChanged.notify_all();
             }
-            InvalidateGuestRect(popup.root, nullptr, FALSE, nullptr);
+            if (repaint || close || activate)
+                InvalidateGuestRect(popup.root, nullptr, FALSE, nullptr);
+            return;
+        }
+
+        if (key == GuestAbi::VkMenu || key == GuestAbi::VkF10)
+        {
+            HWND target = reinterpret_cast<HWND>(m_focusWindow.load());
+            if (!target) target = reinterpret_cast<HWND>(m_foregroundWindow.load());
+            HWND root = nullptr;
+            int ignored = 0;
+            if (target && GetGuestSurfaceGeometry(target, &root, &ignored, &ignored,
+                &ignored, &ignored, &ignored, &ignored))
+            {
+                const auto bar = GetGuestMenuBarItems(root);
+                int x = 8;
+                for (const auto& item : bar)
+                {
+                    if (item.subMenu && !IsMenuItemDisabled(item))
+                    {
+                        HandleGuestMenuPointer(root, x + 1, 1, GuestAbi::WmLButtonDown);
+                        break;
+                    }
+                    x = SaturatingAdd(x, MenuBarItemWidth(item));
+                }
+            }
             return;
         }
     }
@@ -11719,6 +13178,73 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
     if (target && IsGuestWindowVisibleInternal(target) && IsGuestWindowEnabledInternal(target))
     {
         PostGuestMessage(target, message, static_cast<WPARAM>(args->VirtualKey), 0, nullptr);
+    }
+}
+
+void GuestWindowManager::HandleHostSizeChanged(int width, int height)
+{
+    width = (std::max)(0, (std::min)(width, 8192));
+    height = (std::max)(0, (std::min)(height, 8192));
+    if (width <= 0 || height <= 0)
+    {
+        return;
+    }
+    if (m_viewportWidth.exchange(width) == width &&
+        m_viewportHeight.exchange(height) == height)
+    {
+        return;
+    }
+    m_viewportHeight.store(height);
+    GuestMetrics::SetCurrentScreenSize(width, height);
+
+    std::vector<std::shared_ptr<WindowRecord>> roots;
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        for (const auto& item : m_windows)
+        {
+            roots.push_back(item.second);
+        }
+    }
+    for (const auto& root : roots)
+    {
+        HWND handle = nullptr;
+        MiniGdi::DcHandle dc = MiniGdi::InvalidDc;
+        bool resized = false;
+        {
+            std::lock_guard<std::mutex> guard(root->lock);
+            if (root->destroyed || root->parent)
+            {
+                continue;
+            }
+            handle = root->handle;
+            dc = root->dc;
+            const int oldWidth = root->bounds.right - root->bounds.left;
+            const int oldHeight = root->bounds.bottom - root->bounds.top;
+            if (oldWidth == width && oldHeight == height)
+            {
+                continue;
+            }
+            if (!root->surface.Resize(width, height, MiniGdi::OpaqueWhite))
+            {
+                continue;
+            }
+            root->bounds.right = SaturatingAdd(root->bounds.left, width);
+            root->bounds.bottom = SaturatingAdd(root->bounds.top, height);
+            root->invalidated = false;
+            root->erasePending = false;
+            root->updateRect = RECT{};
+            resized = true;
+        }
+        if (resized)
+        {
+            m_gdi.ResetClip(dc);
+            PostGuestMessage(handle, GuestAbi::WmSize, GuestAbi::SizeRestored,
+                GuestAbi::MakeMouseLParam(SignedCoordinateWord(width),
+                    SignedCoordinateWord(height)), nullptr);
+            InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
+            RuntimeDiagnostics::Record(L"VIEWPORT: resized root to " +
+                std::to_wstring(width) + L"x" + std::to_wstring(height) + L".");
+        }
     }
 }
 
@@ -11750,6 +13276,9 @@ void GuestWindowManager::DetachHostEvents()
         const auto pointerWheel = m_pointerWheelToken;
         const auto keyDown = m_keyDownToken;
         const auto keyUp = m_keyUpToken;
+        const auto sizeChanged = m_sizeChangedToken;
+        const auto surfaceSizeChanged = m_surfaceSizeChangedToken;
+        Panel^ surfaceHost = m_surfaceHost.Get();
         CoreDispatcher^ dispatcher = m_dispatcher.Get();
         if (dispatcher && dispatcher->HasThreadAccess)
         {
@@ -11759,21 +13288,27 @@ void GuestWindowManager::DetachHostEvents()
             coreWindow->PointerWheelChanged -= pointerWheel;
             coreWindow->KeyDown -= keyDown;
             coreWindow->KeyUp -= keyUp;
+            coreWindow->SizeChanged -= sizeChanged;
+            if (surfaceHost) surfaceHost->SizeChanged -= surfaceSizeChanged;
             return;
         }
 
         if (dispatcher)
         {
             Platform::Agile<CoreWindow^> agileCoreWindow(coreWindow);
+            Platform::Agile<Panel^> agileSurfaceHost(surfaceHost);
             dispatcher->RunAsync(CoreDispatcherPriority::Normal,
                 ref new DispatchedHandler([
                     agileCoreWindow,
+                    agileSurfaceHost,
                     pointerMoved,
                     pointerPressed,
                     pointerReleased,
                     pointerWheel,
                     keyDown,
-                    keyUp]()
+                    keyUp,
+                    sizeChanged,
+                    surfaceSizeChanged]()
             {
                 try
                 {
@@ -11788,6 +13323,9 @@ void GuestWindowManager::DetachHostEvents()
                     target->PointerWheelChanged -= pointerWheel;
                     target->KeyDown -= keyDown;
                     target->KeyUp -= keyUp;
+                    target->SizeChanged -= sizeChanged;
+                    Panel^ panel = agileSurfaceHost.Get();
+                    if (panel) panel->SizeChanged -= surfaceSizeChanged;
                 }
                 catch (...)
                 {
