@@ -398,3 +398,5 @@ FodyWeavers.xsd
 WinverUWP/
 browser/
 /Win32Bridge/WineSource
+Contexto CoreShell_DesktopModeUWP.html
+Contexto Win32Bridge.html
