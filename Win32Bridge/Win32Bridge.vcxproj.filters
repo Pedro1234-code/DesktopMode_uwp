@@ -47,6 +47,9 @@
     <ClInclude Include="Bridge\MiniGdi.h">
       <Filter>Bridge</Filter>
     </ClInclude>
+    <ClInclude Include="Bridge\DirectWriteText.h">
+      <Filter>Bridge</Filter>
+    </ClInclude>
     <ClInclude Include="Bridge\PeImage.h">
       <Filter>Bridge</Filter>
     </ClInclude>
@@ -104,6 +107,9 @@
       <Filter>Bridge</Filter>
     </ClCompile>
     <ClCompile Include="Bridge\MiniGdi.cpp">
+      <Filter>Bridge</Filter>
+    </ClCompile>
+    <ClCompile Include="Bridge\DirectWriteText.cpp">
       <Filter>Bridge</Filter>
     </ClCompile>
     <ClCompile Include="Bridge\PeImage.cpp">

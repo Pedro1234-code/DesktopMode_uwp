@@ -96,6 +96,7 @@
   <ItemDefinitionGroup>
     <Link>
       <ModuleDefinitionFile>Win32Bridge.def</ModuleDefinitionFile>
+      <AdditionalDependencies>dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
@@ -144,6 +145,7 @@
     <ClInclude Include="Bridge\CommonControlsShims.h" />
     <ClInclude Include="Bridge\Comdlg32Shims.h" />
     <ClInclude Include="Bridge\DialogResources.h" />
+    <ClInclude Include="Bridge\DirectWriteText.h" />
     <ClInclude Include="Bridge\GuestRegistry.h" />
     <ClInclude Include="Bridge\GuestResources.h" />
     <ClInclude Include="Bridge\MsvcrtShims.h" />
@@ -174,6 +176,9 @@
     <ClCompile Include="Bridge\CommonControlsShims.cpp" />
     <ClCompile Include="Bridge\Comdlg32Shims.cpp" />
     <ClCompile Include="Bridge\DialogResources.cpp" />
+    <ClCompile Include="Bridge\DirectWriteText.cpp">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="Bridge\GuestRegistry.cpp" />
     <ClCompile Include="Bridge\GuestResources.cpp" />
     <ClCompile Include="Bridge\MsvcrtShims.cpp" />

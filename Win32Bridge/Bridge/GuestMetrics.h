@@ -73,6 +73,57 @@ namespace GuestMetrics
     constexpr int MenuCheckColumnWidth = 3 * TextWidth;
     constexpr int MaximumControlStripHeight = LogicalDpi;
 
+    constexpr DWORD WindowStyleChild = 0x40000000u;
+    constexpr DWORD WindowStyleCaption = 0x00c00000u;
+    constexpr DWORD WindowStyleBorder = 0x00800000u;
+    constexpr DWORD WindowStyleDialogFrame = 0x00400000u;
+    constexpr DWORD WindowStyleThickFrame = 0x00040000u;
+    constexpr DWORD WindowStyleSystemMenu = 0x00080000u;
+    constexpr DWORD WindowExtendedStyleModalFrame = 0x00000001u;
+
+    struct NonClientMetrics final
+    {
+        int left = 0;
+        int top = 0;
+        int right = 0;
+        int bottom = 0;
+        bool caption = false;
+        bool closeButton = false;
+    };
+
+    // Owned popups live inside the bridge's single host surface but retain
+    // ordinary Win32 non-client geometry. Plain WS_CHILD controls do not;
+    // framed/captioned child windows (such as MDI children) still do.
+    inline NonClientMetrics NonClientForEmbeddedWindow(
+        DWORD style, DWORD extendedStyle, bool hasParent)
+    {
+        NonClientMetrics result;
+        result.caption = (style & WindowStyleCaption) == WindowStyleCaption;
+        const bool framedChild = (style & WindowStyleChild) != 0 &&
+            (result.caption || (style & (WindowStyleDialogFrame |
+                WindowStyleThickFrame)) != 0 ||
+                (extendedStyle & WindowExtendedStyleModalFrame) != 0);
+        if (!hasParent || ((style & WindowStyleChild) != 0 && !framedChild))
+        {
+            result.caption = false;
+            return result;
+        }
+
+        result.closeButton = result.caption &&
+            (style & WindowStyleSystemMenu) != 0;
+        int frame = 0;
+        if ((style & WindowStyleThickFrame) != 0)
+            frame = FixedFrame;
+        else if ((style & WindowStyleDialogFrame) != 0 ||
+            (extendedStyle & WindowExtendedStyleModalFrame) != 0 || result.caption)
+            frame = FixedFrame;
+        else if ((style & WindowStyleBorder) != 0)
+            frame = Border;
+        result.left = result.right = result.bottom = frame;
+        result.top = frame + (result.caption ? CaptionHeight : 0);
+        return result;
+    }
+
     constexpr int ControlHeightForText(int textHeight)
     {
         const int effective = textHeight > TextHeight ? textHeight : TextHeight;

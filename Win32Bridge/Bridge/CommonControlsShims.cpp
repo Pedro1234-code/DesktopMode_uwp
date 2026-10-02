@@ -60,6 +60,27 @@ namespace
     constexpr DWORD PropertySheetHeaderPagesAreStructures = 0x00000008;
     constexpr DWORD PropertySheetHeaderUsesStartPageName = 0x00000040;
 
+    bool ReadBoundedGuestString(LPCWSTR source, std::wstring* result)
+    {
+        if (!result) return false;
+        result->clear();
+        if (!source || reinterpret_cast<ULONG_PTR>(source) <= 0xffff) return false;
+        __try
+        {
+            constexpr std::size_t MaximumCaptionCharacters = 4096;
+            std::size_t length = 0;
+            while (length < MaximumCaptionCharacters && source[length]) ++length;
+            if (length == MaximumCaptionCharacters) return false;
+            result->assign(source, source + length);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            result->clear();
+            return false;
+        }
+    }
+
     bool ReadPropertySheetHeader(const void* source, GuestPropertySheetHeaderW* result)
     {
         if (!source || !result || reinterpret_cast<ULONG_PTR>(source) <= 0xffff) return false;
@@ -313,6 +334,7 @@ INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void* headerPoint
         ? 0
         : (std::min)(static_cast<UINT>(header.startPage), header.pageCount - 1);
     const BYTE* cursor = reinterpret_cast<const BYTE*>(header.pages);
+    const BYTE* selectedPageSource = nullptr;
     GuestPropertySheetPageW page = {};
     for (UINT index = 0; index <= selected; ++index)
     {
@@ -322,14 +344,25 @@ INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void* headerPoint
         if (index == selected)
         {
             page = current;
+            selectedPageSource = cursor;
             break;
         }
         cursor += pageSize;
     }
     RuntimeDiagnostics::Record(L"PROPERTYSHEET: presenting page " +
         std::to_wstring(selected) + L" of " + std::to_wstring(header.pageCount) + L".");
-    return ShowGuestDialogFromResource(page.instance ? page.instance : header.instance,
-        page.templateName, header.parent, page.dialogProcedure, page.parameter);
+    // Property-page templates are WS_CHILD by design because native comctl32
+    // places them inside a separate property-sheet frame.  The bridge's
+    // current single-page host must provide that frame itself.
+    std::wstring caption;
+    ReadBoundedGuestString(header.caption, &caption);
+    return ShowGuestDialogFromResourceWithStyles(
+        page.instance ? page.instance : header.instance,
+        page.templateName, header.parent, page.dialogProcedure,
+        reinterpret_cast<LPARAM>(selectedPageSource),
+        GuestMetrics::WindowStyleCaption | GuestMetrics::WindowStyleSystemMenu,
+        GuestMetrics::WindowStyleChild,
+        caption.empty() ? nullptr : caption.c_str());
 }
 HRESULT WINAPI Win32Bridge::Bridge::BridgeDllGetVersion(GuestDllVersionInfo* versionInfo)
 {

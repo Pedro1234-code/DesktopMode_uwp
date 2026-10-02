@@ -179,6 +179,7 @@ namespace GuestAbi
     constexpr UINT WmKeyUp = 0x0101;
     constexpr UINT WmChar = 0x0102;
     constexpr UINT WmCommand = 0x0111;
+    constexpr UINT WmSysCommand = 0x0112;
     constexpr UINT WmTimer = 0x0113;
     constexpr UINT WmInitMenu = 0x0116;
     constexpr UINT WmInitMenuPopup = 0x0117;
@@ -261,11 +262,31 @@ namespace GuestAbi
     constexpr WPARAM VkDown = 0x28;
     constexpr WPARAM VkDelete = 0x2e;
 
+    constexpr WPARAM ScClose = 0xf060;
+    constexpr WPARAM ScMask = 0xfff0;
+
     constexpr UINT DrawTextCenter = 0x00000001;
     constexpr UINT DrawTextRight = 0x00000002;
     constexpr UINT DrawTextVCenter = 0x00000004;
     constexpr UINT DrawTextBottom = 0x00000008;
+    constexpr UINT DrawTextWordBreak = 0x00000010;
+    constexpr UINT DrawTextSingleLine = 0x00000020;
+    constexpr UINT DrawTextExpandTabs = 0x00000040;
+    constexpr UINT DrawTextTabStop = 0x00000080;
+    constexpr UINT DrawTextNoClip = 0x00000100;
+    constexpr UINT DrawTextExternalLeading = 0x00000200;
     constexpr UINT DrawTextCalcRect = 0x00000400;
+    constexpr UINT DrawTextNoPrefix = 0x00000800;
+    constexpr UINT DrawTextInternal = 0x00001000;
+    constexpr UINT DrawTextEditControl = 0x00002000;
+    constexpr UINT DrawTextPathEllipsis = 0x00004000;
+    constexpr UINT DrawTextEndEllipsis = 0x00008000;
+    constexpr UINT DrawTextModifyString = 0x00010000;
+    constexpr UINT DrawTextRtlReading = 0x00020000;
+    constexpr UINT DrawTextWordEllipsis = 0x00040000;
+    constexpr UINT DrawTextNoFullWidthCharBreak = 0x00080000;
+    constexpr UINT DrawTextHidePrefix = 0x00100000;
+    constexpr UINT DrawTextPrefixOnly = 0x00200000;
 
     constexpr int BrushWhite = 0;
     constexpr int BrushLtGray = 1;

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <string>
+#include <vector>
 #include <windows.h>
 
 namespace Win32Bridge
@@ -11,6 +13,59 @@ namespace Bridge
     // expose a host module or use the desktop resource loader.
     const BYTE* CurrentGuestImageBase();
     size_t CurrentGuestImageSize();
+
+    enum class GuestResourceStatus
+    {
+        Success,
+        InvalidParameter,
+        ModuleNotFound,
+        InvalidImage,
+        TypeNotFound,
+        NameNotFound,
+        LanguageNotFound,
+        InvalidData,
+    };
+
+    struct GuestResourceIdentifier final
+    {
+        bool ordinal = false;
+        WORD id = 0;
+        std::wstring text;
+    };
+
+    struct GuestResourceData final
+    {
+        // Normalized module identity: 0x10000 for the primary executable or
+        // the mapped image base for a guest DLL.
+        HMODULE module = nullptr;
+        GuestResourceIdentifier type;
+        GuestResourceIdentifier name;
+        LANGID language = 0;
+        DWORD codePage = 0;
+        const BYTE* data = nullptr;
+        size_t size = 0;
+    };
+
+    GuestResourceStatus FindGuestResource(
+        HMODULE module,
+        LPCWSTR type,
+        LPCWSTR name,
+        LANGID language,
+        bool requireExactLanguage,
+        GuestResourceData* resource);
+
+    GuestResourceStatus EnumerateGuestResourceTypes(
+        HMODULE module,
+        std::vector<GuestResourceIdentifier>* types);
+    GuestResourceStatus EnumerateGuestResourceNames(
+        HMODULE module,
+        LPCWSTR type,
+        std::vector<GuestResourceIdentifier>* names);
+    GuestResourceStatus EnumerateGuestResourceLanguages(
+        HMODULE module,
+        LPCWSTR type,
+        LPCWSTR name,
+        std::vector<LANGID>* languages);
 
     // Looks up one resource directly in the mapped guest PE.  `name` accepts
     // either an ordinal resource token (MAKEINTRESOURCE-style) or a Unicode

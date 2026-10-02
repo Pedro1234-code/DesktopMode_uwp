@@ -12,11 +12,13 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
 #include <cwchar>
 #include <cwctype>
 #include <limits>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -1704,44 +1706,226 @@ int WINAPI Win32Bridge::Bridge::BridgeDrawTextW(HDC dc, LPWSTR text, int charact
         return 0;
     }
 
-    MiniGdi::Size extent;
-    if (!manager->Gdi().GetTextExtentW(guestDc, count, &extent))
+    const bool processPrefix = (format & GuestAbi::DrawTextNoPrefix) == 0;
+    const bool singleLine = (format & GuestAbi::DrawTextSingleLine) != 0;
+    const auto prepareDisplayText = [processPrefix, singleLine](
+        const std::wstring& source, std::size_t* mnemonicPosition)
+    {
+        std::wstring prepared;
+        prepared.reserve(source.size());
+        if (mnemonicPosition)
+            *mnemonicPosition = static_cast<std::size_t>(-1);
+        for (std::size_t index = 0; index < source.size(); ++index)
+        {
+            wchar_t character = source[index];
+            if (singleLine && (character == L'\r' || character == L'\n'))
+            {
+                if (character == L'\r' && index + 1 < source.size() &&
+                    source[index + 1] == L'\n') ++index;
+                prepared.push_back(L' ');
+                continue;
+            }
+            if (processPrefix && character == L'&')
+            {
+                if (index + 1 < source.size() && source[index + 1] == L'&')
+                {
+                    prepared.push_back(L'&');
+                    ++index;
+                }
+                else if (index + 1 < source.size() && mnemonicPosition &&
+                    *mnemonicPosition == static_cast<std::size_t>(-1))
+                {
+                    *mnemonicPosition = prepared.size();
+                }
+                continue;
+            }
+            prepared.push_back(character);
+        }
+        return prepared;
+    };
+
+    std::wstring sourceText(text, text + count);
+    std::wstring displayText = prepareDisplayText(sourceText, nullptr);
+    bool modifiedByEllipsis = false;
+    const bool calculate = (format & GuestAbi::DrawTextCalcRect) != 0;
+    const bool mayModify = (format & GuestAbi::DrawTextModifyString) != 0 &&
+        (format & (GuestAbi::DrawTextEndEllipsis |
+            GuestAbi::DrawTextPathEllipsis |
+            GuestAbi::DrawTextWordEllipsis)) != 0;
+    const auto boundedRectExtent = [](LONG end, LONG start)
+    {
+        const std::int64_t extent = static_cast<std::int64_t>(end) - start;
+        if (extent <= 0) return 0;
+        if (extent > (std::numeric_limits<int>::max)())
+            return (std::numeric_limits<int>::max)();
+        return static_cast<int>(extent);
+    };
+    const int availableWidth = boundedRectExtent(rect->right, rect->left);
+    const int availableHeight = calculate
+        ? 1024 * 1024
+        : boundedRectExtent(rect->bottom, rect->top);
+    const auto measuredWidth = [manager, guestDc](const std::wstring& value)
+    {
+        MiniGdi::Size measured{};
+        if (!manager->Gdi().GetTextExtentW(
+            guestDc, value.data(), value.size(), &measured))
+            return (std::numeric_limits<int>::max)();
+        return measured.width;
+    };
+    MiniGdi::TextLayoutOptions fitOptions;
+    fitOptions.wordWrap = !singleLine &&
+        (format & GuestAbi::DrawTextWordBreak) != 0;
+    fitOptions.includeExternalLeading =
+        (format & GuestAbi::DrawTextExternalLeading) != 0;
+    fitOptions.clipToLayout = false;
+    if ((format & GuestAbi::DrawTextExpandTabs) != 0)
+    {
+        unsigned tabCharacters = 8;
+        if ((format & GuestAbi::DrawTextTabStop) != 0)
+        {
+            const unsigned requested = (format >> 8) & 0xffu;
+            if (requested != 0) tabCharacters = requested;
+        }
+        MiniGdi::FontMetrics fontMetrics{};
+        if (manager->Gdi().GetSelectedFontMetrics(guestDc, &fontMetrics))
+            fitOptions.tabStop = static_cast<float>((std::max)(1,
+                fontMetrics.averageWidth) * tabCharacters);
+    }
+    const auto fitsInLayout = [manager, guestDc, availableWidth, availableHeight,
+        &fitOptions](const std::wstring& value)
+    {
+        MiniGdi::Size measured{};
+        if (!manager->Gdi().DrawTextW(guestDc,
+            MiniGdi::Rect{ 0, 0, availableWidth, availableHeight },
+            value.data(), value.size(), fitOptions, false, &measured)) return false;
+        return measured.width <= availableWidth && measured.height <= availableHeight;
+    };
+    const auto endEllipsify = [&fitsInLayout](
+        const std::wstring& value, bool atWordBoundary)
+    {
+        static const std::wstring ellipsis = L"...";
+        if (fitsInLayout(value)) return value;
+        std::size_t low = 0;
+        std::size_t high = value.size();
+        while (low < high)
+        {
+            const std::size_t middle = low + (high - low + 1) / 2;
+            if (fitsInLayout(value.substr(0, middle) + ellipsis))
+                low = middle;
+            else
+                high = middle - 1;
+        }
+        std::size_t prefix = low;
+        if (atWordBoundary && prefix < value.size())
+        {
+            while (prefix > 0 && !std::iswspace(value[prefix - 1])) --prefix;
+            while (prefix > 0 && std::iswspace(value[prefix - 1])) --prefix;
+        }
+        return value.substr(0, prefix) + ellipsis;
+    };
+    const auto pathEllipsify = [&measuredWidth, &endEllipsify, availableWidth](
+        const std::wstring& value)
+    {
+        static const std::wstring ellipsis = L"...";
+        if (measuredWidth(value) <= availableWidth) return value;
+        const std::size_t slash = value.find_last_of(L"\\/");
+        if (slash == std::wstring::npos) return endEllipsify(value, false);
+        const std::wstring suffix = value.substr(slash);
+        std::size_t low = 0;
+        std::size_t high = slash;
+        while (low < high)
+        {
+            const std::size_t middle = low + (high - low + 1) / 2;
+            if (measuredWidth(value.substr(0, middle) + ellipsis + suffix) <=
+                availableWidth)
+                low = middle;
+            else
+                high = middle - 1;
+        }
+        return value.substr(0, low) + ellipsis + suffix;
+    };
+
+    if (mayModify && !fitsInLayout(displayText))
+    {
+        std::wstring modified = displayText;
+        if ((format & GuestAbi::DrawTextPathEllipsis) != 0)
+            modified = pathEllipsify(modified);
+        if ((format & GuestAbi::DrawTextEndEllipsis) != 0 &&
+            !fitsInLayout(modified))
+            modified = endEllipsify(modified, false);
+        else if ((format & GuestAbi::DrawTextWordEllipsis) != 0 &&
+            !fitsInLayout(modified))
+            modified = endEllipsify(modified, true);
+        if (modified != displayText)
+        {
+            // Win32 documents DT_MODIFYSTRING as requiring room for four
+            // additional WCHARs: at most three dots plus the terminator.
+            // Never exceed that contract even when the input count names a
+            // buffer that was not originally null-terminated.
+            const std::size_t maximumResult = count + 3;
+            if (modified.size() > maximumResult) modified.resize(maximumResult);
+            for (std::size_t index = 0; index < modified.size(); ++index)
+                text[index] = modified[index];
+            text[modified.size()] = L'\0';
+            displayText = std::move(modified);
+            modifiedByEllipsis = true;
+        }
+    }
+
+    std::size_t mnemonic = static_cast<std::size_t>(-1);
+    std::wstring layoutText = modifiedByEllipsis
+        ? displayText
+        : prepareDisplayText(sourceText, &mnemonic);
+    if ((format & GuestAbi::DrawTextHidePrefix) != 0)
+        mnemonic = static_cast<std::size_t>(-1);
+
+    MiniGdi::TextLayoutOptions options;
+    if ((format & GuestAbi::DrawTextCenter) != 0)
+        options.horizontal = MiniGdi::TextHorizontalAlignment::Center;
+    else if ((format & GuestAbi::DrawTextRight) != 0)
+        options.horizontal = MiniGdi::TextHorizontalAlignment::Right;
+    if (singleLine && (format & GuestAbi::DrawTextVCenter) != 0)
+        options.vertical = MiniGdi::TextVerticalAlignment::Center;
+    else if (singleLine && (format & GuestAbi::DrawTextBottom) != 0)
+        options.vertical = MiniGdi::TextVerticalAlignment::Bottom;
+    options.wordWrap = !singleLine &&
+        (format & GuestAbi::DrawTextWordBreak) != 0;
+    options.rightToLeft = (format & GuestAbi::DrawTextRtlReading) != 0;
+    options.clipToLayout = (format & GuestAbi::DrawTextNoClip) == 0;
+    options.includeExternalLeading =
+        (format & GuestAbi::DrawTextExternalLeading) != 0;
+    options.renderGlyphs = (format & GuestAbi::DrawTextPrefixOnly) == 0;
+    options.mnemonicStart = mnemonic;
+    if (!modifiedByEllipsis)
+    {
+        if ((format & GuestAbi::DrawTextPathEllipsis) != 0)
+            options.trimming = MiniGdi::TextTrimming::Path;
+        else if ((format & GuestAbi::DrawTextWordEllipsis) != 0)
+            options.trimming = MiniGdi::TextTrimming::Word;
+        else if ((format & GuestAbi::DrawTextEndEllipsis) != 0)
+            options.trimming = MiniGdi::TextTrimming::Character;
+    }
+    options.tabStop = fitOptions.tabStop;
+
+    constexpr int MaximumLayoutDimension = 1024 * 1024;
+    MiniGdi::Rect layoutRect{ rect->left, rect->top, rect->right, rect->bottom };
+    if (calculate)
+    {
+        if (!options.wordWrap)
+            layoutRect.right = rect->left + MaximumLayoutDimension;
+        layoutRect.bottom = rect->top + MaximumLayoutDimension;
+    }
+    MiniGdi::Size extent{};
+    if (!manager->Gdi().DrawTextW(guestDc, layoutRect,
+        layoutText.data(), layoutText.size(), options, !calculate, &extent))
     {
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return 0;
     }
-
-    if ((format & GuestAbi::DrawTextCalcRect) != 0)
+    if (calculate)
     {
         rect->right = rect->left + extent.width;
         rect->bottom = rect->top + extent.height;
-        BridgeSetLastError(ERROR_SUCCESS);
-        return extent.height;
-    }
-
-    int x = rect->left;
-    int y = rect->top;
-    if ((format & GuestAbi::DrawTextCenter) != 0)
-    {
-        x = rect->left + ((rect->right - rect->left) - extent.width) / 2;
-    }
-    else if ((format & GuestAbi::DrawTextRight) != 0)
-    {
-        x = rect->right - extent.width;
-    }
-    if ((format & GuestAbi::DrawTextVCenter) != 0)
-    {
-        y = rect->top + ((rect->bottom - rect->top) - extent.height) / 2;
-    }
-    else if ((format & GuestAbi::DrawTextBottom) != 0)
-    {
-        y = rect->bottom - extent.height;
-    }
-
-    if (!manager->Gdi().TextOutW(guestDc, MiniGdi::Point{ x, y }, text, count))
-    {
-        BridgeSetLastError(ERROR_INVALID_PARAMETER);
-        return 0;
     }
 
     BridgeSetLastError(ERROR_SUCCESS);

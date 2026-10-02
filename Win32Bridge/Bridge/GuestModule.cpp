@@ -335,6 +335,26 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
     return nullptr;
 }
 
+bool GuestModuleLoader::GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const
+{
+    if (!imageBase || !imageSize)
+    {
+        return false;
+    }
+    *imageBase = nullptr;
+    *imageSize = 0;
+
+    std::lock_guard<std::mutex> guard(m_lock);
+    const auto candidate = FindModuleLocked(module);
+    if (!candidate || !candidate->runtime.Base() || candidate->runtime.Size() == 0)
+    {
+        return false;
+    }
+    *imageBase = candidate->runtime.Base();
+    *imageSize = candidate->runtime.Size();
+    return true;
+}
+
 bool GuestModuleLoader::FreeLibrary(HMODULE module, DWORD* win32Error)
 {
     std::lock_guard<std::mutex> guard(m_lock);

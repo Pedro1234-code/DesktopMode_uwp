@@ -29,6 +29,7 @@ namespace Bridge
 
         bool LoadLibrary(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error);
         FARPROC GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, DWORD* win32Error) const;
+        bool GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const;
         bool FreeLibrary(HMODULE module, DWORD* win32Error);
         void ReleaseAll();
 

@@ -193,136 +193,24 @@ namespace
     std::mutex g_dialogWindowsLock;
     std::unordered_map<ULONG_PTR, std::shared_ptr<DialogWindowState>> g_dialogWindows;
 
-    struct ResourceImage final
-    {
-        const BYTE* base = nullptr;
-        size_t size = 0;
-
-        bool Contains(const BYTE* address, size_t count) const
-        {
-            return base && address >= base && count <= size &&
-                static_cast<size_t>(address - base) <= size - count;
-        }
-    };
-
-    bool TryReadMappedImageSize(const BYTE* image, size_t* imageSize)
-    {
-        if (!image || !imageSize) return false;
-        __try
-        {
-            const IMAGE_DOS_HEADER* dos =
-                reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
-            if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
-                dos->e_lfanew > 1024 * 1024) return false;
-            const IMAGE_NT_HEADERS64* nt =
-                reinterpret_cast<const IMAGE_NT_HEADERS64*>(image + dos->e_lfanew);
-            if (nt->Signature != IMAGE_NT_SIGNATURE ||
-                nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-                nt->OptionalHeader.SizeOfImage < sizeof(IMAGE_DOS_HEADER) ||
-                nt->OptionalHeader.SizeOfImage > 1024u * 1024u * 1024u) return false;
-            *imageSize = nt->OptionalHeader.SizeOfImage;
-            return true;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            return false;
-        }
-    }
-
-    bool ResolveResourceImage(HINSTANCE instance, ResourceImage* image)
-    {
-        if (!image) return false;
-        *image = ResourceImage{};
-        const BYTE* current = CurrentGuestImageBase();
-        if (!instance || reinterpret_cast<const BYTE*>(instance) == current)
-        {
-            image->base = current;
-            image->size = CurrentGuestImageSize();
-            return image->base && image->size >= sizeof(IMAGE_DOS_HEADER);
-        }
-
-        image->base = reinterpret_cast<const BYTE*>(instance);
-        if (!TryReadMappedImageSize(image->base, &image->size))
-        {
-            *image = ResourceImage{};
-            return false;
-        }
-        return true;
-    }
-
-    const IMAGE_RESOURCE_DIRECTORY_ENTRY* FindResourceEntry(
-        const ResourceImage& image,
-        const BYTE* resourceBase,
-        const IMAGE_RESOURCE_DIRECTORY* directory,
-        const DialogValue& requested)
-    {
-        if (!resourceBase || !directory || !image.Contains(reinterpret_cast<const BYTE*>(directory), sizeof(*directory))) return nullptr;
-        const size_t count = static_cast<size_t>(directory->NumberOfNamedEntries) + directory->NumberOfIdEntries;
-        const auto entries = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(directory + 1);
-        if (!image.Contains(reinterpret_cast<const BYTE*>(entries), count * sizeof(*entries))) return nullptr;
-        for (size_t index = 0; index < count; ++index)
-        {
-            const auto& entry = entries[index];
-            if (requested.ordinal)
-            {
-                if (!entry.NameIsString && entry.Id == requested.id) return &entry;
-                continue;
-            }
-            if (!entry.NameIsString) continue;
-            const auto string = reinterpret_cast<const IMAGE_RESOURCE_DIR_STRING_U*>(resourceBase + entry.NameOffset);
-            if (!image.Contains(reinterpret_cast<const BYTE*>(string), sizeof(WORD))) continue;
-            const size_t bytes = sizeof(WORD) + static_cast<size_t>(string->Length) * sizeof(WCHAR);
-            if (!image.Contains(reinterpret_cast<const BYTE*>(string), bytes)) continue;
-            if (requested.text.size() == string->Length &&
-                std::wmemcmp(requested.text.data(), string->NameString, string->Length) == 0) return &entry;
-        }
-        return nullptr;
-    }
-
-    const IMAGE_RESOURCE_DIRECTORY* ChildDirectory(
-        const ResourceImage& image,
-        const BYTE* resourceBase,
-        const IMAGE_RESOURCE_DIRECTORY_ENTRY* entry)
-    {
-        if (!entry || !entry->DataIsDirectory) return nullptr;
-        const auto directory = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(resourceBase + entry->OffsetToDirectory);
-        return image.Contains(reinterpret_cast<const BYTE*>(directory), sizeof(*directory)) ? directory : nullptr;
-    }
-
     bool FindTypedResource(HINSTANCE instance, WORD resourceType, const DialogValue& requested, const BYTE** data, size_t* size)
     {
         if (!data || !size) return false;
         *data = nullptr;
         *size = 0;
-        ResourceImage image;
-        if (!ResolveResourceImage(instance, &image)) return false;
-        const auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(image.base);
-        if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
-            !image.Contains(image.base + dos->e_lfanew, sizeof(IMAGE_NT_HEADERS64))) return false;
-        const auto nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(image.base + dos->e_lfanew);
-        if (nt->Signature != IMAGE_NT_SIGNATURE || nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC) return false;
-        const auto& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE];
-        if (directory.VirtualAddress == 0 || directory.Size < sizeof(IMAGE_RESOURCE_DIRECTORY) ||
-            !image.Contains(image.base + directory.VirtualAddress, directory.Size)) return false;
-
-        const BYTE* resourceBase = image.base + directory.VirtualAddress;
-        const auto root = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(resourceBase);
-        DialogValue type;
-        type.ordinal = true;
-        type.id = resourceType;
-        const auto typeEntry = FindResourceEntry(image, resourceBase, root, type);
-        const auto names = ChildDirectory(image, resourceBase, typeEntry);
-        const auto nameEntry = FindResourceEntry(image, resourceBase, names, requested);
-        const auto languages = ChildDirectory(image, resourceBase, nameEntry);
-        if (!languages) return false;
-        const size_t languageCount = static_cast<size_t>(languages->NumberOfNamedEntries) + languages->NumberOfIdEntries;
-        const auto languageEntries = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(languages + 1);
-        if (languageCount == 0 || !image.Contains(reinterpret_cast<const BYTE*>(languageEntries), languageCount * sizeof(*languageEntries))) return false;
-        const auto dataEntry = reinterpret_cast<const IMAGE_RESOURCE_DATA_ENTRY*>(resourceBase + languageEntries[0].OffsetToData);
-        if (languageEntries[0].DataIsDirectory || !image.Contains(reinterpret_cast<const BYTE*>(dataEntry), sizeof(*dataEntry)) ||
-            !image.Contains(image.base + dataEntry->OffsetToData, dataEntry->Size)) return false;
-        *data = image.base + dataEntry->OffsetToData;
-        *size = dataEntry->Size;
+        const LPCWSTR type = reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(resourceType));
+        const LPCWSTR name = requested.ordinal
+            ? reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(requested.id))
+            : requested.text.c_str();
+        GuestResourceData resource;
+        if (FindGuestResource(
+            reinterpret_cast<HMODULE>(instance), type, name, 0, false, &resource) !=
+            GuestResourceStatus::Success)
+        {
+            return false;
+        }
+        *data = resource.data;
+        *size = resource.size;
         return true;
     }
 
@@ -694,8 +582,16 @@ namespace
         }
 
         const DialogBaseUnits baseUnits = BaseUnitsFor(dialog);
-        const int dialogWidth = (std::max)(1, PixelsX(dialog.width, baseUnits));
-        const int dialogHeight = (std::max)(1, PixelsY(dialog.height, baseUnits));
+        const int clientWidth = (std::max)(1, PixelsX(dialog.width, baseUnits));
+        const int clientHeight = (std::max)(1, PixelsY(dialog.height, baseUnits));
+        const DWORD rootStyle = (dialog.style | DialogPopupStyle) & ~DialogVisibleStyle;
+        const GuestMetrics::NonClientMetrics nonClient =
+            GuestMetrics::NonClientForEmbeddedWindow(
+                rootStyle, dialog.extendedStyle, parent != nullptr);
+        // Dialog-template dimensions describe the client area. CreateWindowEx
+        // dimensions describe the complete window, including its frame.
+        const int dialogWidth = clientWidth + nonClient.left + nonClient.right;
+        const int dialogHeight = clientHeight + nonClient.top + nonClient.bottom;
         int dialogX = PixelsX(dialog.x, baseUnits);
         int dialogY = PixelsY(dialog.y, baseUnits);
         if ((dialog.style & DialogCenterStyle) != 0 && parent)
@@ -711,7 +607,6 @@ namespace
         }
 
         const std::wstring title = dialog.title.ordinal ? L"" : dialog.title.text;
-        const DWORD rootStyle = (dialog.style | DialogPopupStyle) & ~DialogVisibleStyle;
         HWND root = manager->CreateGuestWindow(
             dialog.extendedStyle,
             className.c_str(),
@@ -924,7 +819,10 @@ namespace
     }
 }
 
-INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResource(HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC procedure, LPARAM initParameter)
+INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResourceWithStyles(
+    HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC procedure,
+    LPARAM initParameter, DWORD stylesToAdd, DWORD stylesToRemove,
+    LPCWSTR titleOverride)
 {
     if (!CurrentGuestWindowManager() || !templateName)
     {
@@ -964,7 +862,18 @@ INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResource(HINSTANCE instance, LPC
         std::wstring(dialog.extended ? L"DLGTEMPLATEEX" : L"DLGTEMPLATE") +
         L" with " + std::to_wstring(dialog.items.size()) + L" control(s).");
 
+    dialog.style = (dialog.style | stylesToAdd) & ~stylesToRemove;
+    if (titleOverride) dialog.title.text = titleOverride;
+
     return RunGuestDialog(instance, dialog, parent, procedure, initParameter);
+}
+
+INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResource(
+    HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC procedure,
+    LPARAM initParameter)
+{
+    return ShowGuestDialogFromResourceWithStyles(instance, templateName, parent,
+        procedure, initParameter, 0, 0, nullptr);
 }
 
 int Win32Bridge::Bridge::ShowGuestMessageBox(

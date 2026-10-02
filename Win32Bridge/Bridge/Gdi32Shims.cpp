@@ -114,6 +114,21 @@ namespace
 
     MiniGdi::Font MakeDefaultMiniGdiFont();
 
+    MiniGdi::Font MakeStockFont(bool fixedPitch, bool oem = false)
+    {
+        MiniGdi::Font font = MakeDefaultMiniGdiFont();
+        const wchar_t* family = fixedPitch ? L"Consolas" : L"Segoe UI";
+        for (std::size_t index = 0; index < MiniGdi::FontFaceNameCapacity; ++index)
+            font.faceName[index] = L'\0';
+        for (std::size_t index = 0;
+            family[index] && index + 1 < MiniGdi::FontFaceNameCapacity; ++index)
+            font.faceName[index] = family[index];
+        font.width = fixedPitch ? 8 : 0;
+        font.pitchAndFamily = fixedPitch ? 0x01 : 0x02;
+        if (oem) font.charSet = 255;
+        return font;
+    }
+
     MiniGdi::ObjectHandle CreateStockObject(GuestWindowManager* manager, int object)
     {
         if (!manager)
@@ -143,16 +158,15 @@ namespace
         case GuestAbi::PenNull:
             return gdi.CreateNullPen();
         case GuestAbi::FontOemFixed:
+            return gdi.CreateFont(MakeStockFont(true, true));
         case GuestAbi::FontAnsiFixed:
+        case GuestAbi::FontSystemFixed:
+            return gdi.CreateFont(MakeStockFont(true));
         case GuestAbi::FontAnsiVariable:
         case GuestAbi::FontSystem:
         case GuestAbi::FontDeviceDefault:
-        case GuestAbi::FontSystemFixed:
         case GuestAbi::FontDefaultGui:
-            // These font IDs all receive the bridge's retained fallback
-            // font.  Their visual distinctions need a scalable glyph backend,
-            // but each remains an independent, safely deletable HFONT.
-            return gdi.CreateFont(MakeDefaultMiniGdiFont());
+            return gdi.CreateFont(MakeStockFont(false));
         default:
             return MiniGdi::InvalidObject;
         }
@@ -487,16 +501,20 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetTextMetricsW(HDC dc, GuestAbi::TextMet
         return FALSE;
     }
 
-    const MiniGdi::Size cell = MiniGdi::FontCellSize(font);
+    MiniGdi::FontMetrics measured{};
+    if (!manager->Gdi().GetSelectedFontMetrics(resolvedDc, &measured))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     GuestAbi::TextMetricW result = {};
-    result.tmHeight = cell.height;
-    result.tmAscent = (std::max)(1, cell.height * MiniGdi::DefaultTextGlyphAscent /
-        MiniGdi::DefaultTextGlyphHeight);
-    result.tmDescent = cell.height - result.tmAscent;
-    result.tmInternalLeading = 0;
-    result.tmExternalLeading = 0;
-    result.tmAveCharWidth = cell.width;
-    result.tmMaxCharWidth = cell.width;
+    result.tmHeight = measured.height;
+    result.tmAscent = measured.ascent;
+    result.tmDescent = measured.descent;
+    result.tmInternalLeading = measured.internalLeading;
+    result.tmExternalLeading = measured.externalLeading;
+    result.tmAveCharWidth = measured.averageWidth;
+    result.tmMaxCharWidth = measured.maximumWidth;
     result.tmWeight = font.weight;
     result.tmOverhang = 0;
     result.tmDigitizedAspectX = 1;
@@ -1026,7 +1044,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetTextExtentPoint32W(
     }
 
     MiniGdi::Size measured;
-    if (!manager->Gdi().GetTextExtentW(resolvedDc,
+    if (!manager->Gdi().GetTextExtentW(resolvedDc, text,
         static_cast<std::size_t>(characterCount), &measured))
     {
         BridgeSetLastError(ERROR_INVALID_PARAMETER);

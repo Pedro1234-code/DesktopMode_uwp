@@ -1,8 +1,9 @@
 #pragma once
 
-// A deliberately small, software-only GDI foundation.  This layer has no
-// WinRT, XAML, Direct2D, or windowing dependency: a future USER32 bridge owns
-// the windows and presents Surface::Pixels() however it chooses.
+// A deliberately small, software-composited GDI foundation. The public layer
+// has no WinRT, XAML, Direct2D, or windowing dependency. Its optional
+// DirectWrite backend rasterizes into the same CPU surfaces that USER32 owns
+// and presents, preserving memory-DC and BitBlt behavior.
 
 #include <cstddef>
 #include <cstdint>
@@ -214,9 +215,9 @@ namespace MiniGdi
 
     // Keep the portable subset of LOGFONTW attributes in a fixed-size object.
     // Face names are deliberately bounded to LF_FACESIZE, so accepting guest
-    // font requests cannot allocate unbounded host strings.  The current
-    // rasterizer still uses its fixed fallback glyphs; these values preserve
-    // the selected HFONT state for future scalable text work.
+    // font requests cannot allocate unbounded host strings. DirectWrite uses
+    // these retained attributes for scalable shaping and rasterization; the
+    // compact fixed-cell renderer is only the initialization-failure fallback.
     constexpr std::size_t FontFaceNameCapacity = 32;
     struct Font
     {
@@ -233,10 +234,57 @@ namespace MiniGdi
         std::uint8_t clipPrecision = 0;
         std::uint8_t quality = 0;
         std::uint8_t pitchAndFamily = 0;
-        // A real host face is intentionally not selected yet.  Giving the
-        // retained fallback a stable name lets GetTextFaceW distinguish it
-        // from an invalid/empty result while remaining within LF_FACESIZE.
-        wchar_t faceName[FontFaceNameCapacity] = L"Win32Bridge Fixed";
+        // Segoe UI is the bridge's logical GUI default. DirectWrite resolves
+        // it normally; the compact rasterizer still remains available if the
+        // host font service cannot be initialized.
+        wchar_t faceName[FontFaceNameCapacity] = L"Segoe UI";
+    };
+
+    struct FontMetrics
+    {
+        int height = 0;
+        int ascent = 0;
+        int descent = 0;
+        int internalLeading = 0;
+        int externalLeading = 0;
+        int averageWidth = 0;
+        int maximumWidth = 0;
+    };
+
+    enum class TextHorizontalAlignment : std::uint8_t
+    {
+        Left,
+        Center,
+        Right
+    };
+
+    enum class TextVerticalAlignment : std::uint8_t
+    {
+        Top,
+        Center,
+        Bottom
+    };
+
+    enum class TextTrimming : std::uint8_t
+    {
+        None,
+        Character,
+        Word,
+        Path
+    };
+
+    struct TextLayoutOptions
+    {
+        TextHorizontalAlignment horizontal = TextHorizontalAlignment::Left;
+        TextVerticalAlignment vertical = TextVerticalAlignment::Top;
+        TextTrimming trimming = TextTrimming::None;
+        bool wordWrap = false;
+        bool rightToLeft = false;
+        bool clipToLayout = true;
+        bool includeExternalLeading = false;
+        bool renderGlyphs = true;
+        float tabStop = 0.0f;
+        std::size_t mnemonicStart = static_cast<std::size_t>(-1);
     };
 
     // Resolves the logical cell used by the software fallback rasterizer.
@@ -292,10 +340,12 @@ namespace MiniGdi
         // implicit default is intentionally queried through GetSelectedFont;
         // it does not have a guest-visible object handle of its own.
         bool GetFont(ObjectHandle object, Font* font) const;
+        bool GetFontMetrics(ObjectHandle object, FontMetrics* metrics) const;
         // Reports the selected HFONT, or the fixed fallback when the DC has
         // not selected an explicit font.  It is valid for a targetless memory
         // DC because Win32 permits font queries before a bitmap is selected.
         bool GetSelectedFont(DcHandle dc, Font* font) const;
+        bool GetSelectedFontMetrics(DcHandle dc, FontMetrics* metrics) const;
 
         // InvalidObject selects the built-in default (black pen / white brush
         // / fixed fallback font).
@@ -344,18 +394,28 @@ namespace MiniGdi
             BackgroundMode* previous = nullptr);
         bool GetBackgroundMode(DcHandle dc, BackgroundMode* mode) const;
 
-        // Renders a scalable-cell ASCII fallback font using the selected
-        // HFONT dimensions. Printable ASCII is supported and all non-ASCII
-        // code points become '?'. The result
-        // is true for a valid, fully clipped draw just like TextOutW; false
-        // denotes invalid input or an invalid DC.
+        // Shapes and rasterizes Unicode through DirectWrite into the BGRA
+        // surface. If DirectWrite is unavailable, the compact scalable-cell
+        // ASCII rasterizer remains a deterministic fallback.
         bool TextOutW(
             DcHandle dc,
             Point origin,
             const wchar_t* text,
             std::size_t characterCount,
             Size* extent = nullptr);
-        bool GetTextExtentW(DcHandle dc, std::size_t characterCount, Size* extent) const;
+        bool GetTextExtentW(
+            DcHandle dc,
+            const wchar_t* text,
+            std::size_t characterCount,
+            Size* extent) const;
+        bool DrawTextW(
+            DcHandle dc,
+            const Rect& layoutRect,
+            const wchar_t* text,
+            std::size_t characterCount,
+            const TextLayoutOptions& options,
+            bool draw,
+            Size* extent);
 
     private:
         struct GdiObject

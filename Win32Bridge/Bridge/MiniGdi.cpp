@@ -1,4 +1,5 @@
 #include "Bridge\\MiniGdi.h"
+#include "Bridge/DirectWriteText.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1165,6 +1166,25 @@ bool GdiContext::GetFont(ObjectHandle object, Font* font) const
     return true;
 }
 
+bool GdiContext::GetFontMetrics(ObjectHandle object, FontMetrics* metrics) const
+{
+    if (!metrics || (object != InvalidObject &&
+        !IsObjectKind(object, ObjectKind::Font))) return false;
+    const Font font = ResolveFont(object);
+    Size ignored{};
+    if (DirectWriteText::Measure(font, nullptr, 0, &ignored, metrics)) return true;
+    const Size cell = FontCellSize(font);
+    metrics->height = cell.height;
+    metrics->ascent = (std::max)(1, cell.height * DefaultTextGlyphAscent /
+        DefaultTextGlyphHeight);
+    metrics->descent = cell.height - metrics->ascent;
+    metrics->internalLeading = 0;
+    metrics->externalLeading = 0;
+    metrics->averageWidth = cell.width;
+    metrics->maximumWidth = cell.width;
+    return true;
+}
+
 bool GdiContext::GetSelectedFont(DcHandle dc, Font* font) const
 {
     const DeviceContext* context = FindDc(dc);
@@ -1175,6 +1195,13 @@ bool GdiContext::GetSelectedFont(DcHandle dc, Font* font) const
 
     *font = ResolveFont(context->font);
     return true;
+}
+
+bool GdiContext::GetSelectedFontMetrics(DcHandle dc, FontMetrics* metrics) const
+{
+    const DeviceContext* context = FindDc(dc);
+    if (!context || !metrics) return false;
+    return GetFontMetrics(context->font, metrics);
 }
 
 bool GdiContext::SelectPen(DcHandle dc, ObjectHandle pen, ObjectHandle* previous)
@@ -1595,6 +1622,31 @@ bool GdiContext::TextOutW(
 
     const Font selectedFont = ResolveFont(context->font);
     const Size cell = FontCellSize(selectedFont);
+    Size directWriteExtent{};
+    if (DirectWriteText::Measure(selectedFont, text, characterCount,
+        &directWriteExtent, nullptr))
+    {
+        if (extent) *extent = directWriteExtent;
+        if (characterCount == 0) return true;
+        const Rect outputClip = SurfaceClip(*context->surface, &context->clip);
+        if (outputClip.Empty()) return true;
+        if (context->backgroundMode == BackgroundMode::Opaque)
+        {
+            MiniGdi::FillRect(*context->surface,
+                Rect{ origin.x, origin.y,
+                    SaturateToInt(static_cast<std::int64_t>(origin.x) +
+                        directWriteExtent.width),
+                    SaturateToInt(static_cast<std::int64_t>(origin.y) +
+                        directWriteExtent.height) },
+                context->backgroundColor, &outputClip);
+        }
+        if (DirectWriteText::Draw(*context->surface, outputClip, origin,
+            selectedFont, text, characterCount, context->textColor,
+            context->backgroundMode == BackgroundMode::Opaque))
+            return true;
+        // A transient DirectWrite failure still falls through to the compact
+        // rasterizer, preserving GDI's best-effort drawing behavior.
+    }
     if (extent != nullptr)
     {
         *extent = TextExtentForCount(characterCount, cell);
@@ -1698,16 +1750,62 @@ bool GdiContext::TextOutW(
     return true;
 }
 
-bool GdiContext::GetTextExtentW(DcHandle dc, std::size_t characterCount, Size* extent) const
+bool GdiContext::GetTextExtentW(DcHandle dc, const wchar_t* text,
+    std::size_t characterCount, Size* extent) const
 {
     const DeviceContext* context = FindDc(dc);
-    if (context == nullptr || extent == nullptr)
+    if (context == nullptr || extent == nullptr ||
+        (characterCount != 0 && text == nullptr))
     {
         return false;
     }
 
+    if (DirectWriteText::Measure(ResolveFont(context->font), text,
+        characterCount, extent, nullptr)) return true;
     *extent = TextExtentForCount(characterCount, FontCellSize(ResolveFont(context->font)));
     return true;
+}
+
+bool GdiContext::DrawTextW(DcHandle dc, const Rect& layoutRect,
+    const wchar_t* text, std::size_t characterCount,
+    const TextLayoutOptions& options, bool draw, Size* extent)
+{
+    DeviceContext* context = FindDc(dc);
+    if (!context || !extent || (characterCount != 0 && !text)) return false;
+    Surface* surface = draw ? context->surface : nullptr;
+    if (draw && !surface) return false;
+
+    Rect effectiveClip{};
+    const Rect* clip = nullptr;
+    if (surface)
+    {
+        effectiveClip = SurfaceClip(*surface, &context->clip);
+        if (options.clipToLayout)
+            effectiveClip = IntersectRect(effectiveClip, NormalizeRect(layoutRect));
+        clip = &effectiveClip;
+    }
+    if (DirectWriteText::Layout(surface, clip, layoutRect,
+        ResolveFont(context->font), text, characterCount, options,
+        context->textColor, context->backgroundColor,
+        context->backgroundMode == BackgroundMode::Opaque, extent)) return true;
+
+    // Keep the deterministic compact rasterizer available on systems where
+    // DirectWrite initialization fails. It cannot reproduce wrapping, but it
+    // preserves the basic DrawText contract and alignment.
+    *extent = TextExtentForCount(characterCount,
+        FontCellSize(ResolveFont(context->font)));
+    if (!draw || characterCount == 0) return true;
+    const Rect normalized = NormalizeRect(layoutRect);
+    Point origin{ normalized.left, normalized.top };
+    if (options.horizontal == TextHorizontalAlignment::Center)
+        origin.x += ((normalized.right - normalized.left) - extent->width) / 2;
+    else if (options.horizontal == TextHorizontalAlignment::Right)
+        origin.x = normalized.right - extent->width;
+    if (options.vertical == TextVerticalAlignment::Center)
+        origin.y += ((normalized.bottom - normalized.top) - extent->height) / 2;
+    else if (options.vertical == TextVerticalAlignment::Bottom)
+        origin.y = normalized.bottom - extent->height;
+    return TextOutW(dc, origin, text, characterCount, nullptr);
 }
 
 GdiContext::DeviceContext* GdiContext::FindDc(DcHandle dc)

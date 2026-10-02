@@ -3403,8 +3403,14 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
         }
         enabled = record->enabled;
         parent = record->parent;
-        width = record->surface.Width();
-        height = record->surface.Height();
+        const GuestMetrics::NonClientMetrics nonClient =
+            GuestMetrics::NonClientForEmbeddedWindow(
+                record->style, record->extendedStyle, parent != nullptr);
+        width = (std::max)(0, record->surface.Width() -
+            nonClient.left - nonClient.right);
+        height = (std::max)(0, record->surface.Height() -
+            nonClient.top - nonClient.bottom -
+            ((!parent && record->menuBar) ? GuestMetrics::MenuHeight : 0));
     }
 
     if (show && !wasVisible)
@@ -3463,10 +3469,15 @@ BOOL GuestWindowManager::GetGuestClientRect(HWND window, LPRECT rect, DWORD* win
     }
 
     std::lock_guard<std::mutex> guard(record->lock);
+    const GuestMetrics::NonClientMetrics nonClient =
+        GuestMetrics::NonClientForEmbeddedWindow(
+            record->style, record->extendedStyle, record->parent != nullptr);
     rect->left = 0;
     rect->top = 0;
-    rect->right = record->surface.Width();
+    rect->right = (std::max)(0, record->surface.Width() -
+        nonClient.left - nonClient.right);
     rect->bottom = (std::max)(0, record->surface.Height() -
+        nonClient.top - nonClient.bottom -
         ((!record->parent && record->menuBar) ? GuestMetrics::MenuHeight : 0));
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
@@ -4240,6 +4251,18 @@ bool GuestWindowManager::GetGuestSurfaceGeometry(
 
         accumulatedLeft = SaturatingAdd(accumulatedLeft, bounds.left);
         accumulatedTop = SaturatingAdd(accumulatedTop, bounds.top);
+        const auto parentRecord = FindWindow(parent);
+        if (!parentRecord) return false;
+        {
+            std::lock_guard<std::mutex> guard(parentRecord->lock);
+            if (parentRecord->destroyed) return false;
+            const GuestMetrics::NonClientMetrics parentNonClient =
+                GuestMetrics::NonClientForEmbeddedWindow(
+                    parentRecord->style, parentRecord->extendedStyle,
+                    parentRecord->parent != nullptr);
+            accumulatedLeft = SaturatingAdd(accumulatedLeft, parentNonClient.left);
+            accumulatedTop = SaturatingAdd(accumulatedTop, parentNonClient.top);
+        }
         current = parent;
     }
     return false;
@@ -4260,6 +4283,8 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
         bool visible = false;
         bool menuBar = false;
         bool topMost = false;
+        int clientLeft = 0;
+        int clientTop = 0;
     };
 
     std::vector<std::shared_ptr<WindowRecord>> records;
@@ -4297,6 +4322,12 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
             }
             snapshot.visible = record->visible;
             snapshot.menuBar = record->menuBar;
+            const GuestMetrics::NonClientMetrics nonClient =
+                GuestMetrics::NonClientForEmbeddedWindow(
+                    record->style, record->extendedStyle,
+                    record->parent != nullptr);
+            snapshot.clientLeft = nonClient.left;
+            snapshot.clientTop = nonClient.top;
             snapshot.topMost = record->windowClass &&
                 record->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
                 record->comboDropped;
@@ -4324,18 +4355,31 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
             return nullptr;
         }
 
+        int clientX = parentX;
+        int clientY = parentY;
+        const auto parentWindow = std::find_if(windows.begin(), windows.end(),
+            [parent](const HitTestSnapshot& candidate)
+            {
+                return candidate.handle == parent;
+            });
+        if (parentWindow != windows.end())
+        {
+            clientX -= parentWindow->clientLeft;
+            clientY -= parentWindow->clientTop;
+        }
+
         HWND hit = nullptr;
         for (auto current = windows.rbegin(); current != windows.rend(); ++current)
         {
             if (!current->visible || current->parent != parent ||
-                parentX < current->bounds.left || parentY < current->bounds.top ||
-                parentX >= current->bounds.right || parentY >= current->bounds.bottom)
+                clientX < current->bounds.left || clientY < current->bounds.top ||
+                clientX >= current->bounds.right || clientY >= current->bounds.bottom)
             {
                 continue;
             }
 
-            const int childX = parentX - current->bounds.left;
-            const int childY = parentY - current->bounds.top;
+            const int childX = clientX - current->bounds.left;
+            const int childY = clientY - current->bounds.top;
             hit = hitTestChildren(current->handle, childX, childY);
             if (!hit)
             {
@@ -6401,9 +6445,22 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return 0;
             }
             int textWidth = GuestMetrics::TextWidth;
+            MiniGdi::DcHandle dc = MiniGdi::InvalidDc;
+            MiniGdi::ObjectHandle font = MiniGdi::InvalidObject;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 textWidth = window->controlTextWidth;
+                dc = window->dc;
+                font = window->controlFont;
+            }
+            MiniGdi::ObjectHandle previous = MiniGdi::InvalidObject;
+            MiniGdi::Size measured{};
+            if (dc != MiniGdi::InvalidDc && m_gdi.SelectFont(dc, font, &previous))
+            {
+                const bool succeeded = m_gdi.GetTextExtentW(
+                    dc, text.data(), text.size(), &measured);
+                m_gdi.SelectFont(dc, previous, nullptr);
+                if (succeeded) return measured.width;
             }
             const size_t maximumCharacters = static_cast<size_t>(
                 (std::numeric_limits<int>::max)() / textWidth);
@@ -9172,16 +9229,33 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
         if ((position.flags & GuestSwpNoSize) == 0)
         {
+            int clientWidth = position.cx;
+            int clientHeight = position.cy;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                const GuestMetrics::NonClientMetrics nonClient =
+                    GuestMetrics::NonClientForEmbeddedWindow(
+                        window->style, window->extendedStyle,
+                        window->parent != nullptr);
+                clientWidth = (std::max)(0, clientWidth -
+                    nonClient.left - nonClient.right);
+                clientHeight = (std::max)(0, clientHeight -
+                    nonClient.top - nonClient.bottom);
+            }
             CallWindowProcedure(window, GuestAbi::WmSize, GuestAbi::SizeRestored,
                 GuestAbi::MakeMouseLParam(
-                    static_cast<WORD>((std::min)(position.cx, 0xffff)),
-                    static_cast<WORD>((std::min)(position.cy, 0xffff))));
+                    static_cast<WORD>((std::min)(clientWidth, 0xffff)),
+                    static_cast<WORD>((std::min)(clientHeight, 0xffff))));
         }
         return 0;
     }
     case GuestAbi::WmEraseBkgnd:
         // BeginPaint owns the class-brush fallback. Returning zero gives it
         // the same negotiation as DefWindowProc without double-erasing.
+        return 0;
+    case GuestAbi::WmSysCommand:
+        if ((wParam & GuestAbi::ScMask) == GuestAbi::ScClose)
+            return CallWindowProcedure(window, GuestAbi::WmClose, 0, 0);
         return 0;
     case GuestAbi::WmClose:
     {
@@ -9265,12 +9339,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return 0;
             }
         }
-        MiniGdi::Font fontMetrics{};
-        if (requested != MiniGdi::InvalidObject)
+        MiniGdi::FontMetrics fontMetrics{};
+        if (!m_gdi.GetFontMetrics(requested, &fontMetrics))
         {
-            m_gdi.GetFont(requested, &fontMetrics);
+            fontMetrics.height = GuestMetrics::TextHeight;
+            fontMetrics.averageWidth = GuestMetrics::TextWidth;
         }
-        const MiniGdi::Size fontCell = MiniGdi::FontCellSize(fontMetrics);
         {
             std::lock_guard<std::mutex> guard(window->lock);
             if (window->destroyed)
@@ -9278,10 +9352,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return 0;
             }
             window->controlFont = requested;
-            window->controlTextWidth = fontCell.width;
-            window->controlTextHeight = fontCell.height;
-            window->listViewHeaderHeight = GuestMetrics::ControlHeightForText(fontCell.height);
-            window->listViewRowHeight = (std::max)(GuestMetrics::TextHeight, fontCell.height);
+            window->controlTextWidth = (std::max)(1, fontMetrics.averageWidth);
+            window->controlTextHeight = (std::max)(1, fontMetrics.height);
+            window->listViewHeaderHeight = GuestMetrics::ControlHeightForText(
+                window->controlTextHeight);
+            window->listViewRowHeight = (std::max)(GuestMetrics::TextHeight,
+                window->controlTextHeight);
         }
         if (lParam != 0)
         {
@@ -9680,7 +9756,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 (std::min)(text.size(), visibleCharacters) * controlTextWidth);
             int textX = 2;
             int textY = (std::max)(0,
-                (height - GuestMetrics::TextHeight) / 2);
+                (height - controlTextHeight) / 2);
             if (controlKind == BuiltinControlKind::Static)
             {
                 const DWORD alignment = style & 0x00000003u;
@@ -11796,10 +11872,23 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
         }
         if ((position.flags & GuestSwpNoSize) == 0)
         {
+            int clientWidth = position.cx;
+            int clientHeight = position.cy;
+            {
+                std::lock_guard<std::mutex> guard(record->lock);
+                const GuestMetrics::NonClientMetrics nonClient =
+                    GuestMetrics::NonClientForEmbeddedWindow(
+                        record->style, record->extendedStyle,
+                        record->parent != nullptr);
+                clientWidth = (std::max)(0, clientWidth -
+                    nonClient.left - nonClient.right);
+                clientHeight = (std::max)(0, clientHeight -
+                    nonClient.top - nonClient.bottom);
+            }
             CallWindowProcedure(record, GuestAbi::WmSize, GuestAbi::SizeRestored,
                 GuestAbi::MakeMouseLParam(
-                    static_cast<WORD>((std::min)(position.cx, 0xffff)),
-                    static_cast<WORD>((std::min)(position.cy, 0xffff))));
+                    static_cast<WORD>((std::min)(clientWidth, 0xffff)),
+                    static_cast<WORD>((std::min)(clientHeight, 0xffff))));
         }
         return 0;
     }
@@ -11808,6 +11897,10 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
         // chance to handle WM_ERASEBKGND. Returning zero here preserves that
         // normal DefWindowProc negotiation without pretending a background
         // was painted when it was not.
+        return 0;
+    case GuestAbi::WmSysCommand:
+        if ((wParam & GuestAbi::ScMask) == GuestAbi::ScClose)
+            return CallWindowProcedure(record, GuestAbi::WmClose, 0, 0);
         return 0;
     case GuestAbi::WmClose:
         DestroyGuestWindow(window, nullptr);
@@ -12322,6 +12415,10 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             bool visible = false;
             int compositionHeight = 0;
             bool topMost = false;
+            std::wstring title;
+            DWORD style = 0;
+            DWORD extendedStyle = 0;
+            GuestMetrics::NonClientMetrics nonClient;
             std::shared_ptr<WindowRecord> record;
         };
 
@@ -12351,6 +12448,12 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                 snapshot.bounds = candidate->bounds;
                 snapshot.visible = candidate->visible;
                 snapshot.compositionHeight = candidate->surface.Height();
+                snapshot.title = candidate->title;
+                snapshot.style = candidate->style;
+                snapshot.extendedStyle = candidate->extendedStyle;
+                snapshot.nonClient = GuestMetrics::NonClientForEmbeddedWindow(
+                    candidate->style, candidate->extendedStyle,
+                    candidate->parent != nullptr);
                 snapshot.topMost = candidate->windowClass &&
                     candidate->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
                     candidate->comboDropped;
@@ -12537,6 +12640,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             &composite,
             &composed,
             &composeChildren,
+            this,
             root,
             menuHeight](size_t parentIndex, int parentX, int parentY)
         {
@@ -12550,9 +12654,14 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     continue;
                 }
 
-                const int childX = SaturatingAdd(parentX, child.bounds.left);
+                const WindowSnapshot& parentSnapshot = snapshots[parentIndex];
+                const int childX = SaturatingAdd(
+                    SaturatingAdd(parentX, parentSnapshot.nonClient.left),
+                    child.bounds.left);
                 const int childY = SaturatingAdd(
-                    SaturatingAdd(parentY, child.bounds.top),
+                    SaturatingAdd(
+                        SaturatingAdd(parentY, parentSnapshot.nonClient.top),
+                        child.bounds.top),
                     parentIndex == root ? menuHeight : 0);
                 bool copied = false;
                 {
@@ -12574,6 +12683,63 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                 }
                 if (copied)
                 {
+                    if (child.nonClient.left > 0 || child.nonClient.top > 0)
+                    {
+                        const int childWidth = child.bounds.right - child.bounds.left;
+                        const int childHeight = child.bounds.bottom - child.bounds.top;
+                        const MiniGdi::Rect frameRect{ childX, childY,
+                            SaturatingAdd(childX, childWidth),
+                            SaturatingAdd(childY, childHeight) };
+                        MiniGdi::DrawRectangle(composite, frameRect,
+                            MiniGdi::Transparent, MiniGdi::MakeColor(92, 92, 92));
+                        if (child.nonClient.caption)
+                        {
+                            const int captionLeft = SaturatingAdd(childX, child.nonClient.left);
+                            const int captionTop = SaturatingAdd(childY,
+                                child.nonClient.top - GuestMetrics::CaptionHeight);
+                            const int captionRight = SaturatingAdd(childX,
+                                childWidth - child.nonClient.right);
+                            const int captionBottom = SaturatingAdd(captionTop,
+                                GuestMetrics::CaptionHeight);
+                            MiniGdi::FillRect(composite,
+                                MiniGdi::Rect{ captionLeft, captionTop,
+                                    captionRight, captionBottom },
+                                MiniGdi::MakeColor(48, 96, 160));
+                            const MiniGdi::DcHandle captionDc = m_gdi.CreateDc(&composite);
+                            if (captionDc != MiniGdi::InvalidDc)
+                            {
+                                m_gdi.SetTextColor(captionDc, MiniGdi::OpaqueWhite, nullptr);
+                                m_gdi.SetBackgroundMode(captionDc,
+                                    MiniGdi::BackgroundMode::Transparent, nullptr);
+                                const int closeExtent = child.nonClient.closeButton
+                                    ? GuestMetrics::CaptionHeight : 0;
+                                const size_t availableCharacters = static_cast<size_t>((std::max)(
+                                    0, captionRight - captionLeft - closeExtent - 10) /
+                                    MiniGdi::DefaultTextGlyphWidth);
+                                const size_t titleLength = (std::min)(
+                                    child.title.size(), availableCharacters);
+                                m_gdi.TextOutW(captionDc,
+                                    MiniGdi::Point{ captionLeft + 6,
+                                        captionTop + (GuestMetrics::CaptionHeight -
+                                            MiniGdi::DefaultTextGlyphHeight) / 2 },
+                                    child.title.data(), titleLength, nullptr);
+                                m_gdi.DestroyDc(captionDc);
+                            }
+                            if (child.nonClient.closeButton)
+                            {
+                                const int buttonLeft = captionRight -
+                                    GuestMetrics::CaptionHeight;
+                                MiniGdi::DrawLine(composite,
+                                    MiniGdi::Point{ buttonLeft + 7, captionTop + 7 },
+                                    MiniGdi::Point{ captionRight - 7, captionBottom - 7 },
+                                    MiniGdi::OpaqueWhite);
+                                MiniGdi::DrawLine(composite,
+                                    MiniGdi::Point{ captionRight - 7, captionTop + 7 },
+                                    MiniGdi::Point{ buttonLeft + 7, captionBottom - 7 },
+                                    MiniGdi::OpaqueWhite);
+                            }
+                        }
+                    }
                     composeChildren(childIndex, childX, childY);
                 }
             }
@@ -12991,6 +13157,34 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         targetTop,
         point->Position,
         m_surfaceImage.Get());
+    const int localX = static_cast<int>(static_cast<short>(position & 0xffff));
+    const int localY = static_cast<int>(static_cast<short>((position >> 16) & 0xffff));
+    if (message == GuestAbi::WmLButtonDown || message == GuestAbi::WmLButtonUp)
+    {
+        const auto targetRecord = FindWindow(target);
+        bool closeHit = false;
+        if (targetRecord)
+        {
+            std::lock_guard<std::mutex> guard(targetRecord->lock);
+            const GuestMetrics::NonClientMetrics nonClient =
+                GuestMetrics::NonClientForEmbeddedWindow(
+                    targetRecord->style, targetRecord->extendedStyle,
+                    targetRecord->parent != nullptr);
+            const int captionTop = nonClient.top - GuestMetrics::CaptionHeight;
+            const int captionRight = targetWidth - nonClient.right;
+            closeHit = nonClient.closeButton &&
+                localX >= captionRight - GuestMetrics::CaptionHeight &&
+                localX < captionRight && localY >= captionTop &&
+                localY < nonClient.top;
+        }
+        if (closeHit)
+        {
+            if (message == GuestAbi::WmLButtonUp)
+                PostGuestMessage(target, GuestAbi::WmSysCommand,
+                    GuestAbi::ScClose, 0, nullptr);
+            return;
+        }
+    }
     WPARAM state = MouseKeyState(properties);
     if (message == GuestAbi::WmXButtonDown || message == GuestAbi::WmXButtonUp)
     {
