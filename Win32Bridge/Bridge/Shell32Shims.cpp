@@ -2,6 +2,7 @@
 #include "Bridge/Shell32Shims.h"
 #include "Bridge/Kernel32Shims.h"
 #include "Bridge/CommonControlsShims.h"
+#include "Bridge/DialogResources.h"
 #include "Bridge/GuestResources.h"
 #include "Bridge/GuestStorage.h"
 #include "Bridge/OleShims.h"
@@ -11,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <climits>
 #include <cstddef>
 #include <new>
 #include <mutex>
@@ -192,11 +194,12 @@ namespace
         }
     }
 
-    // Minimal ABI-only IShellFolder/IEnumIDList implementation.  This is the
+    // ABI-only IShellFolder/IEnumIDList/IContextMenu implementation. This is the
     // Wine-style shell boundary translated to the bridge's LocalFolder-backed
     // namespace: it exposes one virtual drive, not the host desktop.
     struct VirtualEnumIdList;
     struct VirtualShellFolder;
+    struct VirtualContextMenu;
     using QueryInterfaceProc = HRESULT(STDMETHODCALLTYPE*)(void*, REFIID, void**);
     using AddRefProc = ULONG(STDMETHODCALLTYPE*)(void*);
     using ReleaseProc = ULONG(STDMETHODCALLTYPE*)(void*);
@@ -227,6 +230,70 @@ namespace
         HRESULT(STDMETHODCALLTYPE* getUiObjectOf)(void*, HWND, UINT, PVOID const*, REFIID, UINT*, void**);
         HRESULT(STDMETHODCALLTYPE* getDisplayNameOf)(void*, PVOID, DWORD, PVOID);
         HRESULT(STDMETHODCALLTYPE* setNameOf)(void*, HWND, PVOID, LPCWSTR, DWORD, PVOID*);
+    };
+
+    struct ContextMenuVTable final
+    {
+        QueryInterfaceProc queryInterface;
+        AddRefProc addRef;
+        ReleaseProc release;
+        HRESULT(STDMETHODCALLTYPE* queryContextMenu)(void*, HMENU, UINT, UINT, UINT, UINT);
+        HRESULT(STDMETHODCALLTYPE* invokeCommand)(void*, const void*);
+        HRESULT(STDMETHODCALLTYPE* getCommandString)(void*, UINT_PTR, UINT, UINT*, LPSTR, UINT);
+    };
+
+    // CMINVOKECOMMANDINFO/CMINVOKECOMMANDINFOEX guest ABI layouts.  Keeping
+    // these declarations local avoids a dependency on desktop shell headers.
+    struct GuestInvokeCommandInfo final
+    {
+        DWORD size;
+        DWORD mask;
+        HWND owner;
+        LPCSTR verb;
+        LPCSTR parameters;
+        LPCSTR directory;
+        int show;
+        DWORD hotKey;
+        HANDLE icon;
+    };
+    static_assert(sizeof(GuestInvokeCommandInfo) == 56,
+        "CMINVOKECOMMANDINFO x64 guest ABI mismatch");
+
+    struct GuestInvokeCommandInfoEx final
+    {
+        DWORD size;
+        DWORD mask;
+        HWND owner;
+        LPCSTR verb;
+        LPCSTR parameters;
+        LPCSTR directory;
+        int show;
+        DWORD hotKey;
+        HANDLE icon;
+        LPCSTR title;
+        LPCWSTR verbWide;
+        LPCWSTR parametersWide;
+        LPCWSTR directoryWide;
+        LPCWSTR titleWide;
+        POINT invokePoint;
+    };
+    static_assert(sizeof(GuestInvokeCommandInfoEx) == 104,
+        "CMINVOKECOMMANDINFOEX x64 guest ABI mismatch");
+
+    struct GuestMenuItemInfoW final
+    {
+        UINT size;
+        UINT mask;
+        UINT type;
+        UINT state;
+        UINT identifier;
+        HMENU subMenu;
+        HBITMAP checkedBitmap;
+        HBITMAP uncheckedBitmap;
+        ULONG_PTR itemData;
+        LPWSTR text;
+        UINT textLength;
+        HBITMAP itemBitmap;
     };
 
     std::wstring FileNameFromGuestPath(const std::wstring& path);
@@ -275,14 +342,26 @@ namespace
         std::wstring path;
     };
 
+    struct VirtualContextMenu final
+    {
+        const ContextMenuVTable* vtable;
+        std::atomic<ULONG> references{ 1 };
+        HWND owner = nullptr;
+        std::vector<VirtualPidlData> items;
+    };
+
     VirtualEnumIdList* CreateVirtualEnumIdList(std::vector<VirtualPidlData> items = {});
     VirtualShellFolder* CreateVirtualShellFolder(VirtualShellNode node = VirtualShellNode::Desktop,
         const std::wstring& path = std::wstring());
+    VirtualContextMenu* CreateVirtualContextMenu(
+        HWND owner, std::vector<VirtualPidlData> items);
 
     constexpr GUID VirtualIidEnumIdList =
         { 0x000214f2, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
     constexpr GUID VirtualIidShellFolder =
         { 0x000214e6, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+    constexpr GUID VirtualIidContextMenu =
+        { 0x000214e4, 0x0000, 0x0000, { 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
 
     HRESULT STDMETHODCALLTYPE EnumQueryInterface(void* self, REFIID iid, void** object)
     {
@@ -503,7 +582,353 @@ namespace
         *attributes &= supported;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE FolderGetUiObjectOf(void*, HWND, UINT, PVOID const*, REFIID, UINT*, void**) { return E_NOINTERFACE; }
+
+    std::wstring ParentGuestPath(const std::wstring& path)
+    {
+        if (path.empty()) return std::wstring();
+        std::wstring normalized = path;
+        while (normalized.size() > 3 &&
+            (normalized.back() == L'\\' || normalized.back() == L'/'))
+        {
+            normalized.pop_back();
+        }
+        const size_t separator = normalized.find_last_of(L"\\/");
+        if (separator == std::wstring::npos) return std::wstring();
+        if (separator == 2 && normalized.size() >= 3) return normalized.substr(0, 3);
+        return normalized.substr(0, separator);
+    }
+
+    std::wstring FormatGuestFileTime(const FILETIME& value)
+    {
+        if (value.dwLowDateTime == 0 && value.dwHighDateTime == 0)
+            return L"Not available";
+        FILETIME local{};
+        SYSTEMTIME time{};
+        if (!Win32Bridge::Bridge::BridgeFileTimeToLocalFileTime(&value, &local) ||
+            !Win32Bridge::Bridge::BridgeFileTimeToSystemTime(&local, &time))
+        {
+            return L"Not available";
+        }
+        wchar_t buffer[64]{};
+        swprintf_s(buffer, L"%04u-%02u-%02u %02u:%02u:%02u",
+            time.wYear, time.wMonth, time.wDay,
+            time.wHour, time.wMinute, time.wSecond);
+        return buffer;
+    }
+
+    std::wstring FormatGuestAttributes(DWORD attributes)
+    {
+        if (attributes == INVALID_FILE_ATTRIBUTES) return L"Not available";
+        struct AttributeName final { DWORD flag; const wchar_t* name; };
+        constexpr AttributeName names[] =
+        {
+            { FILE_ATTRIBUTE_READONLY, L"Read-only" },
+            { FILE_ATTRIBUTE_HIDDEN, L"Hidden" },
+            { FILE_ATTRIBUTE_SYSTEM, L"System" },
+            { FILE_ATTRIBUTE_DIRECTORY, L"Directory" },
+            { FILE_ATTRIBUTE_ARCHIVE, L"Archive" },
+            { FILE_ATTRIBUTE_TEMPORARY, L"Temporary" },
+            { FILE_ATTRIBUTE_COMPRESSED, L"Compressed" },
+            { FILE_ATTRIBUTE_ENCRYPTED, L"Encrypted" },
+        };
+        std::wstring result;
+        for (const auto& entry : names)
+        {
+            if ((attributes & entry.flag) == 0) continue;
+            if (!result.empty()) result += L", ";
+            result += entry.name;
+        }
+        return result.empty() ? L"Normal" : result;
+    }
+
+    struct VirtualItemMetadata final
+    {
+        DWORD attributes = INVALID_FILE_ATTRIBUTES;
+        ULONGLONG size = 0;
+        FILETIME creation{};
+        FILETIME access{};
+        FILETIME write{};
+        bool hasFindData = false;
+    };
+
+    VirtualItemMetadata ReadVirtualItemMetadata(const VirtualPidlData& item)
+    {
+        VirtualItemMetadata metadata;
+        if (item.path[0] == L'\0') return metadata;
+        metadata.attributes = Win32Bridge::Bridge::BridgeGetFileAttributesW(item.path);
+        if (item.node == VirtualShellNode::Drive) return metadata;
+
+        WIN32_FIND_DATAW data{};
+        HANDLE search = Win32Bridge::Bridge::BridgeFindFirstFileW(item.path, &data);
+        if (search == INVALID_HANDLE_VALUE) return metadata;
+        Win32Bridge::Bridge::BridgeFindClose(search);
+        metadata.attributes = data.dwFileAttributes;
+        metadata.size = (static_cast<ULONGLONG>(data.nFileSizeHigh) << 32) |
+            data.nFileSizeLow;
+        metadata.creation = data.ftCreationTime;
+        metadata.access = data.ftLastAccessTime;
+        metadata.write = data.ftLastWriteTime;
+        metadata.hasFindData = true;
+        return metadata;
+    }
+
+    std::wstring VirtualItemType(const VirtualPidlData& item)
+    {
+        switch (item.node)
+        {
+        case VirtualShellNode::Desktop: return L"Virtual desktop";
+        case VirtualShellNode::Computer: return L"Computer";
+        case VirtualShellNode::Drive: return L"Local disk";
+        case VirtualShellNode::Directory: return L"File folder";
+        default: return L"File";
+        }
+    }
+
+    HRESULT ShowVirtualItemProperties(
+        HWND owner,
+        const std::vector<VirtualPidlData>& items)
+    {
+        if (items.empty()) return E_INVALIDARG;
+
+        std::vector<std::pair<std::wstring, std::wstring>> values;
+        if (items.size() == 1)
+        {
+            const VirtualPidlData& item = items.front();
+            const VirtualItemMetadata metadata = ReadVirtualItemMetadata(item);
+            values.emplace_back(L"Name", ShellDisplayName(item.node, item.path));
+            values.emplace_back(L"Type", VirtualItemType(item));
+            if (item.path[0] != L'\0')
+            {
+                values.emplace_back(L"Location", item.node == VirtualShellNode::Drive
+                    ? std::wstring(L"Computer")
+                    : ParentGuestPath(item.path));
+                values.emplace_back(L"Path", item.path);
+            }
+            if (item.node == VirtualShellNode::File)
+                values.emplace_back(L"Size", metadata.hasFindData
+                    ? std::to_wstring(metadata.size) + L" bytes"
+                    : std::wstring(L"Not available"));
+            if (metadata.hasFindData)
+            {
+                values.emplace_back(L"Created", FormatGuestFileTime(metadata.creation));
+                values.emplace_back(L"Modified", FormatGuestFileTime(metadata.write));
+                values.emplace_back(L"Accessed", FormatGuestFileTime(metadata.access));
+            }
+            if (item.path[0] != L'\0')
+                values.emplace_back(L"Attributes", FormatGuestAttributes(metadata.attributes));
+        }
+        else
+        {
+            ULONGLONG totalSize = 0;
+            UINT fileCount = 0;
+            UINT folderCount = 0;
+            UINT unavailableSizeCount = 0;
+            std::wstring commonLocation;
+            bool sameLocation = true;
+            for (const VirtualPidlData& item : items)
+            {
+                const VirtualItemMetadata metadata = ReadVirtualItemMetadata(item);
+                if (item.node == VirtualShellNode::File)
+                {
+                    ++fileCount;
+                    if (metadata.hasFindData)
+                    {
+                        if (ULLONG_MAX - totalSize >= metadata.size) totalSize += metadata.size;
+                        else totalSize = ULLONG_MAX;
+                    }
+                    else
+                    {
+                        ++unavailableSizeCount;
+                    }
+                }
+                else
+                {
+                    ++folderCount;
+                }
+                const std::wstring location = ParentGuestPath(item.path);
+                if (commonLocation.empty()) commonLocation = location;
+                else if (_wcsicmp(commonLocation.c_str(), location.c_str()) != 0) sameLocation = false;
+            }
+            values.emplace_back(L"Selected items", std::to_wstring(items.size()));
+            values.emplace_back(L"Files", std::to_wstring(fileCount));
+            values.emplace_back(L"Folders", std::to_wstring(folderCount));
+            if (sameLocation && !commonLocation.empty())
+                values.emplace_back(L"Location", commonLocation);
+            values.emplace_back(L"Combined file size", unavailableSizeCount == 0
+                ? std::to_wstring(totalSize) + L" bytes"
+                : std::wstring(L"Not available"));
+        }
+
+        std::vector<Win32Bridge::Bridge::GuestPropertyFieldDescriptor> fields;
+        fields.reserve(values.size());
+        for (const auto& value : values)
+        {
+            Win32Bridge::Bridge::GuestPropertyFieldDescriptor field;
+            field.name = value.first.c_str();
+            field.value = value.second.c_str();
+            fields.push_back(field);
+        }
+
+        const std::wstring caption = items.size() == 1
+            ? ShellDisplayName(items.front().node, items.front().path) + L" Properties"
+            : std::to_wstring(items.size()) + L" Items Properties";
+        Win32Bridge::Bridge::GuestPropertyPageDescriptor page;
+        page.title = L"General";
+        page.fields = fields.data();
+        page.fieldCount = static_cast<UINT>(fields.size());
+        Win32Bridge::Bridge::GuestPropertySheetDescriptor sheet;
+        sheet.parent = owner;
+        sheet.caption = caption.c_str();
+        sheet.pages = &page;
+        sheet.pageCount = 1;
+        sheet.flags = 0x00000080u; // PSH_NOAPPLYNOW: metadata is read-only.
+
+        Win32Bridge::Bridge::RuntimeDiagnostics::Record(
+            L"SHELL: invoking virtual properties for " +
+            std::to_wstring(items.size()) + L" item(s).");
+        return Win32Bridge::Bridge::ShowGuestPropertySheet(sheet) == -1 ? E_FAIL : S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE ContextQueryInterface(void* self, REFIID iid, void** object)
+    {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (!IsEqualGUID(iid, IID_IUnknown) && !IsEqualGUID(iid, VirtualIidContextMenu))
+            return E_NOINTERFACE;
+        auto* value = static_cast<VirtualContextMenu*>(self);
+        ++value->references;
+        *object = value;
+        return S_OK;
+    }
+
+    ULONG STDMETHODCALLTYPE ContextAddRef(void* self)
+    {
+        return ++static_cast<VirtualContextMenu*>(self)->references;
+    }
+
+    ULONG STDMETHODCALLTYPE ContextRelease(void* self)
+    {
+        auto* value = static_cast<VirtualContextMenu*>(self);
+        const ULONG remaining = --value->references;
+        if (!remaining) delete value;
+        return remaining;
+    }
+
+    HRESULT STDMETHODCALLTYPE ContextQueryContextMenu(
+        void*, HMENU menu, UINT insertionIndex,
+        UINT firstCommand, UINT lastCommand, UINT flags)
+    {
+        constexpr UINT CmfDefaultOnly = 0x00000001u;
+        constexpr UINT CmfNoVerbs = 0x00000008u;
+        constexpr UINT MiimId = 0x00000002u;
+        constexpr UINT MiimString = 0x00000040u;
+        constexpr UINT MiimFtype = 0x00000100u;
+        if (!menu) return E_INVALIDARG;
+        if ((flags & (CmfDefaultOnly | CmfNoVerbs)) != 0) return S_OK;
+        if (firstCommand > lastCommand) return HRESULT_FROM_WIN32(ERROR_INSUFFICIENT_BUFFER);
+
+        const int existing = Win32Bridge::Bridge::BridgeGetMenuItemCount(menu);
+        if (existing < 0) return E_INVALIDARG;
+        GuestMenuItemInfoW item{};
+        item.size = sizeof(item);
+        item.mask = MiimId | MiimString | MiimFtype;
+        item.identifier = firstCommand;
+        item.text = const_cast<LPWSTR>(L"Properties");
+        item.textLength = 10;
+        if (!Win32Bridge::Bridge::BridgeInsertMenuItemW(
+                menu, insertionIndex, TRUE, &item))
+        {
+            return E_FAIL;
+        }
+        Win32Bridge::Bridge::RuntimeDiagnostics::Record(
+            L"SHELL: IContextMenu added the properties command.");
+        return static_cast<HRESULT>(1); // One command identifier consumed.
+    }
+
+    HRESULT STDMETHODCALLTYPE ContextInvokeCommand(void* self, const void* commandInfo)
+    {
+        constexpr DWORD CmicMaskUnicode = 0x00004000u;
+        if (!commandInfo) return E_POINTER;
+        const auto* command = static_cast<const GuestInvokeCommandInfo*>(commandInfo);
+        if (command->size < sizeof(GuestInvokeCommandInfo)) return E_INVALIDARG;
+
+        bool properties = false;
+        const ULONG_PTR verbValue = reinterpret_cast<ULONG_PTR>(command->verb);
+        if ((verbValue >> 16) == 0)
+        {
+            properties = static_cast<UINT>(verbValue & 0xffffu) == 0;
+        }
+        else if (command->verb)
+        {
+            properties = _stricmp(command->verb, "properties") == 0;
+        }
+        if (!properties && (command->mask & CmicMaskUnicode) != 0 &&
+            command->size >= sizeof(GuestInvokeCommandInfoEx))
+        {
+            const auto* extended = static_cast<const GuestInvokeCommandInfoEx*>(commandInfo);
+            const ULONG_PTR wideVerbValue = reinterpret_cast<ULONG_PTR>(extended->verbWide);
+            properties = wideVerbValue > 0xffff && extended->verbWide &&
+                _wcsicmp(extended->verbWide, L"properties") == 0;
+        }
+        if (!properties) return E_INVALIDARG;
+
+        auto* context = static_cast<VirtualContextMenu*>(self);
+        return ShowVirtualItemProperties(command->owner ? command->owner : context->owner,
+            context->items);
+    }
+
+    HRESULT STDMETHODCALLTYPE ContextGetCommandString(
+        void*, UINT_PTR command, UINT flags, UINT*, LPSTR buffer, UINT characterCount)
+    {
+        if (command != 0) return E_INVALIDARG;
+        const UINT request = flags & 0x00000007u;
+        if (request == 2 || request == 6) return S_OK; // GCS_VALIDATEA/W.
+        if (!buffer || characterCount == 0) return E_POINTER;
+
+        if (request == 4 || request == 5) // GCS_VERBW / GCS_HELPTEXTW.
+        {
+            const wchar_t* text = request == 4
+                ? L"properties"
+                : L"Displays properties for the selected virtual item.";
+            wcsncpy_s(reinterpret_cast<wchar_t*>(buffer), characterCount, text, _TRUNCATE);
+            return S_OK;
+        }
+        if (request == 0 || request == 1) // GCS_VERBA / GCS_HELPTEXTA.
+        {
+            const char* text = request == 0
+                ? "properties"
+                : "Displays properties for the selected virtual item.";
+            strncpy_s(buffer, characterCount, text, _TRUNCATE);
+            return S_OK;
+        }
+        return E_INVALIDARG;
+    }
+
+    HRESULT STDMETHODCALLTYPE FolderGetUiObjectOf(
+        void*, HWND owner, UINT count, PVOID const* items,
+        REFIID iid, UINT*, void** object)
+    {
+        if (!object) return E_POINTER;
+        *object = nullptr;
+        if (!IsEqualGUID(iid, IID_IUnknown) && !IsEqualGUID(iid, VirtualIidContextMenu))
+            return E_NOINTERFACE;
+        if (count == 0 || !items) return E_INVALIDARG;
+
+        std::vector<VirtualPidlData> selection;
+        selection.reserve(count);
+        for (UINT index = 0; index < count; ++index)
+        {
+            VirtualPidlData item{};
+            if (!ReadVirtualPidl(items[index], &item)) return E_INVALIDARG;
+            selection.push_back(item);
+        }
+        auto* context = CreateVirtualContextMenu(owner, std::move(selection));
+        if (!context) return E_OUTOFMEMORY;
+        *object = context;
+        Win32Bridge::Bridge::RuntimeDiagnostics::Record(
+            L"SHELL: IShellFolder::GetUIObjectOf returned a virtual IContextMenu.");
+        return S_OK;
+    }
     HRESULT STDMETHODCALLTYPE FolderGetDisplayNameOf(void*, PVOID item, DWORD, PVOID result)
     {
         if (!result) return E_POINTER;
@@ -535,6 +960,11 @@ namespace
         FolderBindToObject, FolderBindToStorage, FolderCompareIds, FolderCreateViewObject,
         FolderGetAttributesOf, FolderGetUiObjectOf, FolderGetDisplayNameOf, FolderSetNameOf
     };
+    const ContextMenuVTable g_virtualContextMenuVTable =
+    {
+        ContextQueryInterface, ContextAddRef, ContextRelease,
+        ContextQueryContextMenu, ContextInvokeCommand, ContextGetCommandString
+    };
 
     VirtualEnumIdList* CreateVirtualEnumIdList(std::vector<VirtualPidlData> items)
     {
@@ -555,6 +985,19 @@ namespace
             value->vtable = &g_virtualShellFolderVTable;
             value->node = node;
             value->path = path;
+        }
+        return value;
+    }
+
+    VirtualContextMenu* CreateVirtualContextMenu(
+        HWND owner, std::vector<VirtualPidlData> items)
+    {
+        auto* value = new (std::nothrow) VirtualContextMenu{};
+        if (value)
+        {
+            value->vtable = &g_virtualContextMenuVTable;
+            value->owner = owner;
+            value->items = std::move(items);
         }
         return value;
     }

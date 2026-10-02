@@ -259,7 +259,7 @@ namespace Bridge
     class GuestWindowScope final
     {
     public:
-        explicit GuestWindowScope(GuestWindowManager* manager);
+        explicit GuestWindowScope(GuestWindowManager* manager, bool manageActivation = true);
         ~GuestWindowScope();
 
         GuestWindowScope(const GuestWindowScope&) = delete;
@@ -267,6 +267,7 @@ namespace Bridge
 
     private:
         GuestWindowManager* m_previous;
+        bool m_manageActivation;
     };
 }
 }

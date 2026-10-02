@@ -370,6 +370,44 @@ bool GuestModuleLoader::ReadModuleBytes(
     return false;
 }
 
+bool GuestModuleLoader::ReadExecutableBytes(
+    LPCWSTR requestedName,
+    std::vector<BYTE>* bytes,
+    std::wstring* logicalPath,
+    DWORD* win32Error) const
+{
+    if (!bytes || !logicalPath)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    bytes->clear();
+    logicalPath->clear();
+
+    std::vector<ModuleCandidate> candidates;
+    std::wstring requestedBaseName;
+    bool searchByBaseName = false;
+    if (!BuildCandidates(
+        requestedName, 0, &candidates, &requestedBaseName,
+        &searchByBaseName, win32Error))
+    {
+        return false;
+    }
+    for (const auto& candidate : candidates)
+    {
+        if (ReadModuleBytes(candidate, bytes))
+        {
+            *logicalPath = candidate.displayName;
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            RuntimeDiagnostics::Record(
+                L"PROCESS SOURCE: loaded " + candidate.displayName + L".");
+            return true;
+        }
+    }
+    SetWin32Error(win32Error, ERROR_FILE_NOT_FOUND);
+    return false;
+}
+
 bool GuestModuleLoader::LoadLibrary(
     LPCWSTR requestedName,
     HMODULE* module,

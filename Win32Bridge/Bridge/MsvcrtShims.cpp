@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge/MsvcrtShims.h"
+#include "Bridge/Kernel32Shims.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <cstdlib>
@@ -37,7 +38,25 @@ namespace
     intptr_t __cdecl BridgeGetOsfHandle(int) { return -1; }
     int __cdecl BridgeIsatty(int) { return 0; }
     FILE* __cdecl BridgeIob() { return nullptr; }
-    uintptr_t __cdecl BridgeBeginThreadEx(void*, unsigned, unsigned(__stdcall*)(void*), void*, unsigned, unsigned* threadId) { if (threadId) *threadId = 0; return 0; }
+    uintptr_t __cdecl BridgeBeginThreadEx(
+        void*,
+        unsigned stackSize,
+        unsigned(__stdcall* startAddress)(void*),
+        void* parameter,
+        unsigned creationFlags,
+        unsigned* threadId)
+    {
+        DWORD id = 0;
+        HANDLE handle = Win32Bridge::Bridge::BridgeCreateThread(
+            nullptr,
+            stackSize,
+            reinterpret_cast<LPTHREAD_START_ROUTINE>(startAddress),
+            parameter,
+            creationFlags,
+            &id);
+        if (threadId) *threadId = id;
+        return reinterpret_cast<uintptr_t>(handle);
+    }
     EXCEPTION_DISPOSITION __cdecl BridgeCSpecificHandler(PEXCEPTION_RECORD, PVOID, PCONTEXT, PDISPATCHER_CONTEXT) { return ExceptionContinueSearch; }
     EXCEPTION_DISPOSITION __cdecl BridgeCxxFrameHandler(PEXCEPTION_RECORD, PVOID, PCONTEXT, PDISPATCHER_CONTEXT) { return ExceptionContinueSearch; }
     void __cdecl BridgeCxxThrowException(void*, void*)

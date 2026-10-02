@@ -6,10 +6,39 @@ namespace Win32Bridge
 {
 namespace Bridge
 {
+    struct GuestPropertyFieldDescriptor
+    {
+        LPCWSTR name = nullptr;
+        LPCWSTR value = nullptr;
+    };
+
+    struct GuestPropertyPageDescriptor
+    {
+        HINSTANCE instance = nullptr;
+        LPCWSTR templateName = nullptr;
+        DLGPROC dialogProcedure = nullptr;
+        LPARAM initParameter = 0;
+        LPCWSTR title = nullptr;
+        const GuestPropertyFieldDescriptor* fields = nullptr;
+        UINT fieldCount = 0;
+    };
+
+    struct GuestPropertySheetDescriptor
+    {
+        HWND parent = nullptr;
+        HINSTANCE instance = nullptr;
+        LPCWSTR caption = nullptr;
+        const GuestPropertyPageDescriptor* pages = nullptr;
+        UINT pageCount = 0;
+        UINT startPage = 0;
+        DWORD flags = 0;
+    };
+
     INT_PTR ShowGuestDialogFromResource(HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC procedure, LPARAM initParameter);
     INT_PTR ShowGuestDialogFromResourceWithStyles(HINSTANCE instance, LPCWSTR templateName,
         HWND parent, DLGPROC procedure, LPARAM initParameter,
         DWORD stylesToAdd, DWORD stylesToRemove, LPCWSTR titleOverride);
+    INT_PTR ShowGuestPropertySheet(const GuestPropertySheetDescriptor& descriptor);
     int ShowGuestMessageBox(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type);
     BOOL EndGuestResourceDialog(HWND dialog, INT_PTR result);
     BOOL HandleGuestDialogMessage(HWND dialog, const MSG* message);

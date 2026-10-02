@@ -2,7 +2,9 @@
 #include "Bridge\\GuestKernel.h"
 
 #include <chrono>
+#include <cwctype>
 #include <limits>
+#include <string>
 #include <vector>
 
 using namespace Win32Bridge::Bridge;
@@ -19,13 +21,18 @@ namespace
         }
     }
 
-    bool IsAnonymousName(LPCWSTR name)
+    std::wstring NamedObjectKey(LPCWSTR name)
     {
-        // A non-null name, including L"", names a kernel object in Win32.
-        // The bridge intentionally has no cross-guest/global object namespace.
-        return name == nullptr;
+        std::wstring key = name ? name : L"";
+        for (auto& character : key)
+            character = static_cast<wchar_t>(std::towlower(character));
+        return key;
     }
 }
+
+std::mutex GuestKernelContext::s_namedObjectsLock;
+std::unordered_map<std::wstring, std::weak_ptr<GuestKernelContext::ObjectRecord>>
+    GuestKernelContext::s_namedObjects;
 
 GuestKernelContext::~GuestKernelContext()
 {
@@ -34,27 +41,106 @@ GuestKernelContext::~GuestKernelContext()
 
 HANDLE GuestKernelContext::CreateEvent(bool manualReset, bool initialState, LPCWSTR name, DWORD* win32Error)
 {
-    if (!IsAnonymousName(name))
+    const std::wstring nameKey = NamedObjectKey(name);
+    if (name && nameKey.empty())
     {
-        SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
+        SetWin32Error(win32Error, ERROR_INVALID_NAME);
         return nullptr;
     }
 
-    auto object = std::make_shared<ObjectRecord>(ObjectKind::Event);
-    object->manualReset = manualReset;
-    object->signaled = initialState;
+    std::shared_ptr<ObjectRecord> object;
+    bool alreadyExists = false;
+    if (!nameKey.empty())
+    {
+        std::lock_guard<std::mutex> namedGuard(s_namedObjectsLock);
+        const auto found = s_namedObjects.find(nameKey);
+        if (found != s_namedObjects.end())
+        {
+            object = found->second.lock();
+            if (!object)
+            {
+                s_namedObjects.erase(found);
+            }
+            else
+            {
+                std::lock_guard<std::mutex> objectGuard(object->lock);
+                if (object->closed)
+                {
+                    object.reset();
+                    s_namedObjects.erase(found);
+                }
+                else if (object->kind != ObjectKind::Event)
+                {
+                    SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+                    return nullptr;
+                }
+                else
+                {
+                    alreadyExists = true;
+                }
+            }
+        }
+        if (!object)
+        {
+            object = std::make_shared<ObjectRecord>(ObjectKind::Event);
+            object->manualReset = manualReset;
+            object->signaled = initialState;
+            s_namedObjects[nameKey] = object;
+        }
+    }
+    else
+    {
+        object = std::make_shared<ObjectRecord>(ObjectKind::Event);
+        object->manualReset = manualReset;
+        object->signaled = initialState;
+    }
 
     HANDLE handle = nullptr;
     if (!AddObject(object, &handle, win32Error))
     {
         return nullptr;
     }
+    SetWin32Error(win32Error, alreadyExists ? ERROR_ALREADY_EXISTS : ERROR_SUCCESS);
+    return handle;
+}
+
+HANDLE GuestKernelContext::OpenEvent(DWORD, BOOL, LPCWSTR name, DWORD* win32Error)
+{
+    const std::wstring nameKey = NamedObjectKey(name);
+    if (nameKey.empty())
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_NAME);
+        return nullptr;
+    }
+
+    std::shared_ptr<ObjectRecord> object;
+    {
+        std::lock_guard<std::mutex> namedGuard(s_namedObjectsLock);
+        const auto found = s_namedObjects.find(nameKey);
+        if (found == s_namedObjects.end() || !(object = found->second.lock()))
+        {
+            if (found != s_namedObjects.end()) s_namedObjects.erase(found);
+            SetWin32Error(win32Error, ERROR_FILE_NOT_FOUND);
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> objectGuard(object->lock);
+        if (object->closed || object->kind != ObjectKind::Event)
+        {
+            SetWin32Error(win32Error,
+                object->kind == ObjectKind::Event ? ERROR_FILE_NOT_FOUND : ERROR_INVALID_HANDLE);
+            return nullptr;
+        }
+    }
+
+    HANDLE handle = nullptr;
+    if (!AddObject(object, &handle, win32Error)) return nullptr;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
     return handle;
 }
 
 HANDLE GuestKernelContext::CreateMutex(bool initialOwner, LPCWSTR name, DWORD* win32Error)
 {
-    if (!IsAnonymousName(name))
+    if (name != nullptr)
     {
         SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
         return nullptr;
@@ -77,9 +163,9 @@ HANDLE GuestKernelContext::CreateMutex(bool initialOwner, LPCWSTR name, DWORD* w
 
 HANDLE GuestKernelContext::CreateSemaphore(LONG initialCount, LONG maximumCount, LPCWSTR name, DWORD* win32Error)
 {
-    if (!IsAnonymousName(name) || maximumCount <= 0 || initialCount < 0 || initialCount > maximumCount)
+    if (name != nullptr || maximumCount <= 0 || initialCount < 0 || initialCount > maximumCount)
     {
-        SetWin32Error(win32Error, !IsAnonymousName(name) ? ERROR_NOT_SUPPORTED : ERROR_INVALID_PARAMETER);
+        SetWin32Error(win32Error, name != nullptr ? ERROR_NOT_SUPPORTED : ERROR_INVALID_PARAMETER);
         return nullptr;
     }
 
@@ -386,15 +472,21 @@ bool GuestKernelContext::CloseHandle(HANDLE guestHandle, DWORD* win32Error)
         m_handles.erase(found);
     }
 
+    bool lastHandle = false;
     {
         std::lock_guard<std::mutex> guard(object->lock);
-        object->closed = true;
-        object->signaled = false;
-        object->owner = std::thread::id();
-        object->recursion = 0;
-        object->semaphoreCount = 0;
+        if (object->handleReferences != 0) --object->handleReferences;
+        lastHandle = object->handleReferences == 0;
+        if (lastHandle)
+        {
+            object->closed = true;
+            object->signaled = false;
+            object->owner = std::thread::id();
+            object->recursion = 0;
+            object->semaphoreCount = 0;
+        }
     }
-    object->stateChanged.notify_all();
+    if (lastHandle) object->stateChanged.notify_all();
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return true;
 }
@@ -415,15 +507,21 @@ void GuestKernelContext::CloseAll()
 
     for (const auto& object : objects)
     {
+        bool lastHandle = false;
         {
             std::lock_guard<std::mutex> guard(object->lock);
-            object->closed = true;
-            object->signaled = false;
-            object->owner = std::thread::id();
-            object->recursion = 0;
-            object->semaphoreCount = 0;
+            if (object->handleReferences != 0) --object->handleReferences;
+            lastHandle = object->handleReferences == 0;
+            if (lastHandle)
+            {
+                object->closed = true;
+                object->signaled = false;
+                object->owner = std::thread::id();
+                object->recursion = 0;
+                object->semaphoreCount = 0;
+            }
         }
-        object->stateChanged.notify_all();
+        if (lastHandle) object->stateChanged.notify_all();
     }
 }
 
@@ -460,6 +558,15 @@ bool GuestKernelContext::AddObject(
             continue;
         }
 
+        {
+            std::lock_guard<std::mutex> objectGuard(object->lock);
+            if (object->closed)
+            {
+                SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+                return false;
+            }
+            ++object->handleReferences;
+        }
         m_handles.emplace(token, object);
         *guestHandle = reinterpret_cast<HANDLE>(token);
         SetWin32Error(win32Error, ERROR_SUCCESS);

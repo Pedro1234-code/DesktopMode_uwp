@@ -3,11 +3,30 @@
 #include "Bridge\\CompatibilityCatalog.h"
 
 #include <windows.h>
+#include <string>
 
 namespace Win32Bridge
 {
 namespace Bridge
 {
+    class GuestCommandLineScope final
+    {
+    public:
+        explicit GuestCommandLineScope(
+            const std::wstring& commandLine,
+            DWORD processId = 1,
+            DWORD threadId = 0);
+        ~GuestCommandLineScope();
+
+        GuestCommandLineScope(const GuestCommandLineScope&) = delete;
+        GuestCommandLineScope& operator=(const GuestCommandLineScope&) = delete;
+
+    private:
+        std::wstring m_previous;
+        DWORD m_previousProcessId;
+        DWORD m_previousThreadId;
+    };
+
     void ResetGuestResourceHandles();
     HANDLE WINAPI BridgeCreateFileW(
         LPCWSTR fileName,
@@ -67,6 +86,7 @@ namespace Bridge
     BOOL WINAPI BridgeFindCloseChangeNotification(HANDLE changeHandle);
     HANDLE WINAPI BridgeCreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES attributes, DWORD protection, DWORD maximumSizeHigh, DWORD maximumSizeLow, LPCWSTR name);
     BOOL WINAPI BridgeCreateProcessW(LPCWSTR applicationName, LPWSTR commandLine, LPSECURITY_ATTRIBUTES processAttributes, LPSECURITY_ATTRIBUTES threadAttributes, BOOL inheritHandles, DWORD creationFlags, LPVOID environment, LPCWSTR currentDirectory, LPSTARTUPINFOW startupInfo, LPPROCESS_INFORMATION processInformation);
+    HANDLE WINAPI BridgeCreateThread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stackSize, LPTHREAD_START_ROUTINE startAddress, LPVOID parameter, DWORD creationFlags, LPDWORD threadId);
     void WINAPI BridgeRaiseException(DWORD exceptionCode, DWORD exceptionFlags, DWORD argumentCount, const ULONG_PTR* arguments);
     BOOL WINAPI BridgeCreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES securityAttributes);
     BOOL WINAPI BridgeDeleteFileW(LPCWSTR path);

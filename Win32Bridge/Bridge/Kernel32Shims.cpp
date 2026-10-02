@@ -4,6 +4,7 @@
 #include "Bridge\\GuestKernel.h"
 #include "Bridge\\GuestModule.h"
 #include "Bridge\\GuestResources.h"
+#include "Bridge\\GuestRuntime.h"
 #include "Bridge\\GuestStorage.h"
 #include "Bridge\\RuntimeDiagnostics.h"
 #include "Bridge\\Win32Shims.h"
@@ -11,7 +12,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <cwctype>
+#include <limits>
+#include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -23,12 +28,95 @@ namespace
 {
     thread_local DWORD g_guestLastError = ERROR_SUCCESS;
     thread_local DWORD g_guestThreadId = 0;
+    thread_local DWORD g_guestProcessId = 1;
+    thread_local std::wstring g_guestCommandLine = L"Win32BridgeGuest";
     std::atomic<DWORD> g_nextGuestThreadId{ 1 };
     std::atomic<DWORD> g_guestDllDirectoryFlags{ 0 };
     std::atomic<unsigned> g_storageEnumerationDiagnostics{ 0 };
     std::atomic<ULONG_PTR> g_nextGuestResourceHandle{ 0x73000000 };
     std::mutex g_guestResourcesLock;
     std::unordered_map<ULONG_PTR, GuestResourceData> g_guestResources;
+    constexpr ULONG_PTR FirstFileMappingHandle = 0x74000000;
+    std::atomic<ULONG_PTR> g_nextFileMappingHandle{ FirstFileMappingHandle };
+
+    struct GuestFileMapping final
+    {
+        BYTE* memory = nullptr;
+        SIZE_T size = 0;
+        DWORD protection = PAGE_READONLY;
+        std::wstring name;
+
+        ~GuestFileMapping()
+        {
+            if (memory) ::VirtualFree(memory, 0, MEM_RELEASE);
+        }
+    };
+
+    struct GuestMappingView final
+    {
+        std::shared_ptr<GuestFileMapping> mapping;
+        std::shared_ptr<void> privateAllocation;
+        SIZE_T size = 0;
+        ULONG references = 0;
+    };
+
+    std::mutex g_fileMappingsLock;
+    std::unordered_map<ULONG_PTR, std::shared_ptr<GuestFileMapping>> g_fileMappings;
+    std::unordered_map<std::wstring, std::weak_ptr<GuestFileMapping>> g_namedFileMappings;
+    std::unordered_map<const void*, GuestMappingView> g_fileMappingViews;
+
+    std::wstring FileMappingNameKey(LPCWSTR name)
+    {
+        std::wstring key = name ? name : L"";
+        std::transform(key.begin(), key.end(), key.begin(), [](wchar_t value)
+        {
+            return static_cast<wchar_t>(std::towlower(value));
+        });
+        return key;
+    }
+
+    HANDLE RegisterFileMappingLocked(const std::shared_ptr<GuestFileMapping>& mapping)
+    {
+        if (!mapping) return nullptr;
+        for (size_t attempt = 0; attempt < 4096; ++attempt)
+        {
+            ULONG_PTR token = g_nextFileMappingHandle.fetch_add(1);
+            if (token < FirstFileMappingHandle)
+            {
+                token = FirstFileMappingHandle;
+                g_nextFileMappingHandle.store(token + 1);
+            }
+            if (g_fileMappings.find(token) != g_fileMappings.end()) continue;
+            g_fileMappings.emplace(token, mapping);
+            return reinterpret_cast<HANDLE>(token);
+        }
+        return nullptr;
+    }
+
+    std::shared_ptr<GuestFileMapping> LookupFileMapping(HANDLE handle)
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
+        return found == g_fileMappings.end() ? nullptr : found->second;
+    }
+
+    bool CloseFileMappingHandle(HANDLE handle)
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
+        if (found == g_fileMappings.end()) return false;
+        g_fileMappings.erase(found);
+        return true;
+    }
+
+    void ResetGuestFileMappings()
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        g_fileMappingViews.clear();
+        g_fileMappings.clear();
+        g_namedFileMappings.clear();
+        g_nextFileMappingHandle.store(FirstFileMappingHandle);
+    }
 
     void RecordStorageEnumeration(const wchar_t* message)
     {
@@ -574,9 +662,12 @@ namespace
 
 void Win32Bridge::Bridge::ResetGuestResourceHandles()
 {
-    std::lock_guard<std::mutex> guard(g_guestResourcesLock);
-    g_guestResources.clear();
-    g_nextGuestResourceHandle.store(0x73000000);
+    {
+        std::lock_guard<std::mutex> guard(g_guestResourcesLock);
+        g_guestResources.clear();
+        g_nextGuestResourceHandle.store(0x73000000);
+    }
+    ResetGuestFileMappings();
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileW(
@@ -607,6 +698,11 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileW(
         &error))
     {
         SetGuestLastError(error);
+        RuntimeDiagnostics::Record(
+            L"STORAGE: CreateFileW failed; disposition " +
+            std::to_wstring(creationDisposition) + L", flags/attributes " +
+            std::to_wstring(flagsAndAttributes) + L", error " +
+            std::to_wstring(error) + L".");
         return INVALID_HANDLE_VALUE;
     }
     SetGuestLastError(ERROR_SUCCESS);
@@ -622,6 +718,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeReadFile(
 {
     if (overlapped)
     {
+        RuntimeDiagnostics::Record(
+            L"STORAGE: ReadFile rejected an OVERLAPPED request (" +
+            std::to_wstring(bytesToRead) + L" byte(s)).");
         SetGuestLastError(ERROR_NOT_SUPPORTED);
         return FALSE;
     }
@@ -650,6 +749,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
 {
     if (overlapped)
     {
+        RuntimeDiagnostics::Record(
+            L"STORAGE: WriteFile rejected an OVERLAPPED request (" +
+            std::to_wstring(bytesToWrite) + L" byte(s)).");
         SetGuestLastError(ERROR_NOT_SUPPORTED);
         return FALSE;
     }
@@ -671,6 +773,12 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeCloseHandle(HANDLE object)
 {
+    if (CloseFileMappingHandle(object))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+
     // The ranges are disjoint, but try the synchronization table first so a
     // regular CloseHandle works for either family without changing file-handle
     // or FindClose semantics in the storage adapter.
@@ -893,23 +1001,25 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetFileAttributesW(LPCWSTR path)
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeSetFileAttributesW(LPCWSTR path, DWORD attributes)
 {
-    if (!path || (attributes & ~(FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_NORMAL)) != 0)
-    {
-        SetGuestLastError(ERROR_NOT_SUPPORTED);
-        return FALSE;
-    }
-    // LocalFolder does not expose Win32 attribute mutation. Confirm the item
-    // exists, then allow the no-op NORMAL form used by many portable apps.
-    const DWORD current = BridgeGetFileAttributesW(path);
-    if (current == INVALID_FILE_ATTRIBUTES)
+    GuestStorageContext* storage = CurrentStorageOrFail();
+    if (!storage)
     {
         return FALSE;
     }
-    if (attributes != FILE_ATTRIBUTE_NORMAL)
+
+    DWORD error = ERROR_SUCCESS;
+    if (!storage->SetGuestFileAttributes(path, attributes, &error))
     {
-        SetGuestLastError(ERROR_NOT_SUPPORTED);
+        SetGuestLastError(error);
+        RuntimeDiagnostics::Record(
+            L"STORAGE: SetFileAttributesW failed; attributes " +
+            std::to_wstring(attributes) + L", error " +
+            std::to_wstring(error) + L".");
         return FALSE;
     }
+    RuntimeDiagnostics::Record(
+        L"STORAGE: applied virtual file attributes " +
+        std::to_wstring(attributes) + L".");
     SetGuestLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -1707,10 +1817,7 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetCurrentThreadId()
 
 DWORD WINAPI Win32Bridge::Bridge::BridgeGetCurrentProcessId()
 {
-    // Guest processes are not host processes. One stable synthetic identity
-    // lets code use process IDs for local bookkeeping while preserving the
-    // app-container boundary.
-    return 1;
+    return g_guestProcessId;
 }
 
 void WINAPI Win32Bridge::Bridge::BridgeGetSystemTimeAsFileTime(LPFILETIME systemTime)
@@ -2240,13 +2347,31 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeFreeLibrary(HMODULE module)
     return TRUE;
 }
 
+GuestCommandLineScope::GuestCommandLineScope(
+    const std::wstring& commandLine,
+    DWORD processId,
+    DWORD threadId)
+    : m_previous(std::move(g_guestCommandLine)),
+      m_previousProcessId(g_guestProcessId),
+      m_previousThreadId(g_guestThreadId)
+{
+    g_guestCommandLine = commandLine.empty() ? L"Win32BridgeGuest" : commandLine;
+    g_guestProcessId = processId ? processId : 1;
+    if (threadId) g_guestThreadId = threadId;
+}
+
+GuestCommandLineScope::~GuestCommandLineScope()
+{
+    g_guestCommandLine = std::move(m_previous);
+    g_guestProcessId = m_previousProcessId;
+    g_guestThreadId = m_previousThreadId;
+}
+
 LPWSTR WINAPI Win32Bridge::Bridge::BridgeGetCommandLineW()
 {
-    // The guest is launched from an embedded PE, not a shell command line.
-    // A stable writable string mirrors the ownership contract of
-    // GetCommandLineW without leaking the UWP host's arguments.
-    static wchar_t commandLine[] = L"Win32BridgeGuest";
-    return commandLine;
+    // The backing string is per guest thread and intentionally writable, as
+    // required by the historical GetCommandLineW contract.
+    return g_guestCommandLine.empty() ? const_cast<LPWSTR>(L"") : &g_guestCommandLine[0];
 }
 
 void WINAPI Win32Bridge::Bridge::BridgeOutputDebugStringW(LPCWSTR)
@@ -2284,6 +2409,14 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateEventW(
 
     DWORD error = ERROR_SUCCESS;
     HANDLE handle = kernel->CreateEvent(manualReset != FALSE, initialState != FALSE, name, &error);
+    if (name && *name)
+    {
+        RuntimeDiagnostics::Record(
+            handle
+                ? L"KERNEL: opened or created named event '" + std::wstring(name) + L"'."
+                : L"KERNEL: failed to create named event '" + std::wstring(name) +
+                    L"'; error " + std::to_wstring(error) + L".");
+    }
     SetGuestLastError(error);
     return handle;
 }
@@ -2462,28 +2595,197 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeSetEndOfFile(HANDLE file)
     return result;
 }
 
-HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenEventW(DWORD, BOOL, LPCWSTR)
+HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenEventW(
+    DWORD desiredAccess,
+    BOOL inheritHandle,
+    LPCWSTR name)
 {
-    SetGuestLastError(ERROR_FILE_NOT_FOUND);
-    return nullptr;
+    GuestKernelContext* kernel = CurrentGuestKernelContext();
+    if (!kernel)
+    {
+        SetGuestLastError(ERROR_INVALID_HANDLE);
+        return nullptr;
+    }
+    DWORD error = ERROR_SUCCESS;
+    HANDLE handle = kernel->OpenEvent(desiredAccess, inheritHandle, name, &error);
+    RuntimeDiagnostics::Record(
+        handle
+            ? L"KERNEL: opened named event '" + std::wstring(name ? name : L"") + L"'."
+            : L"KERNEL: failed to open named event '" + std::wstring(name ? name : L"") +
+                L"'; error " + std::to_wstring(error) + L".");
+    SetGuestLastError(error);
+    return handle;
 }
 
-HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenFileMappingW(DWORD, BOOL, LPCWSTR)
+HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenFileMappingW(DWORD, BOOL, LPCWSTR name)
 {
-    SetGuestLastError(ERROR_FILE_NOT_FOUND);
-    return nullptr;
+    if (!name || !*name)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+    const auto found = g_namedFileMappings.find(FileMappingNameKey(name));
+    if (found == g_namedFileMappings.end())
+    {
+        SetGuestLastError(ERROR_FILE_NOT_FOUND);
+        return nullptr;
+    }
+    const std::shared_ptr<GuestFileMapping> mapping = found->second.lock();
+    if (!mapping)
+    {
+        g_namedFileMappings.erase(found);
+        SetGuestLastError(ERROR_FILE_NOT_FOUND);
+        return nullptr;
+    }
+    const HANDLE handle = RegisterFileMappingLocked(mapping);
+    SetGuestLastError(handle ? ERROR_SUCCESS : ERROR_TOO_MANY_OPEN_FILES);
+    return handle;
 }
 
-LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(HANDLE, DWORD, DWORD, DWORD, SIZE_T)
+LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
+    HANDLE handle,
+    DWORD desiredAccess,
+    DWORD offsetHigh,
+    DWORD offsetLow,
+    SIZE_T bytesToMap)
 {
-    SetGuestLastError(ERROR_CALL_NOT_IMPLEMENTED);
-    return nullptr;
+    constexpr DWORD FileMapCopy = 0x00000001u;
+    constexpr DWORD FileMapWrite = 0x00000002u;
+    constexpr DWORD FileMapRead = 0x00000004u;
+    constexpr DWORD FileMapAllAccess = 0x000f001fu;
+    constexpr DWORD FileMapExecute = 0x00000020u;
+    const auto fail = [=](DWORD error, const wchar_t* reason) -> LPVOID
+    {
+        RuntimeDiagnostics::Record(
+            L"STORAGE: MapViewOfFile failed (" + std::wstring(reason) +
+            L"); access " + std::to_wstring(desiredAccess) +
+            L", offset-high " + std::to_wstring(offsetHigh) +
+            L", offset-low " + std::to_wstring(offsetLow) +
+            L", bytes " + std::to_wstring(bytesToMap) +
+            L", error " + std::to_wstring(error) + L".");
+        SetGuestLastError(error);
+        return nullptr;
+    };
+    const std::shared_ptr<GuestFileMapping> mapping = LookupFileMapping(handle);
+    if (!mapping)
+    {
+        return fail(ERROR_INVALID_HANDLE, L"unknown mapping handle");
+    }
+
+    const DWORD pageProtection = mapping->protection & 0xffu;
+    const bool writableMapping = pageProtection == PAGE_READWRITE ||
+        pageProtection == PAGE_WRITECOPY || pageProtection == PAGE_EXECUTE_READWRITE ||
+        pageProtection == PAGE_EXECUTE_WRITECOPY;
+    const bool executableMapping = pageProtection == PAGE_EXECUTE_READ ||
+        pageProtection == PAGE_EXECUTE_READWRITE || pageProtection == PAGE_EXECUTE_WRITECOPY;
+    // FILE_MAP_ALL_ACCESS contains the numeric FILE_MAP_COPY bit.  Treating
+    // access as a simple bit mask therefore rejects valid read/write views.
+    // COPY is a distinct view mode; ALL_ACCESS has normal write semantics.
+    const bool allAccess = (desiredAccess & FileMapAllAccess) == FileMapAllAccess;
+    const bool copyRequested = !allAccess && (desiredAccess & FileMapCopy) != 0;
+    const bool writeRequested = allAccess || (desiredAccess & FileMapWrite) != 0;
+    const bool readRequested = allAccess || (desiredAccess & FileMapRead) != 0 ||
+        desiredAccess == 0;
+    const bool executeRequested = (desiredAccess & FileMapExecute) != 0;
+    const bool readableMapping = pageProtection == PAGE_READONLY || writableMapping ||
+        executableMapping;
+    if (writeRequested && !writableMapping)
+    {
+        return fail(ERROR_ACCESS_DENIED, L"write access is incompatible with protection");
+    }
+    if ((readRequested || copyRequested) && !readableMapping)
+    {
+        return fail(ERROR_ACCESS_DENIED, L"read access is incompatible with protection");
+    }
+    if (executeRequested && !executableMapping)
+    {
+        return fail(ERROR_ACCESS_DENIED, L"execute access is incompatible with protection");
+    }
+
+    ULARGE_INTEGER offset{};
+    offset.HighPart = offsetHigh;
+    offset.LowPart = offsetLow;
+    SYSTEM_INFO systemInfo{};
+    BridgeGetSystemInfo(&systemInfo);
+    const DWORD granularity = systemInfo.dwAllocationGranularity
+        ? systemInfo.dwAllocationGranularity
+        : 65536;
+    if ((offset.QuadPart % granularity) != 0)
+    {
+        return fail(ERROR_MAPPED_ALIGNMENT, L"unaligned file offset");
+    }
+    if (offset.QuadPart >= mapping->size)
+    {
+        return fail(ERROR_INVALID_PARAMETER, L"file offset exceeds mapping size");
+    }
+    const ULONGLONG remaining = mapping->size - offset.QuadPart;
+    const SIZE_T viewSize = bytesToMap == 0
+        ? static_cast<SIZE_T>(remaining)
+        : bytesToMap;
+    if (viewSize == 0 || viewSize > remaining)
+    {
+        return fail(ERROR_INVALID_PARAMETER, L"view size exceeds mapping size");
+    }
+
+    BYTE* address = mapping->memory + static_cast<SIZE_T>(offset.QuadPart);
+    std::shared_ptr<void> privateAllocation;
+    if (copyRequested)
+    {
+        void* copy = VirtualAllocFromApp(
+            nullptr, viewSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!copy)
+        {
+            return fail(ERROR_NOT_ENOUGH_MEMORY, L"private view allocation failed");
+        }
+        memcpy(copy, address, viewSize);
+        try
+        {
+            privateAllocation = std::shared_ptr<void>(copy, [](void* allocation)
+            {
+                if (allocation) ::VirtualFree(allocation, 0, MEM_RELEASE);
+            });
+        }
+        catch (const std::bad_alloc&)
+        {
+            ::VirtualFree(copy, 0, MEM_RELEASE);
+            return fail(ERROR_NOT_ENOUGH_MEMORY, L"private view registration failed");
+        }
+        address = static_cast<BYTE*>(copy);
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        GuestMappingView& view = g_fileMappingViews[address];
+        view.mapping = mapping;
+        view.privateAllocation = std::move(privateAllocation);
+        view.size = viewSize;
+        ++view.references;
+    }
+    RuntimeDiagnostics::Record(
+        L"STORAGE: mapped a " + std::to_wstring(viewSize) +
+        L"-byte guest file view with access " + std::to_wstring(desiredAccess) + L".");
+    SetGuestLastError(ERROR_SUCCESS);
+    return address;
 }
 
-BOOL WINAPI Win32Bridge::Bridge::BridgeUnmapViewOfFile(LPCVOID)
+BOOL WINAPI Win32Bridge::Bridge::BridgeUnmapViewOfFile(LPCVOID baseAddress)
 {
-    SetGuestLastError(ERROR_INVALID_ADDRESS);
-    return FALSE;
+    if (!baseAddress)
+    {
+        SetGuestLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+    const auto found = g_fileMappingViews.find(baseAddress);
+    if (found == g_fileMappingViews.end())
+    {
+        SetGuestLastError(ERROR_INVALID_ADDRESS);
+        return FALSE;
+    }
+    if (found->second.references > 1) --found->second.references;
+    else g_fileMappingViews.erase(found);
+    SetGuestLastError(ERROR_SUCCESS);
+    return TRUE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetFileInformationByHandle(HANDLE file, LPBY_HANDLE_FILE_INFORMATION information)
@@ -2659,8 +2961,15 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeFindNextStreamW(HANDLE, LPVOID)
     return FALSE;
 }
 
-BOOL WINAPI Win32Bridge::Bridge::BridgeCreateHardLinkW(LPCWSTR, LPCWSTR, LPSECURITY_ATTRIBUTES)
+BOOL WINAPI Win32Bridge::Bridge::BridgeCreateHardLinkW(
+    LPCWSTR newFileName,
+    LPCWSTR existingFileName,
+    LPSECURITY_ATTRIBUTES)
 {
+    RuntimeDiagnostics::Record(
+        L"STORAGE: CreateHardLinkW is not implemented (existing '" +
+        std::wstring(existingFileName ? existingFileName : L"") + L"', new '" +
+        std::wstring(newFileName ? newFileName : L"") + L"').");
     SetGuestLastError(ERROR_NOT_SUPPORTED);
     return FALSE;
 }
@@ -2928,16 +3237,266 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeFindCloseChangeNotification(HANDLE change
     SetGuestLastError(error);
     return closed ? TRUE : FALSE;
 }
-HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(HANDLE, LPSECURITY_ATTRIBUTES, DWORD, DWORD, DWORD, LPCWSTR)
+HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
+    HANDLE file,
+    LPSECURITY_ATTRIBUTES,
+    DWORD protection,
+    DWORD maximumSizeHigh,
+    DWORD maximumSizeLow,
+    LPCWSTR name)
 {
-    SetGuestLastError(ERROR_NOT_SUPPORTED);
-    return nullptr;
+    const DWORD pageProtection = protection & 0xffu;
+    if (pageProtection != PAGE_READONLY && pageProtection != PAGE_READWRITE &&
+        pageProtection != PAGE_WRITECOPY && pageProtection != PAGE_EXECUTE_READ &&
+        pageProtection != PAGE_EXECUTE_READWRITE &&
+        pageProtection != PAGE_EXECUTE_WRITECOPY)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    const std::wstring nameKey = FileMappingNameKey(name);
+    if (!nameKey.empty())
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        const auto named = g_namedFileMappings.find(nameKey);
+        if (named != g_namedFileMappings.end())
+        {
+            const std::shared_ptr<GuestFileMapping> existing = named->second.lock();
+            if (existing)
+            {
+                const HANDLE handle = RegisterFileMappingLocked(existing);
+                SetGuestLastError(handle ? ERROR_ALREADY_EXISTS : ERROR_TOO_MANY_OPEN_FILES);
+                return handle;
+            }
+            g_namedFileMappings.erase(named);
+        }
+    }
+
+    ULARGE_INTEGER requestedSize{};
+    requestedSize.HighPart = maximumSizeHigh;
+    requestedSize.LowPart = maximumSizeLow;
+    ULONGLONG mappingSize = requestedSize.QuadPart;
+    ULONGLONG sourceSize = 0;
+    GuestStorageContext* storage = nullptr;
+    DWORD error = ERROR_SUCCESS;
+    LARGE_INTEGER originalPosition{};
+    bool restorePosition = false;
+
+    if (file == INVALID_HANDLE_VALUE)
+    {
+        if (mappingSize == 0)
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+    }
+    else
+    {
+        storage = CurrentGuestStorageContext();
+        LARGE_INTEGER size{};
+        if (!storage || !storage->GetFileSize(file, &size, &error) || size.QuadPart < 0)
+        {
+            SetGuestLastError(storage ? error : ERROR_INVALID_HANDLE);
+            return nullptr;
+        }
+        sourceSize = static_cast<ULONGLONG>(size.QuadPart);
+        if (mappingSize == 0) mappingSize = sourceSize;
+        if (mappingSize == 0)
+        {
+            SetGuestLastError(ERROR_FILE_INVALID);
+            return nullptr;
+        }
+    }
+
+    if (mappingSize > static_cast<ULONGLONG>((std::numeric_limits<SIZE_T>::max)()))
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+
+    std::shared_ptr<GuestFileMapping> mapping;
+    try
+    {
+        mapping = std::make_shared<GuestFileMapping>();
+        mapping->size = static_cast<SIZE_T>(mappingSize);
+        mapping->protection = protection;
+        mapping->name = name ? name : L"";
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    mapping->memory = static_cast<BYTE*>(VirtualAllocFromApp(
+        nullptr, mapping->size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    if (!mapping->memory)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+
+    if (storage && sourceSize != 0)
+    {
+        LARGE_INTEGER zero{};
+        if (!storage->SetFilePointer(file, zero, &originalPosition, FILE_CURRENT, &error) ||
+            !storage->SetFilePointer(file, zero, nullptr, FILE_BEGIN, &error))
+        {
+            SetGuestLastError(error);
+            return nullptr;
+        }
+        restorePosition = true;
+        const ULONGLONG bytesToRead = (std::min)(sourceSize, mappingSize);
+        ULONGLONG offset = 0;
+        while (offset < bytesToRead)
+        {
+            const DWORD request = static_cast<DWORD>((std::min)(
+                bytesToRead - offset, static_cast<ULONGLONG>(8 * 1024 * 1024)));
+            DWORD received = 0;
+            if (!storage->ReadFile(file, mapping->memory + static_cast<SIZE_T>(offset),
+                    request, &received, &error) || received == 0)
+            {
+                if (received == 0 && error == ERROR_SUCCESS) error = ERROR_READ_FAULT;
+                LARGE_INTEGER ignored{};
+                storage->SetFilePointer(file, originalPosition, &ignored, FILE_BEGIN, nullptr);
+                SetGuestLastError(error);
+                return nullptr;
+            }
+            offset += received;
+        }
+    }
+    if (restorePosition)
+    {
+        LARGE_INTEGER ignored{};
+        if (!storage->SetFilePointer(file, originalPosition, &ignored, FILE_BEGIN, &error))
+        {
+            SetGuestLastError(error);
+            return nullptr;
+        }
+    }
+
+    HANDLE handle = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        handle = RegisterFileMappingLocked(mapping);
+        if (handle && !nameKey.empty()) g_namedFileMappings[nameKey] = mapping;
+    }
+    if (!handle)
+    {
+        SetGuestLastError(ERROR_TOO_MANY_OPEN_FILES);
+        return nullptr;
+    }
+    RuntimeDiagnostics::Record(
+        L"STORAGE: created a " + std::to_wstring(mapping->size) +
+        L"-byte guest file mapping.");
+    SetGuestLastError(ERROR_SUCCESS);
+    return handle;
 }
-BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(LPCWSTR, LPWSTR, LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID, LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION processInformation)
+BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
+    LPCWSTR applicationName,
+    LPWSTR commandLine,
+    LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES,
+    BOOL,
+    DWORD creationFlags,
+    LPVOID,
+    LPCWSTR currentDirectory,
+    LPSTARTUPINFOW startupInfo,
+    LPPROCESS_INFORMATION processInformation)
 {
     if (processInformation) ZeroMemory(processInformation, sizeof(*processInformation));
-    SetGuestLastError(ERROR_NOT_SUPPORTED);
-    return FALSE;
+    if (!processInformation || !startupInfo || startupInfo->cb < sizeof(STARTUPINFOW))
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    constexpr DWORD unsupportedFlags = DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS |
+        CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB | EXTENDED_STARTUPINFO_PRESENT;
+    if ((creationFlags & unsupportedFlags) != 0)
+    {
+        RuntimeDiagnostics::Record(
+            L"PROCESS: unsupported CreateProcessW flags " +
+            std::to_wstring(creationFlags) + L".");
+        SetGuestLastError(ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
+
+    std::wstring executable = applicationName ? applicationName : L"";
+    const std::wstring fullCommandLine = commandLine ? commandLine : L"";
+    if (executable.empty())
+    {
+        size_t cursor = fullCommandLine.find_first_not_of(L" \t");
+        if (cursor == std::wstring::npos)
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        if (fullCommandLine[cursor] == L'\"')
+        {
+            const size_t end = fullCommandLine.find(L'\"', cursor + 1);
+            if (end == std::wstring::npos)
+            {
+                SetGuestLastError(ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            executable = fullCommandLine.substr(cursor + 1, end - cursor - 1);
+        }
+        else
+        {
+            const size_t end = fullCommandLine.find_first_of(L" \t", cursor);
+            executable = fullCommandLine.substr(cursor, end - cursor);
+        }
+    }
+    const size_t separator = executable.find_last_of(L"\\/");
+    const size_t dot = executable.find_last_of(L'.');
+    if (dot == std::wstring::npos ||
+        (separator != std::wstring::npos && dot < separator))
+    {
+        executable += L".exe";
+    }
+
+    GuestRuntime* runtime = CurrentGuestRuntime();
+    if (!runtime)
+    {
+        SetGuestLastError(ERROR_INVALID_FUNCTION);
+        return FALSE;
+    }
+    DWORD error = ERROR_SUCCESS;
+    const std::wstring effectiveCommandLine = fullCommandLine.empty()
+        ? L"\"" + executable + L"\""
+        : fullCommandLine;
+    if (!runtime->LaunchChildProcess(
+        executable.c_str(), effectiveCommandLine.c_str(), currentDirectory,
+        processInformation, &error))
+    {
+        SetGuestLastError(error);
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateThread(
+    LPSECURITY_ATTRIBUTES,
+    SIZE_T stackSize,
+    LPTHREAD_START_ROUTINE startAddress,
+    LPVOID parameter,
+    DWORD creationFlags,
+    LPDWORD threadId)
+{
+    GuestRuntime* runtime = CurrentGuestRuntime();
+    if (!runtime)
+    {
+        if (threadId) *threadId = 0;
+        SetGuestLastError(ERROR_INVALID_FUNCTION);
+        return nullptr;
+    }
+    DWORD error = ERROR_SUCCESS;
+    HANDLE handle = runtime->LaunchThread(
+        stackSize, startAddress, parameter, creationFlags, threadId, &error);
+    SetGuestLastError(error);
+    return handle;
 }
 void WINAPI Win32Bridge::Bridge::BridgeRaiseException(DWORD, DWORD, DWORD, const ULONG_PTR*)
 {
@@ -3056,6 +3615,8 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateFileMappingW);
     else if (_wcsicmp(symbol.name.c_str(), L"createprocessw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateProcessW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createthread") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateThread);
     else if (_wcsicmp(symbol.name.c_str(), L"raiseexception") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRaiseException);
     else if (_wcsicmp(symbol.name.c_str(), L"createdirectoryw") == 0)

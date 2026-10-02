@@ -38,6 +38,16 @@ namespace Bridge
         bool GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const;
         bool FreeLibrary(HMODULE module, DWORD* win32Error);
         void ReleaseAll();
+        bool ReadExecutableBytes(
+            LPCWSTR requestedName,
+            std::vector<BYTE>* bytes,
+            std::wstring* logicalPath,
+            DWORD* win32Error) const;
+        std::shared_ptr<GuestStorageContext> StorageContext() const { return m_storage; }
+        Windows::Storage::StorageFolder^ ModuleSourceFolder() const
+        {
+            return m_moduleSourceFolder.Get();
+        }
 
     private:
         struct Module;

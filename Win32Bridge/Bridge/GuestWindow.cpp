@@ -13786,11 +13786,11 @@ LRESULT WINAPI Win32Bridge::Bridge::BridgeBuiltinControlWindowProc(
     return manager ? manager->DefaultGuestWindowProcedure(window, message, wParam, lParam) : 0;
 }
 
-GuestWindowScope::GuestWindowScope(GuestWindowManager* manager)
-    : m_previous(g_currentGuestWindowManager)
+GuestWindowScope::GuestWindowScope(GuestWindowManager* manager, bool manageActivation)
+    : m_previous(g_currentGuestWindowManager), m_manageActivation(manageActivation)
 {
     g_currentGuestWindowManager = manager;
-    if (manager)
+    if (manager && m_manageActivation)
     {
         manager->Activate();
     }
@@ -13798,12 +13798,12 @@ GuestWindowScope::GuestWindowScope(GuestWindowManager* manager)
 
 GuestWindowScope::~GuestWindowScope()
 {
-    if (g_currentGuestWindowManager)
+    if (g_currentGuestWindowManager && m_manageActivation)
     {
         g_currentGuestWindowManager->Deactivate();
     }
     g_currentGuestWindowManager = m_previous;
-    if (m_previous)
+    if (m_previous && m_manageActivation)
     {
         m_previous->Activate();
     }

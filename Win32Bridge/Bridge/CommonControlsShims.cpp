@@ -327,42 +327,67 @@ INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void* headerPoint
         return -1;
     }
 
-    // A named start page is an optional presentation hint.  Until the bridge
-    // exposes a real tab host, start with the first page rather than treating
-    // its string pointer as a numeric index.
-    const UINT selected = (header.flags & PropertySheetHeaderUsesStartPageName) != 0
+    UINT selected = (header.flags & PropertySheetHeaderUsesStartPageName) != 0
         ? 0
         : (std::min)(static_cast<UINT>(header.startPage), header.pageCount - 1);
     const BYTE* cursor = reinterpret_cast<const BYTE*>(header.pages);
-    const BYTE* selectedPageSource = nullptr;
-    GuestPropertySheetPageW page = {};
-    for (UINT index = 0; index <= selected; ++index)
+    std::vector<GuestPropertyPageDescriptor> pages;
+    std::vector<std::wstring> pageTitles;
+    pages.reserve(header.pageCount);
+    pageTitles.reserve(header.pageCount);
+    for (UINT index = 0; index < header.pageCount; ++index)
     {
         DWORD pageSize = 0;
-        GuestPropertySheetPageW current = {};
-        if (!ReadPropertySheetPage(cursor, &current, &pageSize)) return -1;
-        if (index == selected)
+        GuestPropertySheetPageW page = {};
+        if (!ReadPropertySheetPage(cursor, &page, &pageSize)) return -1;
+        RuntimeDiagnostics::Record(
+            L"PROPERTYSHEET: page " + std::to_wstring(index) +
+            L" size " + std::to_wstring(pageSize) +
+            L", flags " + std::to_wstring(page.flags) + L".");
+
+        GuestPropertyPageDescriptor descriptor;
+        descriptor.instance = page.instance ? page.instance : header.instance;
+        descriptor.templateName = page.templateName;
+        descriptor.dialogProcedure = page.dialogProcedure;
+        descriptor.initParameter = reinterpret_cast<LPARAM>(cursor);
+        std::wstring pageTitle;
+        if ((page.flags & 0x00000008u) != 0) // PSP_USETITLE
+            ReadBoundedGuestString(page.title, &pageTitle);
+        pageTitles.push_back(std::move(pageTitle));
+        descriptor.title = nullptr;
+        pages.push_back(descriptor);
+
+        if ((header.flags & PropertySheetHeaderUsesStartPageName) != 0 &&
+            header.startPage > 0xffff && !pageTitles.back().empty())
         {
-            page = current;
-            selectedPageSource = cursor;
-            break;
+            std::wstring requestedTitle;
+            if (ReadBoundedGuestString(
+                    reinterpret_cast<LPCWSTR>(header.startPage), &requestedTitle) &&
+                _wcsicmp(requestedTitle.c_str(), pageTitles.back().c_str()) == 0)
+            {
+                selected = index;
+            }
         }
         cursor += pageSize;
     }
+    for (UINT index = 0; index < header.pageCount; ++index)
+    {
+        if (!pageTitles[index].empty()) pages[index].title = pageTitles[index].c_str();
+    }
     RuntimeDiagnostics::Record(L"PROPERTYSHEET: presenting page " +
         std::to_wstring(selected) + L" of " + std::to_wstring(header.pageCount) + L".");
-    // Property-page templates are WS_CHILD by design because native comctl32
-    // places them inside a separate property-sheet frame.  The bridge's
-    // current single-page host must provide that frame itself.
+
     std::wstring caption;
     ReadBoundedGuestString(header.caption, &caption);
-    return ShowGuestDialogFromResourceWithStyles(
-        page.instance ? page.instance : header.instance,
-        page.templateName, header.parent, page.dialogProcedure,
-        reinterpret_cast<LPARAM>(selectedPageSource),
-        GuestMetrics::WindowStyleCaption | GuestMetrics::WindowStyleSystemMenu,
-        GuestMetrics::WindowStyleChild,
-        caption.empty() ? nullptr : caption.c_str());
+    GuestPropertySheetDescriptor sheet;
+    sheet.parent = header.parent;
+    sheet.instance = header.instance;
+    sheet.caption = caption.empty() ? nullptr : caption.c_str();
+    sheet.pages = pages.data();
+    sheet.pageCount = static_cast<UINT>(pages.size());
+    sheet.startPage = selected;
+    sheet.flags = header.flags;
+    return ShowGuestPropertySheet(sheet);
 }
 HRESULT WINAPI Win32Bridge::Bridge::BridgeDllGetVersion(GuestDllVersionInfo* versionInfo)
 {

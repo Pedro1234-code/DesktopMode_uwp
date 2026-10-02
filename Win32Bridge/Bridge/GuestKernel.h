@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <unordered_map>
 
@@ -27,6 +28,7 @@ namespace Bridge
         GuestKernelContext& operator=(const GuestKernelContext&) = delete;
 
         HANDLE CreateEvent(bool manualReset, bool initialState, LPCWSTR name, DWORD* win32Error);
+        HANDLE OpenEvent(DWORD desiredAccess, BOOL inheritHandle, LPCWSTR name, DWORD* win32Error);
         HANDLE CreateMutex(bool initialOwner, LPCWSTR name, DWORD* win32Error);
         HANDLE CreateSemaphore(LONG initialCount, LONG maximumCount, LPCWSTR name, DWORD* win32Error);
         bool SetEvent(HANDLE guestHandle, DWORD* win32Error);
@@ -57,6 +59,7 @@ namespace Bridge
             std::mutex lock;
             std::condition_variable stateChanged;
             bool closed = false;
+            unsigned int handleReferences = 0;
 
             // Event state.
             bool manualReset = false;
@@ -81,6 +84,9 @@ namespace Bridge
         mutable std::mutex m_handlesLock;
         std::unordered_map<ULONG_PTR, std::shared_ptr<ObjectRecord>> m_handles;
         ULONG_PTR m_nextHandle = FirstHandleToken;
+
+        static std::mutex s_namedObjectsLock;
+        static std::unordered_map<std::wstring, std::weak_ptr<ObjectRecord>> s_namedObjects;
     };
 
     // Synchronization shims resolve their per-guest object table through TLS,

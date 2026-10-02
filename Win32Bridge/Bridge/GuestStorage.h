@@ -57,6 +57,7 @@ namespace Bridge
         bool MoveGuestPath(LPCWSTR existingPath, LPCWSTR newPath, DWORD flags, DWORD* win32Error);
         bool RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error);
         DWORD GetGuestFileAttributes(LPCWSTR path, DWORD* win32Error);
+        bool SetGuestFileAttributes(LPCWSTR path, DWORD attributes, DWORD* win32Error);
         bool FindFirstGuestFile(
             LPCWSTR searchPattern,
             WIN32_FIND_DATAW* findData,
@@ -71,6 +72,7 @@ namespace Bridge
         bool ResetCurrentDirectory(DWORD* win32Error);
         std::wstring CurrentDirectory() const;
         const std::wstring& ModulePath() const { return m_modulePath; }
+        Windows::Storage::StorageFolder^ LocalFolder() const { return m_localFolder.Get(); }
         std::wstring TempPath() const;
 
         void CloseAll();
@@ -109,6 +111,12 @@ namespace Bridge
         bool AllocateHandleLocked(ULONG_PTR* token);
         std::shared_ptr<FileRecord> LookupFile(HANDLE guestHandle) const;
         std::shared_ptr<FindRecord> LookupFind(HANDLE guestHandle) const;
+        DWORD ApplyAttributeOverride(const std::wstring& canonicalPath, DWORD attributes) const;
+        void StoreAttributeOverride(const std::wstring& canonicalPath, DWORD attributes);
+        void RemoveAttributeOverrides(const std::wstring& canonicalPath, bool includeChildren);
+        void MoveAttributeOverrides(
+            const std::wstring& sourceCanonicalPath,
+            const std::wstring& destinationCanonicalPath);
 
         // Keep storage tokens separate from GuestKernelContext, whose
         // synchronization-object namespace begins at 0x40000000.
@@ -124,6 +132,8 @@ namespace Bridge
         std::unordered_map<ULONG_PTR, std::shared_ptr<FileRecord>> m_files;
         std::unordered_map<ULONG_PTR, std::shared_ptr<FindRecord>> m_finds;
         ULONG_PTR m_nextHandle = FirstHandleToken;
+        mutable std::mutex m_metadataLock;
+        std::unordered_map<std::wstring, DWORD> m_attributeOverrides;
     };
 
     // File shims resolve their environment through TLS, so a later CreateThread

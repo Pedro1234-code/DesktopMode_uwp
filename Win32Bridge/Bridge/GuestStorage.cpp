@@ -20,6 +20,16 @@ namespace
 {
     constexpr DWORD MaxSynchronousIo = 16 * 1024 * 1024;
     constexpr size_t MaxGuestPathCharacters = 32767;
+    constexpr DWORD VirtualMutableFileAttributes =
+        FILE_ATTRIBUTE_READONLY |
+        FILE_ATTRIBUTE_HIDDEN |
+        FILE_ATTRIBUTE_SYSTEM |
+        FILE_ATTRIBUTE_DIRECTORY |
+        FILE_ATTRIBUTE_ARCHIVE |
+        FILE_ATTRIBUTE_NORMAL |
+        FILE_ATTRIBUTE_TEMPORARY |
+        FILE_ATTRIBUTE_OFFLINE |
+        FILE_ATTRIBUTE_NOT_CONTENT_INDEXED;
     thread_local GuestStorageContext* g_currentGuestStorage = nullptr;
     thread_local unsigned g_storageEnumerationDiagnostics = 0;
 
@@ -107,6 +117,25 @@ namespace
         result.push_back(L"drive_c");
         result.insert(result.end(), path.components.begin(), path.components.end());
         return result;
+    }
+
+    std::wstring MetadataKey(const std::wstring& canonicalPath)
+    {
+        std::wstring key = canonicalPath;
+        std::transform(key.begin(), key.end(), key.begin(), [](wchar_t value)
+        {
+            return static_cast<wchar_t>(std::towlower(value));
+        });
+        while (key.size() > 3 && key.back() == L'\\') key.pop_back();
+        return key;
+    }
+
+    std::wstring ChildCanonicalPath(
+        const std::wstring& parent,
+        const std::wstring& child)
+    {
+        if (parent.empty()) return child;
+        return parent.back() == L'\\' ? parent + child : parent + L"\\" + child;
     }
 
     bool HasReadAccess(DWORD access)
@@ -631,6 +660,99 @@ std::shared_ptr<GuestStorageContext::FindRecord> GuestStorageContext::LookupFind
     return found == m_finds.end() ? nullptr : found->second;
 }
 
+DWORD GuestStorageContext::ApplyAttributeOverride(
+    const std::wstring& canonicalPath,
+    DWORD attributes) const
+{
+    const std::wstring key = MetadataKey(canonicalPath);
+    std::lock_guard<std::mutex> guard(m_metadataLock);
+    const auto found = m_attributeOverrides.find(key);
+    if (found == m_attributeOverrides.end()) return attributes;
+
+    // DIRECTORY describes the actual storage item and cannot be changed by
+    // SetFileAttributes. NORMAL is represented by the absence of all other
+    // mutable bits, as on Win32.
+    DWORD result = found->second & ~(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_NORMAL);
+    result |= attributes & FILE_ATTRIBUTE_DIRECTORY;
+    return result == 0 ? FILE_ATTRIBUTE_NORMAL : result;
+}
+
+void GuestStorageContext::StoreAttributeOverride(
+    const std::wstring& canonicalPath,
+    DWORD attributes)
+{
+    std::lock_guard<std::mutex> guard(m_metadataLock);
+    m_attributeOverrides[MetadataKey(canonicalPath)] = attributes;
+}
+
+void GuestStorageContext::RemoveAttributeOverrides(
+    const std::wstring& canonicalPath,
+    bool includeChildren)
+{
+    const std::wstring key = MetadataKey(canonicalPath);
+    const std::wstring prefix = key.empty() || key.back() == L'\\'
+        ? key
+        : key + L"\\";
+    std::lock_guard<std::mutex> guard(m_metadataLock);
+    for (auto iterator = m_attributeOverrides.begin(); iterator != m_attributeOverrides.end();)
+    {
+        const bool child = includeChildren && iterator->first.size() > prefix.size() &&
+            iterator->first.compare(0, prefix.size(), prefix) == 0;
+        if (iterator->first == key || child) iterator = m_attributeOverrides.erase(iterator);
+        else ++iterator;
+    }
+}
+
+void GuestStorageContext::MoveAttributeOverrides(
+    const std::wstring& sourceCanonicalPath,
+    const std::wstring& destinationCanonicalPath)
+{
+    const std::wstring source = MetadataKey(sourceCanonicalPath);
+    const std::wstring destination = MetadataKey(destinationCanonicalPath);
+    if (source == destination) return;
+    const std::wstring prefix = source.empty() || source.back() == L'\\'
+        ? source
+        : source + L"\\";
+    const std::wstring destinationPrefix = destination.empty() || destination.back() == L'\\'
+        ? destination
+        : destination + L"\\";
+    std::vector<std::pair<std::wstring, DWORD>> moved;
+    std::lock_guard<std::mutex> guard(m_metadataLock);
+    for (auto iterator = m_attributeOverrides.begin(); iterator != m_attributeOverrides.end();)
+    {
+        if (iterator->first == destination ||
+            (iterator->first.size() > destinationPrefix.size() &&
+             iterator->first.compare(0, destinationPrefix.size(), destinationPrefix) == 0))
+        {
+            iterator = m_attributeOverrides.erase(iterator);
+        }
+        else
+        {
+            ++iterator;
+        }
+    }
+    for (auto iterator = m_attributeOverrides.begin(); iterator != m_attributeOverrides.end();)
+    {
+        if (iterator->first == source)
+        {
+            moved.emplace_back(destination, iterator->second);
+            iterator = m_attributeOverrides.erase(iterator);
+        }
+        else if (iterator->first.size() > prefix.size() &&
+            iterator->first.compare(0, prefix.size(), prefix) == 0)
+        {
+            moved.emplace_back(destination + L"\\" + iterator->first.substr(prefix.size()),
+                iterator->second);
+            iterator = m_attributeOverrides.erase(iterator);
+        }
+        else
+        {
+            ++iterator;
+        }
+    }
+    for (const auto& entry : moved) m_attributeOverrides[entry.first] = entry.second;
+}
+
 bool GuestStorageContext::CreateFile(
     LPCWSTR fileName,
     DWORD desiredAccess,
@@ -712,7 +834,20 @@ bool GuestStorageContext::CreateFile(
             stream->Size = 0;
             stream->Seek(0);
         }
-        return AddFile(stream, readable || !writable, writable, guestHandle, win32Error);
+        if (!AddFile(stream, readable || !writable, writable, guestHandle, win32Error))
+        {
+            return false;
+        }
+        if (creationDisposition == CREATE_NEW || creationDisposition == CREATE_ALWAYS)
+        {
+            DWORD requestedAttributes = flagsAndAttributes & VirtualMutableFileAttributes;
+            requestedAttributes &= ~FILE_ATTRIBUTE_DIRECTORY;
+            if ((requestedAttributes & ~FILE_ATTRIBUTE_NORMAL) != 0)
+                requestedAttributes &= ~FILE_ATTRIBUTE_NORMAL;
+            if (requestedAttributes == 0) requestedAttributes = FILE_ATTRIBUTE_NORMAL;
+            StoreAttributeOverride(path.canonical, requestedAttributes);
+        }
+        return true;
     }
     catch (Exception^ exception)
     {
@@ -1145,6 +1280,7 @@ bool GuestStorageContext::CreateDirectory(LPCWSTR path, DWORD* win32Error)
     try
     {
         create_task(parent->CreateFolderAsync(ref new String(leaf.c_str()), CreationCollisionOption::FailIfExists)).get();
+        StoreAttributeOverride(resolved.canonical, FILE_ATTRIBUTE_DIRECTORY);
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return true;
     }
@@ -1183,6 +1319,7 @@ bool GuestStorageContext::DeleteGuestFile(LPCWSTR path, DWORD* win32Error)
             return false;
         }
         create_task(item->DeleteAsync()).get();
+        RemoveAttributeOverrides(resolved.canonical, false);
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return true;
     }
@@ -1244,6 +1381,7 @@ bool GuestStorageContext::MoveGuestPath(
         {
             StorageFile^ file = safe_cast<StorageFile^>(item);
             create_task(file->MoveAsync(destinationParent, ref new String(destinationName.c_str()), collision)).get();
+            MoveAttributeOverrides(source.canonical, destination.canonical);
             SetWin32Error(win32Error, ERROR_SUCCESS);
             return true;
         }
@@ -1277,6 +1415,7 @@ bool GuestStorageContext::MoveGuestPath(
                 }
                 MoveStorageFolderTree(safe_cast<StorageFolder^>(item), destinationParent,
                     destinationName, (flags & MOVEFILE_REPLACE_EXISTING) != 0, 0);
+                MoveAttributeOverrides(source.canonical, destination.canonical);
                 SetWin32Error(win32Error, ERROR_SUCCESS);
                 RuntimeDiagnostics::Record(L"STORAGE: moved a virtual directory tree.");
                 return true;
@@ -1284,6 +1423,7 @@ bool GuestStorageContext::MoveGuestPath(
 
             StorageFolder^ folder = safe_cast<StorageFolder^>(item);
             create_task(folder->RenameAsync(ref new String(destinationName.c_str()), collision)).get();
+            MoveAttributeOverrides(source.canonical, destination.canonical);
             SetWin32Error(win32Error, ERROR_SUCCESS);
             return true;
         }
@@ -1325,6 +1465,7 @@ bool GuestStorageContext::RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error)
             return false;
         }
         create_task(folder->DeleteAsync()).get();
+        RemoveAttributeOverrides(resolved.canonical, true);
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return true;
     }
@@ -1351,7 +1492,7 @@ DWORD GuestStorageContext::GetGuestFileAttributes(LPCWSTR path, DWORD* win32Erro
             return INVALID_FILE_ATTRIBUTES;
         }
         SetWin32Error(win32Error, ERROR_SUCCESS);
-        return FILE_ATTRIBUTE_DIRECTORY;
+        return ApplyAttributeOverride(resolved.canonical, FILE_ATTRIBUTE_DIRECTORY);
     }
 
     StorageFolder^ parent = nullptr;
@@ -1364,7 +1505,9 @@ DWORD GuestStorageContext::GetGuestFileAttributes(LPCWSTR path, DWORD* win32Erro
     try
     {
         IStorageItem^ item = create_task(parent->GetItemAsync(ref new String(leaf.c_str()))).get();
-        const DWORD attributes = MapFileAttributes(item, item->IsOfType(StorageItemTypes::Folder));
+        const DWORD attributes = ApplyAttributeOverride(
+            resolved.canonical,
+            MapFileAttributes(item, item->IsOfType(StorageItemTypes::Folder)));
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return attributes;
     }
@@ -1372,6 +1515,54 @@ DWORD GuestStorageContext::GetGuestFileAttributes(LPCWSTR path, DWORD* win32Erro
     {
         SetWin32Error(win32Error, ErrorFromException(exception));
         return INVALID_FILE_ATTRIBUTES;
+    }
+}
+
+bool GuestStorageContext::SetGuestFileAttributes(
+    LPCWSTR path,
+    DWORD attributes,
+    DWORD* win32Error)
+{
+    if (!path || attributes == 0 ||
+        (attributes & ~VirtualMutableFileAttributes) != 0 ||
+        ((attributes & FILE_ATTRIBUTE_NORMAL) != 0 && attributes != FILE_ATTRIBUTE_NORMAL))
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    GuestPath resolved;
+    if (!Resolve(path, &resolved, win32Error)) return false;
+    try
+    {
+        bool isDirectory = resolved.components.empty();
+        if (isDirectory)
+        {
+            StorageFolder^ root = nullptr;
+            if (!GetDirectoryFolder(resolved, &root, win32Error)) return false;
+        }
+        else
+        {
+            StorageFolder^ parent = nullptr;
+            std::wstring leaf;
+            if (!GetParentFolder(resolved, &parent, &leaf, win32Error)) return false;
+            IStorageItem^ item = create_task(
+                parent->GetItemAsync(ref new String(leaf.c_str()))).get();
+            isDirectory = item->IsOfType(StorageItemTypes::Folder);
+        }
+
+        DWORD normalized = attributes & ~(FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_NORMAL);
+        if (isDirectory) normalized |= FILE_ATTRIBUTE_DIRECTORY;
+        if (normalized == 0) normalized = FILE_ATTRIBUTE_NORMAL;
+        StoreAttributeOverride(resolved.canonical, normalized);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception)
+    {
+        RecordStorageException(L"SetFileAttributesW item lookup", exception);
+        SetWin32Error(win32Error, ErrorFromException(exception));
+        return false;
     }
 }
 
@@ -1426,6 +1617,9 @@ bool GuestStorageContext::FindFirstGuestFile(
             {
                 return false;
             }
+            entry.dwFileAttributes = ApplyAttributeOverride(
+                ChildCanonicalPath(resolvedDirectory.canonical, name),
+                entry.dwFileAttributes);
             matches.push_back(entry);
         }
 

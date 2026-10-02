@@ -40,6 +40,9 @@ namespace
     constexpr DWORD ButtonTypeMask = 0x0000000f;
     constexpr DWORD ButtonDefaultPush = 0x00000001;
     constexpr DWORD StaticLeft = 0x00000000;
+    constexpr DWORD EditAutoHorizontalScroll = 0x00000080;
+    constexpr DWORD EditReadOnly = 0x00000800;
+    constexpr DWORD WindowBorderStyle = 0x00800000;
     constexpr int DialogMessageResultOffset = 0;
     constexpr int DialogProcedureOffset = sizeof(LONG_PTR);
     constexpr int DialogWindowExtra = sizeof(LONG_PTR) * 4;
@@ -186,6 +189,69 @@ namespace
         HFONT font = nullptr;
         int baseUnitX = GuestMetrics::TextWidth;
         int baseUnitY = GuestMetrics::TextHeight;
+    };
+
+    constexpr UINT PropertyTabId = 0x3020;
+    constexpr UINT PropertyApplyId = 0x3021;
+    constexpr UINT PropertySheetSetCurrent = WM_USER + 101;
+    constexpr UINT PropertySheetChanged = WM_USER + 104;
+    constexpr UINT PropertySheetQuerySiblings = WM_USER + 108;
+    constexpr UINT PropertySheetUnchanged = WM_USER + 109;
+    constexpr UINT PropertySheetApply = WM_USER + 110;
+    constexpr UINT PropertySheetPressButton = WM_USER + 113;
+    constexpr UINT PropertySheetGetTabControl = WM_USER + 116;
+    constexpr UINT PropertySheetGetCurrentPage = WM_USER + 118;
+    constexpr UINT TabGetCurrentSelection = 0x130b;
+    constexpr UINT TabSetCurrentSelection = 0x130c;
+    constexpr UINT TabInsertItemW = 0x133e;
+    constexpr UINT TabNotifySelectionChange = static_cast<UINT>(-551);
+    constexpr int PropertyNotifySetActive = -200;
+    constexpr int PropertyNotifyKillActive = -201;
+    constexpr int PropertyNotifyApply = -202;
+    constexpr int PropertyNotifyReset = -203;
+    constexpr int PropertyNotifyQueryCancel = -209;
+
+    struct PropertyPageRuntime final
+    {
+        HINSTANCE instance = nullptr;
+        LPCWSTR templateName = nullptr;
+        DLGPROC procedure = nullptr;
+        LPARAM initParameter = 0;
+        std::wstring title;
+        std::vector<std::pair<std::wstring, std::wstring>> fields;
+        HWND window = nullptr;
+    };
+
+    struct PropertySheetRuntime final
+    {
+        HWND window = nullptr;
+        HWND parent = nullptr;
+        HWND tabControl = nullptr;
+        std::vector<PropertyPageRuntime> pages;
+        UINT selected = 0;
+        bool dirty = false;
+    };
+
+    struct PropertySheetNotification final
+    {
+        struct Header final
+        {
+            HWND hwndFrom = nullptr;
+            UINT_PTR idFrom = 0;
+            UINT code = 0;
+        } header;
+        LPARAM parameter = 0;
+    };
+
+    struct PropertyTabItemW final
+    {
+        UINT mask = 0;
+        DWORD state = 0;
+        DWORD stateMask = 0;
+        LPWSTR text = nullptr;
+        int textCapacity = 0;
+        int image = -1;
+        LPARAM parameter = 0;
     };
 
     thread_local ModalDialogState* g_activeModalDialog = nullptr;
@@ -412,23 +478,41 @@ namespace
         return false;
     }
 
+    int CaptureDialogException(
+        EXCEPTION_POINTERS* information,
+        DWORD* exceptionCode,
+        ULONG_PTR* exceptionAddress)
+    {
+        if (exceptionCode)
+            *exceptionCode = information && information->ExceptionRecord
+                ? information->ExceptionRecord->ExceptionCode
+                : ERROR_GEN_FAILURE;
+        if (exceptionAddress)
+            *exceptionAddress = information && information->ExceptionRecord
+                ? reinterpret_cast<ULONG_PTR>(information->ExceptionRecord->ExceptionAddress)
+                : 0;
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
     INT_PTR InvokeGuestDialogProcedure(
         DLGPROC procedure,
         HWND window,
         UINT message,
         WPARAM wParam,
         LPARAM lParam,
-        DWORD* exceptionCode)
+        DWORD* exceptionCode,
+        ULONG_PTR* exceptionAddress)
     {
         if (exceptionCode) *exceptionCode = ERROR_SUCCESS;
+        if (exceptionAddress) *exceptionAddress = 0;
         if (!procedure) return FALSE;
         __try
         {
             return procedure(window, message, wParam, lParam);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        __except (CaptureDialogException(
+            GetExceptionInformation(), exceptionCode, exceptionAddress))
         {
-            if (exceptionCode) *exceptionCode = GetExceptionCode();
             return FALSE;
         }
     }
@@ -454,13 +538,16 @@ namespace
         {
             manager->SetGuestWindowLongPtr(window, DialogMessageResultOffset, 0, &error);
             DWORD exceptionCode = ERROR_SUCCESS;
+            ULONG_PTR exceptionAddress = 0;
             const INT_PTR handled = InvokeGuestDialogProcedure(
-                procedure, window, message, wParam, lParam, &exceptionCode);
+                procedure, window, message, wParam, lParam,
+                &exceptionCode, &exceptionAddress);
             if (exceptionCode != ERROR_SUCCESS)
             {
                 RuntimeDiagnostics::Record(L"DIALOG CALLBACK EXCEPTION: code " +
                     std::to_wstring(static_cast<unsigned long>(exceptionCode)) +
-                    L", message " + std::to_wstring(message) + L".");
+                    L", message " + std::to_wstring(message) +
+                    L", address " + std::to_wstring(exceptionAddress) + L".");
             }
             else if (handled != FALSE)
             {
@@ -556,7 +643,9 @@ namespace
         const DialogTemplate& dialog,
         HWND parent,
         DLGPROC procedure,
-        LPARAM initParameter)
+        LPARAM initParameter,
+        bool runModal = true,
+        HWND* createdWindow = nullptr)
     {
         GuestWindowManager* manager = CurrentGuestWindowManager();
         if (!manager)
@@ -584,7 +673,8 @@ namespace
         const DialogBaseUnits baseUnits = BaseUnitsFor(dialog);
         const int clientWidth = (std::max)(1, PixelsX(dialog.width, baseUnits));
         const int clientHeight = (std::max)(1, PixelsY(dialog.height, baseUnits));
-        const DWORD rootStyle = (dialog.style | DialogPopupStyle) & ~DialogVisibleStyle;
+        const DWORD rootStyle = (runModal ? dialog.style | DialogPopupStyle : dialog.style) &
+            ~DialogVisibleStyle;
         const GuestMetrics::NonClientMetrics nonClient =
             GuestMetrics::NonClientForEmbeddedWindow(
                 rootStyle, dialog.extendedStyle, parent != nullptr);
@@ -721,6 +811,28 @@ namespace
             }
         }
 
+        if (!runModal)
+        {
+            const LRESULT initializeFocus = manager->SendGuestMessage(root, WM_INITDIALOG,
+                reinterpret_cast<WPARAM>(initialFocus), initParameter, &error);
+            if (manager->IsGuestWindow(root))
+            {
+                manager->UpdateGuestWindow(root, nullptr);
+                for (const HWND control : runtime->controls)
+                {
+                    if (manager->IsGuestWindow(control)) manager->UpdateGuestWindow(control, nullptr);
+                }
+                manager->ShowGuestWindow(root, SW_SHOW, &error);
+                if (initializeFocus != FALSE && initialFocus)
+                    manager->SetGuestFocus(initialFocus, nullptr);
+            }
+            if (createdWindow) *createdWindow = root;
+            RuntimeDiagnostics::Record(L"DIALOG: instantiated modeless child with " +
+                std::to_wstring(dialog.items.size()) + L" control(s).");
+            BridgeSetLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+
         ModalDialogState modal;
         modal.previous = g_activeModalDialog;
         modal.window = root;
@@ -785,6 +897,400 @@ namespace
         g_activeModalDialog = modal.previous;
         BridgeSetLastError(ERROR_SUCCESS);
         return modal.result;
+    }
+
+    bool ParseDialogResource(
+        HINSTANCE instance,
+        LPCWSTR templateName,
+        DialogTemplate* dialog)
+    {
+        if (!templateName || !dialog) return false;
+        DialogValue requested;
+        if (reinterpret_cast<ULONG_PTR>(templateName) <= 0xffff)
+        {
+            requested.ordinal = true;
+            requested.id = static_cast<WORD>(reinterpret_cast<ULONG_PTR>(templateName));
+        }
+        else
+        {
+            requested.text = templateName;
+        }
+        const BYTE* bytes = nullptr;
+        size_t byteCount = 0;
+        return FindTypedResource(instance, DialogResourceType, requested, &bytes, &byteCount) &&
+            ParseDialog(bytes, byteCount, dialog);
+    }
+
+    INT_PTR CALLBACK SyntheticPropertyPageProcedure(HWND, UINT message, WPARAM, LPARAM)
+    {
+        return message == WM_INITDIALOG ? TRUE : FALSE;
+    }
+
+    bool BuildPropertyFieldsDialog(
+        const PropertyPageRuntime& page,
+        DialogTemplate* dialog)
+    {
+        if (!dialog || page.fields.empty()) return false;
+
+        size_t longestName = 0;
+        size_t longestValue = 0;
+        for (const auto& field : page.fields)
+        {
+            longestName = (std::max)(longestName, field.first.size());
+            longestValue = (std::max)(longestValue, field.second.size());
+        }
+
+        // The template is expressed in dialog units. Its dimensions follow
+        // the supplied data, with generic usability bounds rather than any
+        // application-specific resource geometry.
+        const int labelWidth = (std::max)(44, (std::min)(112,
+            static_cast<int>(longestName * 4 + 8)));
+        const int valueWidth = (std::max)(132, (std::min)(344,
+            static_cast<int>(longestValue * 4 + 12)));
+        const int rowHeight = 18;
+
+        *dialog = DialogTemplate{};
+        dialog->style = DialogChildStyle | DialogVisibleStyle | DialogSetFont;
+        dialog->width = static_cast<short>(labelWidth + valueWidth + 24);
+        dialog->height = static_cast<short>((std::min)(32767,
+            12 + static_cast<int>(page.fields.size()) * rowHeight));
+        dialog->font.present = true;
+        dialog->font.pointSize = 9;
+        dialog->font.weight = FW_NORMAL;
+        dialog->font.face.text = L"Segoe UI";
+
+        for (size_t index = 0; index < page.fields.size(); ++index)
+        {
+            const short y = static_cast<short>(7 + index * rowHeight);
+
+            DialogItem label;
+            label.style = DialogChildStyle | DialogVisibleStyle | StaticLeft;
+            label.x = 8;
+            label.y = y + 2;
+            label.width = static_cast<short>(labelWidth);
+            label.height = 12;
+            label.id = static_cast<DWORD>(0x4100 + index * 2);
+            label.windowClass.ordinal = true;
+            label.windowClass.id = 0x0082; // Static.
+            label.title.text = page.fields[index].first;
+            dialog->items.push_back(std::move(label));
+
+            DialogItem value;
+            value.style = DialogChildStyle | DialogVisibleStyle |
+                DialogTabStopStyle | WindowBorderStyle |
+                EditAutoHorizontalScroll | EditReadOnly;
+            value.x = static_cast<short>(12 + labelWidth);
+            value.y = y;
+            value.width = static_cast<short>(valueWidth);
+            value.height = 14;
+            value.id = static_cast<DWORD>(0x4101 + index * 2);
+            value.windowClass.ordinal = true;
+            value.windowClass.id = 0x0081; // Edit.
+            value.title.text = page.fields[index].second;
+            dialog->items.push_back(std::move(value));
+        }
+        return true;
+    }
+
+    HWND CreatePropertyPageWindow(PropertySheetRuntime* sheet, UINT index)
+    {
+        if (!sheet || index >= sheet->pages.size()) return nullptr;
+        PropertyPageRuntime& page = sheet->pages[index];
+        if (page.window) return page.window;
+
+        DialogTemplate dialog;
+        if (!page.fields.empty())
+        {
+            if (!BuildPropertyFieldsDialog(page, &dialog)) return nullptr;
+        }
+        else if (!ParseDialogResource(page.instance, page.templateName, &dialog))
+        {
+            return nullptr;
+        }
+        dialog.style |= DialogChildStyle;
+        dialog.style &= ~(DialogPopupStyle | DialogCaptionStyle |
+            DialogSystemMenuStyle | DialogCenterStyle);
+        dialog.x = 0;
+        dialog.y = 0;
+        dialog.title = DialogValue{};
+
+        HWND window = nullptr;
+        if (RunGuestDialog(
+                page.instance,
+                dialog,
+                sheet->window,
+                page.procedure ? page.procedure : &SyntheticPropertyPageProcedure,
+                page.initParameter,
+                false,
+                &window) == -1 || !window)
+        {
+            return nullptr;
+        }
+        page.window = window;
+
+        GuestWindowManager* manager = CurrentGuestWindowManager();
+        RECT pageRect{};
+        if (manager && manager->GetGuestWindowRect(window, &pageRect, nullptr))
+        {
+            manager->SetGuestWindowPos(
+                window, nullptr, 12, 42,
+                (std::max)(1L, pageRect.right - pageRect.left),
+                (std::max)(1L, pageRect.bottom - pageRect.top),
+                SWP_NOZORDER | SWP_NOACTIVATE,
+                nullptr);
+        }
+        return window;
+    }
+
+    LRESULT NotifyPropertyPage(
+        PropertySheetRuntime* sheet,
+        UINT index,
+        int code,
+        LPARAM parameter = 0)
+    {
+        if (!sheet || index >= sheet->pages.size()) return 0;
+        GuestWindowManager* manager = CurrentGuestWindowManager();
+        const HWND page = sheet->pages[index].window;
+        if (!manager || !page || !manager->IsGuestWindow(page)) return 0;
+
+        PropertySheetNotification notification;
+        notification.header.hwndFrom = sheet->window;
+        notification.header.idFrom = 0;
+        notification.header.code = static_cast<UINT>(code);
+        notification.parameter = parameter;
+        return manager->SendGuestMessage(
+            page, WM_NOTIFY, 0,
+            reinterpret_cast<LPARAM>(&notification), nullptr);
+    }
+
+    void SetPropertySheetDirty(PropertySheetRuntime* sheet, bool dirty)
+    {
+        if (!sheet) return;
+        sheet->dirty = dirty;
+        GuestWindowManager* manager = CurrentGuestWindowManager();
+        if (!manager) return;
+        const HWND apply = manager->GetGuestDlgItem(
+            sheet->window, PropertyApplyId, nullptr);
+        if (apply) manager->EnableGuestWindow(apply, dirty ? TRUE : FALSE, nullptr);
+    }
+
+    bool SelectPropertyPage(PropertySheetRuntime* sheet, UINT index, bool initial)
+    {
+        if (!sheet || index >= sheet->pages.size()) return false;
+        GuestWindowManager* manager = CurrentGuestWindowManager();
+        if (!manager) return false;
+
+        if (!initial && sheet->selected < sheet->pages.size())
+        {
+            if (NotifyPropertyPage(sheet, sheet->selected, PropertyNotifyKillActive) != 0)
+            {
+                if (sheet->tabControl)
+                    manager->SendGuestMessage(
+                        sheet->tabControl, TabSetCurrentSelection,
+                        sheet->selected, 0, nullptr);
+                return false;
+            }
+            const HWND previous = sheet->pages[sheet->selected].window;
+            if (previous) manager->ShowGuestWindow(previous, SW_HIDE, nullptr);
+        }
+
+        const HWND page = CreatePropertyPageWindow(sheet, index);
+        if (!page) return false;
+        sheet->selected = index;
+        if (sheet->tabControl)
+            manager->SendGuestMessage(
+                sheet->tabControl, TabSetCurrentSelection, index, 0, nullptr);
+        manager->ShowGuestWindow(page, SW_SHOW, nullptr);
+        NotifyPropertyPage(sheet, index, PropertyNotifySetActive);
+        return true;
+    }
+
+    bool ApplyPropertyPages(PropertySheetRuntime* sheet, bool closeAfterApply)
+    {
+        if (!sheet || sheet->selected >= sheet->pages.size()) return false;
+        if (NotifyPropertyPage(sheet, sheet->selected, PropertyNotifyKillActive) != 0)
+            return false;
+        for (UINT index = 0; index < sheet->pages.size(); ++index)
+        {
+            if (sheet->pages[index].window)
+            {
+                const LRESULT result =
+                    NotifyPropertyPage(sheet, index, PropertyNotifyApply);
+                if (result != 0)
+                {
+                    if (result == 1) // PSNRET_INVALID
+                        SelectPropertyPage(sheet, index, index == sheet->selected);
+                    return false;
+                }
+            }
+        }
+        SetPropertySheetDirty(sheet, false);
+        if (closeAfterApply) EndGuestResourceDialog(sheet->window, IDOK);
+        return true;
+    }
+
+    void CancelPropertySheet(PropertySheetRuntime* sheet)
+    {
+        if (!sheet || sheet->selected >= sheet->pages.size()) return;
+        if (NotifyPropertyPage(sheet, sheet->selected, PropertyNotifyQueryCancel) != 0)
+            return;
+        for (UINT index = 0; index < sheet->pages.size(); ++index)
+        {
+            if (sheet->pages[index].window)
+                NotifyPropertyPage(sheet, index, PropertyNotifyReset, FALSE);
+        }
+        EndGuestResourceDialog(sheet->window, IDCANCEL);
+    }
+
+    INT_PTR CALLBACK PropertySheetDialogProcedure(
+        HWND dialog,
+        UINT message,
+        WPARAM wParam,
+        LPARAM lParam)
+    {
+        PropertySheetRuntime* sheet = reinterpret_cast<PropertySheetRuntime*>(
+            BridgeGetWindowLongPtrW(dialog, GWLP_USERDATA));
+        if (message == WM_INITDIALOG)
+        {
+            sheet = reinterpret_cast<PropertySheetRuntime*>(lParam);
+            if (!sheet) return FALSE;
+            sheet->window = dialog;
+            BridgeSetWindowLongPtrW(dialog, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(sheet));
+            GuestWindowManager* manager = CurrentGuestWindowManager();
+            sheet->tabControl = manager
+                ? manager->GetGuestDlgItem(dialog, PropertyTabId, nullptr)
+                : nullptr;
+            if (manager && sheet->tabControl)
+            {
+                for (UINT index = 0; index < sheet->pages.size(); ++index)
+                {
+                    PropertyTabItemW item;
+                    item.mask = 0x00000001u; // TCIF_TEXT
+                    item.text = const_cast<LPWSTR>(sheet->pages[index].title.c_str());
+                    manager->SendGuestMessage(
+                        sheet->tabControl, TabInsertItemW, index,
+                        reinterpret_cast<LPARAM>(&item), nullptr);
+                }
+            }
+            SetPropertySheetDirty(sheet, false);
+            return SelectPropertyPage(sheet, sheet->selected, true) ? TRUE : FALSE;
+        }
+        if (!sheet) return FALSE;
+
+        if (message == WM_COMMAND)
+        {
+            const UINT command = LOWORD(wParam);
+            if (command == IDOK)
+            {
+                ApplyPropertyPages(sheet, true);
+                return TRUE;
+            }
+            if (command == IDCANCEL)
+            {
+                CancelPropertySheet(sheet);
+                return TRUE;
+            }
+            if (command == PropertyApplyId)
+            {
+                ApplyPropertyPages(sheet, false);
+                return TRUE;
+            }
+        }
+        if (message == WM_CLOSE)
+        {
+            CancelPropertySheet(sheet);
+            return TRUE;
+        }
+        if (message == WM_NOTIFY && lParam)
+        {
+            const auto header = reinterpret_cast<const PropertySheetNotification::Header*>(lParam);
+            if (header->hwndFrom == sheet->tabControl &&
+                header->code == TabNotifySelectionChange)
+            {
+                GuestWindowManager* manager = CurrentGuestWindowManager();
+                const LRESULT selected = manager
+                    ? manager->SendGuestMessage(
+                        sheet->tabControl, TabGetCurrentSelection, 0, 0, nullptr)
+                    : -1;
+                if (selected >= 0) SelectPropertyPage(sheet, static_cast<UINT>(selected), false);
+                return TRUE;
+            }
+        }
+        if (message == PropertySheetChanged)
+        {
+            SetPropertySheetDirty(sheet, true);
+            return TRUE;
+        }
+        if (message == PropertySheetUnchanged)
+        {
+            SetPropertySheetDirty(sheet, false);
+            return TRUE;
+        }
+        if (message == PropertySheetSetCurrent)
+        {
+            return SelectPropertyPage(sheet, static_cast<UINT>(wParam), false) ? TRUE : FALSE;
+        }
+        if (message == PropertySheetApply)
+        {
+            return ApplyPropertyPages(sheet, false) ? TRUE : FALSE;
+        }
+        if (message == PropertySheetGetCurrentPage)
+        {
+            return reinterpret_cast<LRESULT>(sheet->pages[sheet->selected].window);
+        }
+        if (message == PropertySheetGetTabControl)
+        {
+            return reinterpret_cast<LRESULT>(sheet->tabControl);
+        }
+        if (message == PropertySheetQuerySiblings)
+        {
+            GuestWindowManager* manager = CurrentGuestWindowManager();
+            if (!manager) return 0;
+            for (const auto& page : sheet->pages)
+            {
+                if (!page.window) continue;
+                const LRESULT result = manager->SendGuestMessage(
+                    page.window, PropertySheetQuerySiblings, wParam, lParam, nullptr);
+                if (result) return result;
+            }
+            return 0;
+        }
+        if (message == PropertySheetPressButton)
+        {
+            // PSBTN_OK=3, PSBTN_APPLYNOW=4, PSBTN_CANCEL=5.
+            const UINT button = static_cast<UINT>(wParam);
+            if (button == 3) ApplyPropertyPages(sheet, true);
+            else if (button == 4) ApplyPropertyPages(sheet, false);
+            else if (button == 5) CancelPropertySheet(sheet);
+            return TRUE;
+        }
+        if (message == WM_NCDESTROY)
+        {
+            BridgeSetWindowLongPtrW(dialog, GWLP_USERDATA, 0);
+        }
+        return FALSE;
+    }
+
+    DialogItem PropertySheetButton(
+        DWORD id,
+        short x,
+        short y,
+        short width,
+        const std::wstring& title,
+        bool defaultButton = false)
+    {
+        DialogItem item;
+        item.style = DialogVisibleStyle | DialogTabStopStyle |
+            (defaultButton ? ButtonDefaultPush : 0);
+        item.x = x;
+        item.y = y;
+        item.width = width;
+        item.height = 14;
+        item.id = id;
+        item.windowClass.ordinal = true;
+        item.windowClass.id = 0x0080;
+        item.title.text = title;
+        return item;
     }
 
     INT_PTR CALLBACK MessageBoxDialogProcedure(HWND dialog, UINT message, WPARAM wParam, LPARAM)
@@ -876,12 +1382,131 @@ INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResource(
         procedure, initParameter, 0, 0, nullptr);
 }
 
+INT_PTR Win32Bridge::Bridge::ShowGuestPropertySheet(
+    const GuestPropertySheetDescriptor& descriptor)
+{
+    if (!descriptor.pages || descriptor.pageCount == 0 || descriptor.pageCount > 256)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return -1;
+    }
+
+    PropertySheetRuntime runtime;
+    runtime.parent = descriptor.parent;
+    runtime.selected = (std::min)(descriptor.startPage, descriptor.pageCount - 1);
+
+    short maximumWidth = 1;
+    short maximumHeight = 1;
+    for (UINT index = 0; index < descriptor.pageCount; ++index)
+    {
+        const GuestPropertyPageDescriptor& source = descriptor.pages[index];
+        const bool resourcePage = source.templateName && source.dialogProcedure;
+        const bool fieldPage = source.fields && source.fieldCount != 0;
+        if (!resourcePage && !fieldPage)
+        {
+            BridgeSetLastError(ERROR_INVALID_DATA);
+            return -1;
+        }
+
+        DialogTemplate pageTemplate;
+        PropertyPageRuntime page;
+        page.instance = source.instance;
+        page.templateName = source.templateName;
+        page.procedure = source.dialogProcedure;
+        page.initParameter = source.initParameter;
+        if (fieldPage)
+        {
+            page.fields.reserve(source.fieldCount);
+            for (UINT fieldIndex = 0; fieldIndex < source.fieldCount; ++fieldIndex)
+            {
+                page.fields.emplace_back(
+                    source.fields[fieldIndex].name ? source.fields[fieldIndex].name : L"",
+                    source.fields[fieldIndex].value ? source.fields[fieldIndex].value : L"");
+            }
+            if (!BuildPropertyFieldsDialog(page, &pageTemplate))
+            {
+                BridgeSetLastError(ERROR_INVALID_DATA);
+                return -1;
+            }
+        }
+        else if (!ParseDialogResource(source.instance, source.templateName, &pageTemplate))
+        {
+            BridgeSetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
+            return -1;
+        }
+
+        if (source.title && *source.title)
+            page.title = source.title;
+        else if (!pageTemplate.title.ordinal && !pageTemplate.title.text.empty())
+            page.title = pageTemplate.title.text;
+        else
+            page.title = L"Page " + std::to_wstring(index + 1);
+        runtime.pages.push_back(std::move(page));
+        maximumWidth = (std::max)(maximumWidth, pageTemplate.width);
+        maximumHeight = (std::max)(maximumHeight, pageTemplate.height);
+    }
+
+    DialogTemplate host;
+    host.style = DialogPopupStyle | DialogCaptionStyle | DialogSystemMenuStyle |
+        DialogModalFrameStyle | DialogCenterStyle | DialogSetFont;
+    const int footerWidth = (descriptor.flags & 0x00000080u) == 0
+        ? 6 + 3 * 46 + 2 * 4 + 6
+        : 6 + 2 * 46 + 4 + 6;
+    host.width = static_cast<short>((std::min)(32767,
+        (std::max)(footerWidth, static_cast<int>(maximumWidth) + 12)));
+    host.height = static_cast<short>((std::min)(32767,
+        static_cast<int>(maximumHeight) + 48));
+    host.title.text = descriptor.caption && *descriptor.caption
+        ? descriptor.caption
+        : L"Properties";
+    host.font.present = true;
+    host.font.pointSize = 9;
+    host.font.weight = FW_NORMAL;
+    host.font.face.text = L"Segoe UI";
+
+    DialogItem tab;
+    tab.style = DialogChildStyle | DialogVisibleStyle | DialogTabStopStyle;
+    tab.x = 4;
+    tab.y = 4;
+    tab.width = static_cast<short>(host.width - 8);
+    tab.height = static_cast<short>(host.height - 32);
+    tab.id = PropertyTabId;
+    tab.windowClass.text = L"SysTabControl32";
+    host.items.push_back(std::move(tab));
+
+    const short buttonY = static_cast<short>(host.height - 22);
+    const short buttonWidth = 46;
+    short buttonX = static_cast<short>(host.width - 6 - buttonWidth);
+    host.items.push_back(PropertySheetButton(IDCANCEL, buttonX, buttonY, buttonWidth, L"Cancel"));
+    buttonX = static_cast<short>(buttonX - buttonWidth - 4);
+    if ((descriptor.flags & 0x00000080u) == 0) // PSH_NOAPPLYNOW
+    {
+        host.items.push_back(PropertySheetButton(
+            PropertyApplyId, buttonX, buttonY, buttonWidth, L"Apply"));
+        buttonX = static_cast<short>(buttonX - buttonWidth - 4);
+    }
+    host.items.push_back(PropertySheetButton(IDOK, buttonX, buttonY, buttonWidth, L"OK", true));
+
+    RuntimeDiagnostics::Record(
+        L"PROPERTYSHEET HOST: creating " + std::to_wstring(descriptor.pageCount) +
+        L" page(s), starting at " + std::to_wstring(runtime.selected) + L".");
+    return RunGuestDialog(
+        descriptor.instance,
+        host,
+        descriptor.parent,
+        &PropertySheetDialogProcedure,
+        reinterpret_cast<LPARAM>(&runtime));
+}
+
 int Win32Bridge::Bridge::ShowGuestMessageBox(
     HWND owner,
     LPCWSTR text,
     LPCWSTR caption,
     UINT type)
 {
+    RuntimeDiagnostics::Record(
+        L"MESSAGE BOX: [" + std::wstring(caption ? caption : L"") + L"] " +
+        std::wstring(text ? text : L""));
     DialogTemplate dialog;
     dialog.style = DialogPopupStyle | DialogCaptionStyle | DialogSystemMenuStyle |
         DialogModalFrameStyle | DialogCenterStyle | DialogSetFont;
