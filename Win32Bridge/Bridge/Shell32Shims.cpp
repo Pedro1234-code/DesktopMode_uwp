@@ -1,13 +1,19 @@
 #include "pch.h"
 #include "Bridge/Shell32Shims.h"
 #include "Bridge/Kernel32Shims.h"
+#include "Bridge/CommonControlsShims.h"
+#include "Bridge/GuestResources.h"
+#include "Bridge/GuestStorage.h"
 #include "Bridge/OleShims.h"
+#include "Bridge/PeMapper.h"
 #include "Bridge/RuntimeDiagnostics.h"
+#include "Bridge/User32Shims.h"
 
 #include <algorithm>
 #include <atomic>
 #include <cstddef>
 #include <new>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +55,39 @@ namespace
     constexpr int CsidlDrives = 0x0011;
     constexpr int CsidlAppData = 0x001a;
     constexpr int CsidlLocalAppData = 0x001c;
+    constexpr UINT ShgfiIcon = 0x00000100;
+    constexpr UINT ShgfiSysIconIndex = 0x00004000;
+    constexpr UINT ShgfiSmallIcon = 0x00000001;
+
+    struct ShellImageList final
+    {
+        Win32Bridge::Bridge::GuestImageList handle = nullptr;
+        HICON file = nullptr;
+        HICON folder = nullptr;
+    };
+    std::mutex g_shellImagesLock;
+    ShellImageList g_smallShellImages;
+    ShellImageList g_largeShellImages;
+
+    ShellImageList* EnsureShellImages(bool useSmallIcons)
+    {
+        std::lock_guard<std::mutex> guard(g_shellImagesLock);
+        ShellImageList& images = useSmallIcons ? g_smallShellImages : g_largeShellImages;
+        if (images.handle) return &images;
+        const int extent = useSmallIcons ? 16 : 32;
+        images.handle = Win32Bridge::Bridge::BridgeImageListCreate(extent, extent, 0, 2, 1);
+        images.file = Win32Bridge::Bridge::CreateGuestShellIcon(false, extent);
+        images.folder = Win32Bridge::Bridge::CreateGuestShellIcon(true, extent);
+        if (!images.handle || !images.file || !images.folder ||
+            Win32Bridge::Bridge::BridgeImageListReplaceIcon(images.handle, -1, images.file) != 0 ||
+            Win32Bridge::Bridge::BridgeImageListReplaceIcon(images.handle, -1, images.folder) != 1)
+        {
+            if (images.handle) Win32Bridge::Bridge::BridgeImageListDestroy(images.handle);
+            images = ShellImageList{};
+            return nullptr;
+        }
+        return &images;
+    }
 
     // PIDLs normally identify shell-namespace objects. The UWP bridge has no
     // host desktop namespace to expose, so its PIDLs describe nodes in one
@@ -698,13 +737,30 @@ DWORD_PTR WINAPI Win32Bridge::Bridge::BridgeSHGetFileInfoW(LPCWSTR path, DWORD a
         directory = result->attributes != INVALID_FILE_ATTRIBUTES &&
             (result->attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     }
-    wcsncpy_s(result->displayName, _countof(result->displayName), display.c_str(), _TRUNCATE);
-    wcsncpy_s(result->typeName, _countof(result->typeName),
-        directory ? L"File folder" : L"File", _TRUNCATE);
+    if (size >= offsetof(GuestShellFileInfoW, displayName) + sizeof(result->displayName))
+        wcsncpy_s(result->displayName, _countof(result->displayName), display.c_str(), _TRUNCATE);
+    if (size >= offsetof(GuestShellFileInfoW, typeName) + sizeof(result->typeName))
+        wcsncpy_s(result->typeName, _countof(result->typeName),
+            directory ? L"File folder" : L"File", _TRUNCATE);
+    DWORD_PTR returnValue = 1;
+    if ((flags & (ShgfiIcon | ShgfiSysIconIndex)) != 0)
+    {
+        ShellImageList* images = EnsureShellImages((flags & ShgfiSmallIcon) != 0);
+        if (!images) return 0;
+        result->iconIndex = directory ? 1 : 0;
+        if ((flags & ShgfiIcon) != 0)
+        {
+            result->icon = reinterpret_cast<HICON>(BridgeCopyImage(
+                directory ? images->folder : images->file, IMAGE_ICON, 0, 0, 0));
+            if (!result->icon) return 0;
+        }
+        if ((flags & ShgfiSysIconIndex) != 0)
+            returnValue = reinterpret_cast<DWORD_PTR>(images->handle);
+    }
     RuntimeDiagnostics::Record(flags & ShgfiPidl
         ? L"SHELL: SHGetFileInfoW resolved bridge PIDL metadata."
         : L"SHELL: SHGetFileInfoW resolved virtual path metadata.");
-    return 1;
+    return returnValue;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeSHGetPathFromIDListW(PVOID itemIdList, LPWSTR path)
@@ -723,11 +779,66 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeSHGetPathFromIDListW(PVOID itemIdList, LP
     return TRUE;
 }
 
-UINT WINAPI Win32Bridge::Bridge::BridgeExtractIconExW(LPCWSTR, int, HICON* largeIcons, HICON* smallIcons, UINT iconCount)
+UINT WINAPI Win32Bridge::Bridge::BridgeExtractIconExW(
+    LPCWSTR fileName, int iconIndex, HICON* largeIcons, HICON* smallIcons, UINT iconCount)
 {
     if (largeIcons) for (UINT index = 0; index < iconCount; ++index) largeIcons[index] = nullptr;
     if (smallIcons) for (UINT index = 0; index < iconCount; ++index) smallIcons[index] = nullptr;
-    return 0;
+    GuestStorageContext* storage = CurrentGuestStorageContext();
+    std::vector<BYTE> file;
+    DWORD error = ERROR_SUCCESS;
+    if (!fileName || !storage || !storage->ReadAllBytes(fileName, &file, &error)) return 0;
+    MappedPeImage mapped;
+    std::wstring mapError;
+    if (!PeMapper::Materialize(file.data(), file.size(), &mapped, &mapError)) return 0;
+    GuestResourceScope scope(mapped.bytes.data(), mapped.bytes.size());
+    std::vector<GuestResourceIdentifier> names;
+    if (EnumerateGuestResourceNames(nullptr, MAKEINTRESOURCEW(14), &names) != GuestResourceStatus::Success)
+        return 0;
+    if (iconIndex == -1 && !largeIcons && !smallIcons) return static_cast<UINT>(names.size());
+    size_t first = iconIndex >= 0 ? static_cast<size_t>(iconIndex) : 0;
+    if (iconIndex < -1)
+    {
+        const WORD requested = static_cast<WORD>(-iconIndex);
+        const auto found = std::find_if(names.begin(), names.end(), [requested](const GuestResourceIdentifier& name)
+            { return name.ordinal && name.id == requested; });
+        if (found == names.end()) return 0;
+        first = static_cast<size_t>(std::distance(names.begin(), found));
+    }
+    if (first >= names.size() || iconCount == 0) return 0;
+    const UINT available = static_cast<UINT>((std::min)(static_cast<size_t>(iconCount), names.size() - first));
+    UINT extracted = 0;
+    for (UINT output = 0; output < available; ++output)
+    {
+        const GuestResourceIdentifier& name = names[first + output];
+        const LPCWSTR resource = name.ordinal ? MAKEINTRESOURCEW(name.id) : name.text.c_str();
+        HICON large = largeIcons ? reinterpret_cast<HICON>(BridgeLoadImageW(
+            nullptr, resource, IMAGE_ICON, 32, 32, LR_DEFAULTCOLOR)) : nullptr;
+        HICON smallIcon = smallIcons ? reinterpret_cast<HICON>(BridgeLoadImageW(
+            nullptr, resource, IMAGE_ICON, 16, 16, LR_DEFAULTCOLOR)) : nullptr;
+        if ((largeIcons && !large) || (smallIcons && !smallIcon))
+        {
+            if (large) BridgeDestroyIcon(large);
+            if (smallIcon) BridgeDestroyIcon(smallIcon);
+            break;
+        }
+        if (largeIcons) largeIcons[output] = large;
+        if (smallIcons) smallIcons[output] = smallIcon;
+        ++extracted;
+    }
+    return extracted;
+}
+
+UINT WINAPI Win32Bridge::Bridge::BridgeExtractIconExA(
+    LPCSTR fileName, int iconIndex, HICON* largeIcons, HICON* smallIcons, UINT iconCount)
+{
+    if (!fileName) return 0;
+    const int required = MultiByteToWideChar(CP_ACP, 0, fileName, -1, nullptr, 0);
+    if (required <= 0) return 0;
+    std::wstring wide(static_cast<size_t>(required), L'\0');
+    if (MultiByteToWideChar(CP_ACP, 0, fileName, -1, &wide[0], required) != required) return 0;
+    wide.resize(static_cast<size_t>(required - 1));
+    return BridgeExtractIconExW(wide.c_str(), iconIndex, largeIcons, smallIcons, iconCount);
 }
 HRESULT WINAPI Win32Bridge::Bridge::BridgeSHGetDesktopFolder(PVOID* desktopFolder)
 {
@@ -857,6 +968,8 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveShell32Import(
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHGetPathFromIDListW);
     else if (_wcsicmp(symbol.name.c_str(), L"extracticonexw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtractIconExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"extracticonexa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtractIconExA);
     else if (_wcsicmp(symbol.name.c_str(), L"shgetdesktopfolder") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHGetDesktopFolder);
     else if (_wcsicmp(symbol.name.c_str(), L"shgetspecialfolderlocation") == 0)

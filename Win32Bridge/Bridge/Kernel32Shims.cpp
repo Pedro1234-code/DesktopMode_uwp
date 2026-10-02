@@ -1,7 +1,9 @@
 #include "pch.h"
 #include "Bridge\\Kernel32Shims.h"
+#include "Bridge/ActivationContext.h"
 #include "Bridge\\GuestKernel.h"
 #include "Bridge\\GuestModule.h"
+#include "Bridge\\GuestResources.h"
 #include "Bridge\\GuestStorage.h"
 #include "Bridge\\RuntimeDiagnostics.h"
 #include "Bridge\\Win32Shims.h"
@@ -10,7 +12,9 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace Win32Bridge::Bridge;
@@ -22,6 +26,9 @@ namespace
     std::atomic<DWORD> g_nextGuestThreadId{ 1 };
     std::atomic<DWORD> g_guestDllDirectoryFlags{ 0 };
     std::atomic<unsigned> g_storageEnumerationDiagnostics{ 0 };
+    std::atomic<ULONG_PTR> g_nextGuestResourceHandle{ 0x73000000 };
+    std::mutex g_guestResourcesLock;
+    std::unordered_map<ULONG_PTR, GuestResourceData> g_guestResources;
 
     void RecordStorageEnumeration(const wchar_t* message)
     {
@@ -63,6 +70,7 @@ namespace
         { L"advapi32.dll", BridgeSystemModuleBaseToken + 9 },
         { L"comdlg32.dll", BridgeSystemModuleBaseToken + 10 },
         { L"msvcrt.dll", BridgeSystemModuleBaseToken + 11 },
+        { L"version.dll", BridgeSystemModuleBaseToken + 12 },
     };
 
     HMODULE GuestMainModule()
@@ -73,6 +81,273 @@ namespace
     bool IsGuestMainModule(HMODULE module)
     {
         return module == nullptr || module == GuestMainModule();
+    }
+
+    DWORD ResourceStatusError(GuestResourceStatus status)
+    {
+        switch (status)
+        {
+        case GuestResourceStatus::Success: return ERROR_SUCCESS;
+        case GuestResourceStatus::InvalidParameter: return ERROR_INVALID_PARAMETER;
+        case GuestResourceStatus::ModuleNotFound: return ERROR_MOD_NOT_FOUND;
+        case GuestResourceStatus::TypeNotFound: return ERROR_RESOURCE_TYPE_NOT_FOUND;
+        case GuestResourceStatus::NameNotFound: return ERROR_RESOURCE_NAME_NOT_FOUND;
+        case GuestResourceStatus::LanguageNotFound: return ERROR_RESOURCE_LANG_NOT_FOUND;
+        case GuestResourceStatus::InvalidImage:
+        case GuestResourceStatus::InvalidData:
+        default:
+            return ERROR_RESOURCE_DATA_NOT_FOUND;
+        }
+    }
+
+    HRSRC RegisterGuestResource(const GuestResourceData& resource)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_guestResourcesLock);
+            for (const auto& existing : g_guestResources)
+            {
+                if (existing.second.module == resource.module &&
+                    existing.second.data == resource.data &&
+                    existing.second.size == resource.size &&
+                    existing.second.language == resource.language)
+                {
+                    return reinterpret_cast<HRSRC>(existing.first);
+                }
+            }
+            ULONG_PTR token = g_nextGuestResourceHandle.fetch_add(1);
+            if (token <= 0xffff)
+            {
+                token = 0x73000000;
+                g_nextGuestResourceHandle.store(token + 1);
+            }
+            g_guestResources[token] = resource;
+            return reinterpret_cast<HRSRC>(token);
+        }
+        catch (...)
+        {
+            return nullptr;
+        }
+    }
+
+    bool LookupGuestResource(HANDLE handle, GuestResourceData* resource)
+    {
+        if (!handle || !resource)
+        {
+            return false;
+        }
+        try
+        {
+            std::lock_guard<std::mutex> guard(g_guestResourcesLock);
+            const auto found = g_guestResources.find(reinterpret_cast<ULONG_PTR>(handle));
+            if (found == g_guestResources.end())
+            {
+                return false;
+            }
+            *resource = found->second;
+            return true;
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool ResourceModuleMatches(HMODULE requested, HMODULE actual)
+    {
+        if (IsGuestMainModule(requested) ||
+            reinterpret_cast<const BYTE*>(requested) == CurrentGuestImageBase())
+        {
+            return actual == GuestMainModule();
+        }
+        return requested == actual;
+    }
+
+    HMODULE NormalizeResourceModule(HMODULE module)
+    {
+        return IsGuestMainModule(module) ||
+            reinterpret_cast<const BYTE*>(module) == CurrentGuestImageBase()
+            ? GuestMainModule()
+            : module;
+    }
+
+    bool EnumeratesLocalResources(DWORD flags)
+    {
+        // MUI satellite probing is intentionally deferred. Zero is the legacy
+        // API behavior; otherwise enumerate the language-neutral image only
+        // when RESOURCE_ENUM_LN is explicitly requested.
+        return flags == 0 || (flags & RESOURCE_ENUM_LN) != 0;
+    }
+
+    LPWSTR ResourceIdentifierPointer(const GuestResourceIdentifier& identifier)
+    {
+        return identifier.ordinal
+            ? reinterpret_cast<LPWSTR>(static_cast<ULONG_PTR>(identifier.id))
+            : const_cast<LPWSTR>(identifier.text.c_str());
+    }
+
+    bool ConvertAnsiResourceIdentifier(
+        LPCSTR value,
+        std::wstring* storage,
+        LPCWSTR* converted)
+    {
+        if (!value || !storage || !converted)
+        {
+            return false;
+        }
+        storage->clear();
+        const ULONG_PTR raw = reinterpret_cast<ULONG_PTR>(value);
+        if (raw <= 0xffff)
+        {
+            *converted = reinterpret_cast<LPCWSTR>(raw);
+            return true;
+        }
+        const int required = ::MultiByteToWideChar(CP_ACP, 0, value, -1, nullptr, 0);
+        if (required <= 0)
+        {
+            return false;
+        }
+        storage->resize(static_cast<size_t>(required));
+        if (::MultiByteToWideChar(CP_ACP, 0, value, -1, &(*storage)[0], required) != required)
+        {
+            storage->clear();
+            return false;
+        }
+        storage->resize(static_cast<size_t>(required - 1));
+        *converted = storage->c_str();
+        return true;
+    }
+
+    LPSTR ConvertResourceIdentifierToAnsi(
+        const GuestResourceIdentifier& identifier,
+        std::string* storage)
+    {
+        if (identifier.ordinal)
+        {
+            return reinterpret_cast<LPSTR>(static_cast<ULONG_PTR>(identifier.id));
+        }
+        if (!storage)
+        {
+            return nullptr;
+        }
+        storage->clear();
+        const int required = ::WideCharToMultiByte(
+            CP_ACP, 0, identifier.text.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (required <= 0)
+        {
+            return nullptr;
+        }
+        storage->resize(static_cast<size_t>(required));
+        if (::WideCharToMultiByte(
+            CP_ACP, 0, identifier.text.c_str(), -1, &(*storage)[0], required,
+            nullptr, nullptr) != required)
+        {
+            storage->clear();
+            return nullptr;
+        }
+        return &(*storage)[0];
+    }
+
+    BOOL InvokeEnumResourceTypeA(
+        ENUMRESTYPEPROCA callback,
+        HMODULE module,
+        LPSTR type,
+        LONG_PTR parameter)
+    {
+        __try
+        {
+            return callback(module, type, parameter);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return FALSE;
+        }
+    }
+
+    BOOL InvokeEnumResourceNameA(
+        ENUMRESNAMEPROCA callback,
+        HMODULE module,
+        LPCSTR type,
+        LPSTR name,
+        LONG_PTR parameter)
+    {
+        __try
+        {
+            return callback(module, type, name, parameter);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return FALSE;
+        }
+    }
+
+    BOOL InvokeEnumResourceLanguageA(
+        ENUMRESLANGPROCA callback,
+        HMODULE module,
+        LPCSTR type,
+        LPCSTR name,
+        WORD language,
+        LONG_PTR parameter)
+    {
+        __try
+        {
+            return callback(module, type, name, language, parameter);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return FALSE;
+        }
+    }
+
+    BOOL InvokeEnumResourceType(
+        ENUMRESTYPEPROCW callback,
+        HMODULE module,
+        LPWSTR type,
+        LONG_PTR parameter)
+    {
+        __try
+        {
+            return callback(module, type, parameter);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return FALSE;
+        }
+    }
+
+    BOOL InvokeEnumResourceName(
+        ENUMRESNAMEPROCW callback,
+        HMODULE module,
+        LPCWSTR type,
+        LPWSTR name,
+        LONG_PTR parameter)
+    {
+        __try
+        {
+            return callback(module, type, name, parameter);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return FALSE;
+        }
+    }
+
+    BOOL InvokeEnumResourceLanguage(
+        ENUMRESLANGPROCW callback,
+        HMODULE module,
+        LPCWSTR type,
+        LPCWSTR name,
+        WORD language,
+        LONG_PTR parameter)
+    {
+        __try
+        {
+            return callback(module, type, name, language, parameter);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return FALSE;
+        }
     }
 
     const wchar_t* FileNameFromPath(LPCWSTR value)
@@ -107,7 +382,13 @@ namespace
             }
         }
 
-        // API-set DLLs are aliases for the bridge's kernel layer. This keeps
+        if (_wcsnicmp(fileName, L"api-ms-win-core-version-", 24) == 0)
+        {
+            for (const auto& candidate : BridgeSystemModules)
+                if (_wcsicmp(candidate.library, L"version.dll") == 0) return &candidate;
+        }
+
+        // Other API-set DLLs are aliases for the bridge's kernel layer. This keeps
         // dynamic API-set probes from reaching the host loader.
         if (_wcsnicmp(fileName, L"api-ms-win-core-", 16) == 0)
         {
@@ -289,6 +570,13 @@ namespace
         return !path || !*path || _wcsicmp(path, L"C:") == 0 ||
             _wcsicmp(path, L"C:\\") == 0;
     }
+}
+
+void Win32Bridge::Bridge::ResetGuestResourceHandles()
+{
+    std::lock_guard<std::mutex> guard(g_guestResourcesLock);
+    g_guestResources.clear();
+    g_nextGuestResourceHandle.store(0x73000000);
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileW(
@@ -836,19 +1124,27 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeExpandEnvironmentStringsW(LPCWSTR source
 
 DWORD WINAPI Win32Bridge::Bridge::BridgeGetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD bufferLength)
 {
-    if (!IsGuestMainModule(module))
+    std::wstring path;
+    if (IsGuestMainModule(module))
     {
-        SetGuestLastError(ERROR_MOD_NOT_FOUND);
-        return 0;
+        GuestStorageContext* storage = CurrentStorageOrFail();
+        if (!storage) return 0;
+        path = storage->ModulePath();
     }
-    GuestStorageContext* storage = CurrentStorageOrFail();
-    if (!storage)
+    else
     {
-        return 0;
+        GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
+        if (!loader) return 0;
+        DWORD error = ERROR_SUCCESS;
+        if (!loader->GetModulePath(module, &path, &error))
+        {
+            SetGuestLastError(error);
+            return 0;
+        }
     }
 
     DWORD result = 0;
-    CopyGuestString(storage->ModulePath(), bufferLength, buffer, &result);
+    CopyGuestString(path, bufferLength, buffer, &result);
     return result;
 }
 
@@ -867,14 +1163,23 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleW(LPCWSTR moduleName)
         return nullptr;
     }
 
-    if (!IsGuestModuleName(storage->ModulePath(), moduleName))
+    if (IsGuestModuleName(storage->ModulePath(), moduleName))
     {
-        SetGuestLastError(ERROR_MOD_NOT_FOUND);
-        return nullptr;
+        SetGuestLastError(ERROR_SUCCESS);
+        return GuestMainModule();
     }
 
+    GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
+    if (!loader) return nullptr;
+    DWORD error = ERROR_SUCCESS;
+    HMODULE module = nullptr;
+    if (!loader->GetModuleHandle(moduleName, &module, &error))
+    {
+        SetGuestLastError(error);
+        return nullptr;
+    }
     SetGuestLastError(ERROR_SUCCESS);
-    return GuestMainModule();
+    return module;
 }
 
 HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleA(LPCSTR moduleName)
@@ -895,6 +1200,451 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleA(LPCSTR moduleName)
         wideName.push_back(static_cast<wchar_t>(value));
     }
     return BridgeGetModuleHandleW(wideName.c_str());
+}
+
+HRSRC WINAPI Win32Bridge::Bridge::BridgeFindResourceA(
+    HMODULE module,
+    LPCSTR name,
+    LPCSTR type)
+{
+    std::wstring wideNameStorage;
+    std::wstring wideTypeStorage;
+    LPCWSTR wideName = nullptr;
+    LPCWSTR wideType = nullptr;
+    if (!ConvertAnsiResourceIdentifier(name, &wideNameStorage, &wideName) ||
+        !ConvertAnsiResourceIdentifier(type, &wideTypeStorage, &wideType))
+    {
+        SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return nullptr;
+    }
+    return BridgeFindResourceW(module, wideName, wideType);
+}
+
+HRSRC WINAPI Win32Bridge::Bridge::BridgeFindResourceW(
+    HMODULE module,
+    LPCWSTR name,
+    LPCWSTR type)
+{
+    GuestResourceData resource;
+    const GuestResourceStatus status =
+        FindGuestResource(module, type, name, 0, false, &resource);
+    if (status != GuestResourceStatus::Success)
+    {
+        SetGuestLastError(ResourceStatusError(status));
+        return nullptr;
+    }
+    const HRSRC handle = RegisterGuestResource(resource);
+    SetGuestLastError(handle ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    return handle;
+}
+
+HRSRC WINAPI Win32Bridge::Bridge::BridgeFindResourceExA(
+    HMODULE module,
+    LPCSTR type,
+    LPCSTR name,
+    WORD language)
+{
+    std::wstring wideNameStorage;
+    std::wstring wideTypeStorage;
+    LPCWSTR wideName = nullptr;
+    LPCWSTR wideType = nullptr;
+    if (!ConvertAnsiResourceIdentifier(name, &wideNameStorage, &wideName) ||
+        !ConvertAnsiResourceIdentifier(type, &wideTypeStorage, &wideType))
+    {
+        SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return nullptr;
+    }
+    return BridgeFindResourceExW(module, wideType, wideName, language);
+}
+
+HRSRC WINAPI Win32Bridge::Bridge::BridgeFindResourceExW(
+    HMODULE module,
+    LPCWSTR type,
+    LPCWSTR name,
+    WORD language)
+{
+    GuestResourceData resource;
+    const GuestResourceStatus status =
+        FindGuestResource(module, type, name, language, true, &resource);
+    if (status != GuestResourceStatus::Success)
+    {
+        SetGuestLastError(ResourceStatusError(status));
+        return nullptr;
+    }
+    const HRSRC handle = RegisterGuestResource(resource);
+    SetGuestLastError(handle ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    return handle;
+}
+
+HGLOBAL WINAPI Win32Bridge::Bridge::BridgeLoadResource(HMODULE module, HRSRC resourceHandle)
+{
+    GuestResourceData resource;
+    if (!LookupGuestResource(resourceHandle, &resource) ||
+        !ResourceModuleMatches(module, resource.module))
+    {
+        SetGuestLastError(ERROR_INVALID_HANDLE);
+        return nullptr;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return reinterpret_cast<HGLOBAL>(resourceHandle);
+}
+
+LPVOID WINAPI Win32Bridge::Bridge::BridgeLockResource(HGLOBAL resourceHandle)
+{
+    GuestResourceData resource;
+    if (!LookupGuestResource(resourceHandle, &resource))
+    {
+        SetGuestLastError(ERROR_INVALID_HANDLE);
+        return nullptr;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return const_cast<BYTE*>(resource.data);
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeSizeofResource(HMODULE module, HRSRC resourceHandle)
+{
+    GuestResourceData resource;
+    if (!LookupGuestResource(resourceHandle, &resource) ||
+        !ResourceModuleMatches(module, resource.module))
+    {
+        SetGuestLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if (resource.size > MAXDWORD)
+    {
+        SetGuestLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
+        return 0;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return static_cast<DWORD>(resource.size);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeFreeResource(HGLOBAL resourceHandle)
+{
+    GuestResourceData resource;
+    if (!LookupGuestResource(resourceHandle, &resource))
+    {
+        SetGuestLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    // Resource bytes belong to the mapped image. FreeResource is obsolete on
+    // Win32 and does not release that storage; preserve the handle registry so
+    // a later LockResource remains valid for the image lifetime.
+    SetGuestLastError(ERROR_SUCCESS);
+    return FALSE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceTypesW(
+    HMODULE module,
+    ENUMRESTYPEPROCW callback,
+    LONG_PTR parameter)
+{
+    if (!callback)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::vector<GuestResourceIdentifier> types;
+    const GuestResourceStatus status = EnumerateGuestResourceTypes(module, &types);
+    if (status != GuestResourceStatus::Success)
+    {
+        SetGuestLastError(ResourceStatusError(status));
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    const HMODULE callbackModule = NormalizeResourceModule(module);
+    for (const auto& type : types)
+    {
+        if (!InvokeEnumResourceType(
+            callback, callbackModule, ResourceIdentifierPointer(type), parameter))
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceTypesA(
+    HMODULE module,
+    ENUMRESTYPEPROCA callback,
+    LONG_PTR parameter)
+{
+    if (!callback)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::vector<GuestResourceIdentifier> types;
+    const GuestResourceStatus status = EnumerateGuestResourceTypes(module, &types);
+    if (status != GuestResourceStatus::Success)
+    {
+        SetGuestLastError(ResourceStatusError(status));
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    const HMODULE callbackModule = NormalizeResourceModule(module);
+    for (const auto& type : types)
+    {
+        std::string ansiType;
+        LPSTR pointer = ConvertResourceIdentifierToAnsi(type, &ansiType);
+        if (!pointer)
+        {
+            SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+            return FALSE;
+        }
+        if (!InvokeEnumResourceTypeA(callback, callbackModule, pointer, parameter))
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceTypesExA(
+    HMODULE module,
+    ENUMRESTYPEPROCA callback,
+    LONG_PTR parameter,
+    DWORD flags,
+    LANGID)
+{
+    if (!EnumeratesLocalResources(flags))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return FALSE;
+    }
+    return BridgeEnumResourceTypesA(module, callback, parameter);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceTypesExW(
+    HMODULE module,
+    ENUMRESTYPEPROCW callback,
+    LONG_PTR parameter,
+    DWORD flags,
+    LANGID)
+{
+    if (!EnumeratesLocalResources(flags))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return FALSE;
+    }
+    return BridgeEnumResourceTypesW(module, callback, parameter);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceNamesW(
+    HMODULE module,
+    LPCWSTR type,
+    ENUMRESNAMEPROCW callback,
+    LONG_PTR parameter)
+{
+    if (!callback || !type)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::vector<GuestResourceIdentifier> names;
+    const GuestResourceStatus status = EnumerateGuestResourceNames(module, type, &names);
+    if (status != GuestResourceStatus::Success)
+    {
+        SetGuestLastError(ResourceStatusError(status));
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    const HMODULE callbackModule = NormalizeResourceModule(module);
+    for (const auto& name : names)
+    {
+        if (!InvokeEnumResourceName(
+            callback, callbackModule, type, ResourceIdentifierPointer(name), parameter))
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceNamesA(
+    HMODULE module,
+    LPCSTR type,
+    ENUMRESNAMEPROCA callback,
+    LONG_PTR parameter)
+{
+    if (!callback || !type)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::wstring wideTypeStorage;
+    LPCWSTR wideType = nullptr;
+    if (!ConvertAnsiResourceIdentifier(type, &wideTypeStorage, &wideType))
+    {
+        SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return FALSE;
+    }
+    std::vector<GuestResourceIdentifier> names;
+    const GuestResourceStatus status = EnumerateGuestResourceNames(module, wideType, &names);
+    if (status != GuestResourceStatus::Success)
+    {
+        SetGuestLastError(ResourceStatusError(status));
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    const HMODULE callbackModule = NormalizeResourceModule(module);
+    for (const auto& name : names)
+    {
+        std::string ansiName;
+        LPSTR pointer = ConvertResourceIdentifierToAnsi(name, &ansiName);
+        if (!pointer)
+        {
+            SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+            return FALSE;
+        }
+        if (!InvokeEnumResourceNameA(callback, callbackModule, type, pointer, parameter))
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceNamesExA(
+    HMODULE module,
+    LPCSTR type,
+    ENUMRESNAMEPROCA callback,
+    LONG_PTR parameter,
+    DWORD flags,
+    LANGID)
+{
+    if (!EnumeratesLocalResources(flags))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return FALSE;
+    }
+    return BridgeEnumResourceNamesA(module, type, callback, parameter);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceNamesExW(
+    HMODULE module,
+    LPCWSTR type,
+    ENUMRESNAMEPROCW callback,
+    LONG_PTR parameter,
+    DWORD flags,
+    LANGID)
+{
+    if (!EnumeratesLocalResources(flags))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return FALSE;
+    }
+    return BridgeEnumResourceNamesW(module, type, callback, parameter);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceLanguagesW(
+    HMODULE module,
+    LPCWSTR type,
+    LPCWSTR name,
+    ENUMRESLANGPROCW callback,
+    LONG_PTR parameter)
+{
+    if (!callback || !type || !name)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::vector<LANGID> languages;
+    const GuestResourceStatus status =
+        EnumerateGuestResourceLanguages(module, type, name, &languages);
+    if (status != GuestResourceStatus::Success)
+    {
+        SetGuestLastError(ResourceStatusError(status));
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    const HMODULE callbackModule = NormalizeResourceModule(module);
+    for (LANGID language : languages)
+    {
+        if (!InvokeEnumResourceLanguage(
+            callback, callbackModule, type, name, language, parameter))
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceLanguagesA(
+    HMODULE module,
+    LPCSTR type,
+    LPCSTR name,
+    ENUMRESLANGPROCA callback,
+    LONG_PTR parameter)
+{
+    if (!callback || !type || !name)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::wstring wideTypeStorage;
+    std::wstring wideNameStorage;
+    LPCWSTR wideType = nullptr;
+    LPCWSTR wideName = nullptr;
+    if (!ConvertAnsiResourceIdentifier(type, &wideTypeStorage, &wideType) ||
+        !ConvertAnsiResourceIdentifier(name, &wideNameStorage, &wideName))
+    {
+        SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return FALSE;
+    }
+    std::vector<LANGID> languages;
+    const GuestResourceStatus status =
+        EnumerateGuestResourceLanguages(module, wideType, wideName, &languages);
+    if (status != GuestResourceStatus::Success)
+    {
+        SetGuestLastError(ResourceStatusError(status));
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    const HMODULE callbackModule = NormalizeResourceModule(module);
+    for (LANGID language : languages)
+    {
+        if (!InvokeEnumResourceLanguageA(
+            callback, callbackModule, type, name, language, parameter))
+        {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceLanguagesExA(
+    HMODULE module,
+    LPCSTR type,
+    LPCSTR name,
+    ENUMRESLANGPROCA callback,
+    LONG_PTR parameter,
+    DWORD flags,
+    LANGID)
+{
+    if (!EnumeratesLocalResources(flags))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return FALSE;
+    }
+    return BridgeEnumResourceLanguagesA(module, type, name, callback, parameter);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeEnumResourceLanguagesExW(
+    HMODULE module,
+    LPCWSTR type,
+    LPCWSTR name,
+    ENUMRESLANGPROCW callback,
+    LONG_PTR parameter,
+    DWORD flags,
+    LANGID)
+{
+    if (!EnumeratesLocalResources(flags))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return FALSE;
+    }
+    return BridgeEnumResourceLanguagesW(module, type, name, callback, parameter);
 }
 
 DWORD WINAPI Win32Bridge::Bridge::BridgeGetTickCount()
@@ -1374,7 +2124,7 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryW(LPCWSTR fileName)
     }
     DWORD error = ERROR_SUCCESS;
     HMODULE module = nullptr;
-    if (!loader->LoadLibrary(fileName, &module, &error))
+    if (!loader->LoadLibrary(fileName, &module, &error, g_guestDllDirectoryFlags.load()))
     {
         SetGuestLastError(error);
         return nullptr;
@@ -1408,12 +2158,36 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryA(LPCSTR fileName)
 
 HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExW(LPCWSTR fileName, HANDLE file, DWORD flags)
 {
-    if (file != nullptr || flags != 0)
+    constexpr DWORD supportedSearchFlags = 0x00000100u | // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+        0x00000200u | // LOAD_LIBRARY_SEARCH_APPLICATION_DIR
+        0x00000400u | // LOAD_LIBRARY_SEARCH_USER_DIRS
+        0x00000800u | // LOAD_LIBRARY_SEARCH_SYSTEM32
+        0x00001000u;  // LOAD_LIBRARY_SEARCH_DEFAULT_DIRS
+    if (file != nullptr || (flags & ~supportedSearchFlags) != 0)
     {
         SetGuestLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
-    return BridgeLoadLibraryW(fileName);
+    if (const BridgeSystemModule* systemModule = FindBridgeSystemModule(fileName))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        RuntimeDiagnostics::Record(L"LOAD LIBRARY EX: bridge " + std::wstring(systemModule->library) + L".");
+        return reinterpret_cast<HMODULE>(systemModule->token);
+    }
+
+    GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
+    if (!loader) return nullptr;
+
+    DWORD error = ERROR_SUCCESS;
+    HMODULE module = nullptr;
+    const DWORD effectiveFlags = flags == 0 ? g_guestDllDirectoryFlags.load() : flags;
+    if (!loader->LoadLibrary(fileName, &module, &error, effectiveFlags))
+    {
+        SetGuestLastError(error);
+        return nullptr;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return module;
 }
 
 FARPROC WINAPI Win32Bridge::Bridge::BridgeGetProcAddress(HMODULE module, LPCSTR nameOrOrdinal)
@@ -2328,6 +3102,64 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetModuleHandleW);
     else if (_wcsicmp(symbol.name.c_str(), L"getmodulehandlea") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetModuleHandleA);
+    else if (_wcsicmp(symbol.name.c_str(), L"findresourcea") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindResourceA);
+    else if (_wcsicmp(symbol.name.c_str(), L"findresourcew") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindResourceW);
+    else if (_wcsicmp(symbol.name.c_str(), L"findresourceexa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindResourceExA);
+    else if (_wcsicmp(symbol.name.c_str(), L"findresourceexw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindResourceExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadresource") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadResource);
+    else if (_wcsicmp(symbol.name.c_str(), L"lockresource") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLockResource);
+    else if (_wcsicmp(symbol.name.c_str(), L"sizeofresource") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSizeofResource);
+    else if (_wcsicmp(symbol.name.c_str(), L"freeresource") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeResource);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcetypesa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceTypesA);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcetypesw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceTypesW);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcetypesexa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceTypesExA);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcetypesexw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceTypesExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcenamesa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceNamesA);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcenamesw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceNamesW);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcenamesexa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceNamesExA);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcenamesexw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceNamesExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcelanguagesa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceLanguagesA);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcelanguagesw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceLanguagesW);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcelanguagesexa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceLanguagesExA);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumresourcelanguagesexw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumResourceLanguagesExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createactctxw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateActCtxW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createactctxa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateActCtxA);
+    else if (_wcsicmp(symbol.name.c_str(), L"addrefactctx") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAddRefActCtx);
+    else if (_wcsicmp(symbol.name.c_str(), L"releaseactctx") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReleaseActCtx);
+    else if (_wcsicmp(symbol.name.c_str(), L"activateactctx") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeActivateActCtx);
+    else if (_wcsicmp(symbol.name.c_str(), L"deactivateactctx") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDeactivateActCtx);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcurrentactctx") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCurrentActCtx);
+    else if (_wcsicmp(symbol.name.c_str(), L"queryactctxw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueryActCtxW);
+    else if (_wcsicmp(symbol.name.c_str(), L"queryactctxsettingsw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueryActCtxSettingsW);
     else if (_wcsicmp(symbol.name.c_str(), L"gettickcount") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTickCount);
     else if (_wcsicmp(symbol.name.c_str(), L"gettickcount64") == 0)

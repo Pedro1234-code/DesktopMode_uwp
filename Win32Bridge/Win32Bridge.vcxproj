@@ -96,7 +96,7 @@
   <ItemDefinitionGroup>
     <Link>
       <ModuleDefinitionFile>Win32Bridge.def</ModuleDefinitionFile>
-      <AdditionalDependencies>dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dwrite.lib;windowscodecs.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
@@ -142,6 +142,7 @@
     <ClInclude Include="RuntimeSession.h" />
     <ClInclude Include="Bridge\CompatibilityCatalog.h" />
     <ClInclude Include="Bridge\Advapi32Shims.h" />
+    <ClInclude Include="Bridge\ActivationContext.h" />
     <ClInclude Include="Bridge\CommonControlsShims.h" />
     <ClInclude Include="Bridge\Comdlg32Shims.h" />
     <ClInclude Include="Bridge\DialogResources.h" />
@@ -165,6 +166,7 @@
     <ClInclude Include="Bridge\PeMapper.h" />
     <ClInclude Include="Bridge\RuntimeImage.h" />
     <ClInclude Include="Bridge\User32Shims.h" />
+    <ClInclude Include="Bridge\VersionShims.h" />
     <ClInclude Include="Bridge\GuestWindow.h" />
     <ClInclude Include="Bridge\Win32Shims.h" />
   </ItemGroup>
@@ -173,6 +175,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Bridge\Advapi32Shims.cpp" />
+    <ClCompile Include="Bridge\ActivationContext.cpp" />
     <ClCompile Include="Bridge\CommonControlsShims.cpp" />
     <ClCompile Include="Bridge\Comdlg32Shims.cpp" />
     <ClCompile Include="Bridge\DialogResources.cpp" />
@@ -215,6 +218,7 @@
     </ClCompile>
     <ClCompile Include="Bridge\Win32Shims.cpp" />
     <ClCompile Include="Bridge\User32Shims.cpp" />
+    <ClCompile Include="Bridge\VersionShims.cpp" />
     <ClInclude Include="Bridge\GuestStorage.h" />
     <ClInclude Include="Bridge\Kernel32Shims.h" />
     <ClInclude Include="Bridge\VirtualPath.h" />

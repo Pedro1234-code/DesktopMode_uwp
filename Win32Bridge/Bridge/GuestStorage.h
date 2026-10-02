@@ -50,6 +50,7 @@ namespace Bridge
         // Internal module loading uses the same virtual filesystem as guest
         // CreateFile calls. It never exposes a host path to a PE.
         bool ReadAllBytes(LPCWSTR path, std::vector<BYTE>* bytes, DWORD* win32Error);
+        bool CanonicalPath(LPCWSTR path, std::wstring* canonical, DWORD* win32Error) const;
 
         bool CreateDirectory(LPCWSTR path, DWORD* win32Error);
         bool DeleteGuestFile(LPCWSTR path, DWORD* win32Error);

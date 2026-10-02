@@ -10,6 +10,7 @@
 #include "Bridge/Shell32Shims.h"
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge\\User32Shims.h"
+#include "Bridge/VersionShims.h"
 
 using namespace Win32Bridge::Bridge;
 
@@ -64,6 +65,8 @@ ULONGLONG MessageBoxWAdapterAddress()
 ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
+    const auto versionResolution = ResolveVersionImport(symbol);
+    if (versionResolution.targetAddress != 0) return versionResolution;
     if (_wcsicmp(symbol.library.c_str(), L"kernel32.dll") == 0 ||
         _wcsicmp(symbol.library.c_str(), L"kernelbase.dll") == 0 ||
         _wcsnicmp(symbol.library.c_str(), L"api-ms-win-core-", 16) == 0)

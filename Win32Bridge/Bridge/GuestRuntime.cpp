@@ -1,15 +1,23 @@
 #include "Bridge\\GuestRuntime.h"
+#include "Bridge/ActivationContext.h"
 #include "Bridge\\GuestKernel.h"
 #include "Bridge\\GuestModule.h"
 #include "Bridge/GuestRegistry.h"
 #include "Bridge/GuestResources.h"
 #include "Bridge\\GuestWindow.h"
+#include "Bridge/Kernel32Shims.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
 using namespace Win32Bridge::Bridge;
 
 namespace
 {
+    struct GuestResourceHandleScope final
+    {
+        GuestResourceHandleScope() { ResetGuestResourceHandles(); }
+        ~GuestResourceHandleScope() { ResetGuestResourceHandles(); }
+    };
+
     void SetError(std::wstring* error, const std::wstring& message)
     {
         if (error)
@@ -123,8 +131,10 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
     GuestKernelScope kernelScope(m_kernel.get());
     GuestModuleScope moduleScope(m_modules.get());
     GuestRegistryScope registryScope(m_registry.get());
+    GuestResourceHandleScope resourceHandleScope;
     GuestResourceScope resourceScope(m_runtime.Base(), m_runtime.Size());
     GuestStorageScope storageScope(m_storage.get());
+    GuestActivationContextScope activationContextScope;
     GuestWindowScope windowScope(m_windows.get());
     if (m_storage && !m_storage->EnsureLayout(error))
     {

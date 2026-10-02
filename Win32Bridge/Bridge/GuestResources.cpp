@@ -2,8 +2,10 @@
 #include "Bridge/GuestResources.h"
 
 #include "Bridge/GuestModule.h"
+#include "Bridge/PeMapper.h"
 
 #include <limits>
+#include <utility>
 
 namespace
 {
@@ -74,6 +76,52 @@ namespace
         return true;
     }
 
+    bool MeasureResourceString(LPCWSTR value, size_t* length)
+    {
+        if (!value || !length)
+        {
+            return false;
+        }
+        __try
+        {
+            size_t count = 0;
+            while (count <= 0xffff && value[count] != L'\0')
+            {
+                ++count;
+            }
+            if (count > 0xffff)
+            {
+                return false;
+            }
+            *length = count;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool CopyResourceString(LPCWSTR value, WCHAR* destination, size_t length)
+    {
+        if (!value || (!destination && length != 0))
+        {
+            return false;
+        }
+        __try
+        {
+            for (size_t index = 0; index < length; ++index)
+            {
+                destination[index] = value[index];
+            }
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
     bool MakeIdentifier(LPCWSTR value, GuestResourceIdentifier* identifier)
     {
         if (!value || !identifier)
@@ -89,7 +137,48 @@ namespace
         }
         else
         {
-            identifier->text = value;
+            size_t length = 0;
+            if (!MeasureResourceString(value, &length))
+            {
+                return false;
+            }
+            identifier->text.resize(length);
+            if (!CopyResourceString(
+                value, length ? &identifier->text[0] : nullptr, length))
+            {
+                *identifier = GuestResourceIdentifier{};
+                return false;
+            }
+            const wchar_t* text = identifier->text.c_str();
+            if (length != 0 && text[0] == L'#')
+            {
+                if (length == 1)
+                {
+                    return false;
+                }
+                unsigned long parsed = 0;
+                size_t index = 1;
+                for (; index < length; ++index)
+                {
+                    if (text[index] < L'0' || text[index] > L'9')
+                    {
+                        break;
+                    }
+                    parsed = parsed * 10 + static_cast<unsigned long>(text[index] - L'0');
+                    if (parsed > 0xffff)
+                    {
+                        break;
+                    }
+                }
+                if (index == length && parsed <= 0xffff)
+                {
+                    identifier->ordinal = true;
+                    identifier->id = static_cast<WORD>(parsed);
+                    identifier->text.clear();
+                    return true;
+                }
+                return false;
+            }
         }
         return true;
     }
@@ -244,8 +333,25 @@ namespace
         const GuestResourceIdentifier& left,
         const GuestResourceIdentifier& right)
     {
-        return left.ordinal == right.ordinal &&
-            (left.ordinal ? left.id == right.id : left.text == right.text);
+        if (left.ordinal != right.ordinal)
+        {
+            return false;
+        }
+        if (left.ordinal)
+        {
+            return left.id == right.id;
+        }
+        if (left.text.size() != right.text.size())
+        {
+            return false;
+        }
+        if (left.text.empty())
+        {
+            return true;
+        }
+        return ::CompareStringOrdinal(
+            left.text.data(), static_cast<int>(left.text.size()),
+            right.text.data(), static_cast<int>(right.text.size()), TRUE) == CSTR_EQUAL;
     }
 
     const IMAGE_RESOURCE_DIRECTORY_ENTRY* FindEntry(
@@ -440,6 +546,50 @@ GuestResourceStatus Win32Bridge::Bridge::FindGuestResource(
     return GuestResourceStatus::Success;
 }
 
+GuestResourceStatus Win32Bridge::Bridge::CopyGuestFileResource(
+    const BYTE* fileBytes,
+    size_t fileSize,
+    LPCWSTR type,
+    LPCWSTR name,
+    LANGID language,
+    bool requireExactLanguage,
+    std::vector<BYTE>* payload,
+    LANGID* selectedLanguage,
+    DWORD* codePage)
+{
+    if (!fileBytes || fileSize == 0 || !payload)
+    {
+        return GuestResourceStatus::InvalidParameter;
+    }
+    payload->clear();
+    if (selectedLanguage) *selectedLanguage = 0;
+    if (codePage) *codePage = 0;
+
+    MappedPeImage image;
+    std::wstring error;
+    if (!PeMapper::Materialize(fileBytes, fileSize, &image, &error))
+    {
+        return GuestResourceStatus::InvalidImage;
+    }
+
+    GuestResourceScope scope(image.bytes.data(), image.bytes.size());
+    GuestResourceData resource;
+    const GuestResourceStatus status = FindGuestResource(
+        nullptr, type, name, language, requireExactLanguage, &resource);
+    if (status != GuestResourceStatus::Success)
+    {
+        return status;
+    }
+    if (resource.size != 0 && !resource.data)
+    {
+        return GuestResourceStatus::InvalidData;
+    }
+    payload->assign(resource.data, resource.data + resource.size);
+    if (selectedLanguage) *selectedLanguage = resource.language;
+    if (codePage) *codePage = resource.codePage;
+    return GuestResourceStatus::Success;
+}
+
 GuestResourceStatus Win32Bridge::Bridge::EnumerateGuestResourceTypes(
     HMODULE module,
     std::vector<GuestResourceIdentifier>* types)
@@ -535,29 +685,6 @@ GuestResourceStatus Win32Bridge::Bridge::EnumerateGuestResourceLanguages(
         languagesOutput->push_back(entry.Id);
     }
     return GuestResourceStatus::Success;
-}
-
-bool Win32Bridge::Bridge::FindGuestResource(
-    WORD resourceType,
-    LPCWSTR name,
-    const BYTE** data,
-    size_t* size)
-{
-    if (!data || !size)
-    {
-        return false;
-    }
-    *data = nullptr;
-    *size = 0;
-    GuestResourceData resource;
-    const LPCWSTR type = reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(resourceType));
-    if (FindGuestResource(nullptr, type, name, 0, false, &resource) != GuestResourceStatus::Success)
-    {
-        return false;
-    }
-    *data = resource.data;
-    *size = resource.size;
-    return true;
 }
 
 Win32Bridge::Bridge::GuestResourceScope::GuestResourceScope(

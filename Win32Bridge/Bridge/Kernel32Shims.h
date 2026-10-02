@@ -8,6 +8,7 @@ namespace Win32Bridge
 {
 namespace Bridge
 {
+    void ResetGuestResourceHandles();
     HANDLE WINAPI BridgeCreateFileW(
         LPCWSTR fileName,
         DWORD desiredAccess,
@@ -91,6 +92,26 @@ namespace Bridge
     DWORD WINAPI BridgeGetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD bufferLength);
     HMODULE WINAPI BridgeGetModuleHandleW(LPCWSTR moduleName);
     HMODULE WINAPI BridgeGetModuleHandleA(LPCSTR moduleName);
+    HRSRC WINAPI BridgeFindResourceA(HMODULE module, LPCSTR name, LPCSTR type);
+    HRSRC WINAPI BridgeFindResourceW(HMODULE module, LPCWSTR name, LPCWSTR type);
+    HRSRC WINAPI BridgeFindResourceExA(HMODULE module, LPCSTR type, LPCSTR name, WORD language);
+    HRSRC WINAPI BridgeFindResourceExW(HMODULE module, LPCWSTR type, LPCWSTR name, WORD language);
+    HGLOBAL WINAPI BridgeLoadResource(HMODULE module, HRSRC resource);
+    LPVOID WINAPI BridgeLockResource(HGLOBAL resource);
+    DWORD WINAPI BridgeSizeofResource(HMODULE module, HRSRC resource);
+    BOOL WINAPI BridgeFreeResource(HGLOBAL resource);
+    BOOL WINAPI BridgeEnumResourceTypesA(HMODULE module, ENUMRESTYPEPROCA callback, LONG_PTR parameter);
+    BOOL WINAPI BridgeEnumResourceTypesW(HMODULE module, ENUMRESTYPEPROCW callback, LONG_PTR parameter);
+    BOOL WINAPI BridgeEnumResourceTypesExA(HMODULE module, ENUMRESTYPEPROCA callback, LONG_PTR parameter, DWORD flags, LANGID language);
+    BOOL WINAPI BridgeEnumResourceTypesExW(HMODULE module, ENUMRESTYPEPROCW callback, LONG_PTR parameter, DWORD flags, LANGID language);
+    BOOL WINAPI BridgeEnumResourceNamesA(HMODULE module, LPCSTR type, ENUMRESNAMEPROCA callback, LONG_PTR parameter);
+    BOOL WINAPI BridgeEnumResourceNamesW(HMODULE module, LPCWSTR type, ENUMRESNAMEPROCW callback, LONG_PTR parameter);
+    BOOL WINAPI BridgeEnumResourceNamesExA(HMODULE module, LPCSTR type, ENUMRESNAMEPROCA callback, LONG_PTR parameter, DWORD flags, LANGID language);
+    BOOL WINAPI BridgeEnumResourceNamesExW(HMODULE module, LPCWSTR type, ENUMRESNAMEPROCW callback, LONG_PTR parameter, DWORD flags, LANGID language);
+    BOOL WINAPI BridgeEnumResourceLanguagesA(HMODULE module, LPCSTR type, LPCSTR name, ENUMRESLANGPROCA callback, LONG_PTR parameter);
+    BOOL WINAPI BridgeEnumResourceLanguagesW(HMODULE module, LPCWSTR type, LPCWSTR name, ENUMRESLANGPROCW callback, LONG_PTR parameter);
+    BOOL WINAPI BridgeEnumResourceLanguagesExA(HMODULE module, LPCSTR type, LPCSTR name, ENUMRESLANGPROCA callback, LONG_PTR parameter, DWORD flags, LANGID language);
+    BOOL WINAPI BridgeEnumResourceLanguagesExW(HMODULE module, LPCWSTR type, LPCWSTR name, ENUMRESLANGPROCW callback, LONG_PTR parameter, DWORD flags, LANGID language);
     DWORD WINAPI BridgeGetTickCount();
     ULONGLONG WINAPI BridgeGetTickCount64();
     BOOL WINAPI BridgeQueryPerformanceCounter(PLARGE_INTEGER counter);

@@ -7,6 +7,7 @@
 #include "Bridge\\MiniGdi.h"
 #include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestResources.h"
+#include "Bridge/GuestStorage.h"
 #include "Bridge/DialogResources.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
@@ -22,17 +23,57 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+#include <wincodec.h>
+#include <wrl/client.h>
 
 using namespace Win32Bridge::Bridge;
 
 namespace
 {
+    constexpr DWORD BitmapCompressionAlphaBitFields = 6;
+    constexpr DWORD GuestBitmapV4HeaderSize = 108;
+    constexpr size_t GuestBitmapV4RedMaskOffset = 40;
+    constexpr UINT DrawIconMask = 0x0001;
+    constexpr UINT DrawIconImage = 0x0002;
+    constexpr UINT DrawIconNormal = DrawIconMask | DrawIconImage;
     constexpr int MaximumGuestSystemColor = 30;
     constexpr ULONG_PTR GuestCursorToken = 0x7fff1000;
     constexpr ULONG_PTR GuestIconToken = 0x7fff2000;
+    ULONG_PTR g_nextGuestCursor = GuestCursorToken + 1;
     ULONG_PTR g_nextGuestIcon = GuestIconToken + 1;
     std::mutex g_iconLock;
     std::unordered_map<ULONG_PTR, MiniGdi::Surface> g_guestIcons;
+    struct GuestCursorRecord final
+    {
+        MiniGdi::Surface image;
+        POINT hotspot{};
+        DWORD systemIdentifier = 0;
+    };
+    std::mutex g_cursorLock;
+    std::unordered_map<ULONG_PTR, GuestCursorRecord> g_guestCursors;
+
+#pragma pack(push, 2)
+    struct GuestBitmapFileHeader final
+    {
+        WORD type;
+        DWORD size;
+        WORD reserved1;
+        WORD reserved2;
+        DWORD pixelOffset;
+    };
+#pragma pack(pop)
+
+    struct GuestBitmapCoreHeader final
+    {
+        DWORD size;
+        WORD width;
+        WORD height;
+        WORD planes;
+        WORD bitCount;
+    };
+
+    static_assert(sizeof(GuestBitmapFileHeader) == 14, "BITMAPFILEHEADER ABI mismatch");
+    static_assert(sizeof(GuestBitmapCoreHeader) == 12, "BITMAPCOREHEADER ABI mismatch");
 
     bool IsUserLibrary(const std::wstring& library)
     {
@@ -166,67 +207,275 @@ namespace
             (static_cast<COLORREF>(MiniGdi::Blue(value)) << 16);
     }
 
+    bool DecodeEncodedImage(
+        const BYTE* data,
+        size_t size,
+        MiniGdi::Surface* image,
+        int requestedWidth = 0,
+        int requestedHeight = 0)
+    {
+        using Microsoft::WRL::ComPtr;
+        if (!data || !image || size == 0 || size > MAXDWORD)
+        {
+            return false;
+        }
+        ComPtr<IWICImagingFactory> factory;
+        HRESULT result = ::CoCreateInstance(
+            CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&factory));
+        if (FAILED(result)) return false;
+        ComPtr<IWICStream> stream;
+        if (FAILED(factory->CreateStream(&stream)) ||
+            FAILED(stream->InitializeFromMemory(const_cast<BYTE*>(data), static_cast<DWORD>(size))))
+        {
+            return false;
+        }
+        ComPtr<IWICBitmapDecoder> decoder;
+        if (FAILED(factory->CreateDecoderFromStream(
+            stream.Get(), nullptr, WICDecodeMetadataCacheOnLoad, &decoder))) return false;
+        UINT frameCount = 0;
+        if (FAILED(decoder->GetFrameCount(&frameCount)) || frameCount == 0) return false;
+        ComPtr<IWICBitmapFrameDecode> frame;
+        int bestDistance = (std::numeric_limits<int>::max)();
+        for (UINT index = 0; index < frameCount; ++index)
+        {
+            ComPtr<IWICBitmapFrameDecode> candidate;
+            UINT candidateWidth = 0;
+            UINT candidateHeight = 0;
+            if (FAILED(decoder->GetFrame(index, &candidate)) ||
+                FAILED(candidate->GetSize(&candidateWidth, &candidateHeight)) ||
+                candidateWidth == 0 || candidateHeight == 0) continue;
+            const int targetWidth = requestedWidth > 0 ? requestedWidth : static_cast<int>(candidateWidth);
+            const int targetHeight = requestedHeight > 0 ? requestedHeight : static_cast<int>(candidateHeight);
+            const int distance = abs(static_cast<int>(candidateWidth) - targetWidth) +
+                abs(static_cast<int>(candidateHeight) - targetHeight);
+            if (!frame || distance < bestDistance)
+            {
+                frame = std::move(candidate);
+                bestDistance = distance;
+            }
+        }
+        if (!frame) return false;
+        UINT width = 0;
+        UINT height = 0;
+        if (FAILED(frame->GetSize(&width, &height)) || width == 0 || height == 0 ||
+            width > 4096 || height > 4096) return false;
+        ComPtr<IWICFormatConverter> converter;
+        if (FAILED(factory->CreateFormatConverter(&converter)) ||
+            FAILED(converter->Initialize(frame.Get(), GUID_WICPixelFormat32bppBGRA,
+                WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom)) ||
+            !image->Resize(static_cast<int>(width), static_cast<int>(height), MiniGdi::Transparent))
+        {
+            return false;
+        }
+        const size_t stride = static_cast<size_t>(width) * sizeof(MiniGdi::Color);
+        const size_t bytes = stride * height;
+        return bytes <= MAXDWORD && SUCCEEDED(converter->CopyPixels(
+            nullptr, static_cast<UINT>(stride), static_cast<UINT>(bytes),
+            reinterpret_cast<BYTE*>(image->Data())));
+    }
+
+    BYTE ExpandMaskedChannel(DWORD value, DWORD mask)
+    {
+        if (mask == 0) return 0;
+        unsigned shift = 0;
+        while (((mask >> shift) & 1u) == 0u && shift < 31) ++shift;
+        const DWORD normalizedMask = mask >> shift;
+        const DWORD component = (value & mask) >> shift;
+        return static_cast<BYTE>((component * 255u + normalizedMask / 2u) / normalizedMask);
+    }
+
+    bool DecodeBitmapResourceWithWic(
+        const BYTE* dib,
+        size_t dibSize,
+        size_t pixelOffset,
+        MiniGdi::Surface* image)
+    {
+        if (!dib || !image || pixelOffset > dibSize ||
+            dibSize > MAXDWORD - sizeof(GuestBitmapFileHeader)) return false;
+        std::vector<BYTE> file(sizeof(GuestBitmapFileHeader) + dibSize);
+        GuestBitmapFileHeader header{};
+        header.type = 0x4d42;
+        header.size = static_cast<DWORD>(file.size());
+        header.pixelOffset = static_cast<DWORD>(sizeof(header) + pixelOffset);
+        memcpy(file.data(), &header, sizeof(header));
+        memcpy(file.data() + sizeof(header), dib, dibSize);
+        return DecodeEncodedImage(file.data(), file.size(), image);
+    }
+
     bool DecodeDeviceIndependentBitmap(const BYTE* data, size_t size, bool iconBitmap, MiniGdi::Surface* image)
     {
-        if (!data || !image || size < sizeof(BITMAPINFOHEADER)) return false;
-        BITMAPINFOHEADER header = {};
-        memcpy(&header, data, sizeof(header));
-        if (header.biSize < sizeof(BITMAPINFOHEADER) || header.biWidth <= 0 || header.biHeight == 0 ||
-            (header.biBitCount != 4 && header.biBitCount != 8 && header.biBitCount != 24 && header.biBitCount != 32) ||
-            header.biCompression != BI_RGB)
+        if (!data || !image || size < sizeof(DWORD)) return false;
+        static const BYTE PngSignature[] = { 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
+        if (size >= sizeof(PngSignature) && memcmp(data, PngSignature, sizeof(PngSignature)) == 0)
+        {
+            return DecodeEncodedImage(data, size, image);
+        }
+
+        DWORD headerSize = 0;
+        memcpy(&headerSize, data, sizeof(headerSize));
+        bool coreHeader = headerSize == sizeof(GuestBitmapCoreHeader);
+        LONG rawWidth = 0;
+        LONG rawHeight = 0;
+        WORD bitCount = 0;
+        DWORD compression = BI_RGB;
+        DWORD colorsUsed = 0;
+        bool topDown = false;
+        if (coreHeader)
+        {
+            if (size < sizeof(GuestBitmapCoreHeader)) return false;
+            GuestBitmapCoreHeader core{};
+            memcpy(&core, data, sizeof(core));
+            rawWidth = core.width;
+            rawHeight = core.height;
+            bitCount = core.bitCount;
+        }
+        else
+        {
+            if (headerSize < sizeof(BITMAPINFOHEADER) || headerSize > size) return false;
+            BITMAPINFOHEADER header{};
+            memcpy(&header, data, sizeof(header));
+            rawWidth = header.biWidth;
+            rawHeight = header.biHeight;
+            bitCount = header.biBitCount;
+            compression = header.biCompression;
+            colorsUsed = header.biClrUsed;
+            topDown = rawHeight < 0;
+        }
+        if (rawWidth <= 0 || rawHeight == 0 || rawHeight == LONG_MIN ||
+            (bitCount != 1 && bitCount != 4 && bitCount != 8 && bitCount != 16 &&
+             bitCount != 24 && bitCount != 32) ||
+            (compression != BI_RGB && compression != BI_BITFIELDS && compression != BitmapCompressionAlphaBitFields &&
+             compression != BI_RLE4 && compression != BI_RLE8 &&
+             compression != BI_JPEG && compression != BI_PNG) ||
+            (compression == BI_RLE4 && bitCount != 4) ||
+            (compression == BI_RLE8 && bitCount != 8))
         {
             return false;
         }
-        const int width = header.biWidth;
-        const int sourceHeight = header.biHeight < 0 ? -header.biHeight : header.biHeight;
-        const int height = iconBitmap ? sourceHeight / 2 : sourceHeight;
-        if (height <= 0 || width > 512 || height > 512 || !image->Resize(width, height, MiniGdi::Transparent))
+
+        const int width = rawWidth;
+        const int totalHeight = rawHeight < 0 ? -rawHeight : rawHeight;
+        const int height = iconBitmap ? totalHeight / 2 : totalHeight;
+        if (height <= 0 || width > 4096 || height > 4096 ||
+            !image->Resize(width, height, MiniGdi::Transparent)) return false;
+
+        size_t cursor = headerSize;
+        DWORD redMask = bitCount == 16 ? 0x7c00u : 0x00ff0000u;
+        DWORD greenMask = bitCount == 16 ? 0x03e0u : 0x0000ff00u;
+        DWORD blueMask = bitCount == 16 ? 0x001fu : 0x000000ffu;
+        DWORD alphaMask = 0;
+        if (!coreHeader && (compression == BI_BITFIELDS || compression == BitmapCompressionAlphaBitFields))
         {
-            return false;
+            if (headerSize >= GuestBitmapV4HeaderSize)
+            {
+                memcpy(&redMask, data + GuestBitmapV4RedMaskOffset, sizeof(redMask));
+                memcpy(&greenMask, data + GuestBitmapV4RedMaskOffset + sizeof(DWORD), sizeof(greenMask));
+                memcpy(&blueMask, data + GuestBitmapV4RedMaskOffset + 2 * sizeof(DWORD), sizeof(blueMask));
+                memcpy(&alphaMask, data + GuestBitmapV4RedMaskOffset + 3 * sizeof(DWORD), sizeof(alphaMask));
+            }
+            else
+            {
+                const size_t maskCount = compression == BitmapCompressionAlphaBitFields ? 4 : 3;
+                if (cursor > size || maskCount * sizeof(DWORD) > size - cursor) return false;
+                const DWORD* masks = reinterpret_cast<const DWORD*>(data + cursor);
+                redMask = masks[0]; greenMask = masks[1]; blueMask = masks[2];
+                if (maskCount == 4) alphaMask = masks[3];
+                cursor += maskCount * sizeof(DWORD);
+            }
         }
-        const size_t paletteEntries = header.biBitCount <= 8
-            ? (header.biClrUsed ? header.biClrUsed : (1u << header.biBitCount)) : 0;
-        const size_t paletteOffset = header.biSize;
-        const size_t paletteBytes = paletteEntries * sizeof(RGBQUAD);
-        if (paletteOffset > size || paletteBytes > size - paletteOffset) return false;
-        const size_t bitsOffset = paletteOffset + paletteBytes;
-        const size_t bitsPerRow = static_cast<size_t>(((static_cast<unsigned long long>(width) * header.biBitCount + 31) / 32) * 4);
-        const size_t xorBytes = bitsPerRow * static_cast<size_t>(height);
-        if (bitsOffset > size || xorBytes > size - bitsOffset) return false;
-        const BYTE* palette = data + paletteOffset;
-        const BYTE* bits = data + bitsOffset;
-        const size_t andStride = static_cast<size_t>(((static_cast<unsigned long long>(width) + 31) / 32) * 4);
-        const BYTE* andBits = nullptr;
-        if (iconBitmap && xorBytes <= size - bitsOffset && andStride <= (size - bitsOffset - xorBytes) / static_cast<size_t>(height))
+
+        const size_t paletteEntries = bitCount <= 8
+            ? (colorsUsed ? colorsUsed : (static_cast<size_t>(1) << bitCount)) : 0;
+        const size_t paletteEntrySize = coreHeader ? sizeof(RGBTRIPLE) : sizeof(RGBQUAD);
+        if (paletteEntries > 256 || cursor > size ||
+            paletteEntries * paletteEntrySize > size - cursor) return false;
+        const BYTE* palette = data + cursor;
+        cursor += paletteEntries * paletteEntrySize;
+
+        if (!iconBitmap && (compression == BI_RLE4 || compression == BI_RLE8))
+            return DecodeBitmapResourceWithWic(data, size, cursor, image);
+        if (!iconBitmap && (compression == BI_JPEG || compression == BI_PNG))
+            return cursor < size && DecodeEncodedImage(data + cursor, size - cursor, image);
+
+        const unsigned long long rowBits = static_cast<unsigned long long>(width) * bitCount;
+        const size_t xorStride = static_cast<size_t>(((rowBits + 31ull) / 32ull) * 4ull);
+        if (xorStride == 0 || static_cast<size_t>(height) > (std::numeric_limits<size_t>::max)() / xorStride) return false;
+        const size_t xorBytes = xorStride * static_cast<size_t>(height);
+        if (cursor > size || xorBytes > size - cursor) return false;
+        const BYTE* bits = data + cursor;
+        const size_t andStride = static_cast<size_t>(((static_cast<unsigned long long>(width) + 31ull) / 32ull) * 4ull);
+        const size_t andBytes = andStride * static_cast<size_t>(height);
+        const BYTE* andBits = iconBitmap && andBytes <= size - cursor - xorBytes
+            ? bits + xorBytes : nullptr;
+
+        bool hasMeaningfulAlpha = false;
+        if (bitCount == 32 && alphaMask == 0 && iconBitmap)
         {
-            andBits = bits + xorBytes;
+            for (int y = 0; y < height && !hasMeaningfulAlpha; ++y)
+            {
+                const BYTE* row = bits + static_cast<size_t>(y) * xorStride;
+                for (int x = 0; x < width; ++x)
+                {
+                    if (row[static_cast<size_t>(x) * 4 + 3] != 0)
+                    {
+                        hasMeaningfulAlpha = true;
+                        break;
+                    }
+                }
+            }
         }
-        const bool topDown = header.biHeight < 0;
+
         for (int y = 0; y < height; ++y)
         {
             const int sourceY = topDown ? y : height - 1 - y;
-            const BYTE* row = bits + static_cast<size_t>(sourceY) * bitsPerRow;
+            const BYTE* row = bits + static_cast<size_t>(sourceY) * xorStride;
             for (int x = 0; x < width; ++x)
             {
                 BYTE red = 0, green = 0, blue = 0, alpha = 255;
-                if (header.biBitCount == 32)
+                if (bitCount == 32)
                 {
-                    const BYTE* pixel = row + static_cast<size_t>(x) * 4;
-                    blue = pixel[0]; green = pixel[1]; red = pixel[2]; alpha = pixel[3] ? pixel[3] : 255;
+                    DWORD pixel = 0;
+                    memcpy(&pixel, row + static_cast<size_t>(x) * 4, sizeof(pixel));
+                    red = ExpandMaskedChannel(pixel, redMask);
+                    green = ExpandMaskedChannel(pixel, greenMask);
+                    blue = ExpandMaskedChannel(pixel, blueMask);
+                    alpha = alphaMask ? ExpandMaskedChannel(pixel, alphaMask)
+                        : (hasMeaningfulAlpha ? static_cast<BYTE>(pixel >> 24) : 255);
                 }
-                else if (header.biBitCount == 24)
+                else if (bitCount == 24)
                 {
                     const BYTE* pixel = row + static_cast<size_t>(x) * 3;
                     blue = pixel[0]; green = pixel[1]; red = pixel[2];
                 }
+                else if (bitCount == 16)
+                {
+                    WORD packed = 0;
+                    memcpy(&packed, row + static_cast<size_t>(x) * 2, sizeof(packed));
+                    red = ExpandMaskedChannel(packed, redMask);
+                    green = ExpandMaskedChannel(packed, greenMask);
+                    blue = ExpandMaskedChannel(packed, blueMask);
+                    if (alphaMask) alpha = ExpandMaskedChannel(packed, alphaMask);
+                }
                 else
                 {
-                    const BYTE index = header.biBitCount == 8
-                        ? row[x]
-                        : static_cast<BYTE>((row[x / 2] >> ((x & 1) ? 0 : 4)) & 0x0f);
+                    BYTE index = 0;
+                    if (bitCount == 8) index = row[x];
+                    else if (bitCount == 4)
+                        index = static_cast<BYTE>((row[x / 2] >> ((x & 1) ? 0 : 4)) & 0x0f);
+                    else
+                        index = static_cast<BYTE>((row[x / 8] >> (7 - (x & 7))) & 1);
                     if (index >= paletteEntries) return false;
-                    const RGBQUAD* color = reinterpret_cast<const RGBQUAD*>(palette) + index;
-                    blue = color->rgbBlue; green = color->rgbGreen; red = color->rgbRed;
+                    if (coreHeader)
+                    {
+                        const RGBTRIPLE* color = reinterpret_cast<const RGBTRIPLE*>(palette) + index;
+                        blue = color->rgbtBlue; green = color->rgbtGreen; red = color->rgbtRed;
+                    }
+                    else
+                    {
+                        const RGBQUAD* color = reinterpret_cast<const RGBQUAD*>(palette) + index;
+                        blue = color->rgbBlue; green = color->rgbGreen; red = color->rgbRed;
+                    }
                 }
                 if (andBits)
                 {
@@ -244,42 +493,258 @@ namespace
         return true;
     }
 
-    bool LoadBitmapResourcePixels(LPCWSTR resource, MiniGdi::Surface* image)
+    bool FindModuleResource(
+        HINSTANCE instance,
+        WORD typeId,
+        LPCWSTR name,
+        const BYTE** data,
+        size_t* size)
     {
-        const BYTE* data = nullptr;
-        size_t size = 0;
-        return FindGuestResource(2 /* RT_BITMAP */, resource, &data, &size) &&
-            DecodeDeviceIndependentBitmap(data, size, false, image);
-    }
-
-    bool LoadIconResourcePixels(LPCWSTR resource, MiniGdi::Surface* image)
-    {
-        const BYTE* group = nullptr;
-        size_t groupSize = 0;
-        if (!FindGuestResource(14 /* RT_GROUP_ICON */, resource, &group, &groupSize) || groupSize < 6)
+        if (!data || !size)
         {
             return false;
         }
+        *data = nullptr;
+        *size = 0;
+        GuestResourceData resource;
+        const LPCWSTR type = reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(typeId));
+        if (FindGuestResource(
+            reinterpret_cast<HMODULE>(instance), type, name, 0, false, &resource) !=
+            GuestResourceStatus::Success)
+        {
+            return false;
+        }
+        *data = resource.data;
+        *size = resource.size;
+        return true;
+    }
+
+    bool LoadBitmapResourcePixels(HINSTANCE instance, LPCWSTR resource, MiniGdi::Surface* image)
+    {
+        const BYTE* data = nullptr;
+        size_t size = 0;
+        return FindModuleResource(instance, 2 /* RT_BITMAP */, resource, &data, &size) &&
+            DecodeDeviceIndependentBitmap(data, size, false, image);
+    }
+
+    MiniGdi::Surface ScaleSurface(const MiniGdi::Surface& source, int width, int height)
+    {
+        if (source.Empty() || width <= 0 || height <= 0 ||
+            (width == source.Width() && height == source.Height())) return source;
+        MiniGdi::Surface scaled(width, height, MiniGdi::Transparent);
+        if (scaled.Empty()) return MiniGdi::Surface{};
+        for (int y = 0; y < height; ++y)
+        {
+            const int sourceY = (std::min)(source.Height() - 1,
+                static_cast<int>((static_cast<long long>(y) * source.Height()) / height));
+            for (int x = 0; x < width; ++x)
+            {
+                const int sourceX = (std::min)(source.Width() - 1,
+                    static_cast<int>((static_cast<long long>(x) * source.Width()) / width));
+                MiniGdi::Color* target = scaled.PixelAt(x, y);
+                const MiniGdi::Color* pixel = source.PixelAt(sourceX, sourceY);
+                if (target && pixel) *target = *pixel;
+            }
+        }
+        return scaled;
+    }
+
+    bool LoadIconResourcePixels(
+        HINSTANCE instance,
+        LPCWSTR resource,
+        int requestedWidth,
+        int requestedHeight,
+        MiniGdi::Surface* image)
+    {
+        const BYTE* group = nullptr;
+        size_t groupSize = 0;
+        if (!FindModuleResource(
+            instance, 14 /* RT_GROUP_ICON */, resource, &group, &groupSize) || groupSize < 6)
+        {
+            return false;
+        }
+        WORD reserved = 0;
+        WORD type = 0;
         WORD count = 0;
+        memcpy(&reserved, group, sizeof(reserved));
+        memcpy(&type, group + 2, sizeof(type));
         memcpy(&count, group + 4, sizeof(count));
-        if (count == 0 || groupSize < 6 + static_cast<size_t>(count) * 14) return false;
-        const BYTE* best = group + 6;
+        if (reserved != 0 || type != 2 || count == 0 ||
+            groupSize < 6 + static_cast<size_t>(count) * 14) return false;
+        const BYTE* best = nullptr;
         int bestDistance = (std::numeric_limits<int>::max)();
+        WORD bestDepth = 0;
+        const int targetWidth = requestedWidth > 0 ? requestedWidth : 32;
+        const int targetHeight = requestedHeight > 0 ? requestedHeight : 32;
         for (WORD index = 0; index < count; ++index)
         {
             const BYTE* entry = group + 6 + static_cast<size_t>(index) * 14;
             const int width = entry[0] ? entry[0] : 256;
             const int height = entry[1] ? entry[1] : 256;
-            const int distance = (width > 24 ? width - 24 : 24 - width) +
-                (height > 24 ? height - 24 : 24 - height);
-            if (distance < bestDistance) { best = entry; bestDistance = distance; }
+            WORD depth = 0;
+            memcpy(&depth, entry + 6, sizeof(depth));
+            const int distance = abs(width - targetWidth) + abs(height - targetHeight);
+            if (distance < bestDistance || (distance == bestDistance && depth > bestDepth))
+            {
+                best = entry;
+                bestDistance = distance;
+                bestDepth = depth;
+            }
         }
+        if (!best) return false;
         WORD iconId = 0;
         memcpy(&iconId, best + 12, sizeof(iconId));
         const BYTE* icon = nullptr;
         size_t iconSize = 0;
-        return FindGuestResource(3 /* RT_ICON */, reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(iconId)), &icon, &iconSize) &&
-            DecodeDeviceIndependentBitmap(icon, iconSize, true, image);
+        if (!FindModuleResource(instance, 3 /* RT_ICON */,
+            reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(iconId)), &icon, &iconSize)) return false;
+        MiniGdi::Surface decoded;
+        if (!DecodeDeviceIndependentBitmap(icon, iconSize, true, &decoded)) return false;
+        *image = ScaleSurface(decoded, requestedWidth > 0 ? requestedWidth : decoded.Width(),
+            requestedHeight > 0 ? requestedHeight : decoded.Height());
+        return !image->Empty();
+    }
+
+    bool LoadCursorResourcePixels(
+        HINSTANCE instance,
+        LPCWSTR resource,
+        int requestedWidth,
+        int requestedHeight,
+        MiniGdi::Surface* image,
+        POINT* hotspot)
+    {
+        if (!image || !hotspot) return false;
+        const BYTE* group = nullptr;
+        size_t groupSize = 0;
+        if (!FindModuleResource(
+            instance, 12 /* RT_GROUP_CURSOR */, resource, &group, &groupSize) || groupSize < 6)
+        {
+            return false;
+        }
+        WORD reserved = 0;
+        WORD type = 0;
+        WORD count = 0;
+        memcpy(&reserved, group, sizeof(reserved));
+        memcpy(&type, group + 2, sizeof(type));
+        memcpy(&count, group + 4, sizeof(count));
+        if (reserved != 0 || type != 1 || count == 0 ||
+            groupSize < 6 + static_cast<size_t>(count) * 14) return false;
+        const int targetWidth = requestedWidth > 0 ? requestedWidth : 32;
+        const int targetHeight = requestedHeight > 0 ? requestedHeight : 32;
+        const BYTE* best = nullptr;
+        int bestDistance = (std::numeric_limits<int>::max)();
+        WORD bestDepth = 0;
+        for (WORD index = 0; index < count; ++index)
+        {
+            const BYTE* entry = group + 6 + static_cast<size_t>(index) * 14;
+            WORD width = 0;
+            WORD height = 0;
+            memcpy(&width, entry, sizeof(width));
+            memcpy(&height, entry + 2, sizeof(height));
+            WORD depth = 0;
+            memcpy(&depth, entry + 6, sizeof(depth));
+            if (height == width * 2) height /= 2;
+            const int distance = abs(static_cast<int>(width) - targetWidth) +
+                abs(static_cast<int>(height) - targetHeight);
+            if (distance < bestDistance || (distance == bestDistance && depth > bestDepth))
+            {
+                best = entry;
+                bestDistance = distance;
+                bestDepth = depth;
+            }
+        }
+        if (!best) return false;
+        WORD cursorId = 0;
+        memcpy(&cursorId, best + 12, sizeof(cursorId));
+        const BYTE* cursor = nullptr;
+        size_t cursorSize = 0;
+        if (!FindModuleResource(instance, 1 /* RT_CURSOR */,
+            reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(cursorId)),
+            &cursor, &cursorSize) || cursorSize < 4) return false;
+        SHORT x = 0;
+        SHORT y = 0;
+        memcpy(&x, cursor, sizeof(x));
+        memcpy(&y, cursor + sizeof(x), sizeof(y));
+        MiniGdi::Surface decoded;
+        if (!DecodeDeviceIndependentBitmap(cursor + 4, cursorSize - 4, true, &decoded)) return false;
+        const int outputWidth = requestedWidth > 0 ? requestedWidth : decoded.Width();
+        const int outputHeight = requestedHeight > 0 ? requestedHeight : decoded.Height();
+        *image = ScaleSurface(decoded, outputWidth, outputHeight);
+        if (image->Empty()) return false;
+        hotspot->x = decoded.Width() > 0 ? x * outputWidth / decoded.Width() : x;
+        hotspot->y = decoded.Height() > 0 ? y * outputHeight / decoded.Height() : y;
+        return true;
+    }
+
+    HICON StoreGuestIcon(MiniGdi::Surface image)
+    {
+        if (image.Empty()) return nullptr;
+        std::lock_guard<std::mutex> guard(g_iconLock);
+        const ULONG_PTR token = g_nextGuestIcon++;
+        g_guestIcons.emplace(token, std::move(image));
+        return reinterpret_cast<HICON>(token);
+    }
+
+    HCURSOR StoreGuestCursor(MiniGdi::Surface image, POINT hotspot)
+    {
+        if (image.Empty()) return nullptr;
+        GuestCursorRecord record;
+        record.image = std::move(image);
+        record.hotspot = hotspot;
+        std::lock_guard<std::mutex> guard(g_cursorLock);
+        const ULONG_PTR token = g_nextGuestCursor++;
+        g_guestCursors.emplace(token, std::move(record));
+        return reinterpret_cast<HCURSOR>(token);
+    }
+
+    HBITMAP CreateGuestBitmapFromSurface(const MiniGdi::Surface& image)
+    {
+        GuestWindowManager* manager = CurrentGuestWindowManager();
+        if (!manager || image.Empty()) return nullptr;
+        const MiniGdi::ObjectHandle bitmap = manager->Gdi().CreateBitmap(
+            image.Width(), image.Height(), MiniGdi::Transparent);
+        MiniGdi::Surface* target = manager->Gdi().GetBitmapSurface(bitmap);
+        if (bitmap == MiniGdi::InvalidObject || !target) return nullptr;
+        target->Pixels() = image.Pixels();
+        return reinterpret_cast<HBITMAP>(static_cast<ULONG_PTR>(bitmap));
+    }
+
+    bool CopyGuestByteRange(const BYTE* source, size_t size, std::vector<BYTE>* copy)
+    {
+        if (!source || !copy || size == 0 || size > 128u * 1024u * 1024u) return false;
+        copy->resize(size);
+        __try
+        {
+            memcpy(copy->data(), source, size);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            copy->clear();
+            return false;
+        }
+    }
+
+    bool ConvertAnsiResourceName(LPCSTR source, std::wstring* storage, LPCWSTR* converted)
+    {
+        if (!source || !storage || !converted) return false;
+        const ULONG_PTR raw = reinterpret_cast<ULONG_PTR>(source);
+        if (raw <= 0xffff)
+        {
+            *converted = reinterpret_cast<LPCWSTR>(raw);
+            return true;
+        }
+        const int count = ::MultiByteToWideChar(CP_ACP, 0, source, -1, nullptr, 0);
+        if (count <= 0) return false;
+        storage->resize(static_cast<size_t>(count));
+        if (::MultiByteToWideChar(CP_ACP, 0, source, -1, &(*storage)[0], count) != count)
+        {
+            storage->clear();
+            return false;
+        }
+        storage->resize(static_cast<size_t>(count - 1));
+        *converted = storage->c_str();
+        return true;
     }
 
     // Wire layout of MENUITEMINFOW.  It belongs to the guest ABI, rather than
@@ -657,11 +1122,11 @@ namespace
         }
     }
 
-    HMENU LoadGuestMenuResource(LPCWSTR resource)
+    HMENU LoadGuestMenuResource(HINSTANCE instance, LPCWSTR resource)
     {
         const BYTE* data = nullptr;
         size_t size = 0;
-        if (!FindGuestResource(MenuResourceType, resource, &data, &size) || size < 4)
+        if (!FindModuleResource(instance, MenuResourceType, resource, &data, &size) || size < 4)
         {
             return nullptr;
         }
@@ -754,7 +1219,7 @@ HWND WINAPI Win32Bridge::Bridge::BridgeCreateWindowExW(
     return result;
 }
 
-HCURSOR WINAPI Win32Bridge::Bridge::BridgeLoadCursorW(HINSTANCE, LPCWSTR cursorName)
+HCURSOR WINAPI Win32Bridge::Bridge::BridgeLoadCursorW(HINSTANCE instance, LPCWSTR cursorName)
 {
     if (!cursorName)
     {
@@ -762,24 +1227,115 @@ HCURSOR WINAPI Win32Bridge::Bridge::BridgeLoadCursorW(HINSTANCE, LPCWSTR cursorN
         return nullptr;
     }
 
-    // Cursor resources are guest-visible tokens only. CoreWindow owns the
-    // actual host pointer, so never surface a desktop HCURSOR to the PE.
+    GuestCursorRecord record;
+    const ULONG_PTR rawName = reinterpret_cast<ULONG_PTR>(cursorName);
+    if (!instance && rawName <= 0xffff)
+    {
+        record.systemIdentifier = static_cast<DWORD>(rawName);
+        std::lock_guard<std::mutex> guard(g_cursorLock);
+        for (const auto& existing : g_guestCursors)
+        {
+            if (existing.second.systemIdentifier == record.systemIdentifier)
+            {
+                BridgeSetLastError(ERROR_SUCCESS);
+                return reinterpret_cast<HCURSOR>(existing.first);
+            }
+        }
+        const ULONG_PTR token = g_nextGuestCursor++;
+        g_guestCursors.emplace(token, std::move(record));
+        BridgeSetLastError(ERROR_SUCCESS);
+        return reinterpret_cast<HCURSOR>(token);
+    }
+
+    if (!LoadCursorResourcePixels(instance, cursorName, 0, 0, &record.image, &record.hotspot))
+    {
+        BridgeSetLastError(ERROR_RESOURCE_NAME_NOT_FOUND);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> guard(g_cursorLock);
+    const ULONG_PTR token = g_nextGuestCursor++;
+    g_guestCursors.emplace(token, std::move(record));
+    RuntimeDiagnostics::Record(L"CURSOR: decoded RT_GROUP_CURSOR/RT_CURSOR resources.");
     BridgeSetLastError(ERROR_SUCCESS);
-    return reinterpret_cast<HCURSOR>(GuestCursorToken);
+    return reinterpret_cast<HCURSOR>(token);
+}
+
+HCURSOR WINAPI Win32Bridge::Bridge::BridgeLoadCursorA(HINSTANCE instance, LPCSTR cursorName)
+{
+    std::wstring storage;
+    LPCWSTR converted = nullptr;
+    if (!ConvertAnsiResourceName(cursorName, &storage, &converted))
+    {
+        BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return nullptr;
+    }
+    return BridgeLoadCursorW(instance, converted);
+}
+
+HCURSOR WINAPI Win32Bridge::Bridge::BridgeLoadCursorFromFileW(LPCWSTR fileName)
+{
+    return reinterpret_cast<HCURSOR>(BridgeLoadImageW(
+        nullptr, fileName, IMAGE_CURSOR, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE));
+}
+
+HCURSOR WINAPI Win32Bridge::Bridge::BridgeLoadCursorFromFileA(LPCSTR fileName)
+{
+    return reinterpret_cast<HCURSOR>(BridgeLoadImageA(
+        nullptr, fileName, IMAGE_CURSOR, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE));
 }
 
 HCURSOR WINAPI Win32Bridge::Bridge::BridgeSetCursor(HCURSOR cursor)
 {
-    // The UWP CoreWindow owns the actual cursor.  Preserve the guest ABI and
-    // return the previous opaque token rather than exposing a host cursor.
     static thread_local HCURSOR current = nullptr;
     HCURSOR previous = current;
+    DWORD systemIdentifier = 0;
+    if (cursor)
+    {
+        std::lock_guard<std::mutex> guard(g_cursorLock);
+        const auto found = g_guestCursors.find(reinterpret_cast<ULONG_PTR>(cursor));
+        if (found == g_guestCursors.end())
+        {
+            BridgeSetLastError(ERROR_INVALID_CURSOR_HANDLE);
+            return nullptr;
+        }
+        systemIdentifier = found->second.systemIdentifier;
+    }
     current = cursor;
+    try
+    {
+        using Windows::UI::Core::CoreCursor;
+        using Windows::UI::Core::CoreCursorType;
+        CoreCursorType type = CoreCursorType::Arrow;
+        switch (systemIdentifier)
+        {
+        case 32513: type = CoreCursorType::IBeam; break;
+        case 32514: type = CoreCursorType::Wait; break;
+        case 32515: type = CoreCursorType::Cross; break;
+        case 32516: type = CoreCursorType::UpArrow; break;
+        case 32642: type = CoreCursorType::SizeNorthwestSoutheast; break;
+        case 32643: type = CoreCursorType::SizeNortheastSouthwest; break;
+        case 32644: type = CoreCursorType::SizeWestEast; break;
+        case 32645: type = CoreCursorType::SizeNorthSouth; break;
+        case 32646: type = CoreCursorType::SizeAll; break;
+        case 32648: type = CoreCursorType::UniversalNo; break;
+        case 32649: type = CoreCursorType::Hand; break;
+        case 32650: type = CoreCursorType::Wait; break;
+        case 32651: type = CoreCursorType::Help; break;
+        default: break;
+        }
+        Windows::UI::Core::CoreWindow^ window = Windows::UI::Core::CoreWindow::GetForCurrentThread();
+        if (window) window->PointerCursor = ref new CoreCursor(type, 0);
+    }
+    catch (Platform::Exception^)
+    {
+        // Keep the guest cursor state even when the current UWP surface does
+        // not expose a mutable hardware cursor (notably controller-only Xbox).
+    }
     BridgeSetLastError(ERROR_SUCCESS);
     return previous;
 }
 
-HICON WINAPI Win32Bridge::Bridge::BridgeLoadIconW(HINSTANCE, LPCWSTR iconName)
+HICON WINAPI Win32Bridge::Bridge::BridgeLoadIconW(HINSTANCE instance, LPCWSTR iconName)
 {
     if (!iconName)
     {
@@ -788,7 +1344,7 @@ HICON WINAPI Win32Bridge::Bridge::BridgeLoadIconW(HINSTANCE, LPCWSTR iconName)
     }
 
     MiniGdi::Surface image;
-    if (LoadIconResourcePixels(iconName, &image))
+    if (LoadIconResourcePixels(instance, iconName, 0, 0, &image))
     {
         std::lock_guard<std::mutex> guard(g_iconLock);
         const ULONG_PTR token = g_nextGuestIcon++;
@@ -798,21 +1354,354 @@ HICON WINAPI Win32Bridge::Bridge::BridgeLoadIconW(HINSTANCE, LPCWSTR iconName)
         return reinterpret_cast<HICON>(token);
     }
 
-    // System/class icons may legitimately have no PE resource. Keep their
-    // opaque fallback token, but prefer decoded guest pixels whenever present.
-    RuntimeDiagnostics::Record(L"ICON: requested resource was unavailable; using the shared fallback token.");
-    BridgeSetLastError(ERROR_SUCCESS);
-    return reinterpret_cast<HICON>(GuestIconToken);
+    // Stock USER icons are not PE resources in the guest. UWP cannot expose
+    // desktop HICONs, so retain a real bridge-owned pixel surface instead of
+    // an unusable sentinel. The fallback remains independent of any app.
+    if (!instance && reinterpret_cast<ULONG_PTR>(iconName) <= 0xffff)
+    {
+        HICON fallback = CreateGuestShellIcon(false, 32);
+        BridgeSetLastError(fallback ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+        return fallback;
+    }
+    RuntimeDiagnostics::Record(L"ICON: requested RT_GROUP_ICON resource was unavailable.");
+    BridgeSetLastError(ERROR_RESOURCE_NAME_NOT_FOUND);
+    return nullptr;
 }
 
-BOOL WINAPI Win32Bridge::Bridge::BridgeDestroyCursor(HCURSOR cursor)
+HICON WINAPI Win32Bridge::Bridge::BridgeLoadIconA(HINSTANCE instance, LPCSTR iconName)
 {
-    if (reinterpret_cast<ULONG_PTR>(cursor) != GuestCursorToken)
+    std::wstring storage;
+    LPCWSTR converted = nullptr;
+    if (!ConvertAnsiResourceName(iconName, &storage, &converted))
+    {
+        BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return nullptr;
+    }
+    return BridgeLoadIconW(instance, converted);
+}
+
+HICON WINAPI Win32Bridge::Bridge::BridgeCreateIconFromResourceEx(
+    PBYTE bits,
+    DWORD size,
+    BOOL icon,
+    DWORD version,
+    int width,
+    int height,
+    UINT)
+{
+    if (!bits || size == 0 || (version != 0 && version != 0x00030000))
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    std::vector<BYTE> copy;
+    if (!CopyGuestByteRange(bits, size, &copy))
+    {
+        BridgeSetLastError(ERROR_INVALID_DATA);
+        return nullptr;
+    }
+    POINT hotspot{};
+    const BYTE* imageBytes = copy.data();
+    size_t imageSize = copy.size();
+    if (!icon)
+    {
+        if (imageSize < 4)
+        {
+            BridgeSetLastError(ERROR_INVALID_DATA);
+            return nullptr;
+        }
+        SHORT x = 0;
+        SHORT y = 0;
+        memcpy(&x, imageBytes, sizeof(x));
+        memcpy(&y, imageBytes + sizeof(x), sizeof(y));
+        hotspot.x = x;
+        hotspot.y = y;
+        imageBytes += 4;
+        imageSize -= 4;
+    }
+    MiniGdi::Surface decoded;
+    if (!DecodeDeviceIndependentBitmap(imageBytes, imageSize, true, &decoded))
+    {
+        BridgeSetLastError(ERROR_INVALID_DATA);
+        return nullptr;
+    }
+    const int outputWidth = width > 0 ? width : decoded.Width();
+    const int outputHeight = height > 0 ? height : decoded.Height();
+    MiniGdi::Surface scaled = ScaleSurface(decoded, outputWidth, outputHeight);
+    if (scaled.Empty())
+    {
+        BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    if (icon)
+    {
+        HICON handle = StoreGuestIcon(std::move(scaled));
+        BridgeSetLastError(handle ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+        return handle;
+    }
+    if (decoded.Width() > 0 && decoded.Height() > 0)
+    {
+        hotspot.x = hotspot.x * outputWidth / decoded.Width();
+        hotspot.y = hotspot.y * outputHeight / decoded.Height();
+    }
+    HCURSOR handle = StoreGuestCursor(std::move(scaled), hotspot);
+    BridgeSetLastError(handle ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    return reinterpret_cast<HICON>(handle);
+}
+
+HICON WINAPI Win32Bridge::Bridge::BridgeCreateIconFromResource(
+    PBYTE bits,
+    DWORD size,
+    BOOL icon,
+    DWORD version)
+{
+    return BridgeCreateIconFromResourceEx(bits, size, icon, version, 0, 0, LR_DEFAULTSIZE | LR_SHARED);
+}
+
+HANDLE WINAPI Win32Bridge::Bridge::BridgeLoadImageW(
+    HINSTANCE instance,
+    LPCWSTR name,
+    UINT type,
+    int width,
+    int height,
+    UINT flags)
+{
+    if (!name || (type != IMAGE_BITMAP && type != IMAGE_ICON && type != IMAGE_CURSOR))
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if ((flags & LR_DEFAULTSIZE) != 0)
+    {
+        if (width <= 0) width = type == IMAGE_BITMAP ? 0 : 32;
+        if (height <= 0) height = type == IMAGE_BITMAP ? 0 : 32;
+    }
+
+    MiniGdi::Surface image;
+    POINT hotspot{};
+    if ((flags & LR_LOADFROMFILE) != 0)
+    {
+        GuestStorageContext* storage = CurrentGuestStorageContext();
+        std::vector<BYTE> bytes;
+        DWORD error = ERROR_SUCCESS;
+        if (!storage || !storage->ReadAllBytes(name, &bytes, &error) ||
+            !DecodeEncodedImage(bytes.data(), bytes.size(), &image, width, height))
+        {
+            BridgeSetLastError(error == ERROR_SUCCESS ? ERROR_INVALID_DATA : error);
+            return nullptr;
+        }
+        if (width > 0 || height > 0)
+        {
+            image = ScaleSurface(image, width > 0 ? width : image.Width(),
+                height > 0 ? height : image.Height());
+        }
+        hotspot.x = image.Width() / 2;
+        hotspot.y = image.Height() / 2;
+    }
+    else if (type == IMAGE_BITMAP)
+    {
+        if (!LoadBitmapResourcePixels(instance, name, &image))
+        {
+            BridgeSetLastError(ERROR_RESOURCE_NAME_NOT_FOUND);
+            return nullptr;
+        }
+        if (width > 0 || height > 0)
+        {
+            image = ScaleSurface(image, width > 0 ? width : image.Width(),
+                height > 0 ? height : image.Height());
+        }
+    }
+    else if (type == IMAGE_ICON)
+    {
+        if (!LoadIconResourcePixels(instance, name, width, height, &image))
+        {
+            BridgeSetLastError(ERROR_RESOURCE_NAME_NOT_FOUND);
+            return nullptr;
+        }
+    }
+    else if (!LoadCursorResourcePixels(instance, name, width, height, &image, &hotspot))
+    {
+        BridgeSetLastError(ERROR_RESOURCE_NAME_NOT_FOUND);
+        return nullptr;
+    }
+
+    HANDLE result = nullptr;
+    if (type == IMAGE_BITMAP) result = CreateGuestBitmapFromSurface(image);
+    else if (type == IMAGE_ICON) result = StoreGuestIcon(std::move(image));
+    else result = StoreGuestCursor(std::move(image), hotspot);
+    BridgeSetLastError(result ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    return result;
+}
+
+HANDLE WINAPI Win32Bridge::Bridge::BridgeLoadImageA(
+    HINSTANCE instance,
+    LPCSTR name,
+    UINT type,
+    int width,
+    int height,
+    UINT flags)
+{
+    std::wstring storage;
+    LPCWSTR converted = nullptr;
+    if (!ConvertAnsiResourceName(name, &storage, &converted))
+    {
+        BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return nullptr;
+    }
+    return BridgeLoadImageW(instance, converted, type, width, height, flags);
+}
+
+HANDLE WINAPI Win32Bridge::Bridge::BridgeCopyImage(
+    HANDLE source,
+    UINT type,
+    int width,
+    int height,
+    UINT flags)
+{
+    if (!source)
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return nullptr;
+    }
+    MiniGdi::Surface image;
+    POINT hotspot{};
+    if (type == IMAGE_ICON)
+    {
+        if (!CopyGuestIconPixels(reinterpret_cast<HICON>(source), &image))
+        {
+            BridgeSetLastError(ERROR_INVALID_HANDLE);
+            return nullptr;
+        }
+    }
+    else if (type == IMAGE_CURSOR)
+    {
+        std::lock_guard<std::mutex> guard(g_cursorLock);
+        const auto found = g_guestCursors.find(reinterpret_cast<ULONG_PTR>(source));
+        if (found == g_guestCursors.end() || found->second.image.Empty())
+        {
+            BridgeSetLastError(ERROR_INVALID_HANDLE);
+            return nullptr;
+        }
+        image = found->second.image;
+        hotspot = found->second.hotspot;
+    }
+    else if (type == IMAGE_BITMAP)
+    {
+        GuestWindowManager* manager = CurrentGuestWindowManager();
+        const MiniGdi::Surface* bitmap = manager ? manager->Gdi().GetBitmapSurface(
+            static_cast<MiniGdi::ObjectHandle>(reinterpret_cast<ULONG_PTR>(source))) : nullptr;
+        if (!bitmap || bitmap->Empty())
+        {
+            BridgeSetLastError(ERROR_INVALID_HANDLE);
+            return nullptr;
+        }
+        image = *bitmap;
+    }
+    else
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    const int outputWidth = width > 0 ? width : image.Width();
+    const int outputHeight = height > 0 ? height : image.Height();
+    if (type == IMAGE_CURSOR && image.Width() > 0 && image.Height() > 0)
+    {
+        hotspot.x = hotspot.x * outputWidth / image.Width();
+        hotspot.y = hotspot.y * outputHeight / image.Height();
+    }
+    image = ScaleSurface(image, outputWidth, outputHeight);
+    HANDLE result = type == IMAGE_ICON
+        ? reinterpret_cast<HANDLE>(StoreGuestIcon(std::move(image)))
+        : type == IMAGE_CURSOR
+            ? reinterpret_cast<HANDLE>(StoreGuestCursor(std::move(image), hotspot))
+            : reinterpret_cast<HANDLE>(CreateGuestBitmapFromSurface(image));
+    if (result && (flags & LR_COPYDELETEORG) != 0)
+    {
+        if (type == IMAGE_ICON) BridgeDestroyIcon(reinterpret_cast<HICON>(source));
+        else if (type == IMAGE_CURSOR) BridgeDestroyCursor(reinterpret_cast<HCURSOR>(source));
+        else if (GuestWindowManager* manager = CurrentGuestWindowManager())
+            manager->Gdi().DeleteObject(static_cast<MiniGdi::ObjectHandle>(reinterpret_cast<ULONG_PTR>(source)));
+    }
+    BridgeSetLastError(result ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    return result;
+}
+
+HICON WINAPI Win32Bridge::Bridge::BridgeCopyIcon(HICON icon)
+{
+    return reinterpret_cast<HICON>(BridgeCopyImage(icon, IMAGE_ICON, 0, 0, 0));
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeDrawIconEx(
+    HDC dc, int x, int y, HICON icon, int width, int height, UINT step, HBRUSH, UINT flags)
+{
+    if (!dc || !icon || step != 0 || (flags & (DrawIconMask | DrawIconImage)) == 0)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    MiniGdi::Surface source;
+    if (!CopyGuestIconPixels(icon, &source))
+    {
+        std::lock_guard<std::mutex> guard(g_cursorLock);
+        const auto found = g_guestCursors.find(reinterpret_cast<ULONG_PTR>(icon));
+        if (found == g_guestCursors.end())
+        {
+            BridgeSetLastError(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        source = found->second.image;
+    }
+    const int outputWidth = width > 0 ? width : source.Width();
+    const int outputHeight = height > 0 ? height : source.Height();
+    source = ScaleSurface(source, outputWidth, outputHeight);
+    GuestWindowManager* manager = CurrentGuestWindowManager();
+    MiniGdi::Surface* destination = manager
+        ? manager->Gdi().GetSurface(manager->GuestDcHandle(dc)) : nullptr;
+    if (!destination || source.Empty())
     {
         BridgeSetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    // Every cursor token is shared/static in this bridge.
+    const bool imagePass = (flags & DrawIconImage) != 0;
+    for (int sourceY = 0; sourceY < source.Height(); ++sourceY)
+    {
+        const int destinationY = y + sourceY;
+        if (destinationY < 0 || destinationY >= destination->Height()) continue;
+        for (int sourceX = 0; sourceX < source.Width(); ++sourceX)
+        {
+            const int destinationX = x + sourceX;
+            if (destinationX < 0 || destinationX >= destination->Width()) continue;
+            const MiniGdi::Color* input = source.PixelAt(sourceX, sourceY);
+            MiniGdi::Color* output = destination->PixelAt(destinationX, destinationY);
+            if (!input || !output) continue;
+            if (imagePass)
+                *output = MiniGdi::BlendSourceOver(*input, *output);
+            else
+                *output = MiniGdi::Alpha(*input) == 0 ? MiniGdi::OpaqueWhite : MiniGdi::OpaqueBlack;
+        }
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeDrawIcon(HDC dc, int x, int y, HICON icon)
+{
+    return BridgeDrawIconEx(dc, x, y, icon, 0, 0, 0, nullptr, DrawIconNormal);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeDestroyCursor(HCURSOR cursor)
+{
+    if (!cursor)
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    std::lock_guard<std::mutex> guard(g_cursorLock);
+    if (g_guestCursors.erase(reinterpret_cast<ULONG_PTR>(cursor)) == 0)
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -843,6 +1732,38 @@ bool Win32Bridge::Bridge::CopyGuestIconPixels(HICON icon, MiniGdi::Surface* dest
     if (found == g_guestIcons.end()) return false;
     *destination = found->second;
     return true;
+}
+
+HICON Win32Bridge::Bridge::CreateGuestShellIcon(bool directory, int size)
+{
+    size = (std::max)(8, (std::min)(size, 256));
+    MiniGdi::Surface image(size, size, MiniGdi::Transparent);
+    const int margin = (std::max)(1, size / 8);
+    if (directory)
+    {
+        const int tabWidth = (std::max)(3, size * 2 / 5);
+        const int tabHeight = (std::max)(2, size / 5);
+        MiniGdi::DrawRectangle(image,
+            MiniGdi::Rect{ margin, margin + tabHeight / 2, margin + tabWidth, margin + tabHeight + 1 },
+            MiniGdi::MakeColor(255, 194, 45), MiniGdi::MakeColor(183, 119, 0));
+        MiniGdi::DrawRectangle(image,
+            MiniGdi::Rect{ margin, margin + tabHeight, size - margin, size - margin },
+            MiniGdi::MakeColor(255, 202, 62), MiniGdi::MakeColor(183, 119, 0));
+    }
+    else
+    {
+        const int fold = (std::max)(2, size / 4);
+        const MiniGdi::Color border = MiniGdi::MakeColor(105, 114, 125);
+        MiniGdi::DrawRectangle(image,
+            MiniGdi::Rect{ margin, margin, size - margin, size - margin },
+            MiniGdi::OpaqueWhite, border);
+        for (int y = margin + fold + 2; y < size - margin - 1; y += (std::max)(2, size / 5))
+            MiniGdi::DrawLine(image, { margin + 2, y }, { size - margin - 3, y },
+                MiniGdi::MakeColor(145, 154, 165));
+        MiniGdi::DrawLine(image, { size - margin - fold, margin },
+            { size - margin, margin + fold }, border);
+    }
+    return StoreGuestIcon(std::move(image));
 }
 
 int WINAPI Win32Bridge::Bridge::BridgeGetSystemMetrics(int index)
@@ -2533,9 +3454,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeDrawMenuBar(HWND window)
     }
     return TRUE;
 }
-HMENU WINAPI Win32Bridge::Bridge::BridgeLoadMenuW(HINSTANCE, LPCWSTR resource)
+HMENU WINAPI Win32Bridge::Bridge::BridgeLoadMenuW(HINSTANCE instance, LPCWSTR resource)
 {
-    const HMENU menu = LoadGuestMenuResource(resource);
+    const HMENU menu = LoadGuestMenuResource(instance, resource);
     BridgeSetLastError(menu ? ERROR_SUCCESS : ERROR_RESOURCE_NAME_NOT_FOUND);
     if (menu)
     {
@@ -2707,11 +3628,11 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeSetWindowPlacement(HWND window, const voi
     return TRUE;
 }
 
-HBITMAP WINAPI Win32Bridge::Bridge::BridgeLoadBitmapW(HINSTANCE, LPCWSTR resource)
+HBITMAP WINAPI Win32Bridge::Bridge::BridgeLoadBitmapW(HINSTANCE instance, LPCWSTR resource)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     MiniGdi::Surface image;
-    if (!manager || !resource || !LoadBitmapResourcePixels(resource, &image))
+    if (!manager || !resource || !LoadBitmapResourcePixels(instance, resource, &image))
     {
         BridgeSetLastError(ERROR_RESOURCE_NAME_NOT_FOUND);
         return nullptr;
@@ -2729,6 +3650,18 @@ HBITMAP WINAPI Win32Bridge::Bridge::BridgeLoadBitmapW(HINSTANCE, LPCWSTR resourc
     BridgeSetLastError(ERROR_SUCCESS);
     return reinterpret_cast<HBITMAP>(static_cast<ULONG_PTR>(bitmap));
 }
+HBITMAP WINAPI Win32Bridge::Bridge::BridgeLoadBitmapA(HINSTANCE instance, LPCSTR resource)
+{
+    std::wstring storage;
+    LPCWSTR converted = nullptr;
+    if (!ConvertAnsiResourceName(resource, &storage, &converted))
+    {
+        BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return nullptr;
+    }
+    return BridgeLoadBitmapW(instance, converted);
+}
+
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetClassInfoW(HINSTANCE, LPCWSTR, GuestAbi::WndClassW*) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
 LRESULT WINAPI Win32Bridge::Bridge::BridgeCallWindowProcW(GuestAbi::WndProc procedure, HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
@@ -2796,8 +3729,32 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateWindowExW);
     else if (_wcsicmp(symbol.name.c_str(), L"loadcursorw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadCursorW);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadcursora") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadCursorA);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadcursorfromfilew") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadCursorFromFileW);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadcursorfromfilea") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadCursorFromFileA);
     else if (_wcsicmp(symbol.name.c_str(), L"loadiconw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadIconW);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadicona") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadIconA);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadimagew") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadImageW);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadimagea") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadImageA);
+    else if (_wcsicmp(symbol.name.c_str(), L"createiconfromresourceex") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateIconFromResourceEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"createiconfromresource") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateIconFromResource);
+    else if (_wcsicmp(symbol.name.c_str(), L"copyimage") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCopyImage);
+    else if (_wcsicmp(symbol.name.c_str(), L"copyicon") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCopyIcon);
+    else if (_wcsicmp(symbol.name.c_str(), L"drawicon") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawIcon);
+    else if (_wcsicmp(symbol.name.c_str(), L"drawiconex") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawIconEx);
     else if (_wcsicmp(symbol.name.c_str(), L"setcursor") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetCursor);
     else if (_wcsicmp(symbol.name.c_str(), L"destroycursor") == 0)
@@ -3024,6 +3981,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowPlacement);
     else if (_wcsicmp(symbol.name.c_str(), L"loadbitmapw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadBitmapW);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadbitmapa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadBitmapA);
     else if (_wcsicmp(symbol.name.c_str(), L"getclassinfow") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassInfoW);
     else if (_wcsicmp(symbol.name.c_str(), L"callwindowprocw") == 0)

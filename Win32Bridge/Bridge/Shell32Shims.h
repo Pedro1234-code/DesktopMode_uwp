@@ -13,6 +13,7 @@ namespace Bridge
     DWORD_PTR WINAPI BridgeSHGetFileInfoW(LPCWSTR path, DWORD attributes, PVOID info, UINT size, UINT flags);
     BOOL WINAPI BridgeSHGetPathFromIDListW(PVOID itemIdList, LPWSTR path);
     UINT WINAPI BridgeExtractIconExW(LPCWSTR fileName, int iconIndex, HICON* largeIcons, HICON* smallIcons, UINT iconCount);
+    UINT WINAPI BridgeExtractIconExA(LPCSTR fileName, int iconIndex, HICON* largeIcons, HICON* smallIcons, UINT iconCount);
     HRESULT WINAPI BridgeSHGetDesktopFolder(PVOID* desktopFolder);
     HRESULT WINAPI BridgeSHGetSpecialFolderLocation(HWND owner, int folder, PVOID* itemIdList);
     BOOL WINAPI BridgeSHGetSpecialFolderPathW(HWND owner, LPWSTR path, int folder, BOOL create);

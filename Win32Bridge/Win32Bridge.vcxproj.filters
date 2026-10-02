@@ -68,6 +68,12 @@
     <ClInclude Include="Bridge\User32Shims.h">
       <Filter>Bridge</Filter>
     </ClInclude>
+    <ClInclude Include="Bridge\VersionShims.h">
+      <Filter>Bridge</Filter>
+    </ClInclude>
+    <ClInclude Include="Bridge\ActivationContext.h">
+      <Filter>Bridge</Filter>
+    </ClInclude>
     <ClInclude Include="Bridge\GuestWindow.h">
       <Filter>Bridge</Filter>
     </ClInclude>
@@ -128,6 +134,12 @@
       <Filter>Bridge</Filter>
     </ClCompile>
     <ClCompile Include="Bridge\User32Shims.cpp">
+      <Filter>Bridge</Filter>
+    </ClCompile>
+    <ClCompile Include="Bridge\VersionShims.cpp">
+      <Filter>Bridge</Filter>
+    </ClCompile>
+    <ClCompile Include="Bridge\ActivationContext.cpp">
       <Filter>Bridge</Filter>
     </ClCompile>
   </ItemGroup>

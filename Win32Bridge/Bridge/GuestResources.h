@@ -46,6 +46,9 @@ namespace Bridge
         size_t size = 0;
     };
 
+    // Reads from a mapped AMD64 image. With requireExactLanguage == false the
+    // first numeric language entry is selected deterministically; locale/MUI
+    // fallback is intentionally outside the current parser.
     GuestResourceStatus FindGuestResource(
         HMODULE module,
         LPCWSTR type,
@@ -53,6 +56,19 @@ namespace Bridge
         LANGID language,
         bool requireExactLanguage,
         GuestResourceData* resource);
+
+    // Materializes an x64 PE file and copies one resource out of its virtual
+    // image. This keeps pointers from temporary mapped storage from escaping.
+    GuestResourceStatus CopyGuestFileResource(
+        const BYTE* fileBytes,
+        size_t fileSize,
+        LPCWSTR type,
+        LPCWSTR name,
+        LANGID language,
+        bool requireExactLanguage,
+        std::vector<BYTE>* payload,
+        LANGID* selectedLanguage = nullptr,
+        DWORD* codePage = nullptr);
 
     GuestResourceStatus EnumerateGuestResourceTypes(
         HMODULE module,
@@ -66,11 +82,6 @@ namespace Bridge
         LPCWSTR type,
         LPCWSTR name,
         std::vector<LANGID>* languages);
-
-    // Looks up one resource directly in the mapped guest PE.  `name` accepts
-    // either an ordinal resource token (MAKEINTRESOURCE-style) or a Unicode
-    // resource name.  The returned bytes remain owned by the mapped image.
-    bool FindGuestResource(WORD resourceType, LPCWSTR name, const BYTE** data, size_t* size);
 
     class GuestResourceScope final
     {

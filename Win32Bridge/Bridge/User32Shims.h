@@ -32,6 +32,7 @@ namespace Bridge
     std::vector<GuestMenuVisualItem> GetGuestMenuItems(HMENU menu);
     std::vector<GuestMenuVisualItem> GetGuestMenuBarItems(HWND window);
     bool CopyGuestIconPixels(HICON icon, MiniGdi::Surface* destination);
+    HICON CreateGuestShellIcon(bool directory, int size);
     ATOM WINAPI BridgeRegisterClassExW(const GuestAbi::WndClassExW* windowClass);
     ATOM WINAPI BridgeRegisterClassW(const GuestAbi::WndClassW* windowClass);
     HWND WINAPI BridgeCreateWindowExW(
@@ -48,8 +49,20 @@ namespace Bridge
         HINSTANCE instance,
         LPVOID parameter);
     HCURSOR WINAPI BridgeLoadCursorW(HINSTANCE instance, LPCWSTR cursorName);
+    HCURSOR WINAPI BridgeLoadCursorA(HINSTANCE instance, LPCSTR cursorName);
+    HCURSOR WINAPI BridgeLoadCursorFromFileW(LPCWSTR fileName);
+    HCURSOR WINAPI BridgeLoadCursorFromFileA(LPCSTR fileName);
     HCURSOR WINAPI BridgeSetCursor(HCURSOR cursor);
     HICON WINAPI BridgeLoadIconW(HINSTANCE instance, LPCWSTR iconName);
+    HICON WINAPI BridgeLoadIconA(HINSTANCE instance, LPCSTR iconName);
+    HANDLE WINAPI BridgeLoadImageW(HINSTANCE instance, LPCWSTR name, UINT type, int width, int height, UINT flags);
+    HANDLE WINAPI BridgeLoadImageA(HINSTANCE instance, LPCSTR name, UINT type, int width, int height, UINT flags);
+    HICON WINAPI BridgeCreateIconFromResourceEx(PBYTE bits, DWORD size, BOOL icon, DWORD version, int width, int height, UINT flags);
+    HICON WINAPI BridgeCreateIconFromResource(PBYTE bits, DWORD size, BOOL icon, DWORD version);
+    HANDLE WINAPI BridgeCopyImage(HANDLE image, UINT type, int width, int height, UINT flags);
+    HICON WINAPI BridgeCopyIcon(HICON icon);
+    BOOL WINAPI BridgeDrawIcon(HDC dc, int x, int y, HICON icon);
+    BOOL WINAPI BridgeDrawIconEx(HDC dc, int x, int y, HICON icon, int width, int height, UINT step, HBRUSH brush, UINT flags);
     BOOL WINAPI BridgeDestroyCursor(HCURSOR cursor);
     BOOL WINAPI BridgeDestroyIcon(HICON icon);
     int WINAPI BridgeGetSystemMetrics(int index);
@@ -163,6 +176,7 @@ namespace Bridge
     BOOL WINAPI BridgeGetWindowPlacement(HWND window, void* placement);
     BOOL WINAPI BridgeSetWindowPlacement(HWND window, const void* placement);
     HBITMAP WINAPI BridgeLoadBitmapW(HINSTANCE instance, LPCWSTR bitmapName);
+    HBITMAP WINAPI BridgeLoadBitmapA(HINSTANCE instance, LPCSTR bitmapName);
     BOOL WINAPI BridgeGetClassInfoW(HINSTANCE instance, LPCWSTR className, GuestAbi::WndClassW* windowClass);
     LRESULT WINAPI BridgeCallWindowProcW(GuestAbi::WndProc procedure, HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 

@@ -401,6 +401,28 @@ bool GuestStorageContext::Resolve(LPCWSTR path, GuestPath* resolved, DWORD* win3
     return true;
 }
 
+bool GuestStorageContext::CanonicalPath(
+    LPCWSTR path,
+    std::wstring* canonical,
+    DWORD* win32Error) const
+{
+    if (!canonical)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    canonical->clear();
+    GuestPath resolved;
+    if (!Resolve(path, &resolved, win32Error))
+    {
+        return false;
+    }
+    *canonical = std::move(resolved.canonical);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
 bool GuestStorageContext::GetFolder(
     const std::vector<std::wstring>& physicalComponents,
     bool createMissing,

@@ -27,21 +27,33 @@ namespace Bridge
             Windows::Storage::StorageFolder^ moduleSourceFolder);
         ~GuestModuleLoader();
 
-        bool LoadLibrary(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error);
-        FARPROC GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, DWORD* win32Error) const;
+        bool LoadLibrary(
+            LPCWSTR requestedName,
+            HMODULE* module,
+            DWORD* win32Error,
+            DWORD searchFlags = 0);
+        bool GetModuleHandle(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error) const;
+        bool GetModulePath(HMODULE module, std::wstring* path, DWORD* win32Error) const;
+        FARPROC GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, DWORD* win32Error);
         bool GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const;
         bool FreeLibrary(HMODULE module, DWORD* win32Error);
         void ReleaseAll();
 
     private:
         struct Module;
+        struct ModuleCandidate;
 
-        static std::wstring CanonicalName(LPCWSTR requestedName);
-        std::shared_ptr<Module> FindModuleLocked(HMODULE module) const;
-        bool ReadModuleBytes(
-            const std::wstring& canonicalName,
-            std::vector<BYTE>* bytes,
+        bool BuildCandidates(
+            LPCWSTR requestedName,
+            DWORD searchFlags,
+            std::vector<ModuleCandidate>* candidates,
+            std::wstring* requestedBaseName,
+            bool* searchByBaseName,
             DWORD* win32Error) const;
+        std::shared_ptr<Module> FindModuleLocked(HMODULE module) const;
+        std::shared_ptr<Module> FindModuleByIdentityLocked(const std::wstring& identity) const;
+        std::shared_ptr<Module> FindModuleByBaseNameLocked(const std::wstring& baseName) const;
+        bool ReadModuleBytes(const ModuleCandidate& candidate, std::vector<BYTE>* bytes) const;
         bool ReadAuthorizedModuleBytes(
             const std::wstring& relativeName,
             std::vector<BYTE>* bytes) const;
