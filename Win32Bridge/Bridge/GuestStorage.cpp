@@ -4,6 +4,7 @@
 
 #include <windows.storage.fileproperties.h>
 
+#include <algorithm>
 #include <cwctype>
 #include <vector>
 
@@ -67,6 +68,36 @@ namespace
             std::wstring(L"STORAGE EXCEPTION: ") + (operation ? operation : L"unknown") +
             L"; HRESULT " + std::to_wstring(static_cast<unsigned long>(
                 exception ? exception->HResult : E_FAIL)) + L".");
+    }
+
+    void MoveStorageFolderTree(StorageFolder^ source, StorageFolder^ destinationParent,
+        const std::wstring& destinationName, bool replaceExisting, unsigned depth)
+    {
+        if (!source || !destinationParent || destinationName.empty() || depth > 64)
+            throw ref new InvalidArgumentException();
+        StorageFolder^ destination = create_task(destinationParent->CreateFolderAsync(
+            ref new String(destinationName.c_str()), replaceExisting
+                ? CreationCollisionOption::ReplaceExisting
+                : CreationCollisionOption::FailIfExists)).get();
+        auto children = create_task(source->GetItemsAsync()).get();
+        for (unsigned index = 0; index < children->Size; ++index)
+        {
+            IStorageItem^ child = children->GetAt(index);
+            const std::wstring childName(child->Name->Data());
+            if (child->IsOfType(StorageItemTypes::File))
+            {
+                StorageFile^ file = safe_cast<StorageFile^>(child);
+                create_task(file->MoveAsync(destination, child->Name,
+                    replaceExisting ? NameCollisionOption::ReplaceExisting
+                        : NameCollisionOption::FailIfExists)).get();
+            }
+            else if (child->IsOfType(StorageItemTypes::Folder))
+            {
+                MoveStorageFolderTree(safe_cast<StorageFolder^>(child), destination,
+                    childName, replaceExisting, depth + 1);
+            }
+        }
+        create_task(source->DeleteAsync()).get();
     }
 
     std::vector<std::wstring> PhysicalComponents(const GuestPath& path)
@@ -1146,10 +1177,11 @@ bool GuestStorageContext::MoveGuestPath(
     DWORD flags,
     DWORD* win32Error)
 {
-    // Every move remains in LocalFolder\drive_c. MOVEFILE_COPY_ALLOWED is
-    // unnecessary for that single volume, and delayed moves have no UWP
-    // equivalent, so reject rather than silently changing Win32 semantics.
-    const DWORD supportedFlags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    // Every move remains in LocalFolder\drive_c. MOVEFILE_COPY_ALLOWED is a
+    // harmless permission on this single virtual volume and must still be
+    // accepted because file managers routinely pass it unconditionally.
+    const DWORD supportedFlags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH |
+        MOVEFILE_COPY_ALLOWED;
     if ((flags & ~supportedFlags) != 0)
     {
         SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
@@ -1196,8 +1228,6 @@ bool GuestStorageContext::MoveGuestPath(
 
         if (item->IsOfType(StorageItemTypes::Folder))
         {
-            // Windows.Storage only exposes a folder rename, not a cross-folder
-            // move. A same-parent move is still a useful and lossless subset.
             bool sameParent = source.components.size() == destination.components.size();
             if (sameParent)
             {
@@ -1212,8 +1242,22 @@ bool GuestStorageContext::MoveGuestPath(
             }
             if (!sameParent)
             {
-                SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
-                return false;
+                if (destination.components.size() >= source.components.size() &&
+                    std::equal(source.components.begin(), source.components.end(),
+                        destination.components.begin(), [](const std::wstring& left,
+                            const std::wstring& right)
+                        {
+                            return _wcsicmp(left.c_str(), right.c_str()) == 0;
+                        }))
+                {
+                    SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+                    return false;
+                }
+                MoveStorageFolderTree(safe_cast<StorageFolder^>(item), destinationParent,
+                    destinationName, (flags & MOVEFILE_REPLACE_EXISTING) != 0, 0);
+                SetWin32Error(win32Error, ERROR_SUCCESS);
+                RuntimeDiagnostics::Record(L"STORAGE: moved a virtual directory tree.");
+                return true;
             }
 
             StorageFolder^ folder = safe_cast<StorageFolder^>(item);

@@ -3,6 +3,7 @@
 #include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestWindow.h"
 #include "Bridge/User32Shims.h"
+#include "Bridge/DialogResources.h"
 #include "Bridge/RuntimeDiagnostics.h"
 #include "Bridge\\MiniGdi.h"
 
@@ -25,6 +26,67 @@ void WINAPI Win32Bridge::Bridge::BridgeInitCommonControls()
 
 namespace
 {
+    struct GuestPropertySheetPageW final
+    {
+        DWORD size;
+        DWORD flags;
+        HINSTANCE instance;
+        LPCWSTR templateName;
+        HICON icon;
+        LPCWSTR title;
+        DLGPROC dialogProcedure;
+        LPARAM parameter;
+        PVOID callback;
+        UINT* referenceCount;
+    };
+
+    struct GuestPropertySheetHeaderW final
+    {
+        DWORD size;
+        DWORD flags;
+        HWND parent;
+        HINSTANCE instance;
+        HICON icon;
+        LPCWSTR caption;
+        UINT pageCount;
+        // PROPSHEETHEADERW declares this field as a union of UINT and
+        // LPCWSTR.  Store the whole pointer-sized union so the following
+        // fields retain their native x64 offsets.
+        ULONG_PTR startPage;
+        const GuestPropertySheetPageW* pages;
+        PVOID callback;
+    };
+
+    constexpr DWORD PropertySheetHeaderPagesAreStructures = 0x00000008;
+    constexpr DWORD PropertySheetHeaderUsesStartPageName = 0x00000040;
+
+    bool ReadPropertySheetHeader(const void* source, GuestPropertySheetHeaderW* result)
+    {
+        if (!source || !result || reinterpret_cast<ULONG_PTR>(source) <= 0xffff) return false;
+        __try
+        {
+            const DWORD size = *static_cast<const DWORD*>(source);
+            if (size < offsetof(GuestPropertySheetHeaderW, callback)) return false;
+            ZeroMemory(result, sizeof(*result));
+            memcpy(result, source, (std::min)(static_cast<size_t>(size), sizeof(*result)));
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    bool ReadPropertySheetPage(const BYTE* source, GuestPropertySheetPageW* result, DWORD* size)
+    {
+        if (!source || !result || !size) return false;
+        __try
+        {
+            *size = *reinterpret_cast<const DWORD*>(source);
+            if (*size < offsetof(GuestPropertySheetPageW, callback) || *size > 4096) return false;
+            ZeroMemory(result, sizeof(*result));
+            memcpy(result, source, (std::min)(static_cast<size_t>(*size), sizeof(*result)));
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
     constexpr COLORREF NoMaskColor = 0xffffffffu; // CLR_NONE without desktop commctrl headers.
     struct ImageListRecord
     {
@@ -231,7 +293,44 @@ HWND WINAPI Win32Bridge::Bridge::BridgeCreateStatusWindowW(LONG style, LPCWSTR t
         0, 0, 100, GuestMetrics::StatusBarHeight, parent,
         reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(identifier)), nullptr, nullptr, &error) : nullptr;
 }
-INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void*) { return -1; }
+INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void* headerPointer)
+{
+    if (!headerPointer || reinterpret_cast<ULONG_PTR>(headerPointer) <= 0xffff)
+        return -1;
+    GuestPropertySheetHeaderW header = {};
+    if (!ReadPropertySheetHeader(headerPointer, &header)) return -1;
+    if (header.pageCount == 0 || header.pageCount > 256 || !header.pages ||
+        (header.flags & PropertySheetHeaderPagesAreStructures) == 0)
+    {
+        RuntimeDiagnostics::Record(L"PROPERTYSHEET: unsupported or empty page collection.");
+        return -1;
+    }
+
+    // A named start page is an optional presentation hint.  Until the bridge
+    // exposes a real tab host, start with the first page rather than treating
+    // its string pointer as a numeric index.
+    const UINT selected = (header.flags & PropertySheetHeaderUsesStartPageName) != 0
+        ? 0
+        : (std::min)(static_cast<UINT>(header.startPage), header.pageCount - 1);
+    const BYTE* cursor = reinterpret_cast<const BYTE*>(header.pages);
+    GuestPropertySheetPageW page = {};
+    for (UINT index = 0; index <= selected; ++index)
+    {
+        DWORD pageSize = 0;
+        GuestPropertySheetPageW current = {};
+        if (!ReadPropertySheetPage(cursor, &current, &pageSize)) return -1;
+        if (index == selected)
+        {
+            page = current;
+            break;
+        }
+        cursor += pageSize;
+    }
+    RuntimeDiagnostics::Record(L"PROPERTYSHEET: presenting page " +
+        std::to_wstring(selected) + L" of " + std::to_wstring(header.pageCount) + L".");
+    return ShowGuestDialogFromResource(page.instance ? page.instance : header.instance,
+        page.templateName, header.parent, page.dialogProcedure, page.parameter);
+}
 HRESULT WINAPI Win32Bridge::Bridge::BridgeDllGetVersion(GuestDllVersionInfo* versionInfo)
 {
     if (!versionInfo || versionInfo->cbSize < sizeof(GuestDllVersionInfo))

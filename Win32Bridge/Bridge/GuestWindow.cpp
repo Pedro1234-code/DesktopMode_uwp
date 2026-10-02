@@ -285,6 +285,8 @@ namespace
         return value == GuestAbi::CwUseDefault ? 0 : value;
     }
 
+    int SaturatingAdd(int value, int delta);
+
     std::wstring MenuCaptionForDisplay(const std::wstring& source)
     {
         std::wstring result;
@@ -658,6 +660,8 @@ namespace
     constexpr UINT ListViewInsertItemW = 0x104d;
     constexpr UINT ListViewSetItemW = 0x104c;
     constexpr UINT ListViewSetItemTextW = 0x1074;
+    constexpr UINT ListViewEditLabelW = 0x1076;
+    constexpr UINT ListViewGetEditControl = 0x1018;
     constexpr UINT ListViewGetItemTextW = 0x1073;
     constexpr UINT ListViewGetItemW = 0x104b;
     constexpr UINT ListViewGetColumnW = 0x105f;
@@ -867,6 +871,8 @@ namespace
     constexpr UINT ListViewNotifyGetDisplayInfoW = static_cast<UINT>(-177); // LVN_GETDISPINFOW
     constexpr UINT ListViewNotifyItemChanged = static_cast<UINT>(-101); // LVN_ITEMCHANGED
     constexpr UINT ListViewNotifyItemActivate = static_cast<UINT>(-114); // LVN_ITEMACTIVATE
+    constexpr UINT ListViewNotifyBeginLabelEditW = static_cast<UINT>(-175); // LVN_BEGINLABELEDITW
+    constexpr UINT ListViewNotifyEndLabelEditW = static_cast<UINT>(-176); // LVN_ENDLABELEDITW
     constexpr UINT NotifyClick = static_cast<UINT>(-2); // NM_CLICK
     constexpr UINT NotifyDoubleClick = static_cast<UINT>(-3); // NM_DBLCLK
     constexpr BYTE ToolbarStateEnabled = 0x04;
@@ -1032,7 +1038,6 @@ namespace
     };
 
     int SetWindowPosExtent(int value);
-    int SaturatingAdd(int value, int delta);
 
     bool IsRebarBandHidden(const RebarBand& band)
     {
@@ -2111,6 +2116,9 @@ struct GuestWindowManager::WindowRecord final
     int listViewSelectionMark = -1;
     int listViewTopItem = 0;
     int listViewPressedItem = -1;
+    int listViewEditItem = -1;
+    std::wstring listViewEditText;
+    size_t listViewEditCaret = 0;
     std::chrono::steady_clock::time_point listViewLastClick = {};
     int listViewLastClickItem = -1;
     std::vector<int> toolbarCommands;
@@ -3611,6 +3619,10 @@ UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int 
         SendGuestMessage(owner, GuestAbi::WmCommand,
             GuestAbi::MakeCommandWParam(static_cast<WORD>(command), 0), 0, nullptr);
     }
+    for (auto iterator = closedLevels.rbegin(); iterator != closedLevels.rend(); ++iterator)
+        SendGuestMessage(owner, GuestAbi::WmUninitMenuPopup,
+            reinterpret_cast<WPARAM>(iterator->menu), 0, nullptr);
+    SendGuestMessage(owner, GuestAbi::WmExitMenuLoop, TRUE, 0, nullptr);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return returnCommand ? command : (command ? TRUE : FALSE);
 }
@@ -3648,6 +3660,7 @@ BOOL GuestWindowManager::EndGuestMenu(DWORD* win32Error)
     }
     m_popupMenuChanged.notify_all();
     InvalidateGuestRect(closing.root, nullptr, FALSE, nullptr);
+    Present(FindWindow(closing.root));
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
@@ -3659,11 +3672,6 @@ BOOL GuestWindowManager::GetGuestWindowRect(HWND window, LPRECT rect, DWORD* win
         SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    for (auto iterator = closedLevels.rbegin(); iterator != closedLevels.rend(); ++iterator)
-        SendGuestMessage(owner, GuestAbi::WmUninitMenuPopup,
-            reinterpret_cast<WPARAM>(iterator->menu), 0, nullptr);
-    SendGuestMessage(owner, GuestAbi::WmExitMenuLoop, TRUE, 0, nullptr);
-
     // Win32 GetWindowRect always returns screen coordinates, including for
     // child windows.  WindowRecord::bounds is deliberately parent-client
     // relative because the compositor consumes it that way, so accumulate
@@ -4427,9 +4435,10 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
             : L"MENU: dismissed without a command.");
         m_popupMenuChanged.notify_all();
         InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+        Present(root);
         if (command && closing.menuBar && closing.notifyOwner)
         {
-            SendGuestMessage(closing.owner, GuestAbi::WmCommand,
+            PostGuestMessage(closing.owner, GuestAbi::WmCommand,
                 GuestAbi::MakeCommandWParam(static_cast<WORD>(command), 0), 0, nullptr);
         }
     };
@@ -4508,6 +4517,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
             notifyMenuSelection(rootWindow, BridgeGetMenu(rootWindow),
                 barItems[static_cast<size_t>(selected)], static_cast<size_t>(selected));
             InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+            Present(root);
             return true;
         }
         if (popup.menuBar && rootY >= 0 && rootY < GuestMetrics::MenuHeight)
@@ -4566,6 +4576,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
             notifyMenuSelection(popup.owner, hitGeometry.menu, hit,
                 static_cast<size_t>(hitItem));
             InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+            Present(root);
         }
 
         if (IsMenuItemDisabled(hit) || IsMenuItemSeparator(hit)) return true;
@@ -4616,6 +4627,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                     RuntimeDiagnostics::Record(L"MENU: opened nested submenu at level " +
                         std::to_wstring(hitLevel + 1) + L".");
                     InvalidateGuestRect(rootWindow, nullptr, FALSE, nullptr);
+                    Present(root);
                 }
             }
             return true;
@@ -4662,7 +4674,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
             if (!item.subMenu && !IsMenuItemDisabled(item) && !IsMenuItemSeparator(item) &&
                 item.identifier)
             {
-                SendGuestMessage(rootWindow, GuestAbi::WmCommand,
+                PostGuestMessage(rootWindow, GuestAbi::WmCommand,
                     GuestAbi::MakeCommandWParam(static_cast<WORD>(item.identifier), 0), 0, nullptr);
             }
             return true;
@@ -4728,6 +4740,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                     std::to_wstring(selected) + L".");
             }
             InvalidateGuestRect(rootWindow, nullptr, TRUE, nullptr);
+            Present(root);
         }
         return true;
     }
@@ -5924,6 +5937,79 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
 
     if (controlKind == BuiltinControlKind::ListView)
     {
+        if (message == ListViewGetEditControl)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->listViewEditItem >= 0
+                ? reinterpret_cast<LRESULT>(window->handle) : 0;
+        }
+        if (message == ListViewEditLabelW)
+        {
+            const int item = static_cast<int>(wParam);
+            HWND parent = nullptr;
+            HWND handle = nullptr;
+            UINT_PTR controlId = 0;
+            LPARAM itemData = 0;
+            std::wstring text;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || item < 0 ||
+                    static_cast<size_t>(item) >= window->listViewItems.size())
+                    return 0;
+                parent = window->parent;
+                handle = window->handle;
+                controlId = window->controlId;
+                if (!window->listViewItems[static_cast<size_t>(item)].empty())
+                    text = window->listViewItems[static_cast<size_t>(item)][0];
+                if (static_cast<size_t>(item) < window->listViewItemData.size())
+                    itemData = window->listViewItemData[static_cast<size_t>(item)];
+            }
+            if (text.empty() && parent)
+            {
+                // Owner-data ListViews do not retain item captions.  Obtain
+                // the current label through the same LVN_GETDISPINFOW contract
+                // used for painting before creating the in-place editor.
+                wchar_t scratch[260] = {};
+                GuestListViewDisplayInfoW displayInfo = {};
+                displayInfo.header.from = handle;
+                displayInfo.header.identifier = controlId;
+                displayInfo.header.code = ListViewNotifyGetDisplayInfoW;
+                displayInfo.item.mask = ListViewItemText;
+                displayInfo.item.item = item;
+                displayInfo.item.subItem = 0;
+                displayInfo.item.text = scratch;
+                displayInfo.item.textCapacity = static_cast<int>(_countof(scratch));
+                displayInfo.item.itemData = itemData;
+                SendGuestMessage(parent, GuestAbi::WmNotify,
+                    static_cast<WPARAM>(controlId),
+                    reinterpret_cast<LPARAM>(&displayInfo), nullptr);
+                TryReadGuestWideString(displayInfo.item.text, &text);
+            }
+            GuestListViewDisplayInfoW notification = {};
+            notification.header.from = handle;
+            notification.header.identifier = controlId;
+            notification.header.code = ListViewNotifyBeginLabelEditW;
+            notification.item.mask = ListViewItemText | ListViewItemParam;
+            notification.item.item = item;
+            notification.item.text = text.empty() ? nullptr : const_cast<LPWSTR>(text.c_str());
+            notification.item.textCapacity = static_cast<int>(text.size() + 1);
+            notification.item.itemData = itemData;
+            if (parent && SendGuestMessage(parent, GuestAbi::WmNotify,
+                static_cast<WPARAM>(controlId), reinterpret_cast<LPARAM>(&notification), nullptr))
+                return 0;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed) return 0;
+                window->listViewEditItem = item;
+                window->listViewEditText = text;
+                window->listViewEditCaret = text.size();
+            }
+            SetGuestFocus(handle, nullptr);
+            InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
+            RuntimeDiagnostics::Record(L"LISTVIEW: began in-place label editing for row " +
+                std::to_wstring(item) + L".");
+            return reinterpret_cast<LRESULT>(handle);
+        }
         if (message == ListViewGetItemCount)
         {
             std::lock_guard<std::mutex> guard(window->lock);
@@ -5941,6 +6027,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 window->listViewSelectionMark = -1;
                 window->listViewTopItem = 0;
                 window->listViewPressedItem = -1;
+                window->listViewEditItem = -1;
+                window->listViewEditText.clear();
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             return TRUE;
@@ -5955,6 +6043,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return FALSE;
                 }
                 window->listViewItems.erase(window->listViewItems.begin() + item);
+                if (window->listViewEditItem == item)
+                {
+                    window->listViewEditItem = -1;
+                    window->listViewEditText.clear();
+                }
+                else if (window->listViewEditItem > item)
+                    --window->listViewEditItem;
                 if (static_cast<size_t>(item) < window->listViewItemData.size())
                 {
                     window->listViewItemData.erase(window->listViewItemData.begin() + item);
@@ -9224,6 +9319,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         UINT listViewExtendedStyle = 0;
         int listViewSelectedItem = -1;
         int listViewTopItem = 0;
+        int listViewEditItem = -1;
+        std::wstring listViewEditText;
+        size_t listViewEditCaret = 0;
         int controlTextWidth = GuestMetrics::TextWidth;
         int controlTextHeight = GuestMetrics::TextHeight;
         int listViewHeaderHeight = GuestMetrics::ListViewHeaderHeight;
@@ -9305,6 +9403,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             listViewExtendedStyle = window->listViewExtendedStyle;
             listViewSelectedItem = window->listViewSelectedItem;
             listViewTopItem = window->listViewTopItem;
+            listViewEditItem = window->listViewEditItem;
+            listViewEditText = window->listViewEditText;
+            listViewEditCaret = window->listViewEditCaret;
             controlTextWidth = window->controlTextWidth;
             controlTextHeight = window->controlTextHeight;
             listViewHeaderHeight = window->listViewHeaderHeight;
@@ -9996,6 +10097,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         static_cast<int>(displayIndex) * listViewRowHeight;
                     const bool selected = index < listViewItemStates.size() &&
                         (listViewItemStates[index] & ListViewStateSelected) != 0;
+                    const bool editingLabel = static_cast<int>(index) == listViewEditItem;
                     if (selected)
                     {
                         MiniGdi::FillRect(
@@ -10013,6 +10115,17 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             *surface,
                             MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + listViewRowHeight },
                             ColorFromGuestColorRef(listViewTextBackgroundColor));
+                    }
+                    if (editingLabel)
+                    {
+                        const int firstColumnWidth = !listDisplayColumns.empty() &&
+                            listDisplayColumns[0] < listColumnWidths.size()
+                            ? (std::max)(24, listColumnWidths[listDisplayColumns[0]]) : 120;
+                        MiniGdi::DrawRectangle(*surface,
+                            MiniGdi::Rect{ 2, rowTop, (std::min)(width - 1, firstColumnWidth + 2),
+                                rowTop + listViewRowHeight },
+                            MiniGdi::OpaqueWhite, MiniGdi::MakeColor(0, 120, 215));
+                        m_gdi.SetTextColor(guestDc, MiniGdi::OpaqueBlack, nullptr);
                     }
                     int cellLeft = 2;
                     const size_t cellCount = (std::max)(
@@ -10032,9 +10145,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         const std::wstring* cellText = subItem < listItems[index].size()
                             ? &listItems[index][subItem]
                             : &emptyCell;
+                        if (editingLabel && displayIndex == 0)
+                            cellText = &listViewEditText;
                         const bool needsImage = subItem == 0 && listViewImageList &&
                             (index >= listViewItemImages.size() || listViewItemImages[index] < 0);
-                        if ((cellText->empty() || needsImage) && parent)
+                        if ((!editingLabel || displayIndex != 0) &&
+                            (cellText->empty() || needsImage) && parent)
                         {
                             // Wine's list-view asks its owner for virtual
                             // text through LVN_GETDISPINFOW. Virtual list views use
@@ -10156,6 +10272,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     if (selected)
                     {
                         m_gdi.SetTextColor(guestDc, textColor, nullptr);
+                    }
+                    if (editingLabel)
+                    {
+                        const int caretX = 4 + static_cast<int>((std::min)(
+                            listViewEditCaret, listViewEditText.size())) * controlTextWidth;
+                        MiniGdi::FillRect(*surface,
+                            MiniGdi::Rect{ (std::min)(width - 2, caretX), rowTop + 1,
+                                (std::min)(width - 1, caretX + 1), rowTop + listViewRowHeight - 1 },
+                            MiniGdi::MakeColor(0, 120, 215));
                     }
                     if ((listViewExtendedStyle & ListViewExtendedGridLines) != 0)
                     {
@@ -11062,10 +11187,95 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 reinterpret_cast<LPARAM>(&notification),
                 nullptr);
         };
+        const auto finishLabelEdit = [this, window, &invalidate](bool accept)
+        {
+            HWND parent = nullptr;
+            HWND handle = nullptr;
+            UINT_PTR controlId = 0;
+            int item = -1;
+            LPARAM itemData = 0;
+            std::wstring text;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || window->listViewEditItem < 0) return false;
+                parent = window->parent;
+                handle = window->handle;
+                controlId = window->controlId;
+                item = window->listViewEditItem;
+                text = window->listViewEditText;
+                if (static_cast<size_t>(item) < window->listViewItemData.size())
+                    itemData = window->listViewItemData[static_cast<size_t>(item)];
+                window->listViewEditItem = -1;
+                window->listViewEditText.clear();
+                window->listViewEditCaret = 0;
+            }
+            GuestListViewDisplayInfoW notification = {};
+            notification.header.from = handle;
+            notification.header.identifier = controlId;
+            notification.header.code = ListViewNotifyEndLabelEditW;
+            notification.item.mask = ListViewItemText | ListViewItemParam;
+            notification.item.item = item;
+            notification.item.text = accept ? const_cast<LPWSTR>(text.c_str()) : nullptr;
+            notification.item.textCapacity = accept ? static_cast<int>(text.size() + 1) : 0;
+            notification.item.itemData = itemData;
+            const bool accepted = accept && parent && SendGuestMessage(parent,
+                GuestAbi::WmNotify, static_cast<WPARAM>(controlId),
+                reinterpret_cast<LPARAM>(&notification), nullptr) != FALSE;
+            if (accepted)
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (!window->destroyed && item >= 0 &&
+                    static_cast<size_t>(item) < window->listViewItems.size())
+                {
+                    auto& row = window->listViewItems[static_cast<size_t>(item)];
+                    if (row.empty()) row.resize(1);
+                    row[0] = text;
+                }
+            }
+            invalidate();
+            RuntimeDiagnostics::Record(std::wstring(L"LISTVIEW: label edit ") +
+                (accepted ? L"accepted." : accept ? L"rejected by owner." : L"cancelled."));
+            return accepted;
+        };
         switch (message)
         {
+        case GuestAbi::WmChar:
+        {
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->listViewEditItem < 0) return 0;
+                window->listViewEditCaret = (std::min)(window->listViewEditCaret,
+                    window->listViewEditText.size());
+                if (wParam == GuestAbi::VkBack)
+                {
+                    if (window->listViewEditCaret > 0)
+                    {
+                        window->listViewEditText.erase(window->listViewEditCaret - 1, 1);
+                        --window->listViewEditCaret;
+                        changed = true;
+                    }
+                }
+                else if (wParam >= 0x20 && wParam <= 0xfffd && wParam != 0x7f &&
+                    window->listViewEditText.size() < MaximumBuiltinControlTextLength)
+                {
+                    window->listViewEditText.insert(window->listViewEditCaret, 1,
+                        static_cast<wchar_t>(wParam));
+                    ++window->listViewEditCaret;
+                    changed = true;
+                }
+            }
+            if (changed) invalidate();
+            return 0;
+        }
         case GuestAbi::WmLButtonDown:
         {
+            bool wasEditing = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                wasEditing = window->listViewEditItem >= 0;
+            }
+            if (wasEditing) finishLabelEdit(true);
             const int x = static_cast<int>(static_cast<WORD>(lParam & 0xffff));
             const int y = static_cast<int>(static_cast<WORD>((static_cast<ULONG_PTR>(lParam) >> 16) & 0xffff));
             HWND handle = nullptr;
@@ -11220,6 +11430,29 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         case GuestAbi::WmKeyDown:
         {
             const WPARAM key = wParam;
+            bool editing = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                editing = window->listViewEditItem >= 0;
+                if (editing && key == GuestAbi::VkLeft && window->listViewEditCaret > 0)
+                    --window->listViewEditCaret;
+                else if (editing && key == GuestAbi::VkRight &&
+                    window->listViewEditCaret < window->listViewEditText.size())
+                    ++window->listViewEditCaret;
+                else if (editing && key == GuestAbi::VkHome) window->listViewEditCaret = 0;
+                else if (editing && key == GuestAbi::VkEnd)
+                    window->listViewEditCaret = window->listViewEditText.size();
+                else if (editing && key == GuestAbi::VkDelete &&
+                    window->listViewEditCaret < window->listViewEditText.size())
+                    window->listViewEditText.erase(window->listViewEditCaret, 1);
+            }
+            if (editing)
+            {
+                if (key == GuestAbi::VkReturn) finishLabelEdit(true);
+                else if (key == GuestAbi::VkEscape) finishLabelEdit(false);
+                else invalidate();
+                return 0;
+            }
             int item = -1;
             int previousItem = -1;
             bool changed = false;
@@ -11284,7 +11517,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             return 0;
         }
         case GuestAbi::WmSetFocus:
+            invalidate();
+            return 0;
         case GuestAbi::WmKillFocus:
+            finishLabelEdit(true);
             invalidate();
             return 0;
         default:
@@ -13135,14 +13371,17 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
                                 reinterpret_cast<WPARAM>(iterator->menu), 0, nullptr);
                         SendGuestMessage(popup.owner, GuestAbi::WmExitMenuLoop, FALSE, 0, nullptr);
                         if (activate && popup.notifyOwner)
-                            SendGuestMessage(popup.owner, GuestAbi::WmCommand,
+                            PostGuestMessage(popup.owner, GuestAbi::WmCommand,
                                 GuestAbi::MakeCommandWParam(static_cast<WORD>(command), 0), 0, nullptr);
                     }
                 }
                 m_popupMenuChanged.notify_all();
             }
             if (repaint || close || activate)
+            {
                 InvalidateGuestRect(popup.root, nullptr, FALSE, nullptr);
+                Present(FindWindow(popup.root));
+            }
             return;
         }
 
