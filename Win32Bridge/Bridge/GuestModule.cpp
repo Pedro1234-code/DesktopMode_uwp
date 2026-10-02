@@ -435,9 +435,19 @@ bool GuestModuleLoader::LoadLibrary(
     if (!resolved)
     {
         SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
+        std::wstring searched;
+        for (const auto& current : candidates)
+        {
+            if (!searched.empty()) searched += L"; ";
+            searched += current.displayName;
+            searched += current.source == ModuleCandidate::Source::AuthorizedApplicationFolder
+                ? L" [application source]"
+                : L" [virtual drive]";
+        }
         RuntimeDiagnostics::Record(
             L"DLL FAILED: no candidate matched " +
-            (requestedName ? std::wstring(requestedName) : L"<null>") + L".");
+            (requestedName ? std::wstring(requestedName) : L"<null>") +
+            L". Searched: " + searched + L".");
         return false;
     }
 

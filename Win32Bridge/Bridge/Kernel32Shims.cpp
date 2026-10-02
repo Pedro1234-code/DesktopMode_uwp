@@ -1125,7 +1125,11 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeExpandEnvironmentStringsW(LPCWSTR source
 DWORD WINAPI Win32Bridge::Bridge::BridgeGetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD bufferLength)
 {
     std::wstring path;
-    if (IsGuestMainModule(module))
+    if (const BridgeSystemModule* systemModule = FindBridgeSystemModule(module))
+    {
+        path = L"C:\\Windows\\System32\\" + std::wstring(systemModule->library);
+    }
+    else if (IsGuestMainModule(module))
     {
         GuestStorageContext* storage = CurrentStorageOrFail();
         if (!storage) return 0;
