@@ -39,6 +39,7 @@ using Windows.ApplicationModel.Background;
 using Windows.Storage;
 using Windows.UI.Xaml.Navigation;
 using Windows.UI;
+using Win32Bridge;
 
 namespace factoryos_10x_shell
 {
@@ -75,6 +76,7 @@ namespace factoryos_10x_shell
         {
             ConfigureServices();
             PreloadServices();
+            await new RuntimeHost().EnsureDriveRootAsync();
             IAppHelper appHelper = ServiceProvider.GetRequiredService<IAppHelper>();
             IBluetoothService btService = ServiceProvider.GetRequiredService<IBluetoothService>();
 

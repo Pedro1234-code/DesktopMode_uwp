@@ -7,6 +7,13 @@
 #include <cstdio>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
+
+extern "C" EXCEPTION_DISPOSITION __cdecl __C_specific_handler(
+    PEXCEPTION_RECORD exceptionRecord,
+    PVOID establisherFrame,
+    PCONTEXT contextRecord,
+    PDISPATCHER_CONTEXT dispatcherContext);
 
 namespace
 {
@@ -57,7 +64,22 @@ namespace
         if (threadId) *threadId = id;
         return reinterpret_cast<uintptr_t>(handle);
     }
-    EXCEPTION_DISPOSITION __cdecl BridgeCSpecificHandler(PEXCEPTION_RECORD, PVOID, PCONTEXT, PDISPATCHER_CONTEXT) { return ExceptionContinueSearch; }
+    EXCEPTION_DISPOSITION __cdecl BridgeCSpecificHandler(
+        PEXCEPTION_RECORD exceptionRecord,
+        PVOID establisherFrame,
+        PCONTEXT contextRecord,
+        PDISPATCHER_CONTEXT dispatcherContext)
+    {
+        // x64 scope tables are interpreted by the platform handler.  Returning
+        // ContinueSearch unconditionally bypasses every guest __try/__except
+        // and __finally block and can turn an intentionally guarded probe into
+        // a process-level failure.
+        return ::__C_specific_handler(
+            exceptionRecord,
+            establisherFrame,
+            contextRecord,
+            dispatcherContext);
+    }
     EXCEPTION_DISPOSITION __cdecl BridgeCxxFrameHandler(PEXCEPTION_RECORD, PVOID, PCONTEXT, PDISPATCHER_CONTEXT) { return ExceptionContinueSearch; }
     void __cdecl BridgeCxxThrowException(void*, void*)
     {
@@ -97,6 +119,33 @@ namespace
     unsigned int g_randomState = 1;
     void __cdecl BridgeSrand(unsigned int seed) { g_randomState = seed ? seed : 1; }
     int __cdecl BridgeRand() { g_randomState = g_randomState * 1103515245u + 12345u; return static_cast<int>((g_randomState >> 16) & 0x7fff); }
+    int __cdecl BridgeVsnwprintf(wchar_t* buffer, size_t count, const wchar_t* format, va_list arguments)
+    {
+        if (!buffer || count == 0 || !format) return -1;
+        const int result = _vsnwprintf_s(buffer, count, _TRUNCATE, format, arguments);
+        return result;
+    }
+    long __cdecl BridgeWtol(const wchar_t* text) { return text ? wcstol(text, nullptr, 10) : 0; }
+    int __cdecl BridgeIswctype(wint_t character, wctype_t type) { return iswctype(character, type); }
+    wchar_t* __cdecl BridgeWcsrchr(const wchar_t* text, wchar_t character)
+    {
+        return const_cast<wchar_t*>(wcsrchr(text ? text : L"", character));
+    }
+    int __cdecl BridgeWcsncmp(const wchar_t* left, const wchar_t* right, size_t count)
+    {
+        return wcsncmp(left ? left : L"", right ? right : L"", count);
+    }
+    void __cdecl BridgeAmsgExit(int error)
+    {
+        Win32Bridge::Bridge::RuntimeDiagnostics::Record(
+            L"CRT: _amsg_exit(" + std::to_wstring(error) + L").");
+    }
+    int __cdecl BridgeIsMbbLead(unsigned int character)
+    {
+        // The virtual ANSI codepage is SBCS 1252.
+        (void)character;
+        return 0;
+    }
 }
 
 Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveMsvcrtImport(const ImportedSymbol& symbol)
@@ -142,6 +191,13 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveMsvcrtImport(c
     else if (_wcsicmp(symbol.name.c_str(), L"_commode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&g_commode);
     else if (_wcsicmp(symbol.name.c_str(), L"_fmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&g_fmode);
     else if (_wcsicmp(symbol.name.c_str(), L"_acmdln") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&g_acmdln);
+    else if (_wcsicmp(symbol.name.c_str(), L"_vsnwprintf") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeVsnwprintf);
+    else if (_wcsicmp(symbol.name.c_str(), L"_wtol") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWtol);
+    else if (_wcsicmp(symbol.name.c_str(), L"iswctype") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIswctype);
+    else if (_wcsicmp(symbol.name.c_str(), L"wcsrchr") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWcsrchr);
+    else if (_wcsicmp(symbol.name.c_str(), L"wcsncmp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWcsncmp);
+    else if (_wcsicmp(symbol.name.c_str(), L"_amsg_exit") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAmsgExit);
+    else if (_wcsicmp(symbol.name.c_str(), L"_ismbblead") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsMbbLead);
 
     if (resolution.targetAddress)
     {

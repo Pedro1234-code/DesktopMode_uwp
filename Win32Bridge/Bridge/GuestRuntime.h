@@ -23,6 +23,7 @@ namespace Bridge
     {
     public:
         void SetStorageContext(std::shared_ptr<GuestStorageContext> storage) { m_storage = std::move(storage); }
+        void SetRegistryContext(std::shared_ptr<GuestRegistryContext> registry) { m_registry = std::move(registry); }
         void SetWindowManager(std::shared_ptr<GuestWindowManager> windows) { m_windows = std::move(windows); }
         void SetModuleSourceFolder(Windows::Storage::StorageFolder^ folder) { m_moduleSourceFolder = folder; }
         void SetCommandLine(std::wstring commandLine) { m_commandLine = std::move(commandLine); }
@@ -30,6 +31,10 @@ namespace Bridge
         void SetSharedWindowManager(bool shared) { m_sharedWindowManager = shared; }
         void SetProcessId(DWORD processId) { m_processId = processId ? processId : 1; }
         void SetMainThreadId(DWORD threadId) { m_mainThreadId = threadId; }
+        bool SetResourceSatellite(
+            const BYTE* fileBytes,
+            size_t fileSize,
+            std::wstring* error);
         bool Prepare(const BYTE* fileBytes, size_t fileSize, const ImportResolver& resolver, std::wstring* error);
         bool Run(int* exitCode, std::wstring* error);
         bool LaunchChildProcess(
@@ -52,6 +57,7 @@ namespace Bridge
     private:
         PeImageInfo m_metadata;
         MappedPeImage m_mapped;
+        MappedPeImage m_resourceSatellite;
         RuntimeImage m_runtime;
         BindingReport m_bindings;
         std::shared_ptr<GuestStorageContext> m_storage;

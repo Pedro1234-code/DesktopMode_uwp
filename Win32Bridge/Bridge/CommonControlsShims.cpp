@@ -402,12 +402,25 @@ HRESULT WINAPI Win32Bridge::Bridge::BridgeDllGetVersion(GuestDllVersionInfo* ver
     return S_OK;
 }
 
+HANDLE WINAPI Win32Bridge::Bridge::BridgeCreatePropertySheetPageW(const void* page)
+{
+    return page ? const_cast<void*>(page) : nullptr;
+}
+
+ULONG_PTR WINAPI Win32Bridge::Bridge::BridgeCommonControlOrdinal345()
+{
+    return TRUE;
+}
+
 Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControlsImport(const ImportedSymbol& symbol)
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
-    if (_wcsicmp(symbol.library.c_str(), L"comctl32.dll") == 0 && symbol.importedByOrdinal && symbol.ordinal == 17)
+    if (_wcsicmp(symbol.library.c_str(), L"comctl32.dll") == 0 &&
+        symbol.importedByOrdinal && (symbol.ordinal == 17 || symbol.ordinal == 345))
     {
-        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitCommonControls);
+        resolution.targetAddress = symbol.ordinal == 17
+            ? reinterpret_cast<ULONGLONG>(&BridgeInitCommonControls)
+            : reinterpret_cast<ULONGLONG>(&BridgeCommonControlOrdinal345);
         resolution.disposition = ImportDisposition::NeedsBridge;
         resolution.note = L"Common-controls bootstrap: uses bridge-owned controls rather than a desktop DLL.";
     }
@@ -422,6 +435,7 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
         else if (_wcsicmp(symbol.name.c_str(), L"createtoolbarex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateToolbarEx);
         else if (_wcsicmp(symbol.name.c_str(), L"createstatuswindoww") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateStatusWindowW);
         else if (_wcsicmp(symbol.name.c_str(), L"propertysheetw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePropertySheetW);
+        else if (_wcsicmp(symbol.name.c_str(), L"createpropertysheetpagew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePropertySheetPageW);
         else if (_wcsicmp(symbol.name.c_str(), L"dllgetversion") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDllGetVersion);
         if (resolution.targetAddress)
         {

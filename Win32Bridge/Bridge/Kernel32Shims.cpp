@@ -21,6 +21,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <winternl.h>
 
 using namespace Win32Bridge::Bridge;
 
@@ -635,6 +636,7 @@ namespace
     {
         return _wcsicmp(library.c_str(), L"kernel32.dll") == 0 ||
             _wcsicmp(library.c_str(), L"kernelbase.dll") == 0 ||
+            _wcsicmp(library.c_str(), L"ntdll.dll") == 0 ||
             _wcsnicmp(library.c_str(), L"api-ms-win-core-", 16) == 0;
     }
 
@@ -764,7 +766,13 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
     DWORD error = ERROR_SUCCESS;
     if (!storage->WriteFile(file, buffer, bytesToWrite, bytesWritten, &error))
     {
+        if (error == ERROR_SUCCESS) error = ERROR_WRITE_FAULT;
         SetGuestLastError(error);
+        RuntimeDiagnostics::Record(
+            L"STORAGE: WriteFile failed for handle " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(file)) + L"; requested " +
+            std::to_wstring(bytesToWrite) + L" byte(s), error " +
+            std::to_wstring(error) + L".");
         return FALSE;
     }
     SetGuestLastError(ERROR_SUCCESS);
@@ -2161,6 +2169,8 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetVersion()
     return 0x0000000a;
 }
 
+#include "Bridge/Kernel32LocaleShims.inl"
+
 void WINAPI Win32Bridge::Bridge::BridgeGetStartupInfoA(LPSTARTUPINFOA startupInfo)
 {
     if (!startupInfo) { SetGuestLastError(ERROR_INVALID_PARAMETER); return; }
@@ -3024,21 +3034,38 @@ LPTOP_LEVEL_EXCEPTION_FILTER WINAPI Win32Bridge::Bridge::BridgeSetUnhandledExcep
     return current.exchange(filter);
 }
 
-PRUNTIME_FUNCTION WINAPI Win32Bridge::Bridge::BridgeRtlLookupFunctionEntry(DWORD64, PDWORD64 imageBase, PUNWIND_HISTORY_TABLE)
+PRUNTIME_FUNCTION WINAPI Win32Bridge::Bridge::BridgeRtlLookupFunctionEntry(
+    DWORD64 controlPc,
+    PDWORD64 imageBase,
+    PUNWIND_HISTORY_TABLE historyTable)
 {
-    if (imageBase) *imageBase = 0;
-    return nullptr;
+    return ::RtlLookupFunctionEntry(controlPc, imageBase, historyTable);
 }
 
-void WINAPI Win32Bridge::Bridge::BridgeRtlVirtualUnwind(DWORD, DWORD64, DWORD64, PRUNTIME_FUNCTION, PCONTEXT, PVOID* handlerData, PDWORD64 establisherFrame, PKNONVOLATILE_CONTEXT_POINTERS)
+PEXCEPTION_ROUTINE WINAPI Win32Bridge::Bridge::BridgeRtlVirtualUnwind(
+    DWORD handlerType,
+    DWORD64 imageBase,
+    DWORD64 controlPc,
+    PRUNTIME_FUNCTION functionEntry,
+    PCONTEXT contextRecord,
+    PVOID* handlerData,
+    PDWORD64 establisherFrame,
+    PKNONVOLATILE_CONTEXT_POINTERS contextPointers)
 {
-    if (handlerData) *handlerData = nullptr;
-    if (establisherFrame) *establisherFrame = 0;
+    return ::RtlVirtualUnwind(
+        handlerType,
+        imageBase,
+        controlPc,
+        functionEntry,
+        contextRecord,
+        handlerData,
+        establisherFrame,
+        contextPointers);
 }
 
 void WINAPI Win32Bridge::Bridge::BridgeRtlCaptureContext(PCONTEXT contextRecord)
 {
-    if (contextRecord) ZeroMemory(contextRecord, sizeof(*contextRecord));
+    if (contextRecord) ::RtlCaptureContext(contextRecord);
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenProcess(DWORD, BOOL, DWORD processId)
@@ -3847,6 +3874,35 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWaitForMultipleObjects);
     else if (_wcsicmp(symbol.name.c_str(), L"sleep") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSleep);
+
+    if (_wcsicmp(symbol.name.c_str(), L"getlocaltime") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLocalTime);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdateformatw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDateFormatW);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettimeformatw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTimeFormatW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getuserdefaultuilanguage") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetUserDefaultUILanguage);
+    else if (_wcsicmp(symbol.name.c_str(), L"findnlsstring") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindNLSString);
+    else if (_wcsicmp(symbol.name.c_str(), L"lstrcmpw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLstrcmpW);
+    else if (_wcsicmp(symbol.name.c_str(), L"lstrcmpiw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLstrcmpiW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getversionexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetVersionExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"wow64disablewow64fsredirection") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWow64DisableWow64FsRedirection);
+    else if (_wcsicmp(symbol.name.c_str(), L"wow64revertwow64fsredirection") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWow64RevertWow64FsRedirection);
+    else if (_wcsicmp(symbol.name.c_str(), L"freelibraryandexitthread") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeLibraryAndExitThread);
+    else if (_wcsicmp(symbol.name.c_str(), L"iswow64process") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsWow64Process);
+    else if (_wcsicmp(symbol.name.c_str(), L"localrealloc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLocalReAlloc);
+    else if (_wcsicmp(symbol.name.c_str(), L"localsize") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLocalSize);
+    else if (_wcsicmp(symbol.name.c_str(), L"locallock") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLocalLock);
+    else if (_wcsicmp(symbol.name.c_str(), L"localunlock") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLocalUnlock);
+    else if (_wcsicmp(symbol.name.c_str(), L"getacp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetACP);
+    else if (_wcsicmp(symbol.name.c_str(), L"getstartupinfow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetStartupInfoW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getfullpathnamew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFullPathNameW);
+    else if (_wcsicmp(symbol.name.c_str(), L"foldstringw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFoldStringW);
+    else if (_wcsicmp(symbol.name.c_str(), L"heapsetinformation") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeHeapSetInformation);
+    else if (_wcsicmp(symbol.name.c_str(), L"muldiv") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMulDiv);
+    else if (_wcsicmp(symbol.name.c_str(), L"getlocaleinfow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLocaleInfoW);
+    else if (_wcsicmp(symbol.name.c_str(), L"seterrormode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetErrorMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"rtlinitunicodestring") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRtlInitUnicodeString);
+    else if (_wcsicmp(symbol.name.c_str(), L"ntquerylicensevalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeNtQueryLicenseValue);
+    else if (_wcsicmp(symbol.name.c_str(), L"winsqmincrementdword") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWinSqmIncrementDWORD);
+    else if (_wcsicmp(symbol.name.c_str(), L"winsqmaddtostream") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWinSqmAddToStream);
 
     if (resolution.targetAddress != 0)
     {

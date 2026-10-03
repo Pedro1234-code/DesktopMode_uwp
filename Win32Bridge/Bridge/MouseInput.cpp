@@ -14,6 +14,65 @@ using namespace Windows::UI::Input;
 
 namespace
 {
+    // The UWP header partition omits the desktop MAPVK_* macros even though
+    // guest applications still pass the documented numeric map types.
+    constexpr UINT MapVirtualKeyVkToVsc = 0;
+    constexpr UINT MapVirtualKeyVscToVk = 1;
+    constexpr UINT MapVirtualKeyVkToChar = 2;
+    constexpr UINT MapVirtualKeyVscToVkEx = 3;
+    constexpr UINT MapVirtualKeyVkToVscEx = 4;
+
+    UINT StandardScanForVirtualKey(UINT key)
+    {
+        if (key >= '1' && key <= '9') return key - '1' + 0x02;
+        if (key >= VK_F1 && key <= VK_F10) return key - VK_F1 + 0x3b;
+        switch (key)
+        {
+        case VK_ESCAPE: return 0x01;
+        case '0': return 0x0b;
+        case VK_BACK: return 0x0e;
+        case VK_TAB: return 0x0f;
+        case 'Q': return 0x10; case 'W': return 0x11; case 'E': return 0x12;
+        case 'R': return 0x13; case 'T': return 0x14; case 'Y': return 0x15;
+        case 'U': return 0x16; case 'I': return 0x17; case 'O': return 0x18;
+        case 'P': return 0x19;
+        case VK_RETURN: return 0x1c;
+        case VK_CONTROL: case VK_LCONTROL: return 0x1d;
+        case VK_RCONTROL: return 0xe01d;
+        case 'A': return 0x1e; case 'S': return 0x1f; case 'D': return 0x20;
+        case 'F': return 0x21; case 'G': return 0x22; case 'H': return 0x23;
+        case 'J': return 0x24; case 'K': return 0x25; case 'L': return 0x26;
+        case VK_SHIFT: case VK_LSHIFT: return 0x2a;
+        case VK_RSHIFT: return 0x36;
+        case 'Z': return 0x2c; case 'X': return 0x2d; case 'C': return 0x2e;
+        case 'V': return 0x2f; case 'B': return 0x30; case 'N': return 0x31;
+        case 'M': return 0x32;
+        case VK_MULTIPLY: return 0x37;
+        case VK_MENU: case VK_LMENU: return 0x38;
+        case VK_RMENU: return 0xe038;
+        case VK_SPACE: return 0x39;
+        case VK_CAPITAL: return 0x3a;
+        case VK_NUMLOCK: return 0x45;
+        case VK_SCROLL: return 0x46;
+        case VK_NUMPAD7: return 0x47; case VK_NUMPAD8: return 0x48;
+        case VK_NUMPAD9: return 0x49; case VK_SUBTRACT: return 0x4a;
+        case VK_NUMPAD4: return 0x4b; case VK_NUMPAD5: return 0x4c;
+        case VK_NUMPAD6: return 0x4d; case VK_ADD: return 0x4e;
+        case VK_NUMPAD1: return 0x4f; case VK_NUMPAD2: return 0x50;
+        case VK_NUMPAD3: return 0x51; case VK_NUMPAD0: return 0x52;
+        case VK_DECIMAL: return 0x53;
+        case VK_F11: return 0x57; case VK_F12: return 0x58;
+        case VK_HOME: return 0xe047; case VK_UP: return 0xe048;
+        case VK_PRIOR: return 0xe049; case VK_LEFT: return 0xe04b;
+        case VK_RIGHT: return 0xe04d; case VK_END: return 0xe04f;
+        case VK_DOWN: return 0xe050; case VK_NEXT: return 0xe051;
+        case VK_INSERT: return 0xe052; case VK_DELETE: return 0xe053;
+        case VK_LWIN: return 0xe05b; case VK_RWIN: return 0xe05c;
+        case VK_APPS: return 0xe05d;
+        default: return 0;
+        }
+    }
+
     using SehInvocation = void(*)(void*);
 
     DWORD InvokeSehProtected(SehInvocation invocation, void* context)
@@ -251,12 +310,20 @@ bool MouseInputBridge::TryDequeue(MouseEvent* event)
 SHORT MouseInputBridge::GetAsyncKeyState(int virtualKey)
 {
     const unsigned int mask = ButtonMaskForVirtualKey(virtualKey);
-    if (mask == 0)
+    if (mask == 0 && (virtualKey < 0 || virtualKey >= 256))
     {
         return 0;
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (mask == 0)
+    {
+        const size_t index = static_cast<size_t>(virtualKey);
+        const bool isDown = (m_keyboardState[index] & 0x80u) != 0;
+        const bool wasPressed = m_keyboardPressedSinceRead[index];
+        m_keyboardPressedSinceRead[index] = false;
+        return static_cast<SHORT>((isDown ? 0x8000 : 0) | (wasPressed ? 0x0001 : 0));
+    }
     const bool isDown = (m_snapshot.buttons & mask) != 0;
     const bool wasPressed = (m_pressedSinceRead & mask) != 0;
     m_pressedSinceRead &= ~mask;
@@ -266,13 +333,150 @@ SHORT MouseInputBridge::GetAsyncKeyState(int virtualKey)
 SHORT MouseInputBridge::GetKeyState(int virtualKey) const
 {
     const unsigned int mask = ButtonMaskForVirtualKey(virtualKey);
-    if (mask == 0)
+    if (mask == 0 && (virtualKey < 0 || virtualKey >= 256))
     {
         return 0;
     }
 
     std::lock_guard<std::mutex> lock(m_mutex);
+    if (mask == 0)
+    {
+        const BYTE state = m_keyboardState[static_cast<size_t>(virtualKey)];
+        return static_cast<SHORT>(((state & 0x80u) != 0 ? 0x8000 : 0) |
+            ((state & 0x01u) != 0 ? 0x0001 : 0));
+    }
     return (m_snapshot.buttons & mask) != 0 ? static_cast<SHORT>(0x8000) : 0;
+}
+
+void MouseInputBridge::UpdateKeyState(int virtualKey, bool down, UINT scanCode,
+    bool extended)
+{
+    if (virtualKey < 0 || virtualKey >= 256) return;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    const size_t index = static_cast<size_t>(virtualKey);
+    const bool wasDown = (m_keyboardState[index] & 0x80u) != 0;
+    BYTE toggled = static_cast<BYTE>(m_keyboardState[index] & 0x01u);
+    if (down && !wasDown &&
+        (virtualKey == VK_CAPITAL || virtualKey == VK_NUMLOCK || virtualKey == VK_SCROLL))
+    {
+        toggled ^= 0x01u;
+    }
+    m_keyboardState[index] = static_cast<BYTE>(toggled | (down ? 0x80u : 0));
+    if (down && !wasDown) m_keyboardPressedSinceRead[index] = true;
+    if (scanCode != 0)
+    {
+        const UINT encodedScan = (scanCode & 0xffu) | (extended ? 0xe000u : 0u);
+        m_virtualKeyToScan[index] = encodedScan;
+        const size_t scanIndex = static_cast<size_t>(scanCode & 0xffu) |
+            (extended ? static_cast<size_t>(0x100u) : 0u);
+        m_scanToVirtualKey[scanIndex] = static_cast<UINT>(virtualKey);
+    }
+
+    int aggregateKey = 0;
+    int leftKey = 0;
+    int rightKey = 0;
+    if (virtualKey == VK_LSHIFT || virtualKey == VK_RSHIFT)
+    {
+        aggregateKey = VK_SHIFT;
+        leftKey = VK_LSHIFT;
+        rightKey = VK_RSHIFT;
+    }
+    else if (virtualKey == VK_LCONTROL || virtualKey == VK_RCONTROL)
+    {
+        aggregateKey = VK_CONTROL;
+        leftKey = VK_LCONTROL;
+        rightKey = VK_RCONTROL;
+    }
+    else if (virtualKey == VK_LMENU || virtualKey == VK_RMENU)
+    {
+        aggregateKey = VK_MENU;
+        leftKey = VK_LMENU;
+        rightKey = VK_RMENU;
+    }
+    if (aggregateKey != 0)
+    {
+        const bool aggregateWasDown =
+            (m_keyboardState[static_cast<size_t>(aggregateKey)] & 0x80u) != 0;
+        const bool aggregateDown =
+            (m_keyboardState[static_cast<size_t>(leftKey)] & 0x80u) != 0 ||
+            (m_keyboardState[static_cast<size_t>(rightKey)] & 0x80u) != 0;
+        BYTE aggregateState = static_cast<BYTE>(
+            m_keyboardState[static_cast<size_t>(aggregateKey)] & 0x01u);
+        if (aggregateDown) aggregateState |= 0x80u;
+        m_keyboardState[static_cast<size_t>(aggregateKey)] = aggregateState;
+        if (aggregateDown && !aggregateWasDown)
+            m_keyboardPressedSinceRead[static_cast<size_t>(aggregateKey)] = true;
+    }
+}
+
+void MouseInputBridge::ResetKeyState()
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (BYTE& state : m_keyboardState)
+        state = static_cast<BYTE>(state & 0x01u);
+    m_keyboardPressedSinceRead.fill(false);
+}
+
+UINT MouseInputBridge::MapVirtualKey(UINT code, UINT mapType) const
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (mapType == MapVirtualKeyVkToVsc || mapType == MapVirtualKeyVkToVscEx)
+    {
+        if (code >= m_virtualKeyToScan.size()) return 0;
+        UINT scan = m_virtualKeyToScan[code];
+        if (scan == 0) scan = StandardScanForVirtualKey(code);
+        return mapType == MapVirtualKeyVkToVsc ? (scan & 0xffu) : scan;
+    }
+    if (mapType == MapVirtualKeyVscToVk || mapType == MapVirtualKeyVscToVkEx)
+    {
+        const bool extended = (code & 0xff00u) == 0xe000u;
+        const size_t scanIndex = static_cast<size_t>(code & 0xffu) |
+            (extended ? static_cast<size_t>(0x100u) : 0u);
+        UINT key = m_scanToVirtualKey[scanIndex];
+        if (key == 0)
+        {
+            for (UINT candidate = 1; candidate < 256; ++candidate)
+            {
+                const UINT scan = StandardScanForVirtualKey(candidate);
+                if ((scan & 0xffu) == (code & 0xffu) &&
+                    ((scan & 0xe000u) != 0) == extended)
+                {
+                    key = candidate;
+                    break;
+                }
+            }
+        }
+        if (mapType == MapVirtualKeyVscToVkEx)
+        {
+            if (key == VK_SHIFT)
+                key = (code & 0xffu) == 0x36u ? VK_RSHIFT : VK_LSHIFT;
+            else if (key == VK_CONTROL)
+                key = extended ? VK_RCONTROL : VK_LCONTROL;
+            else if (key == VK_MENU)
+                key = extended ? VK_RMENU : VK_LMENU;
+        }
+        else
+        {
+            if (key == VK_LSHIFT || key == VK_RSHIFT) key = VK_SHIFT;
+            else if (key == VK_LCONTROL || key == VK_RCONTROL) key = VK_CONTROL;
+            else if (key == VK_LMENU || key == VK_RMENU) key = VK_MENU;
+        }
+        return key;
+    }
+    if (mapType == MapVirtualKeyVkToChar)
+    {
+        if ((code >= 'A' && code <= 'Z') || (code >= '0' && code <= '9'))
+            return code;
+        if (code == VK_SPACE) return L' ';
+        if (code >= VK_NUMPAD0 && code <= VK_NUMPAD9)
+            return L'0' + code - VK_NUMPAD0;
+        if (code == VK_MULTIPLY) return L'*';
+        if (code == VK_ADD) return L'+';
+        if (code == VK_SUBTRACT) return L'-';
+        if (code == VK_DECIMAL) return L'.';
+        if (code == VK_DIVIDE) return L'/';
+    }
+    return 0;
 }
 
 void MouseInputBridge::Update(PointerPoint^ point, int wheelDelta)

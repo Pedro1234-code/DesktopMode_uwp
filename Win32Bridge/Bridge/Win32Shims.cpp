@@ -62,6 +62,58 @@ ULONGLONG MessageBoxWAdapterAddress()
     return reinterpret_cast<ULONGLONG>(&BridgeMessageBoxW);
 }
 
+BOOL WINAPI BridgeOpenPrinterW(LPWSTR, PHANDLE printer, LPVOID)
+{
+    if (printer) *printer = nullptr;
+    BridgeSetLastError(1801u); // ERROR_INVALID_PRINTER_NAME
+    return FALSE;
+}
+
+BOOL WINAPI BridgeGetPrinterDriverW(HANDLE, LPWSTR, DWORD, LPBYTE, DWORD, LPDWORD required)
+{
+    if (required) *required = 0;
+    BridgeSetLastError(1797u); // ERROR_UNKNOWN_PRINTER_DRIVER
+    return FALSE;
+}
+
+BOOL WINAPI BridgeClosePrinter(HANDLE) { return TRUE; }
+
+BOOL WINAPI BridgePathIsFileSpecW(LPCWSTR path)
+{
+    return path && !wcschr(path, L'\\') && !wcschr(path, L'/') && !wcschr(path, L':');
+}
+
+HRESULT WINAPI BridgeSHStrDupW(LPCWSTR source, LPWSTR* result)
+{
+    if (!result) return E_POINTER;
+    *result = nullptr;
+    if (!source) return E_INVALIDARG;
+    const size_t bytes = (wcslen(source) + 1) * sizeof(wchar_t);
+    LPWSTR copy = static_cast<LPWSTR>(BridgeCoTaskMemAlloc(bytes));
+    if (!copy) return E_OUTOFMEMORY;
+    memcpy(copy, source, bytes);
+    *result = copy;
+    return S_OK;
+}
+
+ImportResolution ResolveAuxiliaryImport(const ImportedSymbol& symbol)
+{
+    ImportResolution resolution = CompatibilityCatalog::Resolve(symbol);
+    if (_wcsicmp(symbol.library.c_str(), L"winspool.drv") == 0)
+    {
+        if (_wcsicmp(symbol.name.c_str(), L"openprinterw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOpenPrinterW);
+        else if (_wcsicmp(symbol.name.c_str(), L"getprinterdriverw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPrinterDriverW);
+        else if (_wcsicmp(symbol.name.c_str(), L"closeprinter") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeClosePrinter);
+    }
+    else if (_wcsicmp(symbol.library.c_str(), L"shlwapi.dll") == 0)
+    {
+        if (_wcsicmp(symbol.name.c_str(), L"pathisfilespecw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePathIsFileSpecW);
+        else if (_wcsicmp(symbol.name.c_str(), L"shstrdupw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHStrDupW);
+    }
+    if (resolution.targetAddress) resolution.disposition = ImportDisposition::NeedsBridge;
+    return resolution;
+}
+
 ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
@@ -69,6 +121,7 @@ ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
     if (versionResolution.targetAddress != 0) return versionResolution;
     if (_wcsicmp(symbol.library.c_str(), L"kernel32.dll") == 0 ||
         _wcsicmp(symbol.library.c_str(), L"kernelbase.dll") == 0 ||
+        _wcsicmp(symbol.library.c_str(), L"ntdll.dll") == 0 ||
         _wcsnicmp(symbol.library.c_str(), L"api-ms-win-core-", 16) == 0)
     {
         return ResolveKernel32Import(symbol);
@@ -85,6 +138,8 @@ ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
     if (shellResolution.targetAddress != 0) return shellResolution;
     const auto msvcrtResolution = ResolveMsvcrtImport(symbol);
     if (msvcrtResolution.targetAddress != 0) return msvcrtResolution;
+    const auto auxiliaryResolution = ResolveAuxiliaryImport(symbol);
+    if (auxiliaryResolution.targetAddress != 0) return auxiliaryResolution;
 
     const auto gdiResolution = ResolveGdi32Import(symbol);
     if (gdiResolution.targetAddress != 0)

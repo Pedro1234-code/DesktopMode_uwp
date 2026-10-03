@@ -10,6 +10,7 @@
 #include "Bridge/Win32Shims.h"
 
 #include <atomic>
+#include <cwchar>
 #include <roapi.h>
 #include <system_error>
 #include <thread>
@@ -21,6 +22,16 @@ namespace
     thread_local GuestRuntime* g_currentGuestRuntime = nullptr;
     std::atomic<unsigned> g_activeGuestRuntimeScopes{ 0 };
     std::atomic<DWORD> g_nextGuestProcessId{ 1000 };
+
+    struct GuestExceptionDetails final
+    {
+        DWORD code = ERROR_SUCCESS;
+        ULONG_PTR address = 0;
+        ULONG_PTR instructionPointer = 0;
+        ULONG_PTR stackPointer = 0;
+        ULONG_PTR accessOperation = static_cast<ULONG_PTR>(-1);
+        ULONG_PTR faultAddress = 0;
+    };
 
     struct CurrentGuestRuntimeScope final
     {
@@ -55,27 +66,96 @@ namespace
         }
     }
 
-    // This is intentionally a leaf function. A guest PE shares our process,
+    int CaptureGuestException(EXCEPTION_POINTERS* information, GuestExceptionDetails* details)
+    {
+        if (!details) return EXCEPTION_EXECUTE_HANDLER;
+        *details = GuestExceptionDetails{};
+        if (!information) return EXCEPTION_EXECUTE_HANDLER;
+
+        if (information->ExceptionRecord)
+        {
+            const EXCEPTION_RECORD* record = information->ExceptionRecord;
+            details->code = record->ExceptionCode;
+            details->address = reinterpret_cast<ULONG_PTR>(record->ExceptionAddress);
+            if ((record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+                 record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+                record->NumberParameters >= 2)
+            {
+                details->accessOperation = record->ExceptionInformation[0];
+                details->faultAddress = record->ExceptionInformation[1];
+            }
+        }
+#if defined(_M_X64)
+        if (information->ContextRecord)
+        {
+            details->instructionPointer = static_cast<ULONG_PTR>(information->ContextRecord->Rip);
+            details->stackPointer = static_cast<ULONG_PTR>(information->ContextRecord->Rsp);
+        }
+#endif
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
+    std::wstring HexAddress(ULONG_PTR value)
+    {
+        wchar_t buffer[32]{};
+        swprintf_s(buffer, L"0x%llX", static_cast<unsigned long long>(value));
+        return buffer;
+    }
+
+    std::wstring DescribeGuestException(
+        const GuestExceptionDetails& details,
+        const BYTE* mainImageBase,
+        size_t mainImageSize,
+        const std::wstring& mainImageName,
+        const GuestModuleLoader* modules)
+    {
+        std::wstring location;
+        const ULONG_PTR imageBase = reinterpret_cast<ULONG_PTR>(mainImageBase);
+        if (mainImageBase && details.address >= imageBase &&
+            details.address - imageBase < mainImageSize)
+        {
+            location = mainImageName.empty() ? L"main image" : mainImageName;
+            location += L"+" + HexAddress(details.address - imageBase);
+        }
+        else if (modules)
+        {
+            modules->DescribeAddress(details.address, &location);
+        }
+
+        std::wstring result = L"code " + std::to_wstring(details.code) +
+            L" at " + HexAddress(details.address);
+        if (!location.empty()) result += L" (" + location + L")";
+        if (details.accessOperation != static_cast<ULONG_PTR>(-1))
+        {
+            const wchar_t* operation = details.accessOperation == 0 ? L"read" :
+                details.accessOperation == 1 ? L"write" :
+                details.accessOperation == 8 ? L"execute" : L"access";
+            result += L", " + std::wstring(operation) + L" " + HexAddress(details.faultAddress);
+        }
+        if (details.instructionPointer && details.instructionPointer != details.address)
+            result += L", RIP " + HexAddress(details.instructionPointer);
+        if (details.stackPointer)
+            result += L", RSP " + HexAddress(details.stackPointer);
+        return result;
+    }
+
+    // These are intentionally small SEH boundaries. A guest PE shares our process,
     // and an SEH failure in its message loop would otherwise terminate the
     // CoreShell host before RuntimeSession can persist diagnostics.
-    bool InvokeGuestEntryPoint(int(WINAPI* entryPoint)(), int* exitCode, DWORD* exceptionCode)
+    bool InvokeGuestEntryPoint(
+        int(WINAPI* entryPoint)(),
+        int* exitCode,
+        GuestExceptionDetails* exception)
     {
-        if (exceptionCode)
-        {
-            *exceptionCode = ERROR_SUCCESS;
-        }
+        if (exception) *exception = GuestExceptionDetails{};
 
         __try
         {
             *exitCode = entryPoint();
             return true;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        __except (CaptureGuestException(GetExceptionInformation(), exception))
         {
-            if (exceptionCode)
-            {
-                *exceptionCode = GetExceptionCode();
-            }
             return false;
         }
     }
@@ -84,20 +164,36 @@ namespace
         LPTHREAD_START_ROUTINE startAddress,
         LPVOID parameter,
         DWORD* exitCode,
-        DWORD* exceptionCode)
+        GuestExceptionDetails* exception)
     {
-        if (exceptionCode) *exceptionCode = ERROR_SUCCESS;
+        if (exception) *exception = GuestExceptionDetails{};
         __try
         {
             *exitCode = startAddress(parameter);
             return true;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        __except (CaptureGuestException(GetExceptionInformation(), exception))
         {
-            if (exceptionCode) *exceptionCode = GetExceptionCode();
             return false;
         }
     }
+}
+
+bool GuestRuntime::SetResourceSatellite(
+    const BYTE* fileBytes,
+    size_t fileSize,
+    std::wstring* error)
+{
+    m_resourceSatellite = MappedPeImage{};
+    if (!fileBytes || fileSize == 0) return true;
+    if (!PeMapper::Materialize(fileBytes, fileSize, &m_resourceSatellite, error))
+    {
+        RuntimeDiagnostics::Record(L"MUI: companion image could not be materialized.");
+        return false;
+    }
+    RuntimeDiagnostics::Record(L"MUI: attached resource satellite (" +
+        std::to_wstring(fileSize) + L" bytes).");
+    return true;
 }
 
 bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportResolver& resolver, std::wstring* error)
@@ -175,12 +271,18 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
         m_storage,
         m_resolver,
         m_moduleSourceFolder.Get());
-    m_registry = std::make_shared<GuestRegistryContext>();
+    if (!m_registry)
+    {
+        m_registry = std::make_shared<GuestRegistryContext>(m_storage);
+    }
     GuestKernelScope kernelScope(m_kernel.get());
     GuestModuleScope moduleScope(m_modules.get());
     GuestRegistryScope registryScope(m_registry.get());
     GuestResourceHandleScope resourceHandleScope;
-    GuestResourceScope resourceScope(m_runtime.Base(), m_runtime.Size());
+    GuestResourceScope resourceScope(
+        m_runtime.Base(), m_runtime.Size(),
+        m_resourceSatellite.bytes.empty() ? nullptr : m_resourceSatellite.bytes.data(),
+        m_resourceSatellite.bytes.size());
     GuestStorageScope storageScope(m_storage.get());
     GuestActivationContextScope activationContextScope;
     GuestWindowScope windowScope(m_windows.get(), !m_sharedWindowManager);
@@ -196,6 +298,17 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
         m_kernel->CloseAll();
         m_modules->ReleaseAll();
         RuntimeDiagnostics::Record(L"RUN FAILED: virtual drive layout could not be ensured.");
+        return false;
+    }
+    DWORD registryError = ERROR_SUCCESS;
+    if (!m_registry->Initialize(&registryError))
+    {
+        m_kernel->CloseAll();
+        m_modules->ReleaseAll();
+        SetError(error, L"Could not initialize the guest registry (" +
+            std::to_wstring(registryError) + L").");
+        RuntimeDiagnostics::Record(L"RUN FAILED: guest registry initialization error " +
+            std::to_wstring(registryError) + L".");
         return false;
     }
     if (m_storage)
@@ -227,19 +340,25 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
     try
     {
         RuntimeDiagnostics::Record(L"RUN: entering guest entry point.");
-        DWORD guestException = ERROR_SUCCESS;
+        GuestExceptionDetails guestException;
         if (!InvokeGuestEntryPoint(entryPoint, exitCode, &guestException))
         {
+            const std::wstring exceptionDescription = DescribeGuestException(
+                guestException,
+                m_runtime.Base(),
+                m_runtime.Size(),
+                m_storage ? m_storage->ModulePath() : std::wstring(),
+                m_modules.get());
             if (m_storage)
             {
                 m_storage->CloseAll();
             }
             m_kernel->CloseAll();
             m_modules->ReleaseAll();
-            SetError(error, L"The guest raised a structured exception (" +
-                std::to_wstring(static_cast<unsigned long>(guestException)) + L").");
+            SetError(error, L"The guest raised a structured exception: " +
+                exceptionDescription + L".");
             RuntimeDiagnostics::Record(L"RUN FAILED: guest structured exception " +
-                std::to_wstring(static_cast<unsigned long>(guestException)) + L".");
+                exceptionDescription + L".");
             return false;
         }
         if (m_storage)
@@ -319,6 +438,10 @@ bool GuestRuntime::LaunchChildProcess(
         return false;
     }
     child->SetStorageContext(childStorage);
+    // The registry is machine/user state, not process-private state. Sharing
+    // one synchronized logical context also prevents two cooperative guests
+    // from overwriting each other's persisted hive snapshots.
+    child->SetRegistryContext(m_registry);
     child->SetWindowManager(m_windows);
     child->SetModuleSourceFolder(m_modules->ModuleSourceFolder());
     child->SetCommandLine(commandLine ? commandLine : executableName);
@@ -360,9 +483,16 @@ bool GuestRuntime::LaunchChildProcess(
 
     RuntimeDiagnostics::Record(
         L"PROCESS: entering a cooperative child guest for " + logicalPath + L".");
+    const HWND previousForeground = m_windows->GetGuestForegroundWindow();
+    DWORD activationError = ERROR_SUCCESS;
+    const HWND previousFocus = m_windows->GetGuestFocus(&activationError);
     int exitCode = -1;
     std::wstring childError;
     const bool completed = child->Run(&exitCode, &childError);
+    // A process owns its USER objects. Purge the child's window/DC/message
+    // state before releasing its mapped image, then reactivate the caller.
+    m_windows->DestroyGuestWindowsForProcess(
+        processId, previousForeground, previousFocus);
     DWORD ignored = ERROR_SUCCESS;
     completionKernel->SetEvent(threadHandle, &ignored);
     completionKernel->SetEvent(processHandle, &ignored);
@@ -413,6 +543,9 @@ HANDLE GuestRuntime::LaunchThread(
     const std::shared_ptr<GuestWindowManager> windows = m_windows;
     const BYTE* imageBase = m_runtime.Base();
     const size_t imageSize = m_runtime.Size();
+    const BYTE* resourceSatelliteBase = m_resourceSatellite.bytes.empty()
+        ? nullptr : m_resourceSatellite.bytes.data();
+    const size_t resourceSatelliteSize = m_resourceSatellite.bytes.size();
     const std::wstring commandLine = m_commandLine.empty() && m_storage
         ? L"\"" + m_storage->ModulePath() + L"\""
         : m_commandLine;
@@ -423,14 +556,16 @@ HANDLE GuestRuntime::LaunchThread(
     {
         std::thread([
             kernel, modules, registry, storage, windows,
-            imageBase, imageSize, commandLine, processId, assignedThreadId, runtime,
+            imageBase, imageSize, resourceSatelliteBase, resourceSatelliteSize,
+            commandLine, processId, assignedThreadId, runtime,
             completion, startAddress, parameter]()
         {
             const HRESULT apartment = RoInitialize(RO_INIT_MULTITHREADED);
             GuestKernelScope kernelScope(kernel.get());
             GuestModuleScope moduleScope(modules.get());
             GuestRegistryScope registryScope(registry.get());
-            GuestResourceScope resourceScope(imageBase, imageSize);
+            GuestResourceScope resourceScope(
+                imageBase, imageSize, resourceSatelliteBase, resourceSatelliteSize);
             GuestStorageScope storageScope(storage.get());
             GuestActivationContextScope activationContextScope;
             GuestWindowScope windowScope(windows.get(), false);
@@ -438,13 +573,19 @@ HANDLE GuestRuntime::LaunchThread(
             GuestCommandLineScope commandLineScope(commandLine, processId, assignedThreadId);
 
             DWORD exitCode = 0;
-            DWORD exceptionCode = ERROR_SUCCESS;
+            GuestExceptionDetails exception;
             if (!InvokeGuestThreadEntry(
-                startAddress, parameter, &exitCode, &exceptionCode))
+                startAddress, parameter, &exitCode, &exception))
             {
+                const std::wstring exceptionDescription = DescribeGuestException(
+                    exception,
+                    imageBase,
+                    imageSize,
+                    storage ? storage->ModulePath() : std::wstring(),
+                    modules.get());
                 RuntimeDiagnostics::Record(
                     L"THREAD FAILED: guest structured exception " +
-                    std::to_wstring(exceptionCode) + L".");
+                    exceptionDescription + L".");
             }
             DWORD ignored = ERROR_SUCCESS;
             kernel->SetEvent(completion, &ignored);

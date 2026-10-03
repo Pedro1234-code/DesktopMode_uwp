@@ -8,7 +8,10 @@
 #include "Bridge\RuntimeDiagnostics.h"
 #include "Bridge\Win32Shims.h"
 
+#include <windows.globalization.h>
+
 #include <atomic>
+#include <algorithm>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -17,6 +20,7 @@
 using namespace concurrency;
 using namespace Platform;
 using namespace Windows::Foundation;
+using namespace Windows::Globalization;
 using namespace Windows::Storage;
 using namespace Windows::Storage::Streams;
 using namespace Windows::UI::Core;
@@ -32,6 +36,129 @@ namespace
     std::wstring ToWide(String^ value)
     {
         return value ? std::wstring(value->Data()) : std::wstring();
+    }
+
+    task<StorageFile^> TryGetFileAsync(StorageFolder^ folder, String^ name)
+    {
+        if (!folder || !name) return task_from_result<StorageFile^>(nullptr);
+        return create_task(folder->TryGetItemAsync(name)).then([](task<IStorageItem^> previous)
+        {
+            try
+            {
+                return dynamic_cast<StorageFile^>(previous.get());
+            }
+            catch (...)
+            {
+                return static_cast<StorageFile^>(nullptr);
+            }
+        });
+    }
+
+    task<StorageFile^> TryGetMuiFileAsync(
+        StorageFolder^ sourceFolder,
+        String^ language,
+        String^ satelliteName)
+    {
+        if (!sourceFolder || !language || language->Length() == 0)
+            return task_from_result<StorageFile^>(nullptr);
+        return create_task(sourceFolder->TryGetItemAsync(language)).then(
+            [satelliteName](task<IStorageItem^> previous) -> task<StorageFile^>
+        {
+            try
+            {
+                StorageFolder^ languageFolder = dynamic_cast<StorageFolder^>(previous.get());
+                return languageFolder
+                    ? TryGetFileAsync(languageFolder, satelliteName)
+                    : task_from_result<StorageFile^>(nullptr);
+            }
+            catch (...)
+            {
+                return task_from_result<StorageFile^>(nullptr);
+            }
+        });
+    }
+
+    task<StorageFile^> FindMuiSatelliteAsync(
+        StorageFolder^ sourceFolder,
+        const std::wstring& executableName)
+    {
+        const auto satelliteName = ref new String((executableName + L".mui").c_str());
+        std::vector<task<StorageFile^>> probes;
+        probes.push_back(TryGetFileAsync(sourceFolder, satelliteName));
+
+        std::vector<std::wstring> seen;
+        const auto languages = ApplicationLanguages::Languages;
+        for (unsigned index = 0; languages && index < languages->Size; ++index)
+        {
+            String^ language = languages->GetAt(index);
+            const std::wstring key = ToWide(language);
+            if (key.empty() || std::find(seen.begin(), seen.end(), key) != seen.end()) continue;
+            seen.push_back(key);
+            probes.push_back(TryGetMuiFileAsync(sourceFolder, language, satelliteName));
+        }
+        if (std::find(seen.begin(), seen.end(), L"en-US") == seen.end())
+            probes.push_back(TryGetMuiFileAsync(
+                sourceFolder, ref new String(L"en-US"), satelliteName));
+
+        return when_all(probes.begin(), probes.end()).then(
+            [sourceFolder, satelliteName](const std::vector<StorageFile^>& files)
+            -> task<StorageFile^>
+        {
+            for (StorageFile^ file : files)
+                if (file) return task_from_result(file);
+
+            // The host's preferred languages do not necessarily match the
+            // language folders of a guest Windows installation. If none of
+            // the preferred probes matched, inspect every immediate language
+            // directory for the conventional <module>.mui satellite. This is
+            // a deterministic resource fallback, not an application-specific
+            // path or locale assumption.
+            return create_task(sourceFolder->GetFoldersAsync()).then(
+                [satelliteName](task<Windows::Foundation::Collections::IVectorView<StorageFolder^>^> previous)
+                -> task<StorageFile^>
+            {
+                std::vector<task<StorageFile^>> fallbacks;
+                try
+                {
+                    const auto folders = previous.get();
+                    for (unsigned index = 0; folders && index < folders->Size; ++index)
+                        fallbacks.push_back(TryGetFileAsync(folders->GetAt(index), satelliteName));
+                }
+                catch (...)
+                {
+                    return task_from_result<StorageFile^>(nullptr);
+                }
+                if (fallbacks.empty()) return task_from_result<StorageFile^>(nullptr);
+                return when_all(fallbacks.begin(), fallbacks.end()).then(
+                    [](const std::vector<StorageFile^>& candidates)
+                {
+                    for (StorageFile^ candidate : candidates) if (candidate) return candidate;
+                    return static_cast<StorageFile^>(nullptr);
+                });
+            });
+        });
+    }
+
+    task<std::vector<BYTE>> ReadOptionalFileBytesAsync(StorageFile^ file)
+    {
+        if (!file) return task_from_result(std::vector<BYTE>{});
+        return create_task(FileIO::ReadBufferAsync(file)).then([](task<IBuffer^> previous)
+        {
+            std::vector<BYTE> bytes;
+            try
+            {
+                IBuffer^ buffer = previous.get();
+                if (!buffer || buffer->Length == 0) return bytes;
+                bytes.resize(buffer->Length);
+                DataReader::FromBuffer(buffer)->ReadBytes(
+                    ArrayReference<BYTE>(bytes.data(), static_cast<unsigned int>(bytes.size())));
+            }
+            catch (...)
+            {
+                bytes.clear();
+            }
+            return bytes;
+        });
     }
 
     void PersistReport(const std::wstring& report)
@@ -218,47 +345,71 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
     return create_async([state, executable, moduleSourceFolder]()
     {
         return create_task(FileIO::ReadBufferAsync(executable)).then(
-            [state, moduleSourceFolder](IBuffer^ buffer) -> bool
+            [state, moduleSourceFolder](IBuffer^ buffer) -> task<bool>
         {
             if (!buffer || buffer->Length == 0)
             {
                 state->lastError = L"The selected executable is empty.";
                 RuntimeDiagnostics::Record(L"PREPARE FAILED: empty executable file.");
                 PersistReport(RuntimeDiagnostics::Snapshot());
-                return false;
+                return task_from_result(false);
             }
 
             DataReader^ reader = DataReader::FromBuffer(buffer);
-            std::vector<BYTE> bytes(buffer->Length);
-            reader->ReadBytes(ArrayReference<BYTE>(bytes.data(), static_cast<unsigned int>(bytes.size())));
+            auto bytes = std::make_shared<std::vector<BYTE>>(buffer->Length);
+            reader->ReadBytes(ArrayReference<BYTE>(
+                bytes->data(), static_cast<unsigned int>(bytes->size())));
 
-            const std::wstring virtualModulePath =
-                L"C:\\Program Files\\Win32Bridge\\" + state->executableName;
-            state->storage = std::make_shared<GuestStorageContext>(
-                ApplicationData::Current->LocalFolder,
-                virtualModulePath);
-            state->runtime = std::unique_ptr<GuestRuntime>(new GuestRuntime());
-            state->runtime->SetStorageContext(state->storage);
-            state->runtime->SetWindowManager(state->windows);
-            state->runtime->SetModuleSourceFolder(moduleSourceFolder);
-
-            std::wstring error;
-            const bool prepared = state->runtime->Prepare(
-                bytes.data(),
-                bytes.size(),
-                ResolveRuntimeImport,
-                &error);
-            state->prepared.store(prepared);
-            const auto& bindings = state->runtime->Bindings();
-            state->importSummary = std::to_wstring(bindings.bound) + L" imports bound; " +
-                std::to_wstring(bindings.unresolved) + L" unresolved.";
-            PersistImportReport(BuildImportReport(state->executableName, *state->runtime));
-            if (!prepared)
+            return FindMuiSatelliteAsync(moduleSourceFolder, state->executableName).then(
+                [](StorageFile^ satellite)
             {
-                state->lastError = error.empty() ? L"The runtime could not prepare this executable." : error;
-            }
-            PersistReport(RuntimeDiagnostics::Snapshot());
-            return prepared;
+                if (satellite)
+                {
+                    RuntimeDiagnostics::Record(L"MUI: found companion resource file '" +
+                        ToWide(satellite->Name) + L"'.");
+                }
+                return ReadOptionalFileBytesAsync(satellite);
+            }).then([state, moduleSourceFolder, bytes](std::vector<BYTE> satelliteBytes)
+            {
+                const std::wstring virtualModulePath =
+                    L"C:\\Program Files\\Win32Bridge\\" + state->executableName;
+                state->storage = std::make_shared<GuestStorageContext>(
+                    ApplicationData::Current->LocalFolder,
+                    virtualModulePath);
+                state->runtime = std::unique_ptr<GuestRuntime>(new GuestRuntime());
+                state->runtime->SetStorageContext(state->storage);
+                state->runtime->SetWindowManager(state->windows);
+                state->runtime->SetModuleSourceFolder(moduleSourceFolder);
+
+                std::wstring error;
+                if (!satelliteBytes.empty() && !state->runtime->SetResourceSatellite(
+                    satelliteBytes.data(), satelliteBytes.size(), &error))
+                {
+                    RuntimeDiagnostics::Record(
+                        L"MUI: ignoring an invalid companion resource image: " + error);
+                    error.clear();
+                }
+                else if (satelliteBytes.empty())
+                {
+                    RuntimeDiagnostics::Record(
+                        L"MUI: no companion resource file was found beside the executable.");
+                }
+
+                const bool prepared = state->runtime->Prepare(
+                    bytes->data(), bytes->size(), ResolveRuntimeImport, &error);
+                state->prepared.store(prepared);
+                const auto& bindings = state->runtime->Bindings();
+                state->importSummary = std::to_wstring(bindings.bound) + L" imports bound; " +
+                    std::to_wstring(bindings.unresolved) + L" unresolved.";
+                PersistImportReport(BuildImportReport(state->executableName, *state->runtime));
+                if (!prepared)
+                {
+                    state->lastError = error.empty()
+                        ? L"The runtime could not prepare this executable." : error;
+                }
+                PersistReport(RuntimeDiagnostics::Snapshot());
+                return prepared;
+            });
         });
     });
 }

@@ -1,10 +1,69 @@
 #include "pch.h"
 #include "Bridge/OleShims.h"
 #include "Bridge/RuntimeDiagnostics.h"
+
 using namespace Win32Bridge::Bridge;
-namespace { thread_local unsigned c=0; bool L(const std::wstring&s,const wchar_t*n){return _wcsicmp(s.c_str(),n)==0;} }
-HRESULT WINAPI Win32Bridge::Bridge::BridgeCoInitialize(LPVOID){++c;return c==1?S_OK:S_FALSE;} HRESULT WINAPI Win32Bridge::Bridge::BridgeOleInitialize(LPVOID p){return BridgeCoInitialize(p);} void WINAPI Win32Bridge::Bridge::BridgeCoUninitialize(){if(c)--c;} void WINAPI Win32Bridge::Bridge::BridgeOleUninitialize(){BridgeCoUninitialize();}
-LPVOID WINAPI Win32Bridge::Bridge::BridgeCoTaskMemAlloc(SIZE_T n){return ::CoTaskMemAlloc(n);} void WINAPI Win32Bridge::Bridge::BridgeCoTaskMemFree(LPVOID p){::CoTaskMemFree(p);} HRESULT WINAPI Win32Bridge::Bridge::BridgeCoCreateInstance(REFCLSID clsid,LPUNKNOWN,DWORD,REFIID iid,LPVOID*o){if(o)*o=nullptr;wchar_t line[256]={};swprintf_s(line,L"COM: CoCreateInstance requested class {%08lX-%04hX-%04hX-%02hhX%02hhX-%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX}; IID {%08lX-%04hX-%04hX-%02hhX%02hhX-%02hhX%02hhX%02hhX%02hhX%02hhX%02hhX} is not registered.",clsid.Data1,clsid.Data2,clsid.Data3,clsid.Data4[0],clsid.Data4[1],clsid.Data4[2],clsid.Data4[3],clsid.Data4[4],clsid.Data4[5],clsid.Data4[6],clsid.Data4[7],iid.Data1,iid.Data2,iid.Data3,iid.Data4[0],iid.Data4[1],iid.Data4[2],iid.Data4[3],iid.Data4[4],iid.Data4[5],iid.Data4[6],iid.Data4[7]);RuntimeDiagnostics::Record(line);return REGDB_E_CLASSNOTREG;}
-void WINAPI Win32Bridge::Bridge::BridgeReleaseStgMedium(PVOID){} HRESULT WINAPI Win32Bridge::Bridge::BridgeRegisterDragDrop(HWND,PVOID){return E_NOTIMPL;} HRESULT WINAPI Win32Bridge::Bridge::BridgeRevokeDragDrop(HWND){return E_NOTIMPL;} HRESULT WINAPI Win32Bridge::Bridge::BridgeDoDragDrop(PVOID,PVOID,DWORD,DWORD*effect){if(effect)*effect=0;return E_NOTIMPL;}
-BSTR WINAPI Win32Bridge::Bridge::BridgeSysAllocString(LPCOLESTR s){return ::SysAllocString(s);} BSTR WINAPI Win32Bridge::Bridge::BridgeSysAllocStringLen(const OLECHAR*s,UINT n){return ::SysAllocStringLen(s,n);} void WINAPI Win32Bridge::Bridge::BridgeSysFreeString(BSTR s){::SysFreeString(s);} UINT WINAPI Win32Bridge::Bridge::BridgeSysStringLen(BSTR s){return ::SysStringLen(s);} UINT WINAPI Win32Bridge::Bridge::BridgeSysStringByteLen(BSTR s){return ::SysStringByteLen(s);} HRESULT WINAPI Win32Bridge::Bridge::BridgeVariantClear(VARIANTARG*v){return v?::VariantClear(v):E_INVALIDARG;} HRESULT WINAPI Win32Bridge::Bridge::BridgeVariantCopy(VARIANTARG*d,const VARIANTARG*s){return d&&s?::VariantCopy(d,s):E_INVALIDARG;}
-ImportResolution Win32Bridge::Bridge::ResolveOleImport(const ImportedSymbol&s){auto r=CompatibilityCatalog::Resolve(s);if(L(s.library,L"ole32.dll")){if(L(s.name,L"coinitialize"))r.targetAddress=(ULONGLONG)&BridgeCoInitialize;else if(L(s.name,L"oleinitialize"))r.targetAddress=(ULONGLONG)&BridgeOleInitialize;else if(L(s.name,L"couninitialize"))r.targetAddress=(ULONGLONG)&BridgeCoUninitialize;else if(L(s.name,L"oleuninitialize"))r.targetAddress=(ULONGLONG)&BridgeOleUninitialize;else if(L(s.name,L"cotaskmemalloc"))r.targetAddress=(ULONGLONG)&BridgeCoTaskMemAlloc;else if(L(s.name,L"cotaskmemfree"))r.targetAddress=(ULONGLONG)&BridgeCoTaskMemFree;else if(L(s.name,L"cocreateinstance"))r.targetAddress=(ULONGLONG)&BridgeCoCreateInstance;else if(L(s.name,L"releasestgmedium"))r.targetAddress=(ULONGLONG)&BridgeReleaseStgMedium;else if(L(s.name,L"registerdragdrop"))r.targetAddress=(ULONGLONG)&BridgeRegisterDragDrop;else if(L(s.name,L"revokedragdrop"))r.targetAddress=(ULONGLONG)&BridgeRevokeDragDrop;else if(L(s.name,L"dodragdrop"))r.targetAddress=(ULONGLONG)&BridgeDoDragDrop;}else if(L(s.library,L"oleaut32.dll")&&s.importedByOrdinal){switch(s.ordinal){case 2:r.targetAddress=(ULONGLONG)&BridgeSysAllocString;break;case 4:r.targetAddress=(ULONGLONG)&BridgeSysAllocStringLen;break;case 6:r.targetAddress=(ULONGLONG)&BridgeSysFreeString;break;case 7:r.targetAddress=(ULONGLONG)&BridgeSysStringLen;break;case 9:r.targetAddress=(ULONGLONG)&BridgeVariantClear;break;case 10:r.targetAddress=(ULONGLONG)&BridgeVariantCopy;break;case 149:case 150:r.targetAddress=(ULONGLONG)&BridgeSysStringByteLen;break;}}if(r.targetAddress)r.disposition=ImportDisposition::NeedsBridge;return r;}
+namespace { thread_local unsigned g_comCount = 0; bool Name(const std::wstring& value, const wchar_t* expected) { return _wcsicmp(value.c_str(), expected) == 0; } }
+
+HRESULT WINAPI Win32Bridge::Bridge::BridgeCoInitialize(LPVOID) { ++g_comCount; return g_comCount == 1 ? S_OK : S_FALSE; }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeCoInitializeEx(LPVOID reserved, DWORD) { return BridgeCoInitialize(reserved); }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeOleInitialize(LPVOID reserved) { return BridgeCoInitialize(reserved); }
+void WINAPI Win32Bridge::Bridge::BridgeCoUninitialize() { if (g_comCount) --g_comCount; }
+void WINAPI Win32Bridge::Bridge::BridgeOleUninitialize() { BridgeCoUninitialize(); }
+LPVOID WINAPI Win32Bridge::Bridge::BridgeCoTaskMemAlloc(SIZE_T size) { return ::CoTaskMemAlloc(size); }
+void WINAPI Win32Bridge::Bridge::BridgeCoTaskMemFree(LPVOID memory) { ::CoTaskMemFree(memory); }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeCoCreateInstance(REFCLSID clsid, LPUNKNOWN, DWORD, REFIID iid, LPVOID* result)
+{
+    if (result) *result = nullptr;
+    RuntimeDiagnostics::Record(L"COM: class " + std::to_wstring(clsid.Data1) +
+        L" / interface " + std::to_wstring(iid.Data1) + L" is not registered.");
+    return REGDB_E_CLASSNOTREG;
+}
+void WINAPI Win32Bridge::Bridge::BridgeReleaseStgMedium(PVOID) { }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeRegisterDragDrop(HWND, PVOID) { return E_NOTIMPL; }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeRevokeDragDrop(HWND) { return E_NOTIMPL; }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeDoDragDrop(PVOID, PVOID, DWORD, DWORD* effect) { if (effect) *effect = 0; return E_NOTIMPL; }
+BSTR WINAPI Win32Bridge::Bridge::BridgeSysAllocString(LPCOLESTR value) { return ::SysAllocString(value); }
+BSTR WINAPI Win32Bridge::Bridge::BridgeSysAllocStringLen(const OLECHAR* value, UINT length) { return ::SysAllocStringLen(value, length); }
+BSTR WINAPI Win32Bridge::Bridge::BridgeSysAllocStringByteLen(LPCSTR value, UINT length) { return ::SysAllocStringByteLen(value, length); }
+void WINAPI Win32Bridge::Bridge::BridgeSysFreeString(BSTR value) { ::SysFreeString(value); }
+UINT WINAPI Win32Bridge::Bridge::BridgeSysStringLen(BSTR value) { return ::SysStringLen(value); }
+UINT WINAPI Win32Bridge::Bridge::BridgeSysStringByteLen(BSTR value) { return ::SysStringByteLen(value); }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeVariantClear(VARIANTARG* value) { return value ? ::VariantClear(value) : E_INVALIDARG; }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeVariantCopy(VARIANTARG* destination, const VARIANTARG* source) { return destination && source ? ::VariantCopy(destination, source) : E_INVALIDARG; }
+
+ImportResolution Win32Bridge::Bridge::ResolveOleImport(const ImportedSymbol& symbol)
+{
+    auto result = CompatibilityCatalog::Resolve(symbol);
+    if (Name(symbol.library, L"ole32.dll"))
+    {
+        if (Name(symbol.name, L"coinitialize")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCoInitialize);
+        else if (Name(symbol.name, L"coinitializeex")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCoInitializeEx);
+        else if (Name(symbol.name, L"oleinitialize")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOleInitialize);
+        else if (Name(symbol.name, L"couninitialize")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCoUninitialize);
+        else if (Name(symbol.name, L"oleuninitialize")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOleUninitialize);
+        else if (Name(symbol.name, L"cotaskmemalloc")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCoTaskMemAlloc);
+        else if (Name(symbol.name, L"cotaskmemfree")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCoTaskMemFree);
+        else if (Name(symbol.name, L"cocreateinstance")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCoCreateInstance);
+        else if (Name(symbol.name, L"releasestgmedium")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReleaseStgMedium);
+        else if (Name(symbol.name, L"registerdragdrop")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterDragDrop);
+        else if (Name(symbol.name, L"revokedragdrop")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRevokeDragDrop);
+        else if (Name(symbol.name, L"dodragdrop")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDoDragDrop);
+    }
+    else if (Name(symbol.library, L"oleaut32.dll") && symbol.importedByOrdinal)
+    {
+        switch (symbol.ordinal)
+        {
+        case 2: result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSysAllocString); break;
+        case 4: result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSysAllocStringLen); break;
+        case 6: result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSysFreeString); break;
+        case 7: result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSysStringLen); break;
+        case 9: result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeVariantClear); break;
+        case 10: result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeVariantCopy); break;
+        case 149: result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSysStringByteLen); break;
+        case 150: result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSysAllocStringByteLen); break;
+        }
+    }
+    if (result.targetAddress) result.disposition = ImportDisposition::NeedsBridge;
+    return result;
+}

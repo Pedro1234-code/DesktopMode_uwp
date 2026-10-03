@@ -47,8 +47,9 @@ namespace Bridge
     };
 
     // Reads from a mapped AMD64 image. With requireExactLanguage == false the
-    // first numeric language entry is selected deterministically; locale/MUI
-    // fallback is intentionally outside the current parser.
+    // first numeric language entry is selected deterministically. A resource-
+    // only MUI satellite can be attached to GuestResourceScope and is queried
+    // when the primary executable does not contain the requested resource.
     GuestResourceStatus FindGuestResource(
         HMODULE module,
         LPCWSTR type,
@@ -86,7 +87,11 @@ namespace Bridge
     class GuestResourceScope final
     {
     public:
-        GuestResourceScope(const BYTE* imageBase, size_t imageSize);
+        GuestResourceScope(
+            const BYTE* imageBase,
+            size_t imageSize,
+            const BYTE* satelliteBase = nullptr,
+            size_t satelliteSize = 0);
         ~GuestResourceScope();
 
         GuestResourceScope(const GuestResourceScope&) = delete;
@@ -95,6 +100,8 @@ namespace Bridge
     private:
         const BYTE* m_previousBase;
         size_t m_previousSize;
+        const BYTE* m_previousSatelliteBase;
+        size_t m_previousSatelliteSize;
     };
 }
 }

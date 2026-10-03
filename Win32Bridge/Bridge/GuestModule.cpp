@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cwctype>
+#include <cwchar>
 
 using namespace Win32Bridge::Bridge;
 using namespace Windows::Storage;
@@ -864,6 +865,32 @@ bool GuestModuleLoader::GetMappedImage(HMODULE module, const BYTE** imageBase, s
     *imageBase = candidate->runtime.Base();
     *imageSize = candidate->runtime.Size();
     return true;
+}
+
+bool GuestModuleLoader::DescribeAddress(ULONG_PTR address, std::wstring* description) const
+{
+    if (!description) return false;
+    description->clear();
+
+    // Diagnostics may run while unwinding an exception raised inside loader
+    // code. Never block forever trying to describe that same failure.
+    std::unique_lock<std::mutex> guard(m_lock, std::try_to_lock);
+    if (!guard.owns_lock()) return false;
+    for (const auto& candidate : m_modules)
+    {
+        if (!candidate || !candidate->runtime.Base() || candidate->runtime.Size() == 0)
+            continue;
+
+        const ULONG_PTR base = reinterpret_cast<ULONG_PTR>(candidate->runtime.Base());
+        if (address < base || address - base >= candidate->runtime.Size())
+            continue;
+
+        wchar_t offset[32]{};
+        swprintf_s(offset, L"0x%llX", static_cast<unsigned long long>(address - base));
+        *description = candidate->canonicalName + L"+" + offset;
+        return true;
+    }
+    return false;
 }
 
 bool GuestModuleLoader::FreeLibrary(HMODULE module, DWORD* win32Error)

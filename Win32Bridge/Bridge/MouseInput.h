@@ -7,6 +7,7 @@
 #include <windows.ui.input.h>
 
 #include <cstdint>
+#include <array>
 #include <deque>
 #include <mutex>
 
@@ -50,6 +51,10 @@ namespace Bridge
         bool TryDequeue(MouseEvent* event);
         SHORT GetAsyncKeyState(int virtualKey);
         SHORT GetKeyState(int virtualKey) const;
+        void UpdateKeyState(int virtualKey, bool down, UINT scanCode = 0,
+            bool extended = false);
+        void ResetKeyState();
+        UINT MapVirtualKey(UINT code, UINT mapType) const;
 
     private:
         // Must be called with m_attachmentMutex held.  CoreWindow event
@@ -75,6 +80,10 @@ namespace Bridge
         mutable std::mutex m_mutex;
         MouseSnapshot m_snapshot;
         unsigned int m_pressedSinceRead = 0;
+        std::array<BYTE, 256> m_keyboardState{};
+        std::array<bool, 256> m_keyboardPressedSinceRead{};
+        std::array<UINT, 256> m_virtualKeyToScan{};
+        std::array<UINT, 512> m_scanToVirtualKey{};
         bool m_detected = false;
         std::deque<MouseEvent> m_events;
     };

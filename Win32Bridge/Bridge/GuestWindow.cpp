@@ -2,6 +2,8 @@
 #include "Bridge\\CommonControlsShims.h"
 #include "Bridge\\DialogResources.h"
 #include "Bridge\\GuestWindow.h"
+#include "Bridge\\Kernel32Shims.h"
+#include "Bridge\\MouseInput.h"
 #include "Bridge\\User32Shims.h"
 #include "Bridge/GuestMetrics.h"
 #include "Bridge/RuntimeDiagnostics.h"
@@ -93,6 +95,12 @@ namespace
         GuestWindowManager* manager;
         KeyEventArgs^ args;
         UINT message;
+    };
+
+    struct CharacterInputCall final
+    {
+        GuestWindowManager* manager;
+        CharacterReceivedEventArgs^ args;
     };
 
     void SetWin32Error(DWORD* output, DWORD value)
@@ -283,6 +291,97 @@ namespace
     int DefaultCoordinate(int value)
     {
         return value == GuestAbi::CwUseDefault ? 0 : value;
+    }
+
+    struct EditVisualLine final
+    {
+        EditVisualLine() = default;
+        EditVisualLine(size_t first, size_t last, size_t following)
+            : start(first), end(last), next(following) {}
+
+        size_t start = 0;
+        size_t end = 0;
+        size_t next = 0;
+    };
+
+    std::vector<EditVisualLine> BuildEditVisualLines(
+        const std::wstring& text,
+        bool wrap,
+        int availableWidth,
+        const std::function<int(const wchar_t*, size_t)>& measure)
+    {
+        std::vector<EditVisualLine> lines;
+        size_t paragraphStart = 0;
+        for (;;)
+        {
+            size_t paragraphEnd = paragraphStart;
+            while (paragraphEnd < text.size() && text[paragraphEnd] != L'\r' &&
+                text[paragraphEnd] != L'\n')
+                ++paragraphEnd;
+
+            if (paragraphStart == paragraphEnd)
+            {
+                lines.push_back(EditVisualLine{ paragraphStart, paragraphEnd, paragraphEnd });
+            }
+            else if (!wrap)
+            {
+                lines.push_back(EditVisualLine{ paragraphStart, paragraphEnd, paragraphEnd });
+            }
+            else
+            {
+                size_t lineStart = paragraphStart;
+                while (lineStart < paragraphEnd)
+                {
+                    size_t low = 1;
+                    size_t high = paragraphEnd - lineStart;
+                    size_t fitting = 0;
+                    while (low <= high)
+                    {
+                        const size_t middle = low + (high - low) / 2;
+                        if (measure(text.data() + lineStart, middle) <= availableWidth)
+                        {
+                            fitting = middle;
+                            low = middle + 1;
+                        }
+                        else
+                        {
+                            high = middle - 1;
+                        }
+                    }
+                    if (fitting == 0) fitting = 1;
+                    const size_t lineEnd = (std::min)(paragraphEnd, lineStart + fitting);
+                    lines.push_back(EditVisualLine{ lineStart, lineEnd, lineEnd });
+                    lineStart = lineEnd;
+                }
+            }
+
+            if (paragraphEnd == text.size()) break;
+            size_t nextParagraph = paragraphEnd + 1;
+            if (text[paragraphEnd] == L'\r' && nextParagraph < text.size() &&
+                text[nextParagraph] == L'\n')
+                ++nextParagraph;
+            lines.back().next = nextParagraph;
+            paragraphStart = nextParagraph;
+            if (paragraphStart == text.size())
+            {
+                lines.push_back(EditVisualLine{ paragraphStart, paragraphStart, paragraphStart });
+                break;
+            }
+        }
+        if (lines.empty()) lines.push_back(EditVisualLine{});
+        return lines;
+    }
+
+    size_t EditLineForPosition(
+        const std::vector<EditVisualLine>& lines,
+        size_t position)
+    {
+        if (lines.empty()) return 0;
+        for (size_t index = 0; index < lines.size(); ++index)
+        {
+            if (position < lines[index].next || index + 1 == lines.size()) return index;
+        }
+        return lines.size() - 1;
     }
 
     int SaturatingAdd(int value, int delta);
@@ -617,6 +716,22 @@ namespace
     constexpr UINT ComboBoxExGetItemW = 0x040d;
     constexpr UINT ScrollBarSetPosition = 0x00e0;
     constexpr UINT ScrollBarGetPosition = 0x00e1;
+    constexpr UINT EditGetSelection = 0x00b0;
+    constexpr UINT EditSetSelection = 0x00b1;
+    constexpr UINT EditSetHandle = 0x00bc;
+    constexpr UINT EditGetHandle = 0x00bd;
+    constexpr UINT EditGetLineCount = 0x00ba;
+    constexpr UINT EditLineIndex = 0x00bb;
+    constexpr UINT EditLineLength = 0x00c1;
+    constexpr UINT EditReplaceSelection = 0x00c2;
+    constexpr UINT EditGetLine = 0x00c4;
+    constexpr UINT EditLimitText = 0x00c5;
+    constexpr UINT EditLineFromCharacter = 0x00c9;
+    constexpr UINT EditGetFirstVisibleLine = 0x00ce;
+    constexpr UINT EditSetPasswordCharacter = 0x00cc;
+    constexpr UINT EditSetReadOnly = 0x00cf;
+    constexpr UINT EditGetPasswordCharacter = 0x00d2;
+    constexpr UINT EditGetLimitText = 0x00d5;
     constexpr UINT CommonControlSetUnicodeFormat = 0x2005;
     constexpr UINT CommonControlGetUnicodeFormat = 0x2006;
     constexpr UINT ListViewGetBackgroundColor = 0x1000;
@@ -2051,6 +2166,7 @@ namespace
 
 struct GuestWindowManager::WindowClass final
 {
+    DWORD processId = 0;
     std::wstring name;
     // WNDCLASS owns the menu-resource association for a top-level window.
     // Keep either the resource name or its MAKEINTRESOURCE value so creating
@@ -2068,6 +2184,7 @@ struct GuestWindowManager::WindowClass final
 struct GuestWindowManager::WindowRecord final
 {
     HWND handle = nullptr;
+    DWORD processId = 0;
     std::shared_ptr<WindowClass> windowClass;
     GuestAbi::WndProc procedure = nullptr;
     std::wstring title;
@@ -2080,11 +2197,21 @@ struct GuestWindowManager::WindowRecord final
     UINT_PTR controlId = 0;
     std::vector<BYTE> extraBytes;
     MiniGdi::ObjectHandle controlFont = MiniGdi::InvalidObject;
+    HICON staticIcon = nullptr;
+    MiniGdi::Surface staticImage;
     int controlTextWidth = GuestMetrics::TextWidth;
     int controlTextHeight = GuestMetrics::TextHeight;
     int listViewHeaderHeight = GuestMetrics::ListViewHeaderHeight;
     int listViewRowHeight = GuestMetrics::TextHeight;
     size_t editCaret = 0;
+    size_t editSelectionAnchor = 0;
+    size_t editSelectionEnd = 0;
+    size_t editTextLimit = MaximumBuiltinControlTextLength;
+    size_t editFirstVisibleCharacter = 0;
+    size_t editFirstVisibleLine = 0;
+    int editHorizontalOffset = 0;
+    wchar_t editPasswordCharacter = L'\0';
+    HLOCAL editTextHandle = nullptr;
     bool buttonPressed = false;
     bool buttonKeyboardPressed = false;
     std::vector<std::wstring> choiceItems;
@@ -2186,6 +2313,8 @@ struct GuestWindowManager::WindowRecord final
     UINT upDownBase = 10;
     HWND upDownBuddy = nullptr;
     bool menuBar = false;
+    bool viewportWidthBound = false;
+    bool viewportHeightBound = false;
     int openMenuIndex = -1;
     bool visible = false;
     bool enabled = true;
@@ -2331,6 +2460,32 @@ GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHos
         catch (Exception^ error) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: KeyUp HRESULT " + std::to_wstring(static_cast<unsigned long>(error->HResult)) + L"."); }
         catch (...) { RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: KeyUp raised an unknown exception."); }
     });
+    m_characterReceivedToken = coreWindow->CharacterReceived +=
+        ref new TypedEventHandler<CoreWindow^, CharacterReceivedEventArgs^>(
+        [callbacks](CoreWindow^, CharacterReceivedEventArgs^ args)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> guard(callbacks->lock);
+            if (callbacks->owner)
+            {
+                const DWORD exceptionCode =
+                    GuestWindowManager::InvokeCharacterInput(callbacks->owner, args);
+                if (exceptionCode != ERROR_SUCCESS)
+                    RuntimeDiagnostics::Record(L"HOST INPUT SEH: CharacterReceived code " +
+                        std::to_wstring(static_cast<unsigned long>(exceptionCode)) + L".");
+            }
+        }
+        catch (Exception^ error)
+        {
+            RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: CharacterReceived HRESULT " +
+                std::to_wstring(static_cast<unsigned long>(error->HResult)) + L".");
+        }
+        catch (...)
+        {
+            RuntimeDiagnostics::Record(L"HOST INPUT EXCEPTION: CharacterReceived raised an unknown exception.");
+        }
+    });
     m_sizeChangedToken = coreWindow->SizeChanged +=
         ref new TypedEventHandler<CoreWindow^, WindowSizeChangedEventArgs^>(
         [callbacks](CoreWindow^, WindowSizeChangedEventArgs^ args)
@@ -2415,6 +2570,7 @@ void GuestWindowManager::Activate()
 void GuestWindowManager::Deactivate()
 {
     m_active.store(false);
+    MouseInput().ResetKeyState();
     {
         std::lock_guard<std::mutex> guard(m_popupMenuLock);
         m_popupMenu.open = false;
@@ -2461,6 +2617,11 @@ void GuestWindowManager::Deactivate()
     // Reset only after every WindowRecord has been made unreachable, so no
     // active guest callback can observe invalidated handles mid-execution.
     m_gdi.Reset();
+    {
+        std::lock_guard<std::mutex> guard(m_screenDcLock);
+        m_screenDc = MiniGdi::InvalidDc;
+        m_screenSurface = MiniGdi::Surface();
+    }
 
     {
         std::lock_guard<std::mutex> guard(m_classesLock);
@@ -2497,6 +2658,7 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassExW* windowC
         return 0;
     }
 
+    const DWORD processId = BridgeGetCurrentProcessId();
     const std::wstring name = Lowercase(windowClass->lpszClassName);
     if (name.empty())
     {
@@ -2505,13 +2667,15 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassExW* windowC
     }
 
     std::lock_guard<std::mutex> guard(m_classesLock);
-    if (m_classes.find(name) != m_classes.end())
+    const std::wstring processClassName = std::to_wstring(processId) + L":" + name;
+    if (m_classes.find(processClassName) != m_classes.end())
     {
         SetWin32Error(win32Error, ERROR_CLASS_ALREADY_EXISTS);
         return 0;
     }
 
     auto registered = std::make_shared<WindowClass>();
+    registered->processId = processId;
     registered->name = name;
     if (windowClass->lpszMenuName)
     {
@@ -2533,7 +2697,7 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassExW* windowC
     {
         registered->atom = m_nextAtom++;
     }
-    m_classes.emplace(name, registered);
+    m_classes.emplace(processClassName, registered);
     m_classesByAtom.emplace(registered->atom, registered);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return registered->atom;
@@ -2570,13 +2734,15 @@ std::shared_ptr<GuestWindowManager::WindowClass> GuestWindowManager::FindClass(L
     }
 
     std::lock_guard<std::mutex> guard(m_classesLock);
+    const DWORD processId = BridgeGetCurrentProcessId();
     if (IsAtomPointer(className))
     {
         const auto found = m_classesByAtom.find(static_cast<ATOM>(reinterpret_cast<ULONG_PTR>(className)));
         return found == m_classesByAtom.end() ? nullptr : found->second;
     }
 
-    const auto found = m_classes.find(Lowercase(className));
+    const auto found = m_classes.find(
+        std::to_wstring(processId) + L":" + Lowercase(className));
     return found == m_classes.end() ? nullptr : found->second;
 }
 
@@ -2614,6 +2780,7 @@ HWND GuestWindowManager::CreateGuestWindow(
         // while unregistered STATIC/BUTTON/EDIT windows retain predictable
         // bridge behavior.
         registered = std::make_shared<WindowClass>();
+        registered->processId = BridgeGetCurrentProcessId();
         registered->name = Lowercase(className);
         registered->background = BuiltinControlBackground(builtinKind);
         registered->builtinKind = builtinKind;
@@ -2625,6 +2792,7 @@ HWND GuestWindowManager::CreateGuestWindow(
     }
 
     auto window = std::make_shared<WindowRecord>();
+    window->processId = BridgeGetCurrentProcessId();
     window->windowClass = registered;
     window->procedure = registered->procedure;
     window->title = windowName ? windowName : L"";
@@ -2639,6 +2807,13 @@ HWND GuestWindowManager::CreateGuestWindow(
     window->parent = parent;
     window->controlId = parent ? reinterpret_cast<UINT_PTR>(menu) : 0;
     window->editCaret = window->title.size();
+    window->editSelectionAnchor = window->editCaret;
+    window->editSelectionEnd = window->editCaret;
+    if (registered->builtinKind == BuiltinControlKind::Edit &&
+        (style & GuestAbi::EsPassword) != 0)
+    {
+        window->editPasswordCharacter = L'\x25cf';
+    }
     window->enabled = (style & GuestWsDisabled) == 0;
     if (registered->builtinKind == BuiltinControlKind::StatusBar)
     {
@@ -2672,14 +2847,20 @@ HWND GuestWindowManager::CreateGuestWindow(
         builtinKind == BuiltinControlKind::UpDown ||
         builtinKind == BuiltinControlKind::ToolTip)
         defaultHeight = GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight);
-    window->bounds.left = DefaultCoordinate(x);
-    window->bounds.top = DefaultCoordinate(y);
-    const int initialWindowWidth = parent
-        ? DefaultExtent(width, defaultWidth)
-        : (std::max)(1, m_viewportWidth.load());
-    const int initialWindowHeight = parent
-        ? DefaultExtent(height, defaultHeight)
-        : (std::max)(1, m_viewportHeight.load());
+    const bool defaultTopLevelX = !parent && x == GuestAbi::CwUseDefault;
+    const bool defaultTopLevelY = !parent && y == GuestAbi::CwUseDefault;
+    window->viewportWidthBound = !parent && width == GuestAbi::CwUseDefault;
+    window->viewportHeightBound = !parent && height == GuestAbi::CwUseDefault;
+    const int initialWindowWidth = DefaultExtent(width,
+        parent ? defaultWidth : (std::max)(1, m_viewportWidth.load()));
+    const int initialWindowHeight = DefaultExtent(height,
+        parent ? defaultHeight : (std::max)(1, m_viewportHeight.load()));
+    window->bounds.left = defaultTopLevelX && initialWindowWidth < m_viewportWidth.load()
+        ? (m_viewportWidth.load() - initialWindowWidth) / 2
+        : DefaultCoordinate(x);
+    window->bounds.top = defaultTopLevelY && initialWindowHeight < m_viewportHeight.load()
+        ? (m_viewportHeight.load() - initialWindowHeight) / 2
+        : DefaultCoordinate(y);
     window->bounds.right = window->bounds.left + initialWindowWidth;
     window->bounds.bottom = window->bounds.top + initialWindowHeight;
     if (!window->surface.Resize(window->bounds.right - window->bounds.left, window->bounds.bottom - window->bounds.top, MiniGdi::OpaqueWhite))
@@ -3638,6 +3819,133 @@ UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int 
     return returnCommand ? command : (command ? TRUE : FALSE);
 }
 
+HWND GuestWindowManager::GetGuestForegroundWindow() const
+{
+    const HWND foreground = reinterpret_cast<HWND>(m_foregroundWindow.load());
+    return foreground && IsGuestWindow(foreground) ? foreground : nullptr;
+}
+
+void GuestWindowManager::DestroyGuestWindowsForProcess(
+    DWORD processId,
+    HWND restoreForeground,
+    HWND restoreFocus)
+{
+    if (!processId)
+    {
+        return;
+    }
+
+    // Run has already restored the caller's runtime context. Therefore this is
+    // process-exit teardown, not DestroyWindow: release USER/GDI state without
+    // calling a departed process's WNDPROC under the parent's shim context.
+    std::vector<std::shared_ptr<WindowRecord>> victims;
+    std::unordered_set<ULONG_PTR> victimHandles;
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        for (const auto& item : m_windows)
+        {
+            const auto& candidate = item.second;
+            std::lock_guard<std::mutex> windowGuard(candidate->lock);
+            if (!candidate->destroyed && candidate->processId == processId)
+            {
+                candidate->destroyed = true;
+                victims.push_back(candidate);
+                victimHandles.emplace(item.first);
+            }
+        }
+        for (ULONG_PTR handle : victimHandles)
+        {
+            m_windows.erase(handle);
+        }
+    }
+
+    for (const auto& victim : victims)
+    {
+        CancelGuestTimersForWindow(victim->handle);
+        m_messages.ClearForWindow(victim->handle);
+        m_gdi.DestroyDc(victim->dc);
+    }
+
+    const auto clearOwnedAtomic = [&victimHandles](std::atomic<ULONG_PTR>& value)
+    {
+        ULONG_PTR current = value.load();
+        while (victimHandles.find(current) != victimHandles.end() &&
+            !value.compare_exchange_weak(current, 0))
+        {
+        }
+    };
+    clearOwnedAtomic(m_captureWindow);
+    clearOwnedAtomic(m_focusWindow);
+    clearOwnedAtomic(m_foregroundWindow);
+    {
+        std::lock_guard<std::mutex> guard(m_popupMenuLock);
+        if (victimHandles.find(reinterpret_cast<ULONG_PTR>(m_popupMenu.owner)) != victimHandles.end() ||
+            victimHandles.find(reinterpret_cast<ULONG_PTR>(m_popupMenu.root)) != victimHandles.end())
+        {
+            m_popupMenu = PopupMenuSession{};
+            m_popupMenuChanged.notify_all();
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_classesLock);
+        for (auto iterator = m_classes.begin(); iterator != m_classes.end();)
+        {
+            if (iterator->second && iterator->second->processId == processId)
+                iterator = m_classes.erase(iterator);
+            else
+                ++iterator;
+        }
+        for (auto iterator = m_classesByAtom.begin(); iterator != m_classesByAtom.end();)
+        {
+            if (iterator->second && iterator->second->processId == processId)
+                iterator = m_classesByAtom.erase(iterator);
+            else
+                ++iterator;
+        }
+    }
+
+    HWND foreground = IsGuestWindow(restoreForeground) ? restoreForeground : nullptr;
+    if (!foreground)
+    {
+        ULONG_PTR newest = 0;
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        for (const auto& item : m_windows)
+        {
+            const auto& candidate = item.second;
+            std::lock_guard<std::mutex> windowGuard(candidate->lock);
+            if (!candidate->destroyed && candidate->visible && !candidate->parent &&
+                item.first > newest)
+            {
+                newest = item.first;
+                foreground = candidate->handle;
+            }
+        }
+    }
+    m_foregroundWindow.store(reinterpret_cast<ULONG_PTR>(foreground));
+
+    if (IsGuestWindow(restoreFocus))
+    {
+        DWORD ignored = ERROR_SUCCESS;
+        SetGuestFocus(restoreFocus, &ignored);
+    }
+    else
+    {
+        m_focusWindow.store(reinterpret_cast<ULONG_PTR>(foreground));
+    }
+
+    if (foreground)
+    {
+        const auto record = FindWindow(foreground);
+        if (record)
+        {
+            InvalidateGuestRect(foreground, nullptr, TRUE, nullptr);
+            Present(record);
+        }
+    }
+    RuntimeDiagnostics::Record(L"PROCESS WINDOWS: removed windows for process " +
+        std::to_wstring(processId) + L" and restored the previous desktop activation.");
+}
+
 BOOL GuestWindowManager::EndGuestMenu(DWORD* win32Error)
 {
     PopupMenuSession closing;
@@ -4243,8 +4551,8 @@ bool GuestWindowManager::GetGuestSurfaceGeometry(
             *rootWindow = current;
             *rootWidth = width;
             *rootHeight = height;
-            *targetLeft = accumulatedLeft;
-            *targetTop = SaturatingAdd(accumulatedTop,
+            *targetLeft = SaturatingAdd(bounds.left, accumulatedLeft);
+            *targetTop = SaturatingAdd(SaturatingAdd(bounds.top, accumulatedTop),
                 rootMenuBar && window != current ? GuestMetrics::MenuHeight : 0);
             return width > 0 && height > 0 && *targetWidth > 0 && *targetHeight > 0;
         }
@@ -5332,20 +5640,25 @@ BOOL GuestWindowManager::SetGuestWindowPos(
         previousTop = record->bounds.top;
         className = record->windowClass ? record->windowClass->name : L"<unknown>";
         const bool hostedRoot = record->parent == nullptr;
-        const int newWidth = hostedRoot
-            ? (std::max)(1, m_viewportWidth.load())
-            : (resize ? SetWindowPosExtent(width) : oldWidth);
-        int newHeight = hostedRoot
-            ? (std::max)(1, m_viewportHeight.load())
-            : (resize ? SetWindowPosExtent(height) : oldHeight);
+        const int newWidth = resize ? SetWindowPosExtent(width) : oldWidth;
+        int newHeight = resize ? SetWindowPosExtent(height) : oldHeight;
         if (resize && record->windowClass &&
             record->windowClass->builtinKind == BuiltinControlKind::Rebar &&
             !record->rebarBands.empty())
         {
             newHeight = RequiredRebarHeight(record->rebarBands, newWidth);
         }
-        const int newLeft = hostedRoot ? 0 : (move ? x : record->bounds.left);
-        const int newTop = hostedRoot ? 0 : (move ? y : record->bounds.top);
+        const int newLeft = move ? x : record->bounds.left;
+        const int newTop = move ? y : record->bounds.top;
+
+        // An explicit SetWindowPos/MoveWindow detaches that dimension from the
+        // host viewport. Only CW_USEDEFAULT-created roots continue following a
+        // later host resize automatically.
+        if (hostedRoot && resize)
+        {
+            record->viewportWidthBound = false;
+            record->viewportHeightBound = false;
+        }
 
         if (resize && (newWidth != oldWidth || newHeight != oldHeight))
         {
@@ -5724,6 +6037,57 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
     };
 
+    // Multiline EDIT controls expose their backing local-memory buffer through
+    // EM_GETHANDLE.  Keep the ordinary std::wstring representation used by the
+    // renderer synchronized with that Win32-compatible buffer.
+    const auto syncEditHandleFromTitle = [window]()
+    {
+        HLOCAL handle = nullptr;
+        std::wstring text;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed || !window->editTextHandle) return;
+            handle = window->editTextHandle;
+            text = window->title;
+        }
+        const SIZE_T bytes = BridgeLocalSize(handle);
+        auto* destination = static_cast<wchar_t*>(BridgeLocalLock(handle));
+        if (!destination || bytes < sizeof(wchar_t)) return;
+        const size_t capacity = bytes / sizeof(wchar_t);
+        const size_t copied = (std::min)(text.size(), capacity - 1);
+        if (copied) memcpy(destination, text.data(), copied * sizeof(wchar_t));
+        destination[copied] = L'\0';
+        BridgeLocalUnlock(handle);
+    };
+
+    const auto syncEditTitleFromHandle = [window]()
+    {
+        HLOCAL handle = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed || !window->editTextHandle) return;
+            handle = window->editTextHandle;
+        }
+        const SIZE_T bytes = BridgeLocalSize(handle);
+        auto* source = static_cast<const wchar_t*>(BridgeLocalLock(handle));
+        if (!source || bytes < sizeof(wchar_t)) return;
+        const size_t capacity = bytes / sizeof(wchar_t);
+        size_t length = 0;
+        while (length < capacity && source[length]) ++length;
+        std::wstring text(source, length);
+        BridgeLocalUnlock(handle);
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed || window->editTextHandle != handle) return;
+            window->title = std::move(text);
+            window->editCaret = (std::min)(window->editCaret, window->title.size());
+            window->editSelectionAnchor = (std::min)(
+                window->editSelectionAnchor, window->title.size());
+            window->editSelectionEnd = (std::min)(
+                window->editSelectionEnd, window->title.size());
+        }
+    };
+
     if (message == CommonControlSetUnicodeFormat)
     {
         std::lock_guard<std::mutex> guard(window->lock);
@@ -5735,6 +6099,261 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     {
         std::lock_guard<std::mutex> guard(window->lock);
         return window->commonControlUnicode ? TRUE : FALSE;
+    }
+
+    const bool textEditor = controlKind == BuiltinControlKind::Edit ||
+        controlKind == BuiltinControlKind::ComboBox;
+    if (controlKind == BuiltinControlKind::Edit && message == EditGetHandle)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        if (window->destroyed ||
+            (window->style & GuestAbi::EsMultiline) == 0)
+            return 0;
+        if (!window->editTextHandle)
+        {
+            const size_t characters = MaximumBuiltinControlTextLength + 1;
+            HLOCAL handle = BridgeLocalAlloc(
+                LMEM_MOVEABLE | LMEM_ZEROINIT,
+                characters * sizeof(wchar_t));
+            if (!handle) return 0;
+            auto* destination = static_cast<wchar_t*>(BridgeLocalLock(handle));
+            if (!destination)
+            {
+                BridgeLocalFree(handle);
+                return 0;
+            }
+            const size_t copied = (std::min)(window->title.size(), characters - 1);
+            if (copied)
+                memcpy(destination, window->title.data(), copied * sizeof(wchar_t));
+            destination[copied] = L'\0';
+            BridgeLocalUnlock(handle);
+            window->editTextHandle = handle;
+        }
+        RuntimeDiagnostics::Record(L"EDIT: EM_GETHANDLE returned a virtual local buffer.");
+        return reinterpret_cast<LRESULT>(window->editTextHandle);
+    }
+    if (controlKind == BuiltinControlKind::Edit && message == EditSetHandle)
+    {
+        HLOCAL handle = reinterpret_cast<HLOCAL>(wParam);
+        if (!handle) return 0;
+        const SIZE_T bytes = BridgeLocalSize(handle);
+        auto* source = static_cast<const wchar_t*>(BridgeLocalLock(handle));
+        if (!source || bytes < sizeof(wchar_t)) return 0;
+        const size_t capacity = bytes / sizeof(wchar_t);
+        size_t length = 0;
+        while (length < capacity && source[length]) ++length;
+        std::wstring text(source, length);
+        BridgeLocalUnlock(handle);
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed ||
+                (window->style & GuestAbi::EsMultiline) == 0)
+                return 0;
+            window->editTextHandle = handle;
+            window->title = std::move(text);
+            window->editCaret = 0;
+            window->editSelectionAnchor = 0;
+            window->editSelectionEnd = 0;
+            window->editFirstVisibleCharacter = 0;
+            window->editFirstVisibleLine = 0;
+            window->editHorizontalOffset = 0;
+        }
+        invalidate();
+        return 0;
+    }
+    if (textEditor && message == EditGetSelection)
+    {
+        size_t start = 0;
+        size_t end = 0;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            start = (std::min)(window->editSelectionAnchor, window->editSelectionEnd);
+            end = (std::max)(window->editSelectionAnchor, window->editSelectionEnd);
+        }
+        const DWORD start32 = static_cast<DWORD>((std::min)(start,
+            static_cast<size_t>((std::numeric_limits<DWORD>::max)())));
+        const DWORD end32 = static_cast<DWORD>((std::min)(end,
+            static_cast<size_t>((std::numeric_limits<DWORD>::max)())));
+        if (wParam) TryWriteGuestValue(reinterpret_cast<DWORD*>(wParam), start32);
+        if (lParam) TryWriteGuestValue(reinterpret_cast<DWORD*>(lParam), end32);
+        return MAKELONG(static_cast<WORD>((std::min)(start32,
+            static_cast<DWORD>(0xffff))),
+            static_cast<WORD>((std::min)(end32, static_cast<DWORD>(0xffff))));
+    }
+    if (textEditor && message == EditSetSelection)
+    {
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const size_t length = window->title.size();
+            const LONG requestedStart = static_cast<LONG>(wParam);
+            const LONG requestedEnd = static_cast<LONG>(lParam);
+            if (requestedStart == -1)
+            {
+                window->editSelectionAnchor = window->editCaret;
+                window->editSelectionEnd = window->editCaret;
+            }
+            else
+            {
+                const size_t start = (std::min)(static_cast<size_t>((std::max)(0L, requestedStart)), length);
+                const size_t end = requestedEnd == -1
+                    ? length
+                    : (std::min)(static_cast<size_t>((std::max)(0L, requestedEnd)), length);
+                window->editSelectionAnchor = start;
+                window->editSelectionEnd = end;
+                window->editCaret = end;
+            }
+        }
+        invalidate();
+        return 0;
+    }
+    if (textEditor && (message == EditGetLineCount || message == EditLineIndex ||
+        message == EditLineLength || message == EditGetLine ||
+        message == EditLineFromCharacter || message == EditGetFirstVisibleLine))
+    {
+        std::wstring text;
+        size_t caret = 0;
+        size_t firstVisibleLine = 0;
+        int characterWidth = GuestMetrics::TextWidth;
+        int availableWidth = 1;
+        bool wrap = false;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed) return 0;
+            text = window->title;
+            caret = (std::min)(window->editCaret, text.size());
+            firstVisibleLine = window->editFirstVisibleLine;
+            characterWidth = (std::max)(1, window->controlTextWidth);
+            availableWidth = (std::max)(1, window->surface.Width() - 4 -
+                ((window->style & 0x00200000u /* WS_VSCROLL */) != 0
+                    ? GuestMetrics::ScrollBarExtent : 0));
+            wrap = controlKind == BuiltinControlKind::Edit &&
+                (window->style & GuestAbi::EsMultiline) != 0 &&
+                (window->style & GuestAbi::EsAutoHScroll) == 0 &&
+                (window->style & 0x00100000u /* WS_HSCROLL */) == 0;
+        }
+        const auto lines = BuildEditVisualLines(text, wrap, availableWidth,
+            [characterWidth](const wchar_t*, size_t count)
+        {
+            return static_cast<int>((std::min)(count, static_cast<size_t>(
+                (std::numeric_limits<int>::max)() / characterWidth))) * characterWidth;
+        });
+
+        if (message == EditGetLineCount)
+            return static_cast<LRESULT>((std::min)(lines.size(), static_cast<size_t>(
+                (std::numeric_limits<LRESULT>::max)())));
+        if (message == EditGetFirstVisibleLine)
+            return static_cast<LRESULT>((std::min)(firstVisibleLine, lines.size() - 1));
+
+        if (message == EditLineIndex)
+        {
+            const LRESULT requested = static_cast<LRESULT>(wParam);
+            const size_t line = requested < 0
+                ? EditLineForPosition(lines, caret)
+                : static_cast<size_t>(requested);
+            return line < lines.size() ? static_cast<LRESULT>(lines[line].start) : -1;
+        }
+
+        const LRESULT requestedCharacter = static_cast<LRESULT>(wParam);
+        const size_t character = requestedCharacter < 0
+            ? caret
+            : (std::min)(static_cast<size_t>(requestedCharacter), text.size());
+        const size_t line = EditLineForPosition(lines, character);
+        if (message == EditLineFromCharacter)
+            return static_cast<LRESULT>(line);
+        if (message == EditLineLength)
+            return static_cast<LRESULT>(lines[line].end - lines[line].start);
+
+        if (message == EditGetLine)
+        {
+            WCHAR* destination = reinterpret_cast<WCHAR*>(lParam);
+            WCHAR capacityValue = 0;
+            if (!destination || !TryReadGuestValue(destination, &capacityValue) ||
+                capacityValue == 0)
+                return 0;
+            const WORD capacity = static_cast<WORD>(capacityValue);
+            const size_t requestedLine = static_cast<size_t>(wParam);
+            if (requestedLine >= lines.size()) return 0;
+            const EditVisualLine& source = lines[requestedLine];
+            const size_t copied = (std::min)(source.end - source.start,
+                static_cast<size_t>(capacity));
+            for (size_t index = 0; index < copied; ++index)
+            {
+                const WCHAR characterValue = text[source.start + index];
+                if (!TryWriteGuestValue(destination + index, characterValue)) return 0;
+            }
+            return static_cast<LRESULT>(copied);
+        }
+    }
+    if (textEditor && message == EditReplaceSelection)
+    {
+        std::wstring replacement;
+        if (lParam && !TryReadGuestWideString(reinterpret_cast<LPCWSTR>(lParam), &replacement))
+            return FALSE;
+        bool changed = false;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed || (window->style & GuestAbi::EsReadOnly) != 0)
+                return FALSE;
+            size_t start = (std::min)(window->editSelectionAnchor, window->editSelectionEnd);
+            size_t end = (std::max)(window->editSelectionAnchor, window->editSelectionEnd);
+            start = (std::min)(start, window->title.size());
+            end = (std::min)(end, window->title.size());
+            const size_t capacity = window->editTextLimit > window->title.size() - (end - start)
+                ? window->editTextLimit - (window->title.size() - (end - start))
+                : 0;
+            if (replacement.size() > capacity) replacement.resize(capacity);
+            window->title.replace(start, end - start, replacement);
+            window->editCaret = start + replacement.size();
+            window->editSelectionAnchor = window->editCaret;
+            window->editSelectionEnd = window->editCaret;
+            changed = end != start || !replacement.empty();
+        }
+        if (changed)
+        {
+            if (controlKind == BuiltinControlKind::Edit) syncEditHandleFromTitle();
+            invalidate();
+            notifyParent(GuestAbi::EnChange);
+        }
+        return TRUE;
+    }
+    if (textEditor && message == EditLimitText)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        window->editTextLimit = wParam == 0
+            ? MaximumBuiltinControlTextLength
+            : (std::min)(static_cast<size_t>(wParam), MaximumBuiltinControlTextLength);
+        return TRUE;
+    }
+    if (textEditor && message == EditGetLimitText)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        return static_cast<LRESULT>(window->editTextLimit);
+    }
+    if (controlKind == BuiltinControlKind::Edit &&
+        message == EditSetPasswordCharacter)
+    {
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            window->editPasswordCharacter = static_cast<wchar_t>(wParam);
+        }
+        invalidate();
+        return 0;
+    }
+    if (controlKind == BuiltinControlKind::Edit &&
+        message == EditGetPasswordCharacter)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        return static_cast<LRESULT>(window->editPasswordCharacter);
+    }
+    if (textEditor && message == EditSetReadOnly)
+    {
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (wParam) window->style |= GuestAbi::EsReadOnly;
+            else window->style &= ~GuestAbi::EsReadOnly;
+        }
+        invalidate();
+        return TRUE;
     }
 
     if (controlKind == BuiltinControlKind::Rebar &&
@@ -7885,6 +8504,45 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
 
     if (controlKind == BuiltinControlKind::StatusBar)
     {
+        if (message == GuestAbi::WmSize)
+        {
+            HWND status = nullptr;
+            HWND parent = nullptr;
+            int currentLeft = 0;
+            int currentTop = 0;
+            int currentWidth = 0;
+            int currentHeight = 0;
+            int desiredHeight = GuestMetrics::StatusBarHeight;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                status = window->handle;
+                parent = window->parent;
+                currentLeft = window->bounds.left;
+                currentTop = window->bounds.top;
+                currentWidth = window->surface.Width();
+                currentHeight = window->surface.Height();
+                desiredHeight = (std::max)(window->statusBarMinimumHeight,
+                    GuestMetrics::StatusBarHeight);
+            }
+            RECT parentClient = {};
+            DWORD ignored = ERROR_SUCCESS;
+            if (parent && GetGuestClientRect(parent, &parentClient, &ignored))
+            {
+                const int desiredWidth = (std::max)(0,
+                    static_cast<int>(parentClient.right - parentClient.left));
+                const int desiredTop = (std::max)(0,
+                    static_cast<int>(parentClient.bottom - parentClient.top) - desiredHeight);
+                if (currentLeft != 0 || currentTop != desiredTop ||
+                    currentWidth != desiredWidth || currentHeight != desiredHeight)
+                {
+                    SetGuestWindowPos(status, nullptr, 0, desiredTop,
+                        desiredWidth, desiredHeight,
+                        GuestSwpNoZOrder | GuestSwpNoActivate, &ignored);
+                }
+            }
+            InvalidateGuestRect(status, nullptr, TRUE, nullptr);
+            return 0;
+        }
         if (message == StatusBarSetParts)
         {
             const size_t count = static_cast<size_t>(wParam);
@@ -9269,6 +9927,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     }
     case GuestAbi::WmGetTextLength:
     {
+        if (controlKind == BuiltinControlKind::Edit) syncEditTitleFromHandle();
         std::lock_guard<std::mutex> guard(window->lock);
         return static_cast<LRESULT>((std::min)(
             window->title.size(),
@@ -9276,6 +9935,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     }
     case GuestAbi::WmGetText:
     {
+        if (controlKind == BuiltinControlKind::Edit) syncEditTitleFromHandle();
         LPWSTR destination = reinterpret_cast<LPWSTR>(lParam);
         const size_t capacity = static_cast<size_t>((std::min)(
             wParam,
@@ -9316,13 +9976,27 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
                 return FALSE;
             }
+            if ((controlKind == BuiltinControlKind::Edit ||
+                controlKind == BuiltinControlKind::ComboBox) &&
+                text.size() > window->editTextLimit)
+            {
+                text.resize(window->editTextLimit);
+            }
             window->title = std::move(text);
-            window->editCaret = window->title.size();
+            window->editCaret = controlKind == BuiltinControlKind::Edit &&
+                (window->style & GuestAbi::EsMultiline) != 0
+                    ? 0 : window->title.size();
+            window->editSelectionAnchor = window->editCaret;
+            window->editSelectionEnd = window->editCaret;
+            window->editFirstVisibleCharacter = 0;
+            window->editFirstVisibleLine = 0;
+            window->editHorizontalOffset = 0;
             if (controlKind == BuiltinControlKind::StatusBar && !window->statusBarTexts.empty())
             {
                 window->statusBarTexts[0] = window->title;
             }
         }
+        if (controlKind == BuiltinControlKind::Edit) syncEditHandleFromTitle();
         invalidate();
         return TRUE;
     }
@@ -9372,12 +10046,17 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     }
     case GuestAbi::WmPaint:
     {
+        if (controlKind == BuiltinControlKind::Edit) syncEditTitleFromHandle();
         std::wstring text;
         DWORD style = 0;
         bool enabled = false;
         bool pressed = false;
         size_t caret = 0;
+        size_t selectionAnchor = 0;
+        size_t selectionEnd = 0;
+        wchar_t passwordCharacter = L'\0';
         MiniGdi::ObjectHandle font = MiniGdi::InvalidObject;
+        MiniGdi::Surface staticImage;
         std::vector<std::wstring> choiceItems;
         int selectedChoice = -1;
         bool comboDropped = false;
@@ -9400,6 +10079,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         size_t listViewEditCaret = 0;
         int controlTextWidth = GuestMetrics::TextWidth;
         int controlTextHeight = GuestMetrics::TextHeight;
+        size_t editFirstVisibleLine = 0;
+        int editHorizontalOffset = 0;
         int listViewHeaderHeight = GuestMetrics::ListViewHeaderHeight;
         int listViewRowHeight = GuestMetrics::TextHeight;
         std::vector<int> toolbarCommands;
@@ -9458,7 +10139,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             enabled = window->enabled;
             pressed = window->buttonPressed || window->buttonKeyboardPressed;
             caret = window->editCaret;
+            selectionAnchor = window->editSelectionAnchor;
+            selectionEnd = window->editSelectionEnd;
+            passwordCharacter = window->editPasswordCharacter;
             font = window->controlFont;
+            staticImage = window->staticImage;
             choiceItems = window->choiceItems;
             selectedChoice = window->selectedChoice;
             comboDropped = window->comboDropped ||
@@ -9484,6 +10169,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             listViewEditCaret = window->listViewEditCaret;
             controlTextWidth = window->controlTextWidth;
             controlTextHeight = window->controlTextHeight;
+            editFirstVisibleLine = window->editFirstVisibleLine;
+            editHorizontalOffset = window->editHorizontalOffset;
             listViewHeaderHeight = window->listViewHeaderHeight;
             listViewRowHeight = window->listViewRowHeight;
             toolbarCommands = window->toolbarCommands;
@@ -9532,6 +10219,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             parent = window->parent;
             controlId = window->controlId;
         }
+
+        if (controlKind == BuiltinControlKind::Edit && passwordCharacter != L'\0')
+            text.assign(text.size(), passwordCharacter);
 
         std::vector<size_t> listDisplayColumns(listColumns.size());
         std::iota(listDisplayColumns.begin(), listDisplayColumns.end(), static_cast<size_t>(0));
@@ -9751,14 +10441,251 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             const bool fontSelected = font != MiniGdi::InvalidObject &&
                 m_gdi.SelectFont(guestDc, font, &previousFont);
 
+            const auto measuredTextWidth = [this, guestDc, controlTextWidth](
+                const wchar_t* characters, size_t count)
+            {
+                MiniGdi::Size measured{};
+                if (m_gdi.GetTextExtentW(guestDc, characters, count, &measured))
+                    return measured.width;
+                const size_t bounded = (std::min)(count, static_cast<size_t>(
+                    (std::numeric_limits<int>::max)() / controlTextWidth));
+                return static_cast<int>(bounded * static_cast<size_t>(controlTextWidth));
+            };
+
+            const bool multilineEdit = controlKind == BuiltinControlKind::Edit &&
+                (style & GuestAbi::EsMultiline) != 0;
+            if (multilineEdit)
+            {
+                const int lineHeight = (std::max)(1, controlTextHeight);
+                const bool hasVerticalScroll = (style & 0x00200000u /* WS_VSCROLL */) != 0;
+                const bool hasHorizontalScroll = (style & 0x00100000u /* WS_HSCROLL */) != 0;
+                const int verticalScrollWidth = hasVerticalScroll
+                    ? (std::min)(GuestMetrics::ScrollBarExtent, (std::max)(0, width - 2)) : 0;
+                const int horizontalScrollHeight = hasHorizontalScroll
+                    ? (std::min)(GuestMetrics::ScrollBarExtent, (std::max)(0, height - 2)) : 0;
+                const int contentRight = (std::max)(2, width - 1 - verticalScrollWidth);
+                const int contentBottom = (std::max)(2, height - 1 - horizontalScrollHeight);
+                const int availableWidth = (std::max)(1, contentRight - 3);
+                const bool wrap = (style & GuestAbi::EsAutoHScroll) == 0 &&
+                    !hasHorizontalScroll;
+                const auto lines = BuildEditVisualLines(
+                    text, wrap, availableWidth, measuredTextWidth);
+                const size_t clampedCaret = (std::min)(caret, text.size());
+                const size_t caretLine = EditLineForPosition(lines, clampedCaret);
+                const size_t visibleRows = static_cast<size_t>((std::max)(1,
+                    (std::max)(1, contentBottom - 2) / lineHeight));
+                size_t firstLine = (std::min)(editFirstVisibleLine, lines.size() - 1);
+                if (focused)
+                {
+                    if (caretLine < firstLine) firstLine = caretLine;
+                    else if (caretLine >= firstLine + visibleRows)
+                        firstLine = caretLine - visibleRows + 1;
+                }
+
+                int horizontalOffset = wrap ? 0 : (std::max)(0, editHorizontalOffset);
+                const EditVisualLine& caretVisualLine = lines[caretLine];
+                const size_t caretInLine = (std::min)(clampedCaret, caretVisualLine.end);
+                const int caretNaturalX = measuredTextWidth(
+                    text.data() + caretVisualLine.start,
+                    caretInLine - caretVisualLine.start);
+                if (!wrap && focused)
+                {
+                    if (caretNaturalX < horizontalOffset)
+                        horizontalOffset = caretNaturalX;
+                    else if (caretNaturalX - horizontalOffset > availableWidth)
+                        horizontalOffset = (std::max)(0,
+                            caretNaturalX - availableWidth + controlTextWidth);
+                }
+                {
+                    std::lock_guard<std::mutex> guard(window->lock);
+                    if (!window->destroyed)
+                    {
+                        window->editFirstVisibleLine = firstLine;
+                        window->editHorizontalOffset = horizontalOffset;
+                    }
+                }
+
+                const bool showSelection = focused ||
+                    (style & GuestAbi::EsNoHideSelection) != 0;
+                const size_t selectionStart = showSelection ? (std::min)(
+                    (std::min)(selectionAnchor, selectionEnd), text.size()) : 0;
+                const size_t selectionFinish = showSelection ? (std::min)(
+                    (std::max)(selectionAnchor, selectionEnd), text.size()) : 0;
+                for (size_t row = 0; row < visibleRows && firstLine + row < lines.size(); ++row)
+                {
+                    const EditVisualLine& line = lines[firstLine + row];
+                    const int lineY = 2 + static_cast<int>(row) * lineHeight;
+                    if (lineY >= contentBottom) break;
+                    const int lineX = 2 - horizontalOffset;
+                    const size_t lineLength = line.end - line.start;
+                    m_gdi.TextOutW(guestDc, MiniGdi::Point{ lineX, lineY },
+                        text.data() + line.start, lineLength, nullptr);
+
+                    const size_t selectedStart = (std::max)(selectionStart, line.start);
+                    const size_t selectedEnd = (std::min)(selectionFinish, line.end);
+                    if (selectedEnd > selectedStart)
+                    {
+                        const int selectedLeft = lineX + measuredTextWidth(
+                            text.data() + line.start, selectedStart - line.start);
+                        const int selectedRight = lineX + measuredTextWidth(
+                            text.data() + line.start, selectedEnd - line.start);
+                        const int clippedLeft = (std::max)(1, selectedLeft);
+                        const int clippedRight = (std::min)(contentRight, selectedRight);
+                        if (clippedRight > clippedLeft)
+                        {
+                            MiniGdi::FillRect(*surface,
+                                MiniGdi::Rect{ clippedLeft, lineY, clippedRight,
+                                    (std::min)(contentBottom, lineY + lineHeight) },
+                                MiniGdi::MakeColor(0, 120, 215));
+                            m_gdi.SetTextColor(guestDc, MiniGdi::OpaqueWhite, nullptr);
+                            m_gdi.TextOutW(guestDc,
+                                MiniGdi::Point{ selectedLeft, lineY },
+                                text.data() + selectedStart,
+                                selectedEnd - selectedStart, nullptr);
+                            m_gdi.SetTextColor(guestDc, textColor, nullptr);
+                        }
+                    }
+                }
+
+                if (focused && enabled && caretLine >= firstLine &&
+                    caretLine < firstLine + visibleRows)
+                {
+                    const int caretX = (std::max)(1, (std::min)(contentRight - 1,
+                        2 - horizontalOffset + caretNaturalX));
+                    const int caretY = 2 + static_cast<int>(caretLine - firstLine) * lineHeight;
+                    MiniGdi::FillRect(*surface,
+                        MiniGdi::Rect{ caretX, caretY, caretX + 1,
+                            (std::min)(contentBottom, caretY + lineHeight) },
+                        MiniGdi::MakeColor(0, 120, 215));
+                }
+
+                if (hasVerticalScroll && verticalScrollWidth > 0)
+                {
+                    const int left = width - verticalScrollWidth;
+                    MiniGdi::DrawRectangle(*surface,
+                        MiniGdi::Rect{ left, 0, width, contentBottom + 1 },
+                        MiniGdi::MakeColor(240, 240, 240), MiniGdi::MakeColor(160, 160, 160));
+                    const int button = (std::min)(verticalScrollWidth,
+                        (std::max)(1, contentBottom / 2));
+                    const int trackTop = button;
+                    const int trackBottom = (std::max)(trackTop, contentBottom - button);
+                    if (trackBottom > trackTop)
+                    {
+                        const int trackHeight = trackBottom - trackTop;
+                        const int proportionalThumbHeight = static_cast<int>(
+                            static_cast<unsigned long long>(trackHeight) * visibleRows /
+                            lines.size());
+                        const int thumbHeight = lines.size() <= visibleRows
+                            ? trackHeight
+                            : (std::min)(trackHeight,
+                                (std::max)(8, proportionalThumbHeight));
+                        const size_t maximumFirst = lines.size() > visibleRows
+                            ? lines.size() - visibleRows : 0;
+                        const int thumbTop = maximumFirst == 0 ? trackTop :
+                            trackTop + static_cast<int>(
+                                static_cast<unsigned long long>(trackHeight - thumbHeight) *
+                                (std::min)(firstLine, maximumFirst) / maximumFirst);
+                        MiniGdi::DrawRectangle(*surface,
+                            MiniGdi::Rect{ left + 2, thumbTop, width - 2,
+                                thumbTop + thumbHeight },
+                            MiniGdi::MakeColor(205, 205, 205), MiniGdi::MakeColor(128, 128, 128));
+                    }
+                }
+                if (hasHorizontalScroll && horizontalScrollHeight > 0)
+                {
+                    const int top = height - horizontalScrollHeight;
+                    MiniGdi::DrawRectangle(*surface,
+                        MiniGdi::Rect{ 0, top, contentRight + 1, height },
+                        MiniGdi::MakeColor(240, 240, 240), MiniGdi::MakeColor(160, 160, 160));
+                    int maximumLineWidth = 0;
+                    for (const auto& line : lines)
+                        maximumLineWidth = (std::max)(maximumLineWidth,
+                            measuredTextWidth(text.data() + line.start,
+                                line.end - line.start));
+                    const int trackLeft = horizontalScrollHeight;
+                    const int trackRight = (std::max)(trackLeft,
+                        contentRight - horizontalScrollHeight);
+                    if (trackRight > trackLeft)
+                    {
+                        const int trackWidth = trackRight - trackLeft;
+                        const int proportionalThumbWidth = static_cast<int>(
+                            static_cast<long long>(trackWidth) * availableWidth /
+                            (std::max)(1, maximumLineWidth));
+                        const int thumbWidth = maximumLineWidth <= availableWidth
+                            ? trackWidth
+                            : (std::min)(trackWidth,
+                                (std::max)(8, proportionalThumbWidth));
+                        const int maximumOffset = (std::max)(0,
+                            maximumLineWidth - availableWidth);
+                        const int thumbLeft = maximumOffset == 0 ? trackLeft :
+                            trackLeft + static_cast<int>(
+                                static_cast<long long>(trackWidth - thumbWidth) *
+                                (std::min)(horizontalOffset, maximumOffset) / maximumOffset);
+                        MiniGdi::DrawRectangle(*surface,
+                            MiniGdi::Rect{ thumbLeft, top + 2,
+                                thumbLeft + thumbWidth, height - 2 },
+                            MiniGdi::MakeColor(205, 205, 205), MiniGdi::MakeColor(128, 128, 128));
+                    }
+                }
+            }
+
+            size_t displayTextStart = 0;
+            if ((controlKind == BuiltinControlKind::Edit ||
+                controlKind == BuiltinControlKind::ComboBox) && focused && !multilineEdit)
+            {
+                const size_t clampedCaret = (std::min)(caret, text.size());
+                const int reservedRight = controlKind == BuiltinControlKind::ComboBox
+                    ? GuestMetrics::ScrollBarExtent : 2;
+                const int availableWidth = (std::max)(0, width - 2 - reservedRight);
+                if (measuredTextWidth(text.data(), clampedCaret) > availableWidth)
+                {
+                    size_t low = 0;
+                    size_t high = clampedCaret;
+                    while (low < high)
+                    {
+                        const size_t middle = low + (high - low) / 2;
+                        if (measuredTextWidth(text.data() + middle,
+                            clampedCaret - middle) <= availableWidth)
+                            high = middle;
+                        else
+                            low = middle + 1;
+                    }
+                    displayTextStart = low;
+                }
+            }
+            if (controlKind == BuiltinControlKind::Edit ||
+                controlKind == BuiltinControlKind::ComboBox)
+            {
+                if (!multilineEdit)
+                {
+                    std::lock_guard<std::mutex> guard(window->lock);
+                    if (!window->destroyed)
+                        window->editFirstVisibleCharacter = displayTextStart;
+                }
+            }
+
             const size_t visibleCharacters = static_cast<size_t>((std::max)(0, width / controlTextWidth));
-            const int visibleTextWidth = static_cast<int>(
-                (std::min)(text.size(), visibleCharacters) * controlTextWidth);
+            const size_t displayTextLength = text.size() - displayTextStart;
+            const size_t visibleTextCharacters = (std::min)(displayTextLength, visibleCharacters);
+            const int visibleTextWidth = measuredTextWidth(
+                text.data() + displayTextStart, visibleTextCharacters);
             int textX = 2;
             int textY = (std::max)(0,
                 (height - controlTextHeight) / 2);
             if (controlKind == BuiltinControlKind::Static)
             {
+                if (!staticImage.Empty())
+                {
+                    const int imageWidth = (std::min)(width, staticImage.Width());
+                    const int imageHeight = (std::min)(height, staticImage.Height());
+                    DrawToolbarImage(*surface,
+                        MiniGdi::Rect{
+                            (width - imageWidth) / 2,
+                            (height - imageHeight) / 2,
+                            (width - imageWidth) / 2 + imageWidth,
+                            (height - imageHeight) / 2 + imageHeight },
+                        staticImage);
+                }
                 const DWORD alignment = style & 0x00000003u;
                 if (alignment == GuestAbi::SsCenter)
                 {
@@ -9781,7 +10708,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             else if (controlKind == BuiltinControlKind::Edit)
             {
                 const DWORD alignment = style & 0x00000003u;
-                if (alignment == GuestAbi::EsCenter)
+                if (displayTextStart != 0)
+                {
+                    textX = 2;
+                }
+                else if (alignment == GuestAbi::EsCenter)
                 {
                     textX = (std::max)(2, (width - visibleTextWidth) / 2);
                 }
@@ -9800,13 +10731,51 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
 
             if ((controlKind != BuiltinControlKind::StatusBar ||
                 (!statusBarSimple && statusBarParts.empty())) &&
+                !multilineEdit &&
                 controlKind != BuiltinControlKind::Tab &&
                 controlKind != BuiltinControlKind::Header &&
                 controlKind != BuiltinControlKind::Progress &&
                 controlKind != BuiltinControlKind::TreeView &&
-                controlKind != BuiltinControlKind::UpDown)
+                controlKind != BuiltinControlKind::UpDown &&
+                staticImage.Empty())
             {
-                m_gdi.TextOutW(guestDc, MiniGdi::Point{ textX, textY }, text.data(), text.size(), nullptr);
+                m_gdi.TextOutW(guestDc, MiniGdi::Point{ textX, textY },
+                    text.data() + displayTextStart, displayTextLength, nullptr);
+            }
+
+            if ((controlKind == BuiltinControlKind::Edit ||
+                controlKind == BuiltinControlKind::ComboBox) && focused && enabled &&
+                !multilineEdit)
+            {
+                const size_t start = (std::max)(displayTextStart,
+                    (std::min)((std::min)(selectionAnchor, selectionEnd), text.size()));
+                const size_t end = (std::min)((std::max)(selectionAnchor, selectionEnd), text.size());
+                if (end > start)
+                {
+                    const int selectionLeft = (std::min)(width - 1,
+                        textX + measuredTextWidth(text.data() + displayTextStart,
+                            start - displayTextStart));
+                    int selectionRight = (std::min)(width - 1,
+                        textX + measuredTextWidth(text.data() + displayTextStart,
+                            end - displayTextStart));
+                    if (controlKind == BuiltinControlKind::ComboBox)
+                    {
+                        selectionRight = (std::min)(selectionRight,
+                            (std::max)(selectionLeft, width - GuestMetrics::ScrollBarExtent));
+                    }
+                    if (selectionRight > selectionLeft)
+                    {
+                        MiniGdi::FillRect(*surface,
+                            MiniGdi::Rect{ selectionLeft, 2, selectionRight,
+                                (std::max)(2, textY + controlTextHeight) },
+                            MiniGdi::MakeColor(0, 120, 215));
+                        m_gdi.SetTextColor(guestDc, MiniGdi::OpaqueWhite, nullptr);
+                        m_gdi.TextOutW(guestDc,
+                            MiniGdi::Point{ selectionLeft, textY },
+                            text.data() + start, end - start, nullptr);
+                        m_gdi.SetTextColor(guestDc, textColor, nullptr);
+                    }
+                }
             }
 
             if (controlKind == BuiltinControlKind::ComboBox && comboDropped)
@@ -10369,15 +11338,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 }
             }
 
-            if ((controlKind == BuiltinControlKind::Edit || controlKind == BuiltinControlKind::ComboBox) && focused && enabled)
+            if ((controlKind == BuiltinControlKind::Edit ||
+                controlKind == BuiltinControlKind::ComboBox) && focused && enabled &&
+                !multilineEdit)
             {
                 const size_t clampedCaret = (std::min)(caret, text.size());
                 const int caretX = (std::min)(
                     (std::max)(1, width - 2),
-                    textX + static_cast<int>((std::min)(
-                        clampedCaret,
-                        static_cast<size_t>((std::numeric_limits<int>::max)() / controlTextWidth)) *
-                        controlTextWidth));
+                    textX + measuredTextWidth(text.data() + displayTextStart,
+                        clampedCaret - displayTextStart));
                 MiniGdi::FillRect(
                     *surface,
                     MiniGdi::Rect{ caretX, 2, caretX + 1, (std::max)(2, height - 2) },
@@ -10553,7 +11522,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
         case GuestAbi::WmLButtonDown:
         {
-            const int x = static_cast<int>(static_cast<WORD>(lParam & 0xffff));
+            const int x = static_cast<int>(static_cast<SHORT>(lParam & 0xffff));
             HWND handle = nullptr;
             int button = -1;
             {
@@ -11017,7 +11986,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
         if (message == GuestAbi::WmLButtonDown)
         {
-            const int x = static_cast<int>(static_cast<WORD>(lParam & 0xffff));
+            const int x = static_cast<int>(static_cast<SHORT>(lParam & 0xffff));
             HWND handle = nullptr;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
@@ -11026,10 +11995,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return 0;
                 }
                 const size_t requested = x <= 3
-                    ? 0
-                    : static_cast<size_t>((x - 2 + window->controlTextWidth / 2) /
-                        window->controlTextWidth);
+                    ? window->editFirstVisibleCharacter
+                    : window->editFirstVisibleCharacter +
+                        static_cast<size_t>((x - 2 + window->controlTextWidth / 2) /
+                            window->controlTextWidth);
                 window->editCaret = (std::min)(requested, window->title.size());
+                window->editSelectionAnchor = window->editCaret;
+                window->editSelectionEnd = window->editCaret;
                 handle = window->handle;
             }
             SetGuestFocus(handle, nullptr);
@@ -11057,6 +12029,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         changed = requested != window->selectedChoice;
                         window->selectedChoice = requested;
                         window->title = window->choiceItems[static_cast<size_t>(requested)];
+                        window->editCaret = window->title.size();
+                        window->editSelectionAnchor = window->editCaret;
+                        window->editSelectionEnd = window->editCaret;
                     }
                     window->comboDropped = false;
                     dropChanged = true;
@@ -11114,6 +12089,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 changed = next != window->selectedChoice;
                 window->selectedChoice = next;
                 window->title = window->choiceItems[static_cast<size_t>(next)];
+                window->editCaret = window->title.size();
+                window->editSelectionAnchor = window->editCaret;
+                window->editSelectionEnd = window->editCaret;
             }
             if (changed)
             {
@@ -11135,9 +12113,21 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return 0;
                 }
                 window->editCaret = (std::min)(window->editCaret, window->title.size());
+                size_t selectionStart = (std::min)(window->editSelectionAnchor,
+                    window->editSelectionEnd);
+                size_t selectionEnd = (std::max)(window->editSelectionAnchor,
+                    window->editSelectionEnd);
+                selectionStart = (std::min)(selectionStart, window->title.size());
+                selectionEnd = (std::min)(selectionEnd, window->title.size());
                 if (wParam == GuestAbi::VkBack)
                 {
-                    if (window->editCaret != 0)
+                    if (selectionEnd > selectionStart)
+                    {
+                        window->title.erase(selectionStart, selectionEnd - selectionStart);
+                        window->editCaret = selectionStart;
+                        changed = true;
+                    }
+                    else if (window->editCaret != 0)
                     {
                         window->title.erase(window->editCaret - 1, 1);
                         --window->editCaret;
@@ -11145,11 +12135,18 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     }
                 }
                 else if (wParam >= 0x20 && wParam <= 0xfffd && wParam != 0x7f &&
-                    window->title.size() < MaximumBuiltinControlTextLength)
+                    window->title.size() - (selectionEnd - selectionStart) < window->editTextLimit)
                 {
-                    window->title.insert(window->editCaret, 1, static_cast<wchar_t>(wParam));
-                    ++window->editCaret;
+                    if (selectionEnd > selectionStart)
+                        window->title.erase(selectionStart, selectionEnd - selectionStart);
+                    window->editCaret = selectionStart;
+                    window->title.insert(window->editCaret++, 1, static_cast<wchar_t>(wParam));
                     changed = true;
+                }
+                if (changed)
+                {
+                    window->editSelectionAnchor = window->editCaret;
+                    window->editSelectionEnd = window->editCaret;
                 }
             }
             if (changed)
@@ -11164,6 +12161,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             bool redraw = false;
             bool changed = false;
             bool accept = wParam == GuestAbi::VkReturn;
+            const bool shift = (MouseInput().GetKeyState(
+                static_cast<int>(GuestAbi::VkShift)) & 0x8000) != 0;
+            const bool control = (MouseInput().GetKeyState(
+                static_cast<int>(GuestAbi::VkControl)) & 0x8000) != 0;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 if (window->destroyed || !window->enabled)
@@ -11171,36 +12172,72 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return 0;
                 }
                 window->editCaret = (std::min)(window->editCaret, window->title.size());
+                window->editSelectionAnchor = (std::min)(
+                    window->editSelectionAnchor, window->title.size());
+                window->editSelectionEnd = (std::min)(
+                    window->editSelectionEnd, window->title.size());
+                const size_t selectionStart = (std::min)(
+                    window->editSelectionAnchor, window->editSelectionEnd);
+                const size_t selectionEnd = (std::max)(
+                    window->editSelectionAnchor, window->editSelectionEnd);
+                const auto moveCaret = [window, shift, &redraw](size_t requested)
+                {
+                    requested = (std::min)(requested, window->title.size());
+                    if (!shift)
+                        window->editSelectionAnchor = requested;
+                    window->editCaret = requested;
+                    window->editSelectionEnd = requested;
+                    redraw = true;
+                };
                 switch (wParam)
                 {
                 case GuestAbi::VkLeft:
-                    if (window->editCaret != 0) { --window->editCaret; redraw = true; }
+                    if (!shift && selectionEnd > selectionStart)
+                        moveCaret(selectionStart);
+                    else if (window->editCaret != 0)
+                        moveCaret(window->editCaret >= 2 &&
+                            window->title[window->editCaret - 2] == L'\r' &&
+                            window->title[window->editCaret - 1] == L'\n'
+                                ? window->editCaret - 2 : window->editCaret - 1);
                     break;
                 case GuestAbi::VkRight:
-                    if (window->editCaret < window->title.size()) { ++window->editCaret; redraw = true; }
+                    if (!shift && selectionEnd > selectionStart)
+                        moveCaret(selectionEnd);
+                    else if (window->editCaret < window->title.size())
+                        moveCaret(window->editCaret + 1 < window->title.size() &&
+                            window->title[window->editCaret] == L'\r' &&
+                            window->title[window->editCaret + 1] == L'\n'
+                                ? window->editCaret + 2 : window->editCaret + 1);
                     break;
                 case GuestAbi::VkHome:
-                    if (window->editCaret != 0) { window->editCaret = 0; redraw = true; }
+                    moveCaret(0);
                     break;
                 case GuestAbi::VkEnd:
-                    if (window->editCaret != window->title.size()) { window->editCaret = window->title.size(); redraw = true; }
-                    break;
-                case GuestAbi::VkBack:
-                    if (window->editCaret != 0)
-                    {
-                        window->title.erase(window->editCaret - 1, 1);
-                        --window->editCaret;
-                        redraw = changed = true;
-                    }
+                    moveCaret(window->title.size());
                     break;
                 case GuestAbi::VkDelete:
-                    if (window->editCaret < window->title.size())
+                    if (selectionEnd > selectionStart)
+                    {
+                        window->title.erase(selectionStart, selectionEnd - selectionStart);
+                        window->editCaret = selectionStart;
+                        window->editSelectionAnchor = selectionStart;
+                        window->editSelectionEnd = selectionStart;
+                        redraw = changed = true;
+                    }
+                    else if (window->editCaret < window->title.size())
                     {
                         window->title.erase(window->editCaret, 1);
                         redraw = changed = true;
                     }
                     break;
                 default:
+                    if (control && (wParam == 'A' || wParam == 'a'))
+                    {
+                        window->editSelectionAnchor = 0;
+                        window->editSelectionEnd = window->title.size();
+                        window->editCaret = window->title.size();
+                        redraw = true;
+                    }
                     break;
                 }
             }
@@ -11352,7 +12389,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 wasEditing = window->listViewEditItem >= 0;
             }
             if (wasEditing) finishLabelEdit(true);
-            const int x = static_cast<int>(static_cast<WORD>(lParam & 0xffff));
+            const int x = static_cast<int>(static_cast<SHORT>(lParam & 0xffff));
             const int y = static_cast<int>(static_cast<WORD>((static_cast<ULONG_PTR>(lParam) >> 16) & 0xffff));
             HWND handle = nullptr;
             bool changed = false;
@@ -11609,7 +12646,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
         case GuestAbi::WmLButtonDown:
         {
-            const int x = static_cast<int>(static_cast<WORD>(lParam & 0xffff));
+            const int x = static_cast<int>(static_cast<SHORT>(lParam & 0xffff));
+            const int y = static_cast<int>(static_cast<SHORT>(
+                (static_cast<ULONG_PTR>(lParam) >> 16) & 0xffff));
             HWND handle = nullptr;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
@@ -11617,16 +12656,128 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 {
                     return 0;
                 }
-                const int firstCharacterCenter = 2 + window->controlTextWidth / 2;
-                const size_t requested = x <= firstCharacterCenter
-                    ? 0
-                    : static_cast<size_t>((x - 2 + window->controlTextWidth / 2) /
-                        window->controlTextWidth);
+                size_t requested = 0;
+                if ((window->style & GuestAbi::EsMultiline) != 0)
+                {
+                    const int characterWidth = (std::max)(1, window->controlTextWidth);
+                    const int lineHeight = (std::max)(1, window->controlTextHeight);
+                    const int availableWidth = (std::max)(1, window->surface.Width() - 4 -
+                        ((window->style & 0x00200000u /* WS_VSCROLL */) != 0
+                            ? GuestMetrics::ScrollBarExtent : 0));
+                    const bool wrap = (window->style & GuestAbi::EsAutoHScroll) == 0 &&
+                        (window->style & 0x00100000u /* WS_HSCROLL */) == 0;
+                    const auto lines = BuildEditVisualLines(window->title, wrap,
+                        availableWidth, [characterWidth](const wchar_t*, size_t count)
+                    {
+                        return static_cast<int>((std::min)(count, static_cast<size_t>(
+                            (std::numeric_limits<int>::max)() / characterWidth))) * characterWidth;
+                    });
+                    const size_t row = window->editFirstVisibleLine +
+                        static_cast<size_t>((std::max)(0, y - 2) / lineHeight);
+                    const EditVisualLine& line = lines[(std::min)(row, lines.size() - 1)];
+                    const int contentX = (std::max)(0,
+                        x - 2 + window->editHorizontalOffset);
+                    const size_t column = static_cast<size_t>((contentX + characterWidth / 2) /
+                        characterWidth);
+                    requested = line.start + (std::min)(column, line.end - line.start);
+                }
+                else
+                {
+                    const int firstCharacterCenter = 2 + window->controlTextWidth / 2;
+                    requested = x <= firstCharacterCenter
+                        ? window->editFirstVisibleCharacter
+                        : window->editFirstVisibleCharacter +
+                            static_cast<size_t>((x - 2 + window->controlTextWidth / 2) /
+                                window->controlTextWidth);
+                }
                 window->editCaret = (std::min)(requested, window->title.size());
+                window->editSelectionAnchor = window->editCaret;
+                window->editSelectionEnd = window->editCaret;
                 handle = window->handle;
             }
             SetGuestFocus(handle, nullptr);
+            SetGuestCapture(handle, nullptr);
             invalidate();
+            return 0;
+        }
+        case GuestAbi::WmMouseMove:
+        case GuestAbi::WmLButtonUp:
+        {
+            if (message == GuestAbi::WmMouseMove && (wParam & 0x0001u) == 0)
+                return 0;
+            const int x = static_cast<int>(static_cast<SHORT>(lParam & 0xffff));
+            const int y = static_cast<int>(static_cast<SHORT>(
+                (static_cast<ULONG_PTR>(lParam) >> 16) & 0xffff));
+            bool redraw = false;
+            HWND handle = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed || !window->enabled) return 0;
+                size_t requested = 0;
+                if ((window->style & GuestAbi::EsMultiline) != 0)
+                {
+                    const int characterWidth = (std::max)(1, window->controlTextWidth);
+                    const int lineHeight = (std::max)(1, window->controlTextHeight);
+                    const int availableWidth = (std::max)(1, window->surface.Width() - 4 -
+                        ((window->style & 0x00200000u /* WS_VSCROLL */) != 0
+                            ? GuestMetrics::ScrollBarExtent : 0));
+                    const bool wrap = (window->style & GuestAbi::EsAutoHScroll) == 0 &&
+                        (window->style & 0x00100000u /* WS_HSCROLL */) == 0;
+                    const auto lines = BuildEditVisualLines(window->title, wrap,
+                        availableWidth, [characterWidth](const wchar_t*, size_t count)
+                    {
+                        return static_cast<int>((std::min)(count, static_cast<size_t>(
+                            (std::numeric_limits<int>::max)() / characterWidth))) * characterWidth;
+                    });
+                    const size_t row = window->editFirstVisibleLine +
+                        static_cast<size_t>((std::max)(0, y - 2) / lineHeight);
+                    const EditVisualLine& line = lines[(std::min)(row, lines.size() - 1)];
+                    const int contentX = (std::max)(0,
+                        x - 2 + window->editHorizontalOffset);
+                    const size_t column = static_cast<size_t>((contentX + characterWidth / 2) /
+                        characterWidth);
+                    requested = line.start + (std::min)(column, line.end - line.start);
+                }
+                else
+                {
+                    requested = x <= 2
+                        ? window->editFirstVisibleCharacter
+                        : window->editFirstVisibleCharacter +
+                            static_cast<size_t>((x - 2 + window->controlTextWidth / 2) /
+                                window->controlTextWidth);
+                }
+                const size_t clamped = (std::min)(requested, window->title.size());
+                redraw = clamped != window->editSelectionEnd;
+                window->editCaret = clamped;
+                window->editSelectionEnd = clamped;
+                handle = window->handle;
+            }
+            if (message == GuestAbi::WmLButtonUp)
+            {
+                DWORD ignored = ERROR_SUCCESS;
+                if (GetGuestCapture(&ignored) == handle) ReleaseGuestCapture(&ignored);
+            }
+            if (redraw) invalidate();
+            return 0;
+        }
+        case GuestAbi::WmMouseWheel:
+        {
+            const short delta = static_cast<short>(
+                (static_cast<ULONG_PTR>(wParam) >> 16) & 0xffff);
+            bool changed = false;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if ((window->style & GuestAbi::EsMultiline) == 0) return 0;
+                const size_t previous = window->editFirstVisibleLine;
+                if (delta > 0)
+                    window->editFirstVisibleLine = previous > 3 ? previous - 3 : 0;
+                else if (delta < 0)
+                    window->editFirstVisibleLine = previous >
+                        (std::numeric_limits<size_t>::max)() - 3
+                            ? (std::numeric_limits<size_t>::max)() : previous + 3;
+                changed = previous != window->editFirstVisibleLine;
+            }
+            if (changed) invalidate();
             return 0;
         }
         case GuestAbi::WmChar:
@@ -11639,25 +12790,78 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return 0;
                 }
                 window->editCaret = (std::min)(window->editCaret, window->title.size());
+                size_t selectionStart = (std::min)(window->editSelectionAnchor,
+                    window->editSelectionEnd);
+                size_t selectionEnd = (std::max)(window->editSelectionAnchor,
+                    window->editSelectionEnd);
+                selectionStart = (std::min)(selectionStart, window->title.size());
+                selectionEnd = (std::min)(selectionEnd, window->title.size());
                 if (wParam == GuestAbi::VkBack)
                 {
-                    if (window->editCaret != 0)
+                    if (selectionEnd > selectionStart)
                     {
-                        window->title.erase(window->editCaret - 1, 1);
-                        --window->editCaret;
+                        window->title.erase(selectionStart, selectionEnd - selectionStart);
+                        window->editCaret = selectionStart;
+                        changed = true;
+                    }
+                    else if (window->editCaret != 0)
+                    {
+                        if (window->editCaret >= 2 &&
+                            window->title[window->editCaret - 2] == L'\r' &&
+                            window->title[window->editCaret - 1] == L'\n')
+                        {
+                            window->title.erase(window->editCaret - 2, 2);
+                            window->editCaret -= 2;
+                        }
+                        else
+                        {
+                            window->title.erase(window->editCaret - 1, 1);
+                            --window->editCaret;
+                        }
                         changed = true;
                     }
                 }
-                else if (wParam >= 0x20 && wParam <= 0xfffd && wParam != 0x7f &&
-                    window->title.size() < MaximumBuiltinControlTextLength)
+                else if (wParam == L'\r' &&
+                    (window->style & GuestAbi::EsMultiline) != 0 &&
+                    window->title.size() - (selectionEnd - selectionStart) + 2 <=
+                        window->editTextLimit)
                 {
-                    window->title.insert(window->editCaret, 1, static_cast<wchar_t>(wParam));
-                    ++window->editCaret;
+                    if (selectionEnd > selectionStart)
+                        window->title.erase(selectionStart, selectionEnd - selectionStart);
+                    window->editCaret = selectionStart;
+                    window->title.insert(window->editCaret, L"\r\n");
+                    window->editCaret += 2;
                     changed = true;
+                }
+                else if (wParam == L'\t' &&
+                    (window->style & GuestAbi::EsMultiline) != 0 &&
+                    window->title.size() - (selectionEnd - selectionStart) <
+                        window->editTextLimit)
+                {
+                    if (selectionEnd > selectionStart)
+                        window->title.erase(selectionStart, selectionEnd - selectionStart);
+                    window->editCaret = selectionStart;
+                    window->title.insert(window->editCaret++, 1, L'\t');
+                    changed = true;
+                }
+                else if (wParam >= 0x20 && wParam <= 0xfffd && wParam != 0x7f &&
+                    window->title.size() - (selectionEnd - selectionStart) < window->editTextLimit)
+                {
+                    if (selectionEnd > selectionStart)
+                        window->title.erase(selectionStart, selectionEnd - selectionStart);
+                    window->editCaret = selectionStart;
+                    window->title.insert(window->editCaret++, 1, static_cast<wchar_t>(wParam));
+                    changed = true;
+                }
+                if (changed)
+                {
+                    window->editSelectionAnchor = window->editCaret;
+                    window->editSelectionEnd = window->editCaret;
                 }
             }
             if (changed)
             {
+                syncEditHandleFromTitle();
                 invalidate();
                 notifyParent(GuestAbi::EnChange);
             }
@@ -11667,6 +12871,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
             bool redraw = false;
             bool changed = false;
+            const bool shift = (MouseInput().GetKeyState(
+                static_cast<int>(GuestAbi::VkShift)) & 0x8000) != 0;
+            const bool control = (MouseInput().GetKeyState(
+                static_cast<int>(GuestAbi::VkControl)) & 0x8000) != 0;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 if (window->destroyed || !window->enabled)
@@ -11674,54 +12882,113 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return 0;
                 }
                 window->editCaret = (std::min)(window->editCaret, window->title.size());
+                window->editSelectionAnchor = (std::min)(
+                    window->editSelectionAnchor, window->title.size());
+                window->editSelectionEnd = (std::min)(
+                    window->editSelectionEnd, window->title.size());
+                const size_t selectionStart = (std::min)(
+                    window->editSelectionAnchor, window->editSelectionEnd);
+                const size_t selectionEnd = (std::max)(
+                    window->editSelectionAnchor, window->editSelectionEnd);
+                const auto moveCaret = [window, shift, &redraw](size_t requested)
+                {
+                    requested = (std::min)(requested, window->title.size());
+                    if (!shift)
+                        window->editSelectionAnchor = requested;
+                    window->editCaret = requested;
+                    window->editSelectionEnd = requested;
+                    redraw = true;
+                };
+                const bool multiline = (window->style & GuestAbi::EsMultiline) != 0;
+                std::vector<EditVisualLine> editLines;
+                size_t currentLine = 0;
+                if (multiline)
+                {
+                    const int characterWidth = (std::max)(1, window->controlTextWidth);
+                    const int availableWidth = (std::max)(1, window->surface.Width() - 4 -
+                        ((window->style & 0x00200000u /* WS_VSCROLL */) != 0
+                            ? GuestMetrics::ScrollBarExtent : 0));
+                    const bool wrap = (window->style & GuestAbi::EsAutoHScroll) == 0 &&
+                        (window->style & 0x00100000u /* WS_HSCROLL */) == 0;
+                    editLines = BuildEditVisualLines(window->title, wrap,
+                        availableWidth, [characterWidth](const wchar_t*, size_t count)
+                    {
+                        return static_cast<int>((std::min)(count, static_cast<size_t>(
+                            (std::numeric_limits<int>::max)() / characterWidth))) * characterWidth;
+                    });
+                    currentLine = EditLineForPosition(editLines, window->editCaret);
+                }
                 switch (wParam)
                 {
                 case GuestAbi::VkLeft:
-                    if (window->editCaret != 0)
-                    {
-                        --window->editCaret;
-                        redraw = true;
-                    }
+                    if (!shift && selectionEnd > selectionStart)
+                        moveCaret(selectionStart);
+                    else if (window->editCaret != 0)
+                        moveCaret(window->editCaret - 1);
                     break;
                 case GuestAbi::VkRight:
-                    if (window->editCaret < window->title.size())
-                    {
-                        ++window->editCaret;
-                        redraw = true;
-                    }
+                    if (!shift && selectionEnd > selectionStart)
+                        moveCaret(selectionEnd);
+                    else if (window->editCaret < window->title.size())
+                        moveCaret(window->editCaret + 1);
                     break;
                 case GuestAbi::VkHome:
-                    if (window->editCaret != 0)
-                    {
-                        window->editCaret = 0;
-                        redraw = true;
-                    }
+                    moveCaret(multiline && !control ? editLines[currentLine].start : 0);
                     break;
                 case GuestAbi::VkEnd:
-                    if (window->editCaret != window->title.size())
+                    moveCaret(multiline && !control
+                        ? editLines[currentLine].end : window->title.size());
+                    break;
+                case GuestAbi::VkUp:
+                    if (multiline && currentLine > 0)
                     {
-                        window->editCaret = window->title.size();
-                        redraw = true;
+                        const size_t column = (std::min)(window->editCaret,
+                            editLines[currentLine].end) - editLines[currentLine].start;
+                        const EditVisualLine& target = editLines[currentLine - 1];
+                        moveCaret(target.start + (std::min)(column,
+                            target.end - target.start));
                     }
                     break;
-                case GuestAbi::VkBack:
-                    if ((window->style & GuestAbi::EsReadOnly) == 0 && window->editCaret != 0)
+                case GuestAbi::VkDown:
+                    if (multiline && currentLine + 1 < editLines.size())
                     {
-                        window->title.erase(window->editCaret - 1, 1);
-                        --window->editCaret;
-                        redraw = true;
-                        changed = true;
+                        const size_t column = (std::min)(window->editCaret,
+                            editLines[currentLine].end) - editLines[currentLine].start;
+                        const EditVisualLine& target = editLines[currentLine + 1];
+                        moveCaret(target.start + (std::min)(column,
+                            target.end - target.start));
                     }
                     break;
                 case GuestAbi::VkDelete:
-                    if ((window->style & GuestAbi::EsReadOnly) == 0 && window->editCaret < window->title.size())
+                    if ((window->style & GuestAbi::EsReadOnly) == 0 &&
+                        selectionEnd > selectionStart)
                     {
-                        window->title.erase(window->editCaret, 1);
+                        window->title.erase(selectionStart, selectionEnd - selectionStart);
+                        window->editCaret = selectionStart;
+                        window->editSelectionAnchor = selectionStart;
+                        window->editSelectionEnd = selectionStart;
+                        redraw = true;
+                        changed = true;
+                    }
+                    else if ((window->style & GuestAbi::EsReadOnly) == 0 &&
+                        window->editCaret < window->title.size())
+                    {
+                        const size_t eraseCount = window->editCaret + 1 < window->title.size() &&
+                            window->title[window->editCaret] == L'\r' &&
+                            window->title[window->editCaret + 1] == L'\n' ? 2 : 1;
+                        window->title.erase(window->editCaret, eraseCount);
                         redraw = true;
                         changed = true;
                     }
                     break;
                 default:
+                    if (control && (wParam == 'A' || wParam == 'a'))
+                    {
+                        window->editSelectionAnchor = 0;
+                        window->editSelectionEnd = window->title.size();
+                        window->editCaret = window->title.size();
+                        redraw = true;
+                    }
                     break;
                 }
             }
@@ -11731,6 +12998,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
             if (changed)
             {
+                syncEditHandleFromTitle();
                 notifyParent(GuestAbi::EnChange);
             }
             return 0;
@@ -11745,6 +13013,34 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
 
     case BuiltinControlKind::Static:
+        if (message == GuestAbi::StmSetIcon ||
+            (message == GuestAbi::StmSetImage && wParam == GuestAbi::ImageIcon))
+        {
+            HICON requested = message == GuestAbi::StmSetIcon
+                ? reinterpret_cast<HICON>(wParam)
+                : reinterpret_cast<HICON>(lParam);
+            MiniGdi::Surface decoded;
+            if (requested && !CopyGuestIconPixels(requested, &decoded))
+            {
+                return 0;
+            }
+            HICON previous = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                if (window->destroyed) return 0;
+                previous = window->staticIcon;
+                window->staticIcon = requested;
+                window->staticImage = std::move(decoded);
+            }
+            invalidate();
+            return reinterpret_cast<LRESULT>(previous);
+        }
+        if (message == GuestAbi::StmGetIcon ||
+            (message == GuestAbi::StmGetImage && wParam == GuestAbi::ImageIcon))
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return reinterpret_cast<LRESULT>(window->staticIcon);
+        }
         if (message == GuestAbi::WmSetFocus || message == GuestAbi::WmKillFocus || message == GuestAbi::WmEnable)
         {
             invalidate();
@@ -11984,11 +13280,11 @@ BOOL GuestWindowManager::TranslateGuestMessage(const GuestAbi::Message* message)
         return FALSE;
     }
 
-    if (message->message == GuestAbi::WmKeyDown && message->hwnd && message->wParam >= 0x20 && message->wParam <= 0x7e)
-    {
-        return PostGuestMessage(message->hwnd, GuestAbi::WmChar, message->wParam, message->lParam, nullptr);
-    }
-    return FALSE;
+    // CoreWindow::CharacterReceived already applies the active keyboard
+    // layout, Shift/CapsLock state, dead keys and Unicode composition. A
+    // second VK-to-ASCII conversion here would lose that information and
+    // enqueue duplicate WM_CHAR messages.
+    return message->message == GuestAbi::WmKeyDown && message->hwnd ? TRUE : FALSE;
 }
 
 LRESULT GuestWindowManager::DispatchGuestMessage(const GuestAbi::Message* message, DWORD* win32Error)
@@ -12332,6 +13628,31 @@ BOOL GuestWindowManager::EndGuestPaint(HWND window, const GuestAbi::PaintStruct*
 
 HDC GuestWindowManager::GetGuestDC(HWND window, DWORD* win32Error)
 {
+    if (!window)
+    {
+        std::lock_guard<std::mutex> guard(m_screenDcLock);
+        if (m_screenDc == MiniGdi::InvalidDc || !m_gdi.HasDc(m_screenDc))
+        {
+            const int width = (std::max)(1, m_viewportWidth.load());
+            const int height = (std::max)(1, m_viewportHeight.load());
+            if (!m_screenSurface.Resize(width, height, MiniGdi::OpaqueWhite))
+            {
+                SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY);
+                return nullptr;
+            }
+            m_screenDc = m_gdi.CreateDc(&m_screenSurface);
+            if (m_screenDc == MiniGdi::InvalidDc)
+            {
+                SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY);
+                return nullptr;
+            }
+            RuntimeDiagnostics::Record(L"GDI: created virtual screen DC " +
+                std::to_wstring(static_cast<ULONG_PTR>(m_screenDc)) + L".");
+        }
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return ToGuestDc(m_screenDc);
+    }
+
     const auto record = FindWindow(window);
     if (!record)
     {
@@ -12344,6 +13665,21 @@ HDC GuestWindowManager::GetGuestDC(HWND window, DWORD* win32Error)
 
 int GuestWindowManager::ReleaseGuestDC(HWND window, HDC dc, DWORD* win32Error)
 {
+    if (!window)
+    {
+        std::lock_guard<std::mutex> guard(m_screenDcLock);
+        if (m_screenDc == MiniGdi::InvalidDc || FromGuestDc(dc) != m_screenDc ||
+            !m_gdi.HasDc(m_screenDc))
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return 0;
+        }
+        // Win32 ReleaseDC does not destroy the common screen DC. It merely
+        // releases the caller's use of it, so keep the virtual handle stable.
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return 1;
+    }
+
     const auto record = FindWindow(window);
     if (!record || FromGuestDc(dc) != record->dc)
     {
@@ -12895,6 +14231,94 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             }
         }
 
+        // The host Image is the virtual desktop, not the currently active
+        // top-level HWND. Keep it viewport-sized and place a smaller root at
+        // its real desktop coordinates. Otherwise XAML stretches modal and
+        // process-owned progress windows to fill the entire application.
+        const int viewportWidth = (std::max)(1, m_viewportWidth.load());
+        const int viewportHeight = (std::max)(1, m_viewportHeight.load());
+        if (composite.Width() != viewportWidth || composite.Height() != viewportHeight)
+        {
+            MiniGdi::Surface desktop;
+            if (!desktop.Resize(viewportWidth, viewportHeight, MiniGdi::OpaqueWhite))
+            {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> guard(presentation->lock);
+                if (presentation->pixels && presentation->width == viewportWidth &&
+                    presentation->height == viewportHeight &&
+                    presentation->pixels->size() == desktop.Pixels().size())
+                {
+                    desktop.Pixels() = *presentation->pixels;
+                }
+            }
+
+            // Keep virtual-screen coordinates intact, including partially
+            // off-screen windows. CopyRect clips pixels at the viewport edge;
+            // input uses the same origin and therefore remains aligned.
+            const int rootLeft = snapshots[root].bounds.left;
+            const int rootTop = snapshots[root].bounds.top;
+            MiniGdi::CopyRect(desktop, MiniGdi::Point{ rootLeft, rootTop }, composite,
+                MiniGdi::Rect{ 0, 0, composite.Width(), composite.Height() });
+
+            const GuestMetrics::NonClientMetrics& nonClient = snapshots[root].nonClient;
+            if (nonClient.left > 0 || nonClient.top > 0 || nonClient.right > 0 ||
+                nonClient.bottom > 0)
+            {
+                const int rootRight = SaturatingAdd(rootLeft, composite.Width());
+                const int rootBottom = SaturatingAdd(rootTop, composite.Height());
+                MiniGdi::DrawRectangle(desktop,
+                    MiniGdi::Rect{ rootLeft, rootTop, rootRight, rootBottom },
+                    MiniGdi::Transparent, MiniGdi::MakeColor(92, 92, 92));
+                if (nonClient.caption)
+                {
+                    const int captionLeft = SaturatingAdd(rootLeft, nonClient.left);
+                    const int captionTop = SaturatingAdd(rootTop,
+                        nonClient.top - GuestMetrics::CaptionHeight);
+                    const int captionRight = rootRight - nonClient.right;
+                    const int captionBottom = SaturatingAdd(captionTop,
+                        GuestMetrics::CaptionHeight);
+                    MiniGdi::FillRect(desktop,
+                        MiniGdi::Rect{ captionLeft, captionTop, captionRight, captionBottom },
+                        MiniGdi::MakeColor(48, 96, 160));
+                    const MiniGdi::DcHandle captionDc = m_gdi.CreateDc(&desktop);
+                    if (captionDc != MiniGdi::InvalidDc)
+                    {
+                        m_gdi.SetTextColor(captionDc, MiniGdi::OpaqueWhite, nullptr);
+                        m_gdi.SetBackgroundMode(captionDc,
+                            MiniGdi::BackgroundMode::Transparent, nullptr);
+                        const int closeExtent = nonClient.closeButton
+                            ? GuestMetrics::CaptionHeight : 0;
+                        const size_t availableCharacters = static_cast<size_t>((std::max)(
+                            0, captionRight - captionLeft - closeExtent - 10) /
+                            MiniGdi::DefaultTextGlyphWidth);
+                        const size_t titleLength = (std::min)(
+                            snapshots[root].title.size(), availableCharacters);
+                        m_gdi.TextOutW(captionDc,
+                            MiniGdi::Point{ captionLeft + 6,
+                                captionTop + (GuestMetrics::CaptionHeight -
+                                    MiniGdi::DefaultTextGlyphHeight) / 2 },
+                            snapshots[root].title.data(), titleLength, nullptr);
+                        m_gdi.DestroyDc(captionDc);
+                    }
+                    if (nonClient.closeButton)
+                    {
+                        const int buttonLeft = captionRight - GuestMetrics::CaptionHeight;
+                        MiniGdi::DrawLine(desktop,
+                            MiniGdi::Point{ buttonLeft + 7, captionTop + 7 },
+                            MiniGdi::Point{ captionRight - 7, captionBottom - 7 },
+                            MiniGdi::OpaqueWhite);
+                        MiniGdi::DrawLine(desktop,
+                            MiniGdi::Point{ captionRight - 7, captionTop + 7 },
+                            MiniGdi::Point{ buttonLeft + 7, captionBottom - 7 },
+                            MiniGdi::OpaqueWhite);
+                    }
+                }
+            }
+            composite = std::move(desktop);
+        }
+
         const size_t changedPixels = static_cast<size_t>(std::count_if(
             composite.Pixels().cbegin(),
             composite.Pixels().cend(),
@@ -12968,6 +14392,14 @@ DWORD GuestWindowManager::InvokeKeyInput(GuestWindowManager* manager, KeyEventAr
     return InvokeSehProtected(&GuestWindowManager::InvokeKeyInputThunk, &call);
 }
 
+DWORD GuestWindowManager::InvokeCharacterInput(
+    GuestWindowManager* manager,
+    CharacterReceivedEventArgs^ args)
+{
+    CharacterInputCall call{ manager, args };
+    return InvokeSehProtected(&GuestWindowManager::InvokeCharacterInputThunk, &call);
+}
+
 void GuestWindowManager::InvokePointerInputThunk(void* context)
 {
     const auto* call = static_cast<PointerInputCall*>(context);
@@ -12984,6 +14416,12 @@ void GuestWindowManager::InvokeKeyInputThunk(void* context)
 {
     const auto* call = static_cast<KeyInputCall*>(context);
     call->manager->HandleKey(call->args, call->message);
+}
+
+void GuestWindowManager::InvokeCharacterInputThunk(void* context)
+{
+    const auto* call = static_cast<CharacterInputCall*>(context);
+    call->manager->HandleCharacter(call->args);
 }
 
 void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMessage)
@@ -13025,12 +14463,18 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
     HWND menuRoot = nullptr;
     int menuRootWidth = 0;
     int menuRootHeight = 0;
-    int ignoredDimension = 0;
+    int ignoredWidth = 0;
+    int ignoredHeight = 0;
+    int menuRootLeft = 0;
+    int menuRootTop = 0;
     if (GetGuestSurfaceGeometry(menuForeground, &menuRoot, &menuRootWidth, &menuRootHeight,
-        &ignoredDimension, &ignoredDimension, &ignoredDimension, &ignoredDimension))
+        &ignoredWidth, &ignoredHeight, &menuRootLeft, &menuRootTop))
     {
-        const LPARAM menuPosition = MousePosition(menuRootWidth, menuRootHeight, menuRootWidth,
-            menuRootHeight, 0, 0, point->Position, m_surfaceImage.Get(), false);
+        const LPARAM menuPosition = MousePosition(
+            (std::max)(1, m_viewportWidth.load()),
+            (std::max)(1, m_viewportHeight.load()),
+            menuRootWidth, menuRootHeight, menuRootLeft, menuRootTop,
+            point->Position, m_surfaceImage.Get(), false);
         if (HandleGuestMenuPointer(menuRoot,
             static_cast<int>(static_cast<short>(menuPosition & 0xffff)),
             static_cast<int>(static_cast<short>((menuPosition >> 16) & 0xffff)), menuMessage))
@@ -13071,8 +14515,8 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         int rootHeight = 0;
         int ignoredWidth = 0;
         int ignoredHeight = 0;
-        int ignoredLeft = 0;
-        int ignoredTop = 0;
+        int rootLeft = 0;
+        int rootTop = 0;
         if (!GetGuestSurfaceGeometry(
             foreground,
             &root,
@@ -13080,19 +14524,19 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
             &rootHeight,
             &ignoredWidth,
             &ignoredHeight,
-            &ignoredLeft,
-            &ignoredTop))
+            &rootLeft,
+            &rootTop))
         {
             return;
         }
 
         const LPARAM rootPosition = MousePosition(
+            (std::max)(1, m_viewportWidth.load()),
+            (std::max)(1, m_viewportHeight.load()),
             rootWidth,
             rootHeight,
-            rootWidth,
-            rootHeight,
-            0,
-            0,
+            rootLeft,
+            rootTop,
             point->Position,
             m_surfaceImage.Get());
         const int rootX = static_cast<int>(static_cast<WORD>(rootPosition & 0xffff));
@@ -13149,8 +14593,8 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         return;
     }
     const LPARAM position = MousePosition(
-        rootWidth,
-        rootHeight,
+        (std::max)(1, m_viewportWidth.load()),
+        (std::max)(1, m_viewportHeight.load()),
         targetWidth,
         targetHeight,
         targetLeft,
@@ -13231,8 +14675,8 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
         int rootHeight = 0;
         int ignoredWidth = 0;
         int ignoredHeight = 0;
-        int ignoredLeft = 0;
-        int ignoredTop = 0;
+        int rootLeft = 0;
+        int rootTop = 0;
         if (!GetGuestSurfaceGeometry(
             foreground,
             &root,
@@ -13240,19 +14684,19 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
             &rootHeight,
             &ignoredWidth,
             &ignoredHeight,
-            &ignoredLeft,
-            &ignoredTop))
+            &rootLeft,
+            &rootTop))
         {
             return;
         }
 
         const LPARAM rootPosition = MousePosition(
+            (std::max)(1, m_viewportWidth.load()),
+            (std::max)(1, m_viewportHeight.load()),
             rootWidth,
             rootHeight,
-            rootWidth,
-            rootHeight,
-            0,
-            0,
+            rootLeft,
+            rootTop,
             point->Position,
             m_surfaceImage.Get());
         const int rootX = static_cast<int>(static_cast<WORD>(rootPosition & 0xffff));
@@ -13284,8 +14728,8 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
         return;
     }
     const LPARAM position = MousePosition(
-        rootWidth,
-        rootHeight,
+        (std::max)(1, m_viewportWidth.load()),
+        (std::max)(1, m_viewportHeight.load()),
         targetWidth,
         targetHeight,
         targetLeft,
@@ -13314,6 +14758,19 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
         return;
     }
     const WPARAM key = static_cast<WPARAM>(args->VirtualKey);
+    const auto keyStatus = args->KeyStatus;
+    const UINT repeatCount = (std::max)(1u,
+        (std::min)(static_cast<UINT>(keyStatus.RepeatCount), 0xffffu));
+    ULONG_PTR keyData = repeatCount |
+        ((static_cast<ULONG_PTR>(keyStatus.ScanCode) & 0xffu) << 16);
+    if (keyStatus.IsExtendedKey) keyData |= 1ull << 24;
+    if (keyStatus.IsMenuKeyDown) keyData |= 1ull << 29;
+    if (keyStatus.WasKeyDown) keyData |= 1ull << 30;
+    if (message == GuestAbi::WmKeyUp || keyStatus.IsKeyReleased)
+        keyData |= 1ull << 31;
+    MouseInput().UpdateKeyState(static_cast<int>(key),
+        message == GuestAbi::WmKeyDown, keyStatus.ScanCode,
+        keyStatus.IsExtendedKey);
     if (message == GuestAbi::WmKeyDown)
     {
         PopupMenuSession popup;
@@ -13610,8 +15067,46 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
     }
     if (target && IsGuestWindowVisibleInternal(target) && IsGuestWindowEnabledInternal(target))
     {
-        PostGuestMessage(target, message, static_cast<WPARAM>(args->VirtualKey), 0, nullptr);
+        PostGuestMessage(target, message, static_cast<WPARAM>(args->VirtualKey),
+            static_cast<LPARAM>(keyData), nullptr);
     }
+}
+
+void GuestWindowManager::HandleCharacter(CharacterReceivedEventArgs^ args)
+{
+    if (!m_active.load() || !m_inputEnabled.load() || !args)
+        return;
+
+    {
+        std::lock_guard<std::mutex> guard(m_popupMenuLock);
+        if (m_popupMenu.open) return;
+    }
+
+    HWND target = reinterpret_cast<HWND>(m_focusWindow.load());
+    if (!target) target = reinterpret_cast<HWND>(m_foregroundWindow.load());
+    if (!target || !IsGuestWindowVisibleInternal(target) ||
+        !IsGuestWindowEnabledInternal(target))
+        return;
+
+    const UINT32 codePoint = args->KeyCode;
+    if (codePoint == 0 || codePoint > 0x10ffff ||
+        (codePoint >= 0xd800 && codePoint <= 0xdfff))
+        return;
+
+    if (codePoint <= 0xffff)
+    {
+        PostGuestMessage(target, GuestAbi::WmChar,
+            static_cast<WPARAM>(codePoint), 0, nullptr);
+    }
+    else
+    {
+        const UINT32 scalar = codePoint - 0x10000;
+        const wchar_t high = static_cast<wchar_t>(0xd800 + (scalar >> 10));
+        const wchar_t low = static_cast<wchar_t>(0xdc00 + (scalar & 0x3ff));
+        PostGuestMessage(target, GuestAbi::WmChar, static_cast<WPARAM>(high), 0, nullptr);
+        PostGuestMessage(target, GuestAbi::WmChar, static_cast<WPARAM>(low), 0, nullptr);
+    }
+    args->Handled = true;
 }
 
 void GuestWindowManager::HandleHostSizeChanged(int width, int height)
@@ -13630,6 +15125,15 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
     m_viewportHeight.store(height);
     GuestMetrics::SetCurrentScreenSize(width, height);
 
+    {
+        std::lock_guard<std::mutex> guard(m_screenDcLock);
+        if (m_screenDc != MiniGdi::InvalidDc && m_gdi.HasDc(m_screenDc))
+        {
+            m_screenSurface.Resize(width, height, MiniGdi::OpaqueWhite);
+            m_gdi.ResetClip(m_screenDc);
+        }
+    }
+
     std::vector<std::shared_ptr<WindowRecord>> roots;
     {
         std::lock_guard<std::mutex> guard(m_windowsLock);
@@ -13643,6 +15147,8 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
         HWND handle = nullptr;
         MiniGdi::DcHandle dc = MiniGdi::InvalidDc;
         bool resized = false;
+        int resizedWidth = 0;
+        int resizedHeight = 0;
         {
             std::lock_guard<std::mutex> guard(root->lock);
             if (root->destroyed || root->parent)
@@ -13653,30 +15159,35 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
             dc = root->dc;
             const int oldWidth = root->bounds.right - root->bounds.left;
             const int oldHeight = root->bounds.bottom - root->bounds.top;
-            if (oldWidth == width && oldHeight == height)
+            const int newWidth = root->viewportWidthBound ? width : oldWidth;
+            const int newHeight = root->viewportHeightBound ? height : oldHeight;
+            if (oldWidth == newWidth && oldHeight == newHeight)
             {
                 continue;
             }
-            if (!root->surface.Resize(width, height, MiniGdi::OpaqueWhite))
+            if (!root->surface.Resize(newWidth, newHeight, MiniGdi::OpaqueWhite))
             {
                 continue;
             }
-            root->bounds.right = SaturatingAdd(root->bounds.left, width);
-            root->bounds.bottom = SaturatingAdd(root->bounds.top, height);
+            root->bounds.right = SaturatingAdd(root->bounds.left, newWidth);
+            root->bounds.bottom = SaturatingAdd(root->bounds.top, newHeight);
             root->invalidated = false;
             root->erasePending = false;
             root->updateRect = RECT{};
+            resizedWidth = newWidth;
+            resizedHeight = newHeight;
             resized = true;
         }
         if (resized)
         {
             m_gdi.ResetClip(dc);
             PostGuestMessage(handle, GuestAbi::WmSize, GuestAbi::SizeRestored,
-                GuestAbi::MakeMouseLParam(SignedCoordinateWord(width),
-                    SignedCoordinateWord(height)), nullptr);
+                GuestAbi::MakeMouseLParam(SignedCoordinateWord(resizedWidth),
+                    SignedCoordinateWord(resizedHeight)), nullptr);
             InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
-            RuntimeDiagnostics::Record(L"VIEWPORT: resized root to " +
-                std::to_wstring(width) + L"x" + std::to_wstring(height) + L".");
+            RuntimeDiagnostics::Record(L"VIEWPORT: resized default-bound root to " +
+                std::to_wstring(resizedWidth) + L"x" +
+                std::to_wstring(resizedHeight) + L".");
         }
     }
 }
@@ -13709,6 +15220,7 @@ void GuestWindowManager::DetachHostEvents()
         const auto pointerWheel = m_pointerWheelToken;
         const auto keyDown = m_keyDownToken;
         const auto keyUp = m_keyUpToken;
+        const auto characterReceived = m_characterReceivedToken;
         const auto sizeChanged = m_sizeChangedToken;
         const auto surfaceSizeChanged = m_surfaceSizeChangedToken;
         Panel^ surfaceHost = m_surfaceHost.Get();
@@ -13721,6 +15233,7 @@ void GuestWindowManager::DetachHostEvents()
             coreWindow->PointerWheelChanged -= pointerWheel;
             coreWindow->KeyDown -= keyDown;
             coreWindow->KeyUp -= keyUp;
+            coreWindow->CharacterReceived -= characterReceived;
             coreWindow->SizeChanged -= sizeChanged;
             if (surfaceHost) surfaceHost->SizeChanged -= surfaceSizeChanged;
             return;
@@ -13740,6 +15253,7 @@ void GuestWindowManager::DetachHostEvents()
                     pointerWheel,
                     keyDown,
                     keyUp,
+                    characterReceived,
                     sizeChanged,
                     surfaceSizeChanged]()
             {
@@ -13756,6 +15270,7 @@ void GuestWindowManager::DetachHostEvents()
                     target->PointerWheelChanged -= pointerWheel;
                     target->KeyDown -= keyDown;
                     target->KeyUp -= keyUp;
+                    target->CharacterReceived -= characterReceived;
                     target->SizeChanged -= sizeChanged;
                     Panel^ panel = agileSurfaceHost.Get();
                     if (panel) panel->SizeChanged -= surfaceSizeChanged;

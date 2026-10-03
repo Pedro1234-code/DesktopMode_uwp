@@ -294,6 +294,12 @@
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
     <Content Include="Assets\Files\files.png" />
     <Content Include="Assets\Notepad\notepad.png" />
+    <Content Include="..\Win32Bridge\GuestApps\notepad.exe">
+      <Link>GuestRuntimeDefaults\Windows\notepad.exe</Link>
+    </Content>
+    <Content Include="..\Win32Bridge\GuestApps\pt-BR\notepad.exe.mui">
+      <Link>GuestRuntimeDefaults\Windows\pt-BR\notepad.exe.mui</Link>
+    </Content>
     <Content Include="Assets\TaskView\taskview-hover.png" />
     <Content Include="Windows10x-js-main\Walls\wall1.jpg" />
     <Content Include="Windows10x-js-main\Walls\wall2.jpg" />

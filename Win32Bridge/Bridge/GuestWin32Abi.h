@@ -240,15 +240,29 @@ namespace GuestAbi
     constexpr DWORD SsLeft = 0x00000000u;
     constexpr DWORD SsCenter = 0x00000001u;
     constexpr DWORD SsRight = 0x00000002u;
+    constexpr DWORD SsIcon = 0x00000003u;
+    constexpr UINT StmSetIcon = 0x0170;
+    constexpr UINT StmGetIcon = 0x0171;
+    constexpr UINT StmSetImage = 0x0172;
+    constexpr UINT StmGetImage = 0x0173;
+    constexpr WPARAM ImageIcon = 1;
     constexpr DWORD EsLeft = 0x00000000u;
     constexpr DWORD EsCenter = 0x00000001u;
     constexpr DWORD EsRight = 0x00000002u;
+    constexpr DWORD EsMultiline = 0x00000004u;
+    constexpr DWORD EsPassword = 0x00000020u;
+    constexpr DWORD EsAutoVScroll = 0x00000040u;
+    constexpr DWORD EsAutoHScroll = 0x00000080u;
+    constexpr DWORD EsNoHideSelection = 0x00000100u;
     constexpr DWORD EsReadOnly = 0x00000800u;
+    constexpr DWORD EsWantReturn = 0x00001000u;
 
     constexpr WORD BnClicked = 0;
     constexpr WORD EnChange = 0x0300;
 
     constexpr WPARAM VkBack = 0x08;
+    constexpr WPARAM VkShift = 0x10;
+    constexpr WPARAM VkControl = 0x11;
     constexpr WPARAM VkEscape = 0x1b;
     constexpr WPARAM VkMenu = 0x12;
     constexpr WPARAM VkReturn = 0x0d;

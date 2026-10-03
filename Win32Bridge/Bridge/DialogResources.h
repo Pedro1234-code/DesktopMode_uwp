@@ -2,10 +2,26 @@
 
 #include <windows.h>
 
+#include <string>
+
 namespace Win32Bridge
 {
 namespace Bridge
 {
+    struct GuestFileDialogDescriptor
+    {
+        HWND owner = nullptr;
+        HINSTANCE instance = nullptr;
+        LPCWSTR title = nullptr;
+        LPCWSTR initialDirectory = nullptr;
+        LPCWSTR initialFileName = nullptr;
+        LPCWSTR filter = nullptr;
+        DWORD filterIndex = 1;
+        LPCWSTR defaultExtension = nullptr;
+        DWORD flags = 0;
+        BOOL saveDialog = FALSE;
+    };
+
     struct GuestPropertyFieldDescriptor
     {
         LPCWSTR name = nullptr;
@@ -39,6 +55,9 @@ namespace Bridge
         HWND parent, DLGPROC procedure, LPARAM initParameter,
         DWORD stylesToAdd, DWORD stylesToRemove, LPCWSTR titleOverride);
     INT_PTR ShowGuestPropertySheet(const GuestPropertySheetDescriptor& descriptor);
+    bool ShowGuestFileDialog(const GuestFileDialogDescriptor& descriptor,
+        std::wstring* selectedPath, DWORD* selectedFilterIndex);
+    int ShowGuestShellAbout(HWND owner, LPCWSTR title, LPCWSTR text, HICON icon);
     int ShowGuestMessageBox(HWND owner, LPCWSTR text, LPCWSTR caption, UINT type);
     BOOL EndGuestResourceDialog(HWND dialog, INT_PTR result);
     BOOL HandleGuestDialogMessage(HWND dialog, const MSG* message);

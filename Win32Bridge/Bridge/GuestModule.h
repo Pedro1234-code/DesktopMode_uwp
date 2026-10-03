@@ -36,6 +36,7 @@ namespace Bridge
         bool GetModulePath(HMODULE module, std::wstring* path, DWORD* win32Error) const;
         FARPROC GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, DWORD* win32Error);
         bool GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const;
+        bool DescribeAddress(ULONG_PTR address, std::wstring* description) const;
         bool FreeLibrary(HMODULE module, DWORD* win32Error);
         void ReleaseAll();
         bool ReadExecutableBytes(

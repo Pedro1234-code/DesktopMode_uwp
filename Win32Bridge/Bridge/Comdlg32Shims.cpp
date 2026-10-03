@@ -1,23 +1,13 @@
 #include "pch.h"
 #include "Bridge/Comdlg32Shims.h"
-
-#include <windows.applicationmodel.core.h>
-#include <windows.storage.h>
-#include <windows.storage.pickers.h>
-#include <windows.ui.core.h>
-
-using namespace Platform;
-using namespace Windows::ApplicationModel::Core;
-using namespace Windows::Storage;
-using namespace Windows::Storage::Pickers;
-using namespace Windows::UI::Core;
-using namespace concurrency;
+#include "Bridge/DialogResources.h"
 
 namespace
 {
     thread_local DWORD g_commonDialogError = 0;
     constexpr DWORD kCdErrInitialization = 0x0002;
     constexpr DWORD kFnErrBufferTooSmall = 0x3003;
+    constexpr DWORD kOfnExtensionDifferent = 0x00000400;
 
     bool IsComdlgLibrary(const std::wstring& library)
     {
@@ -56,167 +46,121 @@ namespace
         const size_t separator = guestPath.find_last_of(L'\\');
         openFileName->nFileOffset = static_cast<WORD>(separator == std::wstring::npos ? 0 : separator + 1);
         const size_t dot = guestPath.find_last_of(L'.');
-        openFileName->nFileExtension = static_cast<WORD>(dot == std::wstring::npos ? 0 : dot + 1);
+        openFileName->nFileExtension = static_cast<WORD>(
+            dot == std::wstring::npos ||
+            (separator != std::wstring::npos && dot < separator)
+                ? 0 : dot + 1);
+        if (openFileName->lpstrFileTitle && openFileName->nMaxFileTitle != 0)
+        {
+            const std::wstring title = separator == std::wstring::npos
+                ? guestPath : guestPath.substr(separator + 1);
+            wcsncpy_s(openFileName->lpstrFileTitle,
+                openFileName->nMaxFileTitle, title.c_str(), _TRUNCATE);
+        }
         SetCommonDialogError(0);
         return true;
     }
 
-    StorageFolder^ GuestDocumentsFolder()
+    bool RunVirtualFileDialog(
+        Win32Bridge::Bridge::GuestOpenFileNameW* openFileName,
+        bool saveDialog)
     {
-        StorageFolder^ local = ApplicationData::Current->LocalFolder;
-        StorageFolder^ drive = create_task(local->CreateFolderAsync(L"drive_c", CreationCollisionOption::OpenIfExists)).get();
-        StorageFolder^ users = create_task(drive->CreateFolderAsync(L"Users", CreationCollisionOption::OpenIfExists)).get();
-        StorageFolder^ guest = create_task(users->CreateFolderAsync(L"Default", CreationCollisionOption::OpenIfExists)).get();
-        return create_task(guest->CreateFolderAsync(L"Documents", CreationCollisionOption::OpenIfExists)).get();
-    }
+        if (!openFileName || !openFileName->lpstrFile ||
+            openFileName->nMaxFile == 0)
+        {
+            SetCommonDialogError(kCdErrInitialization);
+            return false;
+        }
 
-    bool StageSelectedFile(Win32Bridge::Bridge::GuestOpenFileNameW* openFileName, StorageFile^ selected)
-    {
-        if (!selected)
+        std::wstring initialFile(openFileName->lpstrFile);
+        std::wstring embeddedDirectory;
+        const size_t separator = initialFile.find_last_of(L"\\/");
+        if (separator != std::wstring::npos)
+        {
+            embeddedDirectory = initialFile.substr(0, separator);
+            initialFile.erase(0, separator + 1);
+        }
+
+        Win32Bridge::Bridge::GuestFileDialogDescriptor descriptor;
+        descriptor.owner = openFileName->hwndOwner;
+        descriptor.instance = openFileName->hInstance;
+        descriptor.title = openFileName->lpstrTitle;
+        descriptor.initialDirectory = openFileName->lpstrInitialDir &&
+            *openFileName->lpstrInitialDir
+            ? openFileName->lpstrInitialDir
+            : (embeddedDirectory.empty() ? nullptr : embeddedDirectory.c_str());
+        descriptor.initialFileName = initialFile.c_str();
+        descriptor.filter = openFileName->lpstrFilter;
+        descriptor.filterIndex = openFileName->nFilterIndex;
+        descriptor.defaultExtension = openFileName->lpstrDefExt;
+        descriptor.flags = openFileName->Flags;
+        descriptor.saveDialog = saveDialog ? TRUE : FALSE;
+
+        std::wstring selected;
+        DWORD selectedFilter = descriptor.filterIndex;
+        if (!Win32Bridge::Bridge::ShowGuestFileDialog(
+            descriptor, &selected, &selectedFilter))
         {
             SetCommonDialogError(0);
             return false;
         }
-
-        try
+        openFileName->nFilterIndex = selectedFilter;
+        if (openFileName->lpstrDefExt && *openFileName->lpstrDefExt)
         {
-            StorageFolder^ documents = GuestDocumentsFolder();
-            StorageFile^ staged = create_task(selected->CopyAsync(
-                documents,
-                selected->Name,
-                NameCollisionOption::GenerateUniqueName)).get();
-            return CopyGuestPathToCaller(openFileName, L"C:\\Users\\Default\\Documents\\" + std::wstring(staged->Name->Data()));
-        }
-        catch (Exception^ exception)
-        {
-            SetCommonDialogError(HRESULT_FACILITY(exception->HResult) == FACILITY_WIN32
-                ? HRESULT_CODE(exception->HResult)
-                : kCdErrInitialization);
-            return false;
-        }
-    }
-
-    bool PickOpenFile(Win32Bridge::Bridge::GuestOpenFileNameW* openFileName)
-    {
-        try
-        {
-            CoreDispatcher^ dispatcher = CoreApplication::MainView->CoreWindow->Dispatcher;
-            if (!dispatcher || dispatcher->HasThreadAccess)
+            const size_t dot = selected.find_last_of(L'.');
+            const size_t slash = selected.find_last_of(L'\\');
+            if (dot != std::wstring::npos &&
+                (slash == std::wstring::npos || dot > slash) &&
+                _wcsicmp(selected.c_str() + dot + 1,
+                    openFileName->lpstrDefExt[0] == L'.'
+                        ? openFileName->lpstrDefExt + 1
+                        : openFileName->lpstrDefExt) != 0)
             {
-                SetCommonDialogError(kCdErrInitialization);
-                return false;
+                openFileName->Flags |= kOfnExtensionDifferent;
             }
-
-            task_completion_event<StorageFile^> completion;
-            auto showPicker = ref new DispatchedHandler([completion]() mutable
+            else
             {
-                try
-                {
-                    FileOpenPicker^ picker = ref new FileOpenPicker();
-                    picker->SuggestedStartLocation = PickerLocationId::DocumentsLibrary;
-                    picker->FileTypeFilter->Append(L"*");
-                    create_task(picker->PickSingleFileAsync()).then([completion](StorageFile^ selected) mutable
-                    {
-                        completion.set(selected);
-                    });
-                }
-                catch (...)
-                {
-                    completion.set(nullptr);
-                }
-            });
-            create_task(dispatcher->RunAsync(CoreDispatcherPriority::Normal, showPicker)).then([completion](task<void> dispatched) mutable
-            {
-                try { dispatched.get(); }
-                catch (...) { completion.set(nullptr); }
-            });
-
-            return StageSelectedFile(openFileName, create_task(completion).get());
-        }
-        catch (...)
-        {
-            SetCommonDialogError(kCdErrInitialization);
-            return false;
-        }
-    }
-
-    bool PickSaveFile(Win32Bridge::Bridge::GuestOpenFileNameW* openFileName)
-    {
-        try
-        {
-            CoreDispatcher^ dispatcher = CoreApplication::MainView->CoreWindow->Dispatcher;
-            if (!dispatcher || dispatcher->HasThreadAccess)
-            {
-                SetCommonDialogError(kCdErrInitialization);
-                return false;
+                openFileName->Flags &= ~kOfnExtensionDifferent;
             }
-
-            std::wstring suggested = openFileName && openFileName->lpstrFile ? openFileName->lpstrFile : L"Untitled";
-            const size_t separator = suggested.find_last_of(L"\\/");
-            if (separator != std::wstring::npos)
-            {
-                suggested.erase(0, separator + 1);
-            }
-            if (suggested.empty())
-            {
-                suggested = L"Untitled";
-            }
-
-            task_completion_event<StorageFile^> completion;
-            String^ suggestedName = ref new String(suggested.c_str());
-            auto showPicker = ref new DispatchedHandler([completion, suggestedName]() mutable
-            {
-                try
-                {
-                    FileSavePicker^ picker = ref new FileSavePicker();
-                    picker->SuggestedStartLocation = PickerLocationId::DocumentsLibrary;
-                    picker->SuggestedFileName = suggestedName;
-                    auto types = ref new Platform::Collections::Vector<String^>();
-                    types->Append(L".dat");
-                    picker->FileTypeChoices->Insert(L"All files", types);
-                    create_task(picker->PickSaveFileAsync()).then([completion](StorageFile^ selected) mutable
-                    {
-                        completion.set(selected);
-                    });
-                }
-                catch (...)
-                {
-                    completion.set(nullptr);
-                }
-            });
-            create_task(dispatcher->RunAsync(CoreDispatcherPriority::Normal, showPicker)).then([completion](task<void> dispatched) mutable
-            {
-                try { dispatched.get(); }
-                catch (...) { completion.set(nullptr); }
-            });
-
-            // The picked file is immediately represented in the virtual C:
-            // drive. Later guest writes therefore remain inside LocalFolder,
-            // with no dependency on the external picker token.
-            return StageSelectedFile(openFileName, create_task(completion).get());
         }
-        catch (...)
-        {
-            SetCommonDialogError(kCdErrInitialization);
-            return false;
-        }
+        return CopyGuestPathToCaller(openFileName, selected);
     }
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetOpenFileNameW(GuestOpenFileNameW* openFileName)
 {
-    return PickOpenFile(openFileName) ? TRUE : FALSE;
+    return RunVirtualFileDialog(openFileName, false) ? TRUE : FALSE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetSaveFileNameW(GuestOpenFileNameW* openFileName)
 {
-    return PickSaveFile(openFileName) ? TRUE : FALSE;
+    return RunVirtualFileDialog(openFileName, true) ? TRUE : FALSE;
 }
 
 DWORD WINAPI Win32Bridge::Bridge::BridgeCommDlgExtendedError()
 {
     return g_commonDialogError;
 }
+
+namespace Win32Bridge { namespace Bridge {
+HWND WINAPI BridgeFindTextW(PVOID) { SetCommonDialogError(0); return nullptr; }
+HWND WINAPI BridgeReplaceTextW(PVOID) { SetCommonDialogError(0); return nullptr; }
+BOOL WINAPI BridgePageSetupDlgW(PVOID) { SetCommonDialogError(0); return FALSE; }
+BOOL WINAPI BridgeChooseFontW(PVOID) { SetCommonDialogError(0); return FALSE; }
+HRESULT WINAPI BridgePrintDlgExW(PVOID) { SetCommonDialogError(0); return E_NOTIMPL; }
+short WINAPI BridgeGetFileTitleW(LPCWSTR path, LPWSTR title, WORD capacity)
+{
+    if (!path || !title || capacity == 0) return -1;
+    const wchar_t* slash = wcsrchr(path, L'\\');
+    const wchar_t* forward = wcsrchr(path, L'/');
+    const wchar_t* name = slash && (!forward || slash > forward) ? slash + 1 :
+        forward ? forward + 1 : path;
+    const size_t length = wcslen(name);
+    if (length + 1 > capacity) return -1;
+    wcscpy_s(title, capacity, name);
+    return 0;
+}
+} }
 
 Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveComdlg32Import(const ImportedSymbol& symbol)
 {
@@ -238,6 +182,12 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveComdlg32Import
     {
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCommDlgExtendedError);
     }
+    else if (IsName(symbol.name, L"findtextw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindTextW);
+    else if (IsName(symbol.name, L"replacetextw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReplaceTextW);
+    else if (IsName(symbol.name, L"pagesetupdlgw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePageSetupDlgW);
+    else if (IsName(symbol.name, L"choosefontw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeChooseFontW);
+    else if (IsName(symbol.name, L"getfiletitlew")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFileTitleW);
+    else if (IsName(symbol.name, L"printdlgexw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePrintDlgExW);
 
     if (resolution.targetAddress)
     {

@@ -529,7 +529,8 @@ bool GuestStorageContext::EnsureLayout(std::wstring* error)
         { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming" },
         { L"drive_c", L"Users", L"Default", L"AppData", L"Local", L"Temp" },
         { L"drive_c", L"Windows" },
-        { L"drive_c", L"Windows", L"System32" }
+        { L"drive_c", L"Windows", L"System32" },
+        { L"drive_c", L"Windows", L"System32", L"config" }
     };
 
     DWORD win32Error = ERROR_SUCCESS;
@@ -932,14 +933,11 @@ bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWOR
     }
     try
     {
-        IBuffer^ data = nullptr;
+        Array<byte>^ copy = nullptr;
         if (bytesToWrite != 0)
         {
-            auto copy = ref new Array<byte>(bytesToWrite);
+            copy = ref new Array<byte>(bytesToWrite);
             memcpy(copy->Data, buffer, bytesToWrite);
-            auto writer = ref new DataWriter();
-            writer->WriteBytes(copy);
-            data = writer->DetachBuffer();
         }
 
         std::lock_guard<std::mutex> guard(record->lock);
@@ -959,7 +957,17 @@ bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWOR
             SetWin32Error(win32Error, ERROR_SUCCESS);
             return true;
         }
-        const unsigned int written = create_task(stream->WriteAsync(data)).get();
+        // Bind the writer directly to the random-access stream.  This is the
+        // UWP storage contract equivalent of synchronous Win32 WriteFile and
+        // avoids relying on a detached in-memory IBuffer being accepted by
+        // every IRandomAccessStream implementation.  DetachStream is required
+        // because disposing a DataWriter would otherwise close the file handle
+        // after the first write.
+        auto writer = ref new DataWriter(stream);
+        writer->WriteBytes(copy);
+        const unsigned int written = create_task(writer->StoreAsync()).get();
+        writer->DetachStream();
+        delete writer;
         if (bytesWritten)
         {
             *bytesWritten = written;
@@ -974,7 +982,10 @@ bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWOR
     }
     catch (Exception^ exception)
     {
-        SetWin32Error(win32Error, ErrorFromException(exception));
+        RecordStorageException(L"WriteFile", exception);
+        const DWORD error = ErrorFromException(exception);
+        SetWin32Error(win32Error,
+            error == ERROR_SUCCESS ? ERROR_WRITE_FAULT : error);
         return false;
     }
 }

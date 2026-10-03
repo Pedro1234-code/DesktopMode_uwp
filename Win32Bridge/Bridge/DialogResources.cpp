@@ -3,6 +3,7 @@
 #include "Bridge/GuestMetrics.h"
 
 #include "Bridge/GuestResources.h"
+#include "Bridge/GuestStorage.h"
 #include "Bridge/GuestWindow.h"
 #include "Bridge/Gdi32Shims.h"
 #include "Bridge/Kernel32Shims.h"
@@ -14,6 +15,7 @@
 #include <atomic>
 #include <cstring>
 #include <cwchar>
+#include <cwctype>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -43,6 +45,30 @@ namespace
     constexpr DWORD EditAutoHorizontalScroll = 0x00000080;
     constexpr DWORD EditReadOnly = 0x00000800;
     constexpr DWORD WindowBorderStyle = 0x00800000;
+    constexpr DWORD ListViewReportStyle = 0x00000001;
+    constexpr DWORD ListViewSingleSelectionStyle = 0x00000004;
+    constexpr DWORD ListViewShowSelectionAlwaysStyle = 0x00000008;
+    constexpr DWORD ComboBoxDropDownListStyle = 0x00000003;
+    constexpr DWORD FileDialogOverwritePrompt = 0x00000002;
+    constexpr DWORD FileDialogNoValidate = 0x00000100;
+    constexpr DWORD FileDialogPathMustExist = 0x00000800;
+    constexpr DWORD FileDialogFileMustExist = 0x00001000;
+    constexpr UINT FileDialogPathId = 0x5201;
+    constexpr UINT FileDialogUpId = 0x5202;
+    constexpr UINT FileDialogListId = 0x5203;
+    constexpr UINT FileDialogNameId = 0x5204;
+    constexpr UINT FileDialogFilterId = 0x5205;
+    constexpr UINT ShellAboutIconId = 0x5301;
+    constexpr UINT StaticSetIconMessage = 0x0170;
+    constexpr UINT ListViewDeleteAllItemsMessage = 0x1009;
+    constexpr UINT ListViewInsertItemWMessage = 0x104d;
+    constexpr UINT ListViewInsertColumnWMessage = 0x1061;
+    constexpr UINT ComboBoxAddStringMessage = 0x0143;
+    constexpr UINT ComboBoxGetCurrentSelectionMessage = 0x0147;
+    constexpr UINT ComboBoxResetContentMessage = 0x014b;
+    constexpr UINT ComboBoxSetCurrentSelectionMessage = 0x014e;
+    constexpr UINT ListViewItemChangedNotification = static_cast<UINT>(-101);
+    constexpr UINT ListViewItemActivateNotification = static_cast<UINT>(-114);
     constexpr int DialogMessageResultOffset = 0;
     constexpr int DialogProcedureOffset = sizeof(LONG_PTR);
     constexpr int DialogWindowExtra = sizeof(LONG_PTR) * 4;
@@ -169,6 +195,78 @@ namespace
         DialogValue title;
         DialogFont font;
         std::vector<DialogItem> items;
+    };
+
+    struct FileDialogListViewColumn final
+    {
+        UINT mask = 0;
+        int format = 0;
+        int width = 0;
+        LPWSTR text = nullptr;
+        int textCapacity = 0;
+        int subItem = 0;
+        int image = 0;
+        int order = 0;
+    };
+
+    struct FileDialogListViewItem final
+    {
+        UINT mask = 0;
+        int item = 0;
+        int subItem = 0;
+        UINT state = 0;
+        UINT stateMask = 0;
+        LPWSTR text = nullptr;
+        int textCapacity = 0;
+        int image = 0;
+        LPARAM itemData = 0;
+    };
+
+    struct FileDialogNotifyHeader final
+    {
+        HWND from = nullptr;
+        UINT_PTR identifier = 0;
+        UINT code = 0;
+    };
+
+    struct FileDialogListViewNotification final
+    {
+        FileDialogNotifyHeader header;
+        int item = -1;
+        int subItem = 0;
+        UINT newState = 0;
+        UINT oldState = 0;
+        UINT changed = 0;
+        POINT action{};
+        LPARAM itemData = 0;
+        UINT keyFlags = 0;
+    };
+    static_assert(sizeof(FileDialogListViewNotification) == 72,
+        "Virtual file picker notifications must remain x64-compatible.");
+
+    struct FileDialogFilter final
+    {
+        std::wstring label;
+        std::vector<std::wstring> patterns;
+    };
+
+    struct FileDialogEntry final
+    {
+        std::wstring name;
+        bool directory = false;
+    };
+
+    struct FileDialogRuntime final
+    {
+        GuestFileDialogDescriptor descriptor;
+        GuestStorageContext* storage = nullptr;
+        HWND window = nullptr;
+        std::wstring currentDirectory;
+        std::wstring selectedPath;
+        std::vector<FileDialogFilter> filters;
+        std::vector<FileDialogEntry> entries;
+        DWORD selectedFilter = 1;
+        bool listColumnCreated = false;
     };
 
     struct ModalDialogState final
@@ -1293,6 +1391,396 @@ namespace
         return item;
     }
 
+    bool FileDialogWildcardMatch(const wchar_t* pattern, const wchar_t* text)
+    {
+        if (!pattern || !text) return false;
+        const wchar_t* star = nullptr;
+        const wchar_t* retry = nullptr;
+        while (*text)
+        {
+            if (*pattern == L'?' || std::towlower(*pattern) == std::towlower(*text))
+            {
+                ++pattern;
+                ++text;
+                continue;
+            }
+            if (*pattern == L'*')
+            {
+                star = pattern++;
+                retry = text;
+                continue;
+            }
+            if (star)
+            {
+                pattern = star + 1;
+                text = ++retry;
+                continue;
+            }
+            return false;
+        }
+        while (*pattern == L'*') ++pattern;
+        return *pattern == L'\0';
+    }
+
+    std::vector<std::wstring> SplitFileDialogPatterns(const std::wstring& value)
+    {
+        std::vector<std::wstring> patterns;
+        size_t start = 0;
+        while (start <= value.size())
+        {
+            const size_t separator = value.find(L';', start);
+            const size_t end = separator == std::wstring::npos ? value.size() : separator;
+            if (end > start) patterns.push_back(value.substr(start, end - start));
+            if (separator == std::wstring::npos) break;
+            start = separator + 1;
+        }
+        if (patterns.empty()) patterns.push_back(L"*.*");
+        return patterns;
+    }
+
+    std::vector<FileDialogFilter> ParseFileDialogFilters(LPCWSTR filter)
+    {
+        std::vector<FileDialogFilter> result;
+        const wchar_t* current = filter;
+        for (size_t count = 0; current && *current && count < 128; ++count)
+        {
+            FileDialogFilter entry;
+            entry.label = current;
+            current += entry.label.size() + 1;
+            if (!*current) break;
+            const std::wstring patterns = current;
+            current += patterns.size() + 1;
+            entry.patterns = SplitFileDialogPatterns(patterns);
+            result.push_back(std::move(entry));
+        }
+        if (result.empty())
+        {
+            FileDialogFilter entry;
+            entry.label = L"All files (*.*)";
+            entry.patterns.push_back(L"*.*");
+            result.push_back(std::move(entry));
+        }
+        return result;
+    }
+
+    bool FileDialogNameMatches(const FileDialogRuntime& runtime, const std::wstring& name)
+    {
+        if (runtime.filters.empty()) return true;
+        const size_t index = (std::min)(runtime.filters.size() - 1,
+            runtime.selectedFilter > 0 ? static_cast<size_t>(runtime.selectedFilter - 1) : 0);
+        for (const auto& pattern : runtime.filters[index].patterns)
+        {
+            if (pattern == L"*" || pattern == L"*.*" ||
+                FileDialogWildcardMatch(pattern.c_str(), name.c_str())) return true;
+        }
+        return false;
+    }
+
+    std::wstring FileDialogJoinPath(const std::wstring& directory, const std::wstring& name)
+    {
+        if (directory.empty()) return name;
+        return directory.back() == L'\\' ? directory + name : directory + L"\\" + name;
+    }
+
+    std::wstring FileDialogParentPath(const std::wstring& path)
+    {
+        if (path.size() <= 3) return L"C:\\";
+        const size_t separator = path.find_last_of(L'\\');
+        if (separator == std::wstring::npos || separator <= 2) return L"C:\\";
+        return path.substr(0, separator);
+    }
+
+    bool FileDialogDirectoryExists(
+        GuestStorageContext* storage,
+        const std::wstring& requested,
+        std::wstring* canonical)
+    {
+        if (!storage || requested.empty()) return false;
+        DWORD error = ERROR_SUCCESS;
+        std::wstring normalized;
+        if (!storage->CanonicalPath(requested.c_str(), &normalized, &error)) return false;
+        const DWORD attributes = storage->GetGuestFileAttributes(normalized.c_str(), &error);
+        if (attributes == INVALID_FILE_ATTRIBUTES ||
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0) return false;
+        if (canonical) *canonical = std::move(normalized);
+        return true;
+    }
+
+    void PopulateFileDialog(FileDialogRuntime* runtime)
+    {
+        if (!runtime || !runtime->window || !runtime->storage) return;
+        HWND list = BridgeGetDlgItem(runtime->window, FileDialogListId);
+        if (!list) return;
+
+        BridgeSetDlgItemTextW(runtime->window, FileDialogPathId,
+            runtime->currentDirectory.c_str());
+        BridgeSendMessageW(list, ListViewDeleteAllItemsMessage, 0, 0);
+        if (!runtime->listColumnCreated)
+        {
+            std::wstring heading = L"Name";
+            FileDialogListViewColumn column{};
+            column.mask = 0x0002 | 0x0004; // LVCF_WIDTH | LVCF_TEXT.
+            column.width = 500;
+            column.text = &heading[0];
+            BridgeSendMessageW(list, ListViewInsertColumnWMessage, 0,
+                reinterpret_cast<LPARAM>(&column));
+            runtime->listColumnCreated = true;
+        }
+
+        runtime->entries.clear();
+        WIN32_FIND_DATAW data{};
+        HANDLE search = INVALID_HANDLE_VALUE;
+        DWORD error = ERROR_SUCCESS;
+        const std::wstring pattern = FileDialogJoinPath(runtime->currentDirectory, L"*");
+        if (runtime->storage->FindFirstGuestFile(
+            pattern.c_str(), &data, &search, &error))
+        {
+            do
+            {
+                const std::wstring name(data.cFileName);
+                if (name == L"." || name == L"..") continue;
+                const bool directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                if (!directory && !FileDialogNameMatches(*runtime, name)) continue;
+                FileDialogEntry entry;
+                entry.name = name;
+                entry.directory = directory;
+                runtime->entries.push_back(std::move(entry));
+            } while (runtime->storage->FindNextGuestFile(search, &data, &error));
+            runtime->storage->CloseFindHandle(search, &error);
+        }
+
+        std::sort(runtime->entries.begin(), runtime->entries.end(),
+            [](const FileDialogEntry& left, const FileDialogEntry& right)
+        {
+            if (left.directory != right.directory) return left.directory > right.directory;
+            return _wcsicmp(left.name.c_str(), right.name.c_str()) < 0;
+        });
+
+        for (size_t index = 0; index < runtime->entries.size(); ++index)
+        {
+            std::wstring caption = runtime->entries[index].directory
+                ? runtime->entries[index].name + L"\\"
+                : runtime->entries[index].name;
+            FileDialogListViewItem item{};
+            item.mask = 0x0001 | 0x0004; // LVIF_TEXT | LVIF_PARAM.
+            item.item = static_cast<int>(index);
+            item.text = &caption[0];
+            item.itemData = static_cast<LPARAM>(index);
+            BridgeSendMessageW(list, ListViewInsertItemWMessage, 0,
+                reinterpret_cast<LPARAM>(&item));
+        }
+    }
+
+    bool NavigateFileDialog(FileDialogRuntime* runtime, const std::wstring& requested)
+    {
+        std::wstring canonical;
+        if (!runtime || !FileDialogDirectoryExists(
+            runtime->storage, requested, &canonical)) return false;
+        runtime->currentDirectory = std::move(canonical);
+        BridgeSetDlgItemTextW(runtime->window, FileDialogNameId, L"");
+        PopulateFileDialog(runtime);
+        return true;
+    }
+
+    void SelectFileDialogEntry(FileDialogRuntime* runtime, int index)
+    {
+        if (!runtime || index < 0 ||
+            static_cast<size_t>(index) >= runtime->entries.size()) return;
+        const auto& entry = runtime->entries[static_cast<size_t>(index)];
+        if (!entry.directory)
+            BridgeSetDlgItemTextW(runtime->window, FileDialogNameId, entry.name.c_str());
+    }
+
+    bool AcceptFileDialog(FileDialogRuntime* runtime)
+    {
+        if (!runtime || !runtime->storage) return false;
+        std::vector<wchar_t> buffer(32768, L'\0');
+        BridgeGetDlgItemTextW(runtime->window, FileDialogNameId,
+            buffer.data(), static_cast<int>(buffer.size()));
+        std::wstring name(buffer.data());
+        while (!name.empty() && std::iswspace(name.front())) name.erase(name.begin());
+        while (!name.empty() && std::iswspace(name.back())) name.pop_back();
+        if (name.empty()) return false;
+
+        if (runtime->descriptor.saveDialog && runtime->descriptor.defaultExtension &&
+            *runtime->descriptor.defaultExtension)
+        {
+            const size_t slash = name.find_last_of(L"\\/");
+            const size_t dot = name.find_last_of(L'.');
+            if (dot == std::wstring::npos ||
+                (slash != std::wstring::npos && dot < slash))
+            {
+                if (runtime->descriptor.defaultExtension[0] != L'.') name += L'.';
+                name += runtime->descriptor.defaultExtension;
+            }
+        }
+
+        const bool absolute = name.size() >= 3 && std::iswalpha(name[0]) &&
+            name[1] == L':' && (name[2] == L'\\' || name[2] == L'/');
+        const std::wstring requested = absolute
+            ? name : FileDialogJoinPath(runtime->currentDirectory, name);
+        DWORD error = ERROR_SUCCESS;
+        std::wstring canonical;
+        if (!runtime->storage->CanonicalPath(requested.c_str(), &canonical, &error))
+        {
+            ShowGuestMessageBox(runtime->window, L"The file name is not valid.",
+                runtime->descriptor.title, MB_OK | MB_ICONERROR);
+            return false;
+        }
+
+        const DWORD attributes = runtime->storage->GetGuestFileAttributes(
+            canonical.c_str(), &error);
+        if (attributes != INVALID_FILE_ATTRIBUTES &&
+            (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            return NavigateFileDialog(runtime, canonical);
+        }
+        if (!runtime->descriptor.saveDialog &&
+            (runtime->descriptor.flags & FileDialogFileMustExist) != 0 &&
+            attributes == INVALID_FILE_ATTRIBUTES)
+        {
+            ShowGuestMessageBox(runtime->window, L"The file does not exist.",
+                runtime->descriptor.title, MB_OK | MB_ICONERROR);
+            return false;
+        }
+        if ((runtime->descriptor.flags & FileDialogPathMustExist) != 0 &&
+            (runtime->descriptor.flags & FileDialogNoValidate) == 0)
+        {
+            const std::wstring parent = FileDialogParentPath(canonical);
+            if (!FileDialogDirectoryExists(runtime->storage, parent, nullptr))
+            {
+                ShowGuestMessageBox(runtime->window, L"The specified path does not exist.",
+                    runtime->descriptor.title, MB_OK | MB_ICONERROR);
+                return false;
+            }
+        }
+        if (runtime->descriptor.saveDialog &&
+            (runtime->descriptor.flags & FileDialogOverwritePrompt) != 0 &&
+            attributes != INVALID_FILE_ATTRIBUTES)
+        {
+            const int answer = ShowGuestMessageBox(runtime->window,
+                L"This file already exists. Do you want to replace it?",
+                runtime->descriptor.title, MB_YESNO | MB_ICONWARNING);
+            if (answer != IDYES) return false;
+        }
+
+        runtime->selectedPath = std::move(canonical);
+        EndGuestResourceDialog(runtime->window, IDOK);
+        return true;
+    }
+
+    INT_PTR CALLBACK FileDialogProcedure(HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        FileDialogRuntime* runtime = reinterpret_cast<FileDialogRuntime*>(
+            BridgeGetWindowLongPtrW(dialog, GWLP_USERDATA));
+        if (message == WM_INITDIALOG)
+        {
+            runtime = reinterpret_cast<FileDialogRuntime*>(lParam);
+            if (!runtime) return FALSE;
+            runtime->window = dialog;
+            BridgeSetWindowLongPtrW(dialog, GWLP_USERDATA,
+                reinterpret_cast<LONG_PTR>(runtime));
+            BridgeSetDlgItemTextW(dialog, FileDialogNameId,
+                runtime->descriptor.initialFileName
+                    ? runtime->descriptor.initialFileName : L"");
+            HWND filter = BridgeGetDlgItem(dialog, FileDialogFilterId);
+            BridgeSendMessageW(filter, ComboBoxResetContentMessage, 0, 0);
+            for (const auto& entry : runtime->filters)
+                BridgeSendMessageW(filter, ComboBoxAddStringMessage, 0,
+                    reinterpret_cast<LPARAM>(entry.label.c_str()));
+            BridgeSendMessageW(filter, ComboBoxSetCurrentSelectionMessage,
+                runtime->selectedFilter - 1, 0);
+            PopulateFileDialog(runtime);
+            return TRUE;
+        }
+        if (!runtime) return FALSE;
+
+        if (message == WM_NOTIFY)
+        {
+            const auto* notification = reinterpret_cast<const FileDialogListViewNotification*>(lParam);
+            if (!notification || notification->header.identifier != FileDialogListId) return FALSE;
+            if (notification->header.code == ListViewItemChangedNotification)
+            {
+                if ((notification->newState & 0x0002) != 0)
+                    SelectFileDialogEntry(runtime, notification->item);
+                return TRUE;
+            }
+            if (notification->header.code == ListViewItemActivateNotification)
+            {
+                if (notification->item >= 0 &&
+                    static_cast<size_t>(notification->item) < runtime->entries.size())
+                {
+                    const auto& entry = runtime->entries[static_cast<size_t>(notification->item)];
+                    if (entry.directory)
+                        NavigateFileDialog(runtime,
+                            FileDialogJoinPath(runtime->currentDirectory, entry.name));
+                    else
+                    {
+                        SelectFileDialogEntry(runtime, notification->item);
+                        AcceptFileDialog(runtime);
+                    }
+                }
+                return TRUE;
+            }
+        }
+        if (message == WM_COMMAND)
+        {
+            const UINT command = LOWORD(wParam);
+            const UINT notification = HIWORD(wParam);
+            if (command == IDOK)
+            {
+                AcceptFileDialog(runtime);
+                return TRUE;
+            }
+            if (command == IDCANCEL)
+            {
+                EndGuestResourceDialog(dialog, IDCANCEL);
+                return TRUE;
+            }
+            if (command == FileDialogUpId)
+            {
+                NavigateFileDialog(runtime,
+                    FileDialogParentPath(runtime->currentDirectory));
+                return TRUE;
+            }
+            if (command == FileDialogFilterId && notification == 1) // CBN_SELCHANGE.
+            {
+                HWND filter = BridgeGetDlgItem(dialog, FileDialogFilterId);
+                const LRESULT selection = BridgeSendMessageW(
+                    filter, ComboBoxGetCurrentSelectionMessage, 0, 0);
+                if (selection >= 0 &&
+                    static_cast<size_t>(selection) < runtime->filters.size())
+                {
+                    runtime->selectedFilter = static_cast<DWORD>(selection + 1);
+                    PopulateFileDialog(runtime);
+                }
+                return TRUE;
+            }
+        }
+        if (message == WM_CLOSE)
+        {
+            EndGuestResourceDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    DialogItem FileDialogItem(
+        DWORD id, LPCWSTR windowClass, LPCWSTR text,
+        short x, short y, short width, short height, DWORD style)
+    {
+        DialogItem item;
+        item.id = id;
+        item.windowClass.text = windowClass ? windowClass : L"static";
+        item.title.text = text ? text : L"";
+        item.x = x;
+        item.y = y;
+        item.width = width;
+        item.height = height;
+        item.style = style | DialogChildStyle | DialogVisibleStyle;
+        return item;
+    }
+
     INT_PTR CALLBACK MessageBoxDialogProcedure(HWND dialog, UINT message, WPARAM wParam, LPARAM)
     {
         if (message == WM_INITDIALOG) return TRUE;
@@ -1315,6 +1803,39 @@ namespace
             default:
                 break;
             }
+        }
+        if (message == WM_CLOSE)
+        {
+            EndGuestResourceDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    struct ShellAboutRuntime final
+    {
+        HICON icon = nullptr;
+    };
+
+    INT_PTR CALLBACK ShellAboutDialogProcedure(
+        HWND dialog, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        if (message == WM_INITDIALOG)
+        {
+            const auto* runtime = reinterpret_cast<const ShellAboutRuntime*>(lParam);
+            if (runtime && runtime->icon)
+            {
+                BridgeSendDlgItemMessageW(dialog, ShellAboutIconId,
+                    StaticSetIconMessage,
+                    reinterpret_cast<WPARAM>(runtime->icon), 0);
+            }
+            return TRUE;
+        }
+        if (message == WM_COMMAND &&
+            (LOWORD(wParam) == IDOK || LOWORD(wParam) == IDCANCEL))
+        {
+            EndGuestResourceDialog(dialog, LOWORD(wParam));
+            return TRUE;
         }
         if (message == WM_CLOSE)
         {
@@ -1496,6 +2017,173 @@ INT_PTR Win32Bridge::Bridge::ShowGuestPropertySheet(
         descriptor.parent,
         &PropertySheetDialogProcedure,
         reinterpret_cast<LPARAM>(&runtime));
+}
+
+bool Win32Bridge::Bridge::ShowGuestFileDialog(
+    const GuestFileDialogDescriptor& descriptor,
+    std::wstring* selectedPath,
+    DWORD* selectedFilterIndex)
+{
+    if (!selectedPath)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    selectedPath->clear();
+
+    FileDialogRuntime runtime;
+    runtime.descriptor = descriptor;
+    runtime.storage = CurrentGuestStorageContext();
+    if (!runtime.storage)
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+    runtime.filters = ParseFileDialogFilters(descriptor.filter);
+    runtime.selectedFilter = descriptor.filterIndex == 0
+        ? 1
+        : (std::min)(descriptor.filterIndex,
+            static_cast<DWORD>(runtime.filters.size()));
+
+    std::wstring initial;
+    if (descriptor.initialDirectory)
+        FileDialogDirectoryExists(runtime.storage,
+            descriptor.initialDirectory, &initial);
+    if (initial.empty())
+        FileDialogDirectoryExists(runtime.storage,
+            runtime.storage->CurrentDirectory(), &initial);
+    if (initial.empty())
+        FileDialogDirectoryExists(runtime.storage,
+            L"C:\\Users\\Default\\Documents", &initial);
+    if (initial.empty()) initial = L"C:\\";
+    runtime.currentDirectory = std::move(initial);
+
+    DialogTemplate dialog;
+    dialog.style = DialogPopupStyle | DialogCaptionStyle | DialogSystemMenuStyle |
+        DialogModalFrameStyle | DialogCenterStyle | DialogSetFont;
+    dialog.width = 330;
+    dialog.height = 210;
+    dialog.title.text = descriptor.title && *descriptor.title
+        ? descriptor.title
+        : (descriptor.saveDialog ? L"Save As" : L"Open");
+    dialog.font.present = true;
+    dialog.font.pointSize = 9;
+    dialog.font.weight = FW_NORMAL;
+    dialog.font.face.text = L"Segoe UI";
+
+    const DWORD labelStyle = StaticLeft;
+    const DWORD editStyle = DialogTabStopStyle | WindowBorderStyle |
+        EditAutoHorizontalScroll;
+    const DWORD buttonStyle = DialogTabStopStyle;
+    dialog.items.push_back(FileDialogItem(
+        static_cast<DWORD>(-1), L"static", L"Look in:",
+        6, 8, 42, 10, labelStyle));
+    dialog.items.push_back(FileDialogItem(
+        FileDialogPathId, L"edit", L"",
+        48, 5, 230, 14, editStyle | EditReadOnly));
+    dialog.items.push_back(FileDialogItem(
+        FileDialogUpId, L"button", L"Up",
+        282, 5, 40, 14, buttonStyle));
+    dialog.items.push_back(FileDialogItem(
+        FileDialogListId, L"SysListView32", L"",
+        6, 24, 316, 116,
+        DialogTabStopStyle | WindowBorderStyle | ListViewReportStyle |
+        ListViewSingleSelectionStyle | ListViewShowSelectionAlwaysStyle));
+    dialog.items.push_back(FileDialogItem(
+        static_cast<DWORD>(-1), L"static", L"File name:",
+        6, 149, 48, 10, labelStyle));
+    dialog.items.push_back(FileDialogItem(
+        FileDialogNameId, L"edit", L"",
+        55, 146, 147, 14, editStyle));
+    dialog.items.push_back(FileDialogItem(
+        static_cast<DWORD>(-1), L"static", L"Files of type:",
+        6, 169, 48, 10, labelStyle));
+    dialog.items.push_back(FileDialogItem(
+        FileDialogFilterId, L"combobox", L"",
+        55, 166, 147, 38,
+        DialogTabStopStyle | WindowBorderStyle | ComboBoxDropDownListStyle));
+    dialog.items.push_back(FileDialogItem(
+        IDOK, L"button", descriptor.saveDialog ? L"Save" : L"Open",
+        218, 166, 50, 14, buttonStyle | ButtonDefaultPush));
+    dialog.items.push_back(FileDialogItem(
+        IDCANCEL, L"button", L"Cancel",
+        272, 166, 50, 14, buttonStyle));
+
+    RuntimeDiagnostics::Record(std::wstring(L"COMMON DIALOG: opening virtual ") +
+        (descriptor.saveDialog ? L"save" : L"open") +
+        L" picker in '" + runtime.currentDirectory + L"'.");
+    const HINSTANCE instance = descriptor.instance
+        ? descriptor.instance
+        : reinterpret_cast<HINSTANCE>(const_cast<BYTE*>(CurrentGuestImageBase()));
+    const INT_PTR result = RunGuestDialog(
+        instance,
+        dialog,
+        descriptor.owner,
+        &FileDialogProcedure,
+        reinterpret_cast<LPARAM>(&runtime));
+    if (selectedFilterIndex) *selectedFilterIndex = runtime.selectedFilter;
+    if (result != IDOK || runtime.selectedPath.empty()) return false;
+
+    *selectedPath = std::move(runtime.selectedPath);
+    RuntimeDiagnostics::Record(
+        L"COMMON DIALOG: selected virtual path '" + *selectedPath + L"'.");
+    BridgeSetLastError(ERROR_SUCCESS);
+    return true;
+}
+
+int Win32Bridge::Bridge::ShowGuestShellAbout(
+    HWND owner,
+    LPCWSTR title,
+    LPCWSTR text,
+    HICON icon)
+{
+    const std::wstring applicationName = title && *title ? title : L"About";
+    RuntimeDiagnostics::Record(L"SHELL ABOUT: creating virtual About dialog for '" +
+        applicationName + L"'.");
+
+    DialogTemplate dialog;
+    dialog.style = DialogPopupStyle | DialogCaptionStyle | DialogSystemMenuStyle |
+        DialogModalFrameStyle | DialogCenterStyle | DialogSetFont;
+    dialog.width = 230;
+    dialog.height = text && *text ? 116 : 100;
+    dialog.title.text = applicationName;
+    dialog.font.present = true;
+    dialog.font.pointSize = 9;
+    dialog.font.weight = FW_NORMAL;
+    dialog.font.face.text = L"Segoe UI";
+
+    DialogItem iconItem;
+    iconItem.style = DialogChildStyle | DialogVisibleStyle | 0x00000003u; // SS_ICON.
+    iconItem.x = 12;
+    iconItem.y = 13;
+    iconItem.width = 32;
+    iconItem.height = 32;
+    iconItem.id = ShellAboutIconId;
+    iconItem.windowClass.ordinal = true;
+    iconItem.windowClass.id = 0x0082;
+    dialog.items.push_back(std::move(iconItem));
+
+    dialog.items.push_back(FileDialogItem(static_cast<DWORD>(-1), L"static",
+        applicationName.c_str(), 54, 13, 164, 14, StaticLeft));
+    dialog.items.push_back(FileDialogItem(static_cast<DWORD>(-1), L"static",
+        L"Microsoft Windows", 54, 30, 164, 12, StaticLeft));
+    if (text && *text)
+    {
+        dialog.items.push_back(FileDialogItem(static_cast<DWORD>(-1), L"static",
+            text, 12, 54, 206, 26, StaticLeft));
+    }
+
+    const short buttonY = static_cast<short>(dialog.height - 23);
+    dialog.items.push_back(PropertySheetButton(
+        IDOK, static_cast<short>((dialog.width - 50) / 2), buttonY, 50, L"OK", true));
+
+    ShellAboutRuntime runtime;
+    runtime.icon = icon ? icon : BridgeLoadIconW(nullptr, MAKEINTRESOURCEW(32512));
+    HINSTANCE instance = reinterpret_cast<HINSTANCE>(
+        const_cast<BYTE*>(CurrentGuestImageBase()));
+    const INT_PTR result = RunGuestDialog(instance, dialog, owner,
+        &ShellAboutDialogProcedure, reinterpret_cast<LPARAM>(&runtime));
+    return result < 0 ? FALSE : TRUE;
 }
 
 int Win32Bridge::Bridge::ShowGuestMessageBox(

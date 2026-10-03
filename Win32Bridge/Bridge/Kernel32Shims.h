@@ -73,7 +73,7 @@ namespace Bridge
     LONG WINAPI BridgeUnhandledExceptionFilter(EXCEPTION_POINTERS* exceptionInfo);
     LPTOP_LEVEL_EXCEPTION_FILTER WINAPI BridgeSetUnhandledExceptionFilter(LPTOP_LEVEL_EXCEPTION_FILTER filter);
     PRUNTIME_FUNCTION WINAPI BridgeRtlLookupFunctionEntry(DWORD64 controlPc, PDWORD64 imageBase, PUNWIND_HISTORY_TABLE historyTable);
-    void WINAPI BridgeRtlVirtualUnwind(DWORD handlerType, DWORD64 imageBase, DWORD64 controlPc, PRUNTIME_FUNCTION functionEntry, PCONTEXT contextRecord, PVOID* handlerData, PDWORD64 establisherFrame, PKNONVOLATILE_CONTEXT_POINTERS contextPointers);
+    PEXCEPTION_ROUTINE WINAPI BridgeRtlVirtualUnwind(DWORD handlerType, DWORD64 imageBase, DWORD64 controlPc, PRUNTIME_FUNCTION functionEntry, PCONTEXT contextRecord, PVOID* handlerData, PDWORD64 establisherFrame, PKNONVOLATILE_CONTEXT_POINTERS contextPointers);
     void WINAPI BridgeRtlCaptureContext(PCONTEXT contextRecord);
     HANDLE WINAPI BridgeOpenProcess(DWORD desiredAccess, BOOL inheritHandle, DWORD processId);
     HANDLE WINAPI BridgeCreateToolhelp32Snapshot(DWORD flags, DWORD processId);
@@ -170,6 +170,36 @@ namespace Bridge
     LANGID WINAPI BridgeGetSystemDefaultLangID();
     LANGID WINAPI BridgeGetUserDefaultLangID();
     DWORD WINAPI BridgeGetVersion();
+    void WINAPI BridgeGetLocalTime(LPSYSTEMTIME systemTime);
+    int WINAPI BridgeGetDateFormatW(LCID locale, DWORD flags, const SYSTEMTIME* date,
+        LPCWSTR format, LPWSTR buffer, int characterCount);
+    int WINAPI BridgeGetTimeFormatW(LCID locale, DWORD flags, const SYSTEMTIME* time,
+        LPCWSTR format, LPWSTR buffer, int characterCount);
+    LANGID WINAPI BridgeGetUserDefaultUILanguage();
+    int WINAPI BridgeFindNLSString(LCID locale, DWORD flags, LPCWSTR source,
+        int sourceCount, LPCWSTR value, int valueCount, LPINT foundCount);
+    int WINAPI BridgeLstrcmpW(LPCWSTR left, LPCWSTR right);
+    int WINAPI BridgeLstrcmpiW(LPCWSTR left, LPCWSTR right);
+    BOOL WINAPI BridgeGetVersionExW(LPOSVERSIONINFOW versionInformation);
+    BOOL WINAPI BridgeWow64DisableWow64FsRedirection(PVOID* oldValue);
+    BOOL WINAPI BridgeWow64RevertWow64FsRedirection(PVOID oldValue);
+    void WINAPI BridgeFreeLibraryAndExitThread(HMODULE module, DWORD exitCode);
+    BOOL WINAPI BridgeIsWow64Process(HANDLE process, PBOOL wow64Process);
+    HLOCAL WINAPI BridgeLocalReAlloc(HLOCAL memory, SIZE_T bytes, UINT flags);
+    SIZE_T WINAPI BridgeLocalSize(HLOCAL memory);
+    LPVOID WINAPI BridgeLocalLock(HLOCAL memory);
+    BOOL WINAPI BridgeLocalUnlock(HLOCAL memory);
+    UINT WINAPI BridgeGetACP();
+    void WINAPI BridgeGetStartupInfoW(LPSTARTUPINFOW startupInfo);
+    DWORD WINAPI BridgeGetFullPathNameW(LPCWSTR fileName, DWORD bufferLength,
+        LPWSTR buffer, LPWSTR* filePart);
+    int WINAPI BridgeFoldStringW(DWORD flags, LPCWSTR source, int sourceCount,
+        LPWSTR destination, int destinationCount);
+    BOOL WINAPI BridgeHeapSetInformation(HANDLE heap, HEAP_INFORMATION_CLASS informationClass,
+        PVOID information, SIZE_T informationLength);
+    int WINAPI BridgeMulDiv(int number, int numerator, int denominator);
+    int WINAPI BridgeGetLocaleInfoW(LCID locale, LCTYPE type, LPWSTR data, int characterCount);
+    UINT WINAPI BridgeSetErrorMode(UINT mode);
     void WINAPI BridgeGetStartupInfoA(LPSTARTUPINFOA startupInfo);
     HANDLE WINAPI BridgeGetStdHandle(DWORD standardHandle);
     BOOL WINAPI BridgeGetConsoleMode(HANDLE console, LPDWORD mode);

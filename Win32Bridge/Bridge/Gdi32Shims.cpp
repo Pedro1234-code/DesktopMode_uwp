@@ -1184,6 +1184,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeBitBlt(
     return TRUE;
 }
 
+#include "Bridge/Gdi32CompatibilityShims.inl"
+
 ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& symbol)
 {
     ImportResolution resolution = CompatibilityCatalog::Resolve(symbol);
@@ -1244,6 +1246,18 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateCompatibleBitmap);
     else if (_wcsicmp(symbol.name.c_str(), L"bitblt") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBitBlt);
+    else if (_wcsicmp(symbol.name.c_str(), L"startpage") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStartPage);
+    else if (_wcsicmp(symbol.name.c_str(), L"startdocw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStartDocW);
+    else if (_wcsicmp(symbol.name.c_str(), L"setabortproc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetAbortProc);
+    else if (_wcsicmp(symbol.name.c_str(), L"enddoc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndDoc);
+    else if (_wcsicmp(symbol.name.c_str(), L"abortdoc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAbortDoc);
+    else if (_wcsicmp(symbol.name.c_str(), L"endpage") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndPage);
+    else if (_wcsicmp(symbol.name.c_str(), L"lptodp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLPtoDP);
+    else if (_wcsicmp(symbol.name.c_str(), L"setwindowextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowExtEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"setviewportextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetViewportExtEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"setmapmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetMapMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumfontsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumFontsW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createdcw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDCW);
 
     if (resolution.targetAddress != 0)
     {

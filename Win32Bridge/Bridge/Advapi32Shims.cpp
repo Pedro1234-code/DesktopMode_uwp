@@ -44,6 +44,72 @@ LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegCreateKeyExW(HKEY parent, LPCWSTR s
     return Registry()->CreateKey(parent, subKey, access, result, disposition, &error) ? ERROR_SUCCESS : Status(error);
 }
 
+LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegCreateKeyW(HKEY parent, LPCWSTR subKey, PHKEY result)
+{
+    return BridgeRegCreateKeyExW(parent, subKey, 0, nullptr, 0,
+        KEY_READ | KEY_WRITE, nullptr, result, nullptr);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeIsTextUnicode(
+    const void* buffer, int byteCount, LPINT tests)
+{
+    if (!buffer || byteCount < 0)
+    {
+        ::SetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (byteCount < static_cast<int>(sizeof(wchar_t))) return FALSE;
+    const BYTE* bytes = static_cast<const BYTE*>(buffer);
+    bool hasZeroHighByte = false;
+    bool hasUnicodeBom = byteCount >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe;
+    for (int index = 1; index < byteCount; index += 2)
+        hasZeroHighByte = hasZeroHighByte || bytes[index] == 0;
+    if (tests)
+    {
+        int result = 0;
+        if (hasUnicodeBom) result |= IS_TEXT_UNICODE_SIGNATURE;
+        if (hasZeroHighByte) result |= IS_TEXT_UNICODE_STATISTICS;
+        *tests &= result;
+    }
+    return hasUnicodeBom || hasZeroHighByte;
+}
+
+HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenSCManagerW(LPCWSTR, LPCWSTR, DWORD)
+{
+    ::SetLastError(ERROR_SUCCESS);
+    return reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0x76000001));
+}
+
+HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenServiceW(
+    HANDLE manager, LPCWSTR serviceName, DWORD)
+{
+    if (manager != reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0x76000001)) ||
+        !serviceName || !*serviceName)
+    {
+        ::SetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    // The sandbox has no host SCM services. Report absence rather than exposing
+    // or fabricating control over services outside the guest environment.
+    ::SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
+    return nullptr;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeCloseServiceHandle(HANDLE handle)
+{
+    if (!handle) { ::SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    ::SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeQueryServiceConfigW(
+    HANDLE, PVOID, DWORD, LPDWORD requiredSize)
+{
+    if (requiredSize) *requiredSize = 0;
+    ::SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
+    return FALSE;
+}
+
 LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegQueryValueExW(HKEY key, LPCWSTR name, LPDWORD, LPDWORD type, LPBYTE data, LPDWORD byteCount)
 {
     if (!Registry()) return Status(ERROR_INVALID_FUNCTION);
@@ -60,7 +126,8 @@ LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegSetValueExW(HKEY key, LPCWSTR name,
 
 LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegCloseKey(HKEY key)
 {
-    if (key == HKEY_CURRENT_USER || key == HKEY_LOCAL_MACHINE) return ERROR_SUCCESS;
+    if (key == HKEY_CURRENT_USER || key == HKEY_LOCAL_MACHINE || key == HKEY_USERS ||
+        key == HKEY_CLASSES_ROOT || key == HKEY_CURRENT_CONFIG) return ERROR_SUCCESS;
     if (!Registry()) return Status(ERROR_INVALID_FUNCTION);
     DWORD error = 0;
     return Registry()->CloseKey(key, &error) ? ERROR_SUCCESS : Status(error);
@@ -85,6 +152,34 @@ LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegEnumKeyExW(HKEY key, DWORD index, L
     if (!Registry()) return Status(ERROR_INVALID_FUNCTION);
     DWORD error = 0;
     return Registry()->EnumKey(key, index, name, characterCount, &error) ? ERROR_SUCCESS : Status(error);
+}
+
+LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegEnumValueW(HKEY key, DWORD index, LPWSTR name,
+    LPDWORD characterCount, LPDWORD, LPDWORD type, LPBYTE data, LPDWORD byteCount)
+{
+    if (!Registry()) return Status(ERROR_INVALID_FUNCTION);
+    DWORD error = 0;
+    return Registry()->EnumValue(key, index, name, characterCount, type, data, byteCount, &error)
+        ? ERROR_SUCCESS : Status(error);
+}
+
+LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegQueryInfoKeyW(HKEY key, LPWSTR, LPDWORD, LPDWORD,
+    LPDWORD subKeys, LPDWORD maximumSubKeyLength, LPDWORD, LPDWORD values,
+    LPDWORD maximumValueNameLength, LPDWORD maximumValueDataLength, LPDWORD,
+    PFILETIME lastWriteTime)
+{
+    if (!Registry()) return Status(ERROR_INVALID_FUNCTION);
+    DWORD error = 0;
+    return Registry()->QueryInfoKey(key, subKeys, maximumSubKeyLength, values,
+        maximumValueNameLength, maximumValueDataLength, lastWriteTime, &error)
+        ? ERROR_SUCCESS : Status(error);
+}
+
+LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegFlushKey(HKEY)
+{
+    if (!Registry()) return Status(ERROR_INVALID_FUNCTION);
+    DWORD error = 0;
+    return Registry()->Flush(&error) ? ERROR_SUCCESS : Status(error);
 }
 
 LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegOpenKeyExA(HKEY parent, LPCSTR subKey, DWORD options, REGSAM access, PHKEY result)
@@ -157,6 +252,65 @@ LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegDeleteKeyA(HKEY key, LPCSTR subKey)
 {
     std::wstring wide;
     return ToWide(subKey, &wide) ? BridgeRegDeleteKeyW(key, wide.c_str()) : Status(ERROR_INVALID_PARAMETER);
+}
+
+LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegEnumValueA(HKEY key, DWORD index, LPSTR name,
+    LPDWORD characterCount, LPDWORD reserved, LPDWORD type, LPBYTE data, LPDWORD byteCount)
+{
+    if (!characterCount) return Status(ERROR_INVALID_PARAMETER);
+    const DWORD suppliedNameCharacters = *characterCount;
+    const DWORD suppliedDataBytes = byteCount ? *byteCount : 0;
+    DWORD wideCharacters = 0;
+    DWORD registryType = 0;
+    DWORD wideDataBytes = 0;
+    LSTATUS status = BridgeRegEnumValueW(key, index, nullptr, &wideCharacters, reserved,
+        &registryType, nullptr, &wideDataBytes);
+    if (status != ERROR_MORE_DATA && status != ERROR_SUCCESS) return status;
+    std::vector<wchar_t> wideName(static_cast<size_t>(wideCharacters) + 1);
+    DWORD capacity = wideCharacters + 1;
+    std::vector<BYTE> wideData(IsTextRegistryType(registryType) ? wideDataBytes : 0);
+    DWORD readDataBytes = wideDataBytes;
+    status = BridgeRegEnumValueW(key, index, wideName.data(), &capacity, reserved,
+        &registryType, IsTextRegistryType(registryType) ? wideData.data() : data,
+        IsTextRegistryType(registryType) ? &readDataBytes : byteCount);
+    if (status != ERROR_SUCCESS) return status;
+    if (type) *type = registryType;
+    const int required = ::WideCharToMultiByte(CP_ACP, 0, wideName.data(), static_cast<int>(capacity),
+        nullptr, 0, nullptr, nullptr);
+    if (required < 0) return Status(ERROR_INVALID_DATA);
+    DWORD requiredDataBytes = wideDataBytes;
+    if (IsTextRegistryType(registryType))
+    {
+        requiredDataBytes = static_cast<DWORD>(::WideCharToMultiByte(CP_ACP, 0,
+            reinterpret_cast<LPCWCH>(wideData.data()), static_cast<int>(readDataBytes / sizeof(wchar_t)),
+            nullptr, 0, nullptr, nullptr));
+    }
+    if (byteCount) *byteCount = requiredDataBytes;
+    if (!name || suppliedNameCharacters <= static_cast<DWORD>(required) ||
+        (data && (!byteCount || suppliedDataBytes < requiredDataBytes)))
+    {
+        *characterCount = static_cast<DWORD>(required);
+        return Status(ERROR_MORE_DATA);
+    }
+    ::WideCharToMultiByte(CP_ACP, 0, wideName.data(), static_cast<int>(capacity),
+        name, static_cast<int>(suppliedNameCharacters), nullptr, nullptr);
+    name[required] = '\0';
+    if (data && IsTextRegistryType(registryType) && requiredDataBytes)
+        ::WideCharToMultiByte(CP_ACP, 0, reinterpret_cast<LPCWCH>(wideData.data()),
+            static_cast<int>(readDataBytes / sizeof(wchar_t)), reinterpret_cast<LPSTR>(data),
+            static_cast<int>(suppliedDataBytes), nullptr, nullptr);
+    *characterCount = static_cast<DWORD>(required);
+    return ERROR_SUCCESS;
+}
+
+LSTATUS WINAPI Win32Bridge::Bridge::BridgeRegQueryInfoKeyA(HKEY key, LPSTR, LPDWORD,
+    LPDWORD reserved, LPDWORD subKeys, LPDWORD maximumSubKeyLength, LPDWORD maximumClassLength,
+    LPDWORD values, LPDWORD maximumValueNameLength, LPDWORD maximumValueDataLength,
+    LPDWORD securityDescriptorLength, PFILETIME lastWriteTime)
+{
+    return BridgeRegQueryInfoKeyW(key, nullptr, nullptr, reserved, subKeys, maximumSubKeyLength,
+        maximumClassLength, values, maximumValueNameLength, maximumValueDataLength,
+        securityDescriptorLength, lastWriteTime);
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeLookupPrivilegeValueW(LPCWSTR, LPCWSTR name, PLUID value)
@@ -293,18 +447,24 @@ ImportResolution Win32Bridge::Bridge::ResolveAdvapi32Import(const ImportedSymbol
     if (symbol.importedByOrdinal || !IsAdvapiLibrary(symbol.library)) return resolution;
 
     if (_wcsicmp(symbol.name.c_str(), L"regopenkeyexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegOpenKeyExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"regcreatekeyw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegCreateKeyW);
     else if (_wcsicmp(symbol.name.c_str(), L"regcreatekeyexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegCreateKeyExW);
     else if (_wcsicmp(symbol.name.c_str(), L"regqueryvalueexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegQueryValueExW);
     else if (_wcsicmp(symbol.name.c_str(), L"regsetvalueexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegSetValueExW);
     else if (_wcsicmp(symbol.name.c_str(), L"regdeletevaluew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegDeleteValueW);
     else if (_wcsicmp(symbol.name.c_str(), L"regdeletekeyw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegDeleteKeyW);
     else if (_wcsicmp(symbol.name.c_str(), L"regenumkeyexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegEnumKeyExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"regenumvaluew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegEnumValueW);
+    else if (_wcsicmp(symbol.name.c_str(), L"regqueryinfokeyw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegQueryInfoKeyW);
+    else if (_wcsicmp(symbol.name.c_str(), L"regflushkey") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegFlushKey);
     else if (_wcsicmp(symbol.name.c_str(), L"regopenkeyexa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegOpenKeyExA);
     else if (_wcsicmp(symbol.name.c_str(), L"regcreatekeyexa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegCreateKeyExA);
     else if (_wcsicmp(symbol.name.c_str(), L"regqueryvalueexa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegQueryValueExA);
     else if (_wcsicmp(symbol.name.c_str(), L"regsetvalueexa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegSetValueExA);
     else if (_wcsicmp(symbol.name.c_str(), L"regdeletevaluea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegDeleteValueA);
     else if (_wcsicmp(symbol.name.c_str(), L"regdeletekeya") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegDeleteKeyA);
+    else if (_wcsicmp(symbol.name.c_str(), L"regenumvaluea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegEnumValueA);
+    else if (_wcsicmp(symbol.name.c_str(), L"regqueryinfokeya") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegQueryInfoKeyA);
     else if (_wcsicmp(symbol.name.c_str(), L"regclosekey") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegCloseKey);
     else if (_wcsicmp(symbol.name.c_str(), L"lookupprivilegevaluew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLookupPrivilegeValueW);
     else if (_wcsicmp(symbol.name.c_str(), L"openprocesstoken") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOpenProcessToken);
@@ -318,6 +478,11 @@ ImportResolution Win32Bridge::Bridge::ResolveAdvapi32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"lsaaddaccountrights") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLsaAddAccountRights);
     else if (_wcsicmp(symbol.name.c_str(), L"lsaclose") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLsaClose);
     else if (_wcsicmp(symbol.name.c_str(), L"systemfunction036") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSystemFunction036);
+    else if (_wcsicmp(symbol.name.c_str(), L"istextunicode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsTextUnicode);
+    else if (_wcsicmp(symbol.name.c_str(), L"openscmanagerw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOpenSCManagerW);
+    else if (_wcsicmp(symbol.name.c_str(), L"openservicew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOpenServiceW);
+    else if (_wcsicmp(symbol.name.c_str(), L"closeservicehandle") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCloseServiceHandle);
+    else if (_wcsicmp(symbol.name.c_str(), L"queryserviceconfigw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueryServiceConfigW);
 
     if (resolution.targetAddress) resolution.disposition = ImportDisposition::NeedsBridge;
     return resolution;

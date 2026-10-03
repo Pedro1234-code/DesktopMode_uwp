@@ -61,6 +61,11 @@ namespace Bridge
             LPVOID parameter,
             DWORD* win32Error);
         BOOL DestroyGuestWindow(HWND window, DWORD* win32Error);
+        HWND GetGuestForegroundWindow() const;
+        void DestroyGuestWindowsForProcess(
+            DWORD processId,
+            HWND restoreForeground,
+            HWND restoreFocus);
         BOOL ShowGuestWindow(HWND window, int command, DWORD* win32Error);
         BOOL SetGuestWindowMenuBar(HWND window, BOOL visible, DWORD* win32Error);
         UINT TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int y, HWND owner,
@@ -200,12 +205,15 @@ namespace Bridge
         static DWORD InvokePointerInput(GuestWindowManager* manager, Windows::UI::Core::PointerEventArgs^ args, UINT message);
         static DWORD InvokeWheelInput(GuestWindowManager* manager, Windows::UI::Core::PointerEventArgs^ args);
         static DWORD InvokeKeyInput(GuestWindowManager* manager, Windows::UI::Core::KeyEventArgs^ args, UINT message);
+        static DWORD InvokeCharacterInput(GuestWindowManager* manager, Windows::UI::Core::CharacterReceivedEventArgs^ args);
         static void InvokePointerInputThunk(void* context);
         static void InvokeWheelInputThunk(void* context);
         static void InvokeKeyInputThunk(void* context);
+        static void InvokeCharacterInputThunk(void* context);
         void HandlePointer(Windows::UI::Core::PointerEventArgs^ args, UINT message);
         void HandleWheel(Windows::UI::Core::PointerEventArgs^ args);
         void HandleKey(Windows::UI::Core::KeyEventArgs^ args, UINT message);
+        void HandleCharacter(Windows::UI::Core::CharacterReceivedEventArgs^ args);
         void HandleHostSizeChanged(int width, int height);
         void DetachHostEvents();
 
@@ -222,6 +230,7 @@ namespace Bridge
         Windows::Foundation::EventRegistrationToken m_pointerWheelToken{};
         Windows::Foundation::EventRegistrationToken m_keyDownToken{};
         Windows::Foundation::EventRegistrationToken m_keyUpToken{};
+        Windows::Foundation::EventRegistrationToken m_characterReceivedToken{};
         Windows::Foundation::EventRegistrationToken m_sizeChangedToken{};
         Windows::Foundation::EventRegistrationToken m_surfaceSizeChangedToken{};
         std::atomic<int> m_viewportWidth{ 800 };
@@ -247,6 +256,12 @@ namespace Bridge
 
         GuestMessageQueue m_messages;
         MiniGdi::GdiContext m_gdi;
+        // GetDC(NULL) is a real screen DC in Win32 and is commonly requested
+        // before the first HWND exists for font and device-capability probes.
+        // Keep one bridge-owned surface/DC for that process-wide role.
+        std::mutex m_screenDcLock;
+        MiniGdi::Surface m_screenSurface;
+        MiniGdi::DcHandle m_screenDc = MiniGdi::InvalidDc;
     };
 
     GuestWindowManager* CurrentGuestWindowManager();

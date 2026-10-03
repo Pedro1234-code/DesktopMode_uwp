@@ -38,6 +38,8 @@ namespace Bridge
     HWND WINAPI BridgeCreateStatusWindowW(LONG style, LPCWSTR text, HWND parent, UINT identifier);
     INT_PTR WINAPI BridgePropertySheetW(const void* header);
     HRESULT WINAPI BridgeDllGetVersion(GuestDllVersionInfo* versionInfo);
+    HANDLE WINAPI BridgeCreatePropertySheetPageW(const void* page);
+    ULONG_PTR WINAPI BridgeCommonControlOrdinal345();
     ImportResolution ResolveCommonControlsImport(const ImportedSymbol& symbol);
 }
 }

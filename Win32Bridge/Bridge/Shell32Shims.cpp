@@ -9,6 +9,7 @@
 #include "Bridge/PeMapper.h"
 #include "Bridge/RuntimeDiagnostics.h"
 #include "Bridge/User32Shims.h"
+#include "Bridge/Win32Shims.h"
 
 #include <algorithm>
 #include <atomic>
@@ -1399,6 +1400,34 @@ HINSTANCE WINAPI Win32Bridge::Bridge::BridgeShellExecuteW(HWND, LPCWSTR, LPCWSTR
     return reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(5)); // SE_ERR_ACCESSDENIED
 }
 
+HRESULT WINAPI Win32Bridge::Bridge::BridgeSHGetFolderPathW(
+    HWND, int folder, HANDLE, DWORD, LPWSTR path)
+{
+    if (!path) return E_INVALIDARG;
+    const wchar_t* value = folder == 5 ? L"C:\\Users\\Default\\Documents" :
+        folder == 26 ? L"C:\\Users\\Default\\AppData\\Roaming" :
+        L"C:\\Users\\Default";
+    wcscpy_s(path, MAX_PATH, value);
+    return S_OK;
+}
+void WINAPI Win32Bridge::Bridge::BridgeDragAcceptFiles(HWND, BOOL) { }
+void WINAPI Win32Bridge::Bridge::BridgeDragFinish(HANDLE) { }
+void WINAPI Win32Bridge::Bridge::BridgeSHAddToRecentDocs(UINT, LPCVOID) { }
+HRESULT WINAPI Win32Bridge::Bridge::BridgeSHCreateItemFromParsingName(
+    PCWSTR, PVOID, REFIID, void** result)
+{
+    if (result) *result = nullptr;
+    return E_NOTIMPL;
+}
+int WINAPI Win32Bridge::Bridge::BridgeShellAboutW(HWND owner, LPCWSTR title, LPCWSTR text, HICON icon)
+{
+    return ShowGuestShellAbout(owner, title, text, icon);
+}
+UINT WINAPI Win32Bridge::Bridge::BridgeDragQueryFileW(HANDLE, UINT file, LPWSTR, UINT)
+{
+    return file == 0xffffffffu ? 0 : 0;
+}
+
 Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveShell32Import(const ImportedSymbol& symbol)
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
@@ -1427,6 +1456,13 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveShell32Import(
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShellExecuteExW);
     else if (_wcsicmp(symbol.name.c_str(), L"shellexecutew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShellExecuteW);
+    else if (_wcsicmp(symbol.name.c_str(), L"shgetfolderpathw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHGetFolderPathW);
+    else if (_wcsicmp(symbol.name.c_str(), L"dragacceptfiles") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDragAcceptFiles);
+    else if (_wcsicmp(symbol.name.c_str(), L"dragfinish") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDragFinish);
+    else if (_wcsicmp(symbol.name.c_str(), L"shaddtorecentdocs") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHAddToRecentDocs);
+    else if (_wcsicmp(symbol.name.c_str(), L"shcreateitemfromparsingname") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHCreateItemFromParsingName);
+    else if (_wcsicmp(symbol.name.c_str(), L"shellaboutw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShellAboutW);
+    else if (_wcsicmp(symbol.name.c_str(), L"dragqueryfilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDragQueryFileW);
     if (resolution.targetAddress)
     {
         resolution.disposition = ImportDisposition::NeedsBridge;

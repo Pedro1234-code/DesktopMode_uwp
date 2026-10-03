@@ -13,9 +13,54 @@ namespace
 
     thread_local const BYTE* g_guestImageBase = nullptr;
     thread_local size_t g_guestImageSize = 0;
+    thread_local const BYTE* g_guestResourceSatelliteBase = nullptr;
+    thread_local size_t g_guestResourceSatelliteSize = 0;
 
     constexpr ULONG_PTR GuestMainModuleToken = 0x10000;
     constexpr size_t MaximumResourceEntries = 1024u * 1024u;
+
+    bool IsMainResourceModule(HMODULE module)
+    {
+        return !module ||
+            module == reinterpret_cast<HMODULE>(GuestMainModuleToken) ||
+            reinterpret_cast<const BYTE*>(module) == g_guestImageBase;
+    }
+
+    class SatelliteResourceImageScope final
+    {
+    public:
+        SatelliteResourceImageScope()
+            : m_primaryBase(g_guestImageBase),
+              m_primarySize(g_guestImageSize),
+              m_satelliteBase(g_guestResourceSatelliteBase),
+              m_satelliteSize(g_guestResourceSatelliteSize)
+        {
+            g_guestImageBase = m_satelliteBase;
+            g_guestImageSize = m_satelliteSize;
+            g_guestResourceSatelliteBase = nullptr;
+            g_guestResourceSatelliteSize = 0;
+        }
+
+        ~SatelliteResourceImageScope()
+        {
+            g_guestImageBase = m_primaryBase;
+            g_guestImageSize = m_primarySize;
+            g_guestResourceSatelliteBase = m_satelliteBase;
+            g_guestResourceSatelliteSize = m_satelliteSize;
+        }
+
+    private:
+        const BYTE* m_primaryBase;
+        size_t m_primarySize;
+        const BYTE* m_satelliteBase;
+        size_t m_satelliteSize;
+    };
+
+    bool CanTryResourceSatellite(HMODULE module)
+    {
+        return IsMainResourceModule(module) &&
+            g_guestResourceSatelliteBase && g_guestResourceSatelliteSize != 0;
+    }
 
     struct ImageView final
     {
@@ -354,6 +399,46 @@ namespace
             right.text.data(), static_cast<int>(right.text.size()), TRUE) == CSTR_EQUAL;
     }
 
+    void AppendUniqueIdentifiers(
+        const std::vector<GuestResourceIdentifier>& source,
+        std::vector<GuestResourceIdentifier>* destination)
+    {
+        if (!destination) return;
+        for (const auto& candidate : source)
+        {
+            bool present = false;
+            for (const auto& existing : *destination)
+            {
+                if (IdentifierEquals(existing, candidate))
+                {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) destination->push_back(candidate);
+        }
+    }
+
+    void AppendUniqueLanguages(
+        const std::vector<LANGID>& source,
+        std::vector<LANGID>* destination)
+    {
+        if (!destination) return;
+        for (LANGID candidate : source)
+        {
+            bool present = false;
+            for (LANGID existing : *destination)
+            {
+                if (existing == candidate)
+                {
+                    present = true;
+                    break;
+                }
+            }
+            if (!present) destination->push_back(candidate);
+        }
+    }
+
     const IMAGE_RESOURCE_DIRECTORY_ENTRY* FindEntry(
         const ResourceView& resources,
         const DirectoryView& directory,
@@ -487,63 +572,55 @@ GuestResourceStatus Win32Bridge::Bridge::FindGuestResource(
     {
         return GuestResourceStatus::InvalidParameter;
     }
-    *resource = GuestResourceData{};
-
-    ResourceView resources;
-    GuestResourceIdentifier type;
-    GuestResourceIdentifier name;
-    DirectoryView languages;
-    GuestResourceStatus status = OpenNamedResource(
-        module, typePointer, namePointer, &resources, &type, &name, &languages);
-    if (status != GuestResourceStatus::Success)
+    const auto findInCurrentImage = [&](HMODULE currentModule) -> GuestResourceStatus
     {
+        *resource = GuestResourceData{};
+        ResourceView resources;
+        GuestResourceIdentifier type;
+        GuestResourceIdentifier name;
+        DirectoryView languages;
+        GuestResourceStatus status = OpenNamedResource(
+            currentModule, typePointer, namePointer, &resources, &type, &name, &languages);
+        if (status != GuestResourceStatus::Success) return status;
+        if (languages.count == 0) return GuestResourceStatus::LanguageNotFound;
+
+        const IMAGE_RESOURCE_DIRECTORY_ENTRY* selected = nullptr;
+        LANGID selectedLanguage = 0;
+        for (size_t index = 0; index < languages.count; ++index)
+        {
+            const IMAGE_RESOURCE_DIRECTORY_ENTRY& candidate = languages.entries[index];
+            if (candidate.NameIsString) continue;
+            if (!requireExactLanguage || candidate.Id == requestedLanguage)
+            {
+                selected = &candidate;
+                selectedLanguage = candidate.Id;
+                break;
+            }
+        }
+        if (!selected) return GuestResourceStatus::LanguageNotFound;
+        if (selected->DataIsDirectory) return GuestResourceStatus::InvalidData;
+
+        const IMAGE_RESOURCE_DATA_ENTRY* dataEntry =
+            resources.At<IMAGE_RESOURCE_DATA_ENTRY>(selected->OffsetToData);
+        if (!dataEntry || !resources.image.Contains(dataEntry->OffsetToData, dataEntry->Size))
+            return GuestResourceStatus::InvalidData;
+
+        resource->module = resources.image.module;
+        resource->type = std::move(type);
+        resource->name = std::move(name);
+        resource->language = selectedLanguage;
+        resource->codePage = dataEntry->CodePage;
+        resource->data = resources.image.base + dataEntry->OffsetToData;
+        resource->size = dataEntry->Size;
+        return GuestResourceStatus::Success;
+    };
+
+    GuestResourceStatus status = findInCurrentImage(module);
+    if (status == GuestResourceStatus::Success || !CanTryResourceSatellite(module))
         return status;
-    }
-    if (languages.count == 0)
-    {
-        return GuestResourceStatus::LanguageNotFound;
-    }
 
-    const IMAGE_RESOURCE_DIRECTORY_ENTRY* selected = nullptr;
-    LANGID selectedLanguage = 0;
-    for (size_t index = 0; index < languages.count; ++index)
-    {
-        const IMAGE_RESOURCE_DIRECTORY_ENTRY& candidate = languages.entries[index];
-        if (candidate.NameIsString)
-        {
-            continue;
-        }
-        if (!requireExactLanguage || candidate.Id == requestedLanguage)
-        {
-            selected = &candidate;
-            selectedLanguage = candidate.Id;
-            break;
-        }
-    }
-    if (!selected)
-    {
-        return GuestResourceStatus::LanguageNotFound;
-    }
-    if (selected->DataIsDirectory)
-    {
-        return GuestResourceStatus::InvalidData;
-    }
-
-    const IMAGE_RESOURCE_DATA_ENTRY* dataEntry =
-        resources.At<IMAGE_RESOURCE_DATA_ENTRY>(selected->OffsetToData);
-    if (!dataEntry || !resources.image.Contains(dataEntry->OffsetToData, dataEntry->Size))
-    {
-        return GuestResourceStatus::InvalidData;
-    }
-
-    resource->module = resources.image.module;
-    resource->type = std::move(type);
-    resource->name = std::move(name);
-    resource->language = selectedLanguage;
-    resource->codePage = dataEntry->CodePage;
-    resource->data = resources.image.base + dataEntry->OffsetToData;
-    resource->size = dataEntry->Size;
-    return GuestResourceStatus::Success;
+    SatelliteResourceImageScope satellite;
+    return findInCurrentImage(nullptr);
 }
 
 GuestResourceStatus Win32Bridge::Bridge::CopyGuestFileResource(
@@ -598,19 +675,37 @@ GuestResourceStatus Win32Bridge::Bridge::EnumerateGuestResourceTypes(
     {
         return GuestResourceStatus::InvalidParameter;
     }
-    types->clear();
-    ResourceView resources;
-    GuestResourceStatus status = OpenResources(module, &resources);
-    if (status != GuestResourceStatus::Success)
+    const auto enumerateCurrentImage = [types](HMODULE currentModule)
+        -> GuestResourceStatus
     {
-        return status;
-    }
-    DirectoryView root;
-    if (!OpenDirectory(resources, 0, &root))
+        types->clear();
+        ResourceView resources;
+        GuestResourceStatus status = OpenResources(currentModule, &resources);
+        if (status != GuestResourceStatus::Success) return status;
+        DirectoryView root;
+        if (!OpenDirectory(resources, 0, &root)) return GuestResourceStatus::InvalidData;
+        return EnumerateDirectoryIdentifiers(resources, root, types);
+    };
+
+    GuestResourceStatus primaryStatus = enumerateCurrentImage(module);
+    if (!CanTryResourceSatellite(module)) return primaryStatus;
+
+    std::vector<GuestResourceIdentifier> primary;
+    if (primaryStatus == GuestResourceStatus::Success) primary = *types;
+    GuestResourceStatus satelliteStatus = GuestResourceStatus::ModuleNotFound;
     {
-        return GuestResourceStatus::InvalidData;
+        SatelliteResourceImageScope satellite;
+        satelliteStatus = enumerateCurrentImage(nullptr);
     }
-    return EnumerateDirectoryIdentifiers(resources, root, types);
+    if (satelliteStatus == GuestResourceStatus::Success)
+    {
+        std::vector<GuestResourceIdentifier> satellite = std::move(*types);
+        *types = std::move(primary);
+        AppendUniqueIdentifiers(satellite, types);
+        return GuestResourceStatus::Success;
+    }
+    *types = std::move(primary);
+    return primaryStatus;
 }
 
 GuestResourceStatus Win32Bridge::Bridge::EnumerateGuestResourceNames(
@@ -622,34 +717,45 @@ GuestResourceStatus Win32Bridge::Bridge::EnumerateGuestResourceNames(
     {
         return GuestResourceStatus::InvalidParameter;
     }
-    names->clear();
-    GuestResourceIdentifier type;
-    if (!MakeIdentifier(typePointer, &type))
+    const auto enumerateCurrentImage = [typePointer, names](HMODULE currentModule)
+        -> GuestResourceStatus
     {
-        return GuestResourceStatus::InvalidParameter;
-    }
-    ResourceView resources;
-    GuestResourceStatus status = OpenResources(module, &resources);
-    if (status != GuestResourceStatus::Success)
+        names->clear();
+        GuestResourceIdentifier type;
+        if (!MakeIdentifier(typePointer, &type)) return GuestResourceStatus::InvalidParameter;
+        ResourceView resources;
+        GuestResourceStatus status = OpenResources(currentModule, &resources);
+        if (status != GuestResourceStatus::Success) return status;
+        DirectoryView root;
+        if (!OpenDirectory(resources, 0, &root)) return GuestResourceStatus::InvalidData;
+        const IMAGE_RESOURCE_DIRECTORY_ENTRY* typeEntry =
+            FindEntry(resources, root, type, nullptr);
+        if (!typeEntry) return GuestResourceStatus::TypeNotFound;
+        DirectoryView nameDirectory;
+        if (!OpenChildDirectory(resources, typeEntry, &nameDirectory))
+            return GuestResourceStatus::InvalidData;
+        return EnumerateDirectoryIdentifiers(resources, nameDirectory, names);
+    };
+
+    GuestResourceStatus primaryStatus = enumerateCurrentImage(module);
+    if (!CanTryResourceSatellite(module)) return primaryStatus;
+
+    std::vector<GuestResourceIdentifier> primary;
+    if (primaryStatus == GuestResourceStatus::Success) primary = *names;
+    GuestResourceStatus satelliteStatus = GuestResourceStatus::ModuleNotFound;
     {
-        return status;
+        SatelliteResourceImageScope satellite;
+        satelliteStatus = enumerateCurrentImage(nullptr);
     }
-    DirectoryView root;
-    if (!OpenDirectory(resources, 0, &root))
+    if (satelliteStatus == GuestResourceStatus::Success)
     {
-        return GuestResourceStatus::InvalidData;
+        std::vector<GuestResourceIdentifier> satellite = std::move(*names);
+        *names = std::move(primary);
+        AppendUniqueIdentifiers(satellite, names);
+        return GuestResourceStatus::Success;
     }
-    const IMAGE_RESOURCE_DIRECTORY_ENTRY* typeEntry = FindEntry(resources, root, type, nullptr);
-    if (!typeEntry)
-    {
-        return GuestResourceStatus::TypeNotFound;
-    }
-    DirectoryView nameDirectory;
-    if (!OpenChildDirectory(resources, typeEntry, &nameDirectory))
-    {
-        return GuestResourceStatus::InvalidData;
-    }
-    return EnumerateDirectoryIdentifiers(resources, nameDirectory, names);
+    *names = std::move(primary);
+    return primaryStatus;
 }
 
 GuestResourceStatus Win32Bridge::Bridge::EnumerateGuestResourceLanguages(
@@ -662,42 +768,72 @@ GuestResourceStatus Win32Bridge::Bridge::EnumerateGuestResourceLanguages(
     {
         return GuestResourceStatus::InvalidParameter;
     }
-    languagesOutput->clear();
-    ResourceView resources;
-    GuestResourceIdentifier type;
-    GuestResourceIdentifier name;
-    DirectoryView languages;
-    GuestResourceStatus status = OpenNamedResource(
-        module, typePointer, namePointer, &resources, &type, &name, &languages);
-    if (status != GuestResourceStatus::Success)
+    const auto enumerateCurrentImage = [typePointer, namePointer, languagesOutput](
+        HMODULE currentModule) -> GuestResourceStatus
     {
-        return status;
-    }
-    languagesOutput->reserve(languages.count);
-    for (size_t index = 0; index < languages.count; ++index)
-    {
-        const IMAGE_RESOURCE_DIRECTORY_ENTRY& entry = languages.entries[index];
-        if (entry.NameIsString || entry.DataIsDirectory)
+        languagesOutput->clear();
+        ResourceView resources;
+        GuestResourceIdentifier type;
+        GuestResourceIdentifier name;
+        DirectoryView languages;
+        GuestResourceStatus status = OpenNamedResource(
+            currentModule, typePointer, namePointer, &resources, &type, &name, &languages);
+        if (status != GuestResourceStatus::Success) return status;
+        languagesOutput->reserve(languages.count);
+        for (size_t index = 0; index < languages.count; ++index)
         {
-            languagesOutput->clear();
-            return GuestResourceStatus::InvalidData;
+            const IMAGE_RESOURCE_DIRECTORY_ENTRY& entry = languages.entries[index];
+            if (entry.NameIsString || entry.DataIsDirectory)
+            {
+                languagesOutput->clear();
+                return GuestResourceStatus::InvalidData;
+            }
+            languagesOutput->push_back(entry.Id);
         }
-        languagesOutput->push_back(entry.Id);
+        return GuestResourceStatus::Success;
+    };
+
+    GuestResourceStatus primaryStatus = enumerateCurrentImage(module);
+    if (!CanTryResourceSatellite(module)) return primaryStatus;
+
+    std::vector<LANGID> primary;
+    if (primaryStatus == GuestResourceStatus::Success) primary = *languagesOutput;
+    GuestResourceStatus satelliteStatus = GuestResourceStatus::ModuleNotFound;
+    {
+        SatelliteResourceImageScope satellite;
+        satelliteStatus = enumerateCurrentImage(nullptr);
     }
-    return GuestResourceStatus::Success;
+    if (satelliteStatus == GuestResourceStatus::Success)
+    {
+        std::vector<LANGID> satellite = std::move(*languagesOutput);
+        *languagesOutput = std::move(primary);
+        AppendUniqueLanguages(satellite, languagesOutput);
+        return GuestResourceStatus::Success;
+    }
+    *languagesOutput = std::move(primary);
+    return primaryStatus;
 }
 
 Win32Bridge::Bridge::GuestResourceScope::GuestResourceScope(
     const BYTE* imageBase,
-    size_t imageSize)
-    : m_previousBase(g_guestImageBase), m_previousSize(g_guestImageSize)
+    size_t imageSize,
+    const BYTE* satelliteBase,
+    size_t satelliteSize)
+    : m_previousBase(g_guestImageBase),
+      m_previousSize(g_guestImageSize),
+      m_previousSatelliteBase(g_guestResourceSatelliteBase),
+      m_previousSatelliteSize(g_guestResourceSatelliteSize)
 {
     g_guestImageBase = imageBase;
     g_guestImageSize = imageSize;
+    g_guestResourceSatelliteBase = satelliteBase;
+    g_guestResourceSatelliteSize = satelliteSize;
 }
 
 Win32Bridge::Bridge::GuestResourceScope::~GuestResourceScope()
 {
     g_guestImageBase = m_previousBase;
     g_guestImageSize = m_previousSize;
+    g_guestResourceSatelliteBase = m_previousSatelliteBase;
+    g_guestResourceSatelliteSize = m_previousSatelliteSize;
 }
