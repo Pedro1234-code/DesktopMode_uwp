@@ -47,7 +47,7 @@ Join our server: https://discord.gg/dEKYCqFXt
 
 ## Building
 
-1. Install Visual Studio 2022 with the **Universal Windows Platform development** workload.
+1. Install Visual Studio 2022 with the **Universal Windows Platform development** and the latest C++ workload.
 2. Install Windows 10 SDK `10.0.19041` or a compatible version.
 3. Open [`factoryos-10x-shell.sln`](factoryos-10x-shell.sln).
 4. Build and launch the application from Visual Studio.
