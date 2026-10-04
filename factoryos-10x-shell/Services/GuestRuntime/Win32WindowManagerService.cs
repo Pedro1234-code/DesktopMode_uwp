@@ -15,6 +15,7 @@ namespace factoryos_10x_shell.Services.Win32
         private double m_workspaceWidth;
         private double m_workspaceHeight;
         private bool m_inputSuppressed;
+        private bool m_changingWindowState;
 
         private Win32WindowManagerService() { }
 
@@ -65,15 +66,19 @@ namespace factoryos_10x_shell.Services.Win32
         public void Activate(Win32WindowModel window)
         {
             if (window == null || !Windows.Contains(window)) return;
+            m_changingWindowState = true;
             foreach (Win32WindowModel item in Windows) item.IsActive = item == window;
             window.Visibility = Visibility.Visible;
             window.ZIndex = ++m_nextZIndex;
+            m_changingWindowState = false;
             WindowsChanged?.Invoke(this, EventArgs.Empty);
         }
 
         public void DeactivateAll()
         {
+            m_changingWindowState = true;
             foreach (Win32WindowModel item in Windows) item.IsActive = false;
+            m_changingWindowState = false;
             WindowsChanged?.Invoke(this, EventArgs.Empty);
         }
 
@@ -90,13 +95,15 @@ namespace factoryos_10x_shell.Services.Win32
 
         public void Minimize(Win32WindowModel window)
         {
-            if (window == null) return;
+            if (window == null || !Windows.Contains(window)) return;
+            m_changingWindowState = true;
             window.IsActive = false;
             window.Visibility = Visibility.Collapsed;
             Win32WindowModel next = Windows.Where(item => item != window && item.Visibility == Visibility.Visible)
                 .OrderByDescending(item => item.ZIndex).FirstOrDefault();
-            if (next != null) Activate(next);
-            else WindowsChanged?.Invoke(this, EventArgs.Empty);
+            if (next != null) ActivateCore(next);
+            m_changingWindowState = false;
+            WindowsChanged?.Invoke(this, EventArgs.Empty);
             DesktopFocusRequested?.Invoke(this, EventArgs.Empty);
         }
 
@@ -130,12 +137,14 @@ namespace factoryos_10x_shell.Services.Win32
         public void Close(Win32WindowModel window)
         {
             if (window == null || !Windows.Contains(window)) return;
+            m_changingWindowState = true;
             window.PropertyChanged -= Window_PropertyChanged;
             Windows.Remove(window);
             Win32WindowModel next = Windows.Where(item => item.Visibility == Visibility.Visible)
                 .OrderByDescending(item => item.ZIndex).FirstOrDefault();
-            if (next != null) Activate(next);
-            else WindowsChanged?.Invoke(this, EventArgs.Empty);
+            if (next != null) ActivateCore(next);
+            m_changingWindowState = false;
+            WindowsChanged?.Invoke(this, EventArgs.Empty);
             DesktopFocusRequested?.Invoke(this, EventArgs.Empty);
         }
 
@@ -159,11 +168,19 @@ namespace factoryos_10x_shell.Services.Win32
 
         private void Window_PropertyChanged(object sender, PropertyChangedEventArgs e)
         {
-            if (e.PropertyName == nameof(Win32WindowModel.IsActive) ||
+            if (!m_changingWindowState &&
+                (e.PropertyName == nameof(Win32WindowModel.IsActive) ||
                 e.PropertyName == nameof(Win32WindowModel.Visibility) ||
                 e.PropertyName == nameof(Win32WindowModel.Status) ||
-                e.PropertyName == nameof(Win32WindowModel.IconSource))
+                e.PropertyName == nameof(Win32WindowModel.IconSource)))
                 WindowsChanged?.Invoke(this, EventArgs.Empty);
+        }
+
+        private void ActivateCore(Win32WindowModel window)
+        {
+            foreach (Win32WindowModel item in Windows) item.IsActive = item == window;
+            window.Visibility = Visibility.Visible;
+            window.ZIndex = ++m_nextZIndex;
         }
     }
 }

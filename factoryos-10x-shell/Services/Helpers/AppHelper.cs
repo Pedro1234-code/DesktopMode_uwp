@@ -176,13 +176,14 @@ namespace factoryos_10x_shell.Services.Helpers
                 // no AppListEntry to recover, so restore its pin directly.
                 if (string.Equals(appId, "CoreShell.Files", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase))
+                    string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase))
                 {
                     loaded.Add(new StartIconModel
                     {
                         AppId = appId,
                         IconName = string.IsNullOrWhiteSpace(iconName)
-                            ? (string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ? "Notepad" : string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ? "Settings" : "Files")
+                            ? (string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ? "Notepad" : string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ? "Settings" : string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ? "Calculator" : "Files")
                             : iconName
                     });
                     continue;

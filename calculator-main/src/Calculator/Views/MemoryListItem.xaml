@@ -1,0 +1,98 @@
+<UserControl x:Class="CalculatorApp.MemoryListItem"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
+             xmlns:utils="using:CalculatorApp.Utils"
+             FlowDirection="LeftToRight"
+             mc:Ignorable="d">
+    <UserControl.Resources>
+        <muxc:FontIconSource x:Key="MemClearGlyph"
+                             FontFamily="{StaticResource CalculatorFontFamily}"
+                             Glyph="&#xf754;"/>
+        <muxc:FontIconSource x:Key="MemPlusGlyph"
+                             FontFamily="{StaticResource CalculatorFontFamily}"
+                             Glyph="&#xf757;"/>
+        <muxc:FontIconSource x:Key="MemMinusGlyph"
+                             FontFamily="{StaticResource CalculatorFontFamily}"
+                             Glyph="&#xf758;"/>
+
+        <muxc:SwipeItems x:Key="MemorySwipeItems" Mode="Reveal">
+            <muxc:SwipeItem Background="{ThemeResource SystemControlBackgroundAccentBrush}"
+                            AutomationProperties.Name="{utils:ResourceString Name=ClearMemorySwipeItem/[using:Windows.UI.Xaml.Automation]AutomationProperties/Name}"
+                            IconSource="{StaticResource MemClearGlyph}"
+                            Invoked="OnClearSwipeInvoked"/>
+            <muxc:SwipeItem Background="{ThemeResource SystemControlBackgroundAccentBrush}"
+                            AutomationProperties.Name="{utils:ResourceString Name=MemPlusSwipeItem/[using:Windows.UI.Xaml.Automation]AutomationProperties/Name}"
+                            IconSource="{StaticResource MemPlusGlyph}"
+                            Invoked="OnMemoryAddSwipeInvoked"/>
+            <muxc:SwipeItem Background="{ThemeResource SystemControlBackgroundAccentBrush}"
+                            AutomationProperties.Name="{utils:ResourceString Name=MemMinusSwipeItem/[using:Windows.UI.Xaml.Automation]AutomationProperties/Name}"
+                            IconSource="{StaticResource MemMinusGlyph}"
+                            Invoked="OnMemorySubtractSwipeInvoked"/>
+        </muxc:SwipeItems>
+    </UserControl.Resources>
+
+    <muxc:SwipeControl RightItems="{StaticResource MemorySwipeItems}">
+        <VisualStateManager.VisualStateGroups>
+            <VisualStateGroup x:Name="HoverStates">
+                <VisualState x:Name="MemoryButtonsVisible">
+                    <VisualState.Setters>
+                        <Setter Target="MemoryHoverButtons.Opacity" Value="1"/>
+                    </VisualState.Setters>
+                </VisualState>
+                <VisualState x:Name="MemoryButtonsHidden"/>
+            </VisualStateGroup>
+        </VisualStateManager.VisualStateGroups>
+        <Grid Background="Transparent">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <TextBlock Margin="0,4,20,0"
+                       HorizontalAlignment="Right"
+                       Style="{ThemeResource SubtitleTextBlockStyle}"
+                       AutomationProperties.AccessibilityView="Raw"
+                       AutomationProperties.AutomationId="MemoryItemValue"
+                       FlowDirection="LeftToRight"
+                       IsTextSelectionEnabled="True"
+                       Text="{x:Bind ViewModel.Value, Mode=OneWay}"
+                       TextAlignment="Right"
+                       TextReadingOrder="DetectFromContent"
+                       TextWrapping="Wrap"/>
+            <Grid x:Name="MemoryHoverButtons"
+                  Grid.Row="1"
+                  Margin="0,0,16,4"
+                  HorizontalAlignment="Right"
+                  Opacity="0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="Auto"/>
+                </Grid.ColumnDefinitions>
+                <Button Style="{StaticResource MemoryHoverButtonStyle}"
+                        AutomationProperties.AutomationId="MClearButton"
+                        AutomationProperties.Name="{utils:ResourceString Name=ClearMemoryItemButton/[using:Windows.UI.Xaml.Automation]AutomationProperties/Name}"
+                        Click="OnClearButtonClicked"
+                        Content="MC"
+                        ToolTipService.ToolTip="{utils:ResourceString Name=ClearMemoryItemButton/[using:Windows.UI.Xaml.Controls]ToolTipService/ToolTip}"/>
+                <Button Grid.Column="1"
+                        Margin="1,0"
+                        Style="{StaticResource MemoryHoverButtonStyle}"
+                        AutomationProperties.AutomationId="MAddButton"
+                        AutomationProperties.Name="{utils:ResourceString Name=MemPlusItem/[using:Windows.UI.Xaml.Automation]AutomationProperties/Name}"
+                        Click="OnMemoryAddButtonClicked"
+                        Content="M+"
+                        ToolTipService.ToolTip="{utils:ResourceString Name=MemPlusItem/[using:Windows.UI.Xaml.Controls]ToolTipService/ToolTip}"/>
+                <Button Grid.Column="2"
+                        Style="{StaticResource MemoryHoverButtonStyle}"
+                        AutomationProperties.AutomationId="MSubButton"
+                        AutomationProperties.Name="{utils:ResourceString Name=MemMinusItem/[using:Windows.UI.Xaml.Automation]AutomationProperties/Name}"
+                        Click="OnMemorySubtractButtonClicked"
+                        Content="M-"
+                        ToolTipService.ToolTip="{utils:ResourceString Name=MemMinusItem/[using:Windows.UI.Xaml.Controls]ToolTipService/ToolTip}"/>
+            </Grid>
+        </Grid>
+    </muxc:SwipeControl>
+</UserControl>

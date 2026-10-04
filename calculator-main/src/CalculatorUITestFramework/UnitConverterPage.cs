@@ -1,0 +1,102 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+using OpenQA.Selenium.Appium.Windows;
+
+namespace CalculatorUITestFramework
+{
+    public class UnitConverterPage
+    {
+        public UnitConverterOperatorsPanel UnitConverterOperators = new UnitConverterOperatorsPanel();
+        public NavigationMenu NavigationMenu = new NavigationMenu();
+        public UnitConverterResults UnitConverterResults = new UnitConverterResults();
+
+        private WindowsDriver<WindowsElement> session => CalculatorDriver.Instance.CalculatorSession;
+
+        /// <summary>
+        /// Clear the Calculator display
+        /// </summary>
+        public void ClearAll()
+        {
+            UnitConverterOperators.ClearButton.Click();
+        }
+
+        ///// <summary>
+        ///// Ensures that the calculator result text is zero; if not, clears all
+        ///// </summary>
+        public void EnsureCalculatorResultTextIsZero()
+        {
+            if ("0" != UnitConverterResults.GetCalculationResult1Text())
+            {
+                ClearAll();
+            }
+        }
+
+        /// <summary>
+        /// Navigates the calculator is in currency mode
+        /// </summary>
+        public void NavigateToUnitConverter()
+        {
+            // Ensure that calculator is in Currency Mode
+            NavigationMenu.ChangeCalculatorMode(CalculatorMode.Currency);
+            UnitConverterResults.IsResultsDisplayPresent();
+        }
+
+        ///// <summary>
+        ///// Ensures that the calculator is in Currency Mode
+        ///// </summary>
+        public void EnsureCalculatorIsCurrencyMode()
+        {
+            string source = CalculatorDriver.Instance.CalculatorSession.PageSource;
+            if (source.Contains("Header"))
+            {
+                string header = CalculatorApp.Header.Text;
+                if (header == "Currency")
+                {
+                    return;
+                }
+                else
+                {
+                    NavigateToUnitConverter();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Ensure Units1 and Units2 are the same 
+        /// </summary>
+        public void EnsureSameUnitsAreSelected()
+        {
+            CalculatorApp.ClickOnWindow();
+            UnitConverterOperators.Units1.SendKeys(OpenQA.Selenium.Keys.Home);
+
+            CalculatorApp.ClickOnWindow();
+            UnitConverterOperators.Units2.SendKeys(OpenQA.Selenium.Keys.Home);
+
+            CalculatorApp.ClickOnWindow();
+        }
+
+        /// <summary>
+        /// Select value in Units1 ComboBox
+        /// </summary>
+        /// <param name="value">Value in ComboBox Units1</param>
+        public void SelectUnits1(string value)
+        {
+            UnitConverterOperators.Units1.Click();
+            var accessibleName = value.Replace(" - ", " ");
+            var item = session.FindElementByXPath($"//ListItem[@Name='{accessibleName}']");
+            item.Click();
+        }
+
+        /// <summary>
+        /// Select value in Units2 ComboBox
+        /// </summary>
+        /// <param name="value">Value in ComboBox Units2</param>
+        public void SelectUnits2(string value)
+        {
+            UnitConverterOperators.Units2.Click();
+            var accessibleName = value.Replace(" - ", " ");
+            var item = session.FindElementByXPath($"//ListItem[@Name='{accessibleName}']");
+            item.Click();
+        }
+    }
+}

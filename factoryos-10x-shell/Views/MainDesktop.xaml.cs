@@ -33,6 +33,7 @@ using factoryos_10x_shell.Services.Helpers;
 using factoryos_10x_shell.Library.Services.WebApps;
 using factoryos_10x_shell.Library.Models.InternalData;
 using factoryos_10x_shell.Services.Win32;
+using factoryos_10x_shell.Services.Windowing;
 
 namespace factoryos_10x_shell.Views
 {
@@ -48,7 +49,19 @@ namespace factoryos_10x_shell.Views
         private readonly IStartManagerService m_startManager;
         private readonly IActionCenterManagerService m_actionManager;
         private readonly IWindowManagerService m_windowManager;
+        private readonly IWebAppService m_webAppService;
         private readonly Win32WindowManagerService m_nativeWindowManager;
+        private readonly ShellWindowCoordinator m_shellWindowCoordinator;
+        private bool m_coordinatingActivation;
+        private readonly BitmapImage m_filesIcon = new BitmapImage(new Uri("ms-appx:///Assets/Files/files.png"));
+        private readonly BitmapImage m_notepadIcon = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
+        private readonly BitmapImage m_settingsIcon = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
+        private readonly BitmapImage m_calculatorIcon = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
+
+        private const string FilesWindowIdentity = "CoreShell.Files";
+        private const string NotepadWindowIdentity = "CoreShell.Notepad";
+        private const string SettingsWindowIdentity = "CoreShell.Settings";
+        private const string CalculatorWindowIdentity = "CoreShell.Calculator";
 
         public MainDesktop()
         {
@@ -61,6 +74,8 @@ namespace factoryos_10x_shell.Views
             m_actionManager = App.ServiceProvider.GetRequiredService<IActionCenterManagerService>();
             m_actionManager.ActionVisibilityChanged += ActionCenterManager_ActionVisibilityChanged;
             m_windowManager = App.ServiceProvider.GetRequiredService<IWindowManagerService>();
+            m_webAppService = App.ServiceProvider.GetRequiredService<IWebAppService>();
+            m_shellWindowCoordinator = App.ServiceProvider.GetRequiredService<ShellWindowCoordinator>();
             m_windowManager.DesktopFocusRequested += WindowManager_DesktopFocusRequested;
             m_windowManager.TaskViewChanged += WindowManager_TaskViewChanged;
             WindowHost.DataContext = m_windowManager;
@@ -70,6 +85,7 @@ namespace factoryos_10x_shell.Views
             NativeWindowHost.ItemsSource = m_nativeWindowManager.Windows;
             m_nativeWindowManager.WindowsChanged += NativeWindowsChanged;
             m_nativeWindowManager.DesktopFocusRequested += WindowManager_DesktopFocusRequested;
+            m_webAppService.AppsChanged += WebAppsChanged;
             Loaded += MainDesktop_Loaded;
             SizeChanged += MainDesktop_SizeChanged;
 
@@ -92,16 +108,21 @@ namespace factoryos_10x_shell.Views
 
             AppState.Instance.OnBgChangeButtonVisibilityChanged += UpdateBgChangeButtonVisibility;
             AppState.Instance.OnFilesRequested += FilesRequested;
-            AppState.Instance.OnFilesStateChanged += UpdateFilesTaskCard;
+            AppState.Instance.OnFilesStateChanged += FilesStateChanged;
             AppState.Instance.OnFilesActivated += FilesActivated;
             AppState.Instance.OnNotepadRequested += NotepadRequested;
-            AppState.Instance.OnNotepadStateChanged += UpdateNotepadTaskCard;
+            AppState.Instance.OnNotepadStateChanged += NotepadStateChanged;
             AppState.Instance.OnNotepadActivated += NotepadActivated;
             AppState.Instance.OnSettingsRequested += SettingsRequested;
-            AppState.Instance.OnSettingsStateChanged += UpdateSettingsTaskCard;
+            AppState.Instance.OnSettingsStateChanged += SettingsStateChanged;
             AppState.Instance.OnSettingsActivated += SettingsActivated;
+            AppState.Instance.OnCalculatorRequested += CalculatorRequested;
+            AppState.Instance.OnCalculatorStateChanged += CalculatorStateChanged;
+            AppState.Instance.OnCalculatorActivated += CalculatorActivated;
             AppState.Instance.OnWallpaperRequested += SetWallpaper;
             m_windowManager.WindowsChanged += WebWindowsChanged;
+            TaskViewGrid.ItemsSource = m_shellWindowCoordinator.Windows;
+            SynchronizeShellWindows();
             UpdateBgChangeButtonVisibility(AppState.Instance.IsBgChangeButtonVisible);
         }
 
@@ -119,15 +140,7 @@ namespace factoryos_10x_shell.Views
 
         private void FilesActivated()
         {
-            m_windowManager.DeactivateAll();
-            m_nativeWindowManager.DeactivateAll();
-            // Files and Web Apps live in separate hosts. Raise the active host rather
-            // than sending the inactive one below the wallpaper.
-            Canvas.SetZIndex(WindowHost, 1);
-            Canvas.SetZIndex(NativeWindowHost, 1);
-            Canvas.SetZIndex(FilesWindowHost, 2);
-            Canvas.SetZIndex(NotepadWindowHost, 1);
-            Canvas.SetZIndex(SettingsWindowHost, 1);
+            ActivateShellWindow(ShellWindowKind.Files, FilesWindowIdentity);
         }
 
         private void NotepadRequested()
@@ -139,52 +152,308 @@ namespace factoryos_10x_shell.Views
 
         private void NotepadActivated()
         {
-            m_windowManager.DeactivateAll();
-            m_nativeWindowManager.DeactivateAll();
-            Canvas.SetZIndex(WindowHost, 1);
-            Canvas.SetZIndex(NativeWindowHost, 1);
-            Canvas.SetZIndex(FilesWindowHost, 1);
-            Canvas.SetZIndex(NotepadWindowHost, 2);
-            Canvas.SetZIndex(SettingsWindowHost, 1);
+            ActivateShellWindow(ShellWindowKind.Notepad, NotepadWindowIdentity);
         }
 
         private void SettingsRequested() => SettingsWindow.Open();
 
         private void SettingsActivated()
         {
-            m_windowManager.DeactivateAll();
-            m_nativeWindowManager.DeactivateAll();
-            Canvas.SetZIndex(WindowHost, 1);
-            Canvas.SetZIndex(NativeWindowHost, 1);
-            Canvas.SetZIndex(FilesWindowHost, 1);
-            Canvas.SetZIndex(NotepadWindowHost, 1);
-            Canvas.SetZIndex(SettingsWindowHost, 2);
+            ActivateShellWindow(ShellWindowKind.Settings, SettingsWindowIdentity);
+        }
+
+        private void CalculatorRequested() => CalculatorWindow.Open();
+
+        private void CalculatorActivated()
+        {
+            ActivateShellWindow(ShellWindowKind.Calculator, CalculatorWindowIdentity);
         }
 
         private void WebWindowsChanged(object sender, EventArgs e)
         {
-            if (m_windowManager.Windows.Any(window => window.IsActive && window.Visibility == Visibility.Visible))
-            {
-                Canvas.SetZIndex(FilesWindowHost, 1);
-                Canvas.SetZIndex(NotepadWindowHost, 1);
-                Canvas.SetZIndex(SettingsWindowHost, 1);
-                Canvas.SetZIndex(WindowHost, 2);
-                Canvas.SetZIndex(NativeWindowHost, 1);
-                m_nativeWindowManager.DeactivateAll();
-            }
+            if (m_coordinatingActivation) return;
+            SynchronizeShellWindows();
+
+            WebAppWindowModel active = m_windowManager.Windows
+                .Where(window => window.IsActive && window.Visibility == Visibility.Visible)
+                .OrderByDescending(window => window.ZIndex)
+                .FirstOrDefault();
+            if (active != null) ActivateShellWindow(ShellWindowKind.WebApp, active);
+            else RestoreMostRecentWindow();
         }
 
         private void NativeWindowsChanged(object sender, EventArgs e)
         {
-            if (m_nativeWindowManager.Windows.Any(window => window.IsActive && window.Visibility == Visibility.Visible))
+            if (m_coordinatingActivation) return;
+            SynchronizeShellWindows();
+
+            Win32WindowModel active = m_nativeWindowManager.Windows
+                .Where(window => window.IsActive && window.Visibility == Visibility.Visible)
+                .OrderByDescending(window => window.ZIndex)
+                .FirstOrDefault();
+            if (active != null) ActivateShellWindow(ShellWindowKind.Win32App, active);
+            else RestoreMostRecentWindow();
+        }
+
+        private void FilesStateChanged()
+        {
+            SynchronizeShellWindows();
+            RestoreMostRecentWindow();
+        }
+
+        private void NotepadStateChanged()
+        {
+            SynchronizeShellWindows();
+            RestoreMostRecentWindow();
+        }
+
+        private void SettingsStateChanged()
+        {
+            SynchronizeShellWindows();
+            RestoreMostRecentWindow();
+        }
+
+        private void CalculatorStateChanged()
+        {
+            SynchronizeShellWindows();
+            RestoreMostRecentWindow();
+        }
+
+        private void WebAppsChanged(object sender, EventArgs e) => SynchronizeShellWindows();
+
+        private void ActivateShellWindow(ShellWindowKind kind, object identity)
+        {
+            if (identity == null) return;
+
+            m_coordinatingActivation = true;
+            try
             {
-                m_windowManager.DeactivateAll();
-                Canvas.SetZIndex(WindowHost, 1);
-                Canvas.SetZIndex(FilesWindowHost, 1);
-                Canvas.SetZIndex(NotepadWindowHost, 1);
-                Canvas.SetZIndex(SettingsWindowHost, 1);
-                Canvas.SetZIndex(NativeWindowHost, 2);
+                m_shellWindowCoordinator.Prune(IsWindowRegistered);
+                m_shellWindowCoordinator.Activate(kind, identity);
+                if (kind != ShellWindowKind.WebApp) m_windowManager.DeactivateAll();
+                if (kind != ShellWindowKind.Win32App) m_nativeWindowManager.DeactivateAll();
+                ApplyWindowLayers(kind);
+                SynchronizeShellWindows();
             }
+            finally
+            {
+                m_coordinatingActivation = false;
+            }
+        }
+
+        private void RestoreMostRecentWindow()
+        {
+            if (m_coordinatingActivation) return;
+
+            m_shellWindowCoordinator.Prune(IsWindowRegistered);
+            ShellWindowReference active = m_shellWindowCoordinator.ActiveWindow;
+            if (active != null && IsWindowAvailable(active))
+            {
+                ApplyWindowLayers(active.Kind);
+                return;
+            }
+
+            m_shellWindowCoordinator.ClearActive();
+            ShellWindowReference next = m_shellWindowCoordinator.GetMostRecentAvailable(IsWindowAvailable);
+            if (next == null)
+            {
+                ApplyWindowLayers(null);
+                return;
+            }
+
+            ActivateWindowReference(next);
+        }
+
+        private bool IsWindowRegistered(ShellWindowReference window)
+        {
+            switch (window.Kind)
+            {
+                case ShellWindowKind.WebApp:
+                    return window.Identity is WebAppWindowModel webWindow && m_windowManager.Windows.Contains(webWindow);
+                case ShellWindowKind.Win32App:
+                    return window.Identity is Win32WindowModel nativeWindow && m_nativeWindowManager.Windows.Contains(nativeWindow);
+                case ShellWindowKind.Files:
+                    return AppState.Instance.IsFilesOpen;
+                case ShellWindowKind.Notepad:
+                    return AppState.Instance.IsNotepadOpen;
+                case ShellWindowKind.Settings:
+                    return AppState.Instance.IsSettingsOpen;
+                case ShellWindowKind.Calculator:
+                    return AppState.Instance.IsCalculatorOpen;
+                default:
+                    return false;
+            }
+        }
+
+        private bool IsWindowAvailable(ShellWindowReference window)
+        {
+            if (!IsWindowRegistered(window)) return false;
+
+            switch (window.Kind)
+            {
+                case ShellWindowKind.WebApp:
+                    return ((WebAppWindowModel)window.Identity).Visibility == Visibility.Visible;
+                case ShellWindowKind.Win32App:
+                    return ((Win32WindowModel)window.Identity).Visibility == Visibility.Visible;
+                case ShellWindowKind.Files:
+                    return !AppState.Instance.IsFilesMinimized;
+                case ShellWindowKind.Notepad:
+                    return !AppState.Instance.IsNotepadMinimized;
+                case ShellWindowKind.Settings:
+                    return !AppState.Instance.IsSettingsMinimized;
+                case ShellWindowKind.Calculator:
+                    return !AppState.Instance.IsCalculatorMinimized;
+                default:
+                    return false;
+            }
+        }
+
+        private void ActivateWindowReference(ShellWindowReference window)
+        {
+            switch (window.Kind)
+            {
+                case ShellWindowKind.WebApp:
+                    m_windowManager.Activate((WebAppWindowModel)window.Identity);
+                    break;
+                case ShellWindowKind.Win32App:
+                    m_nativeWindowManager.Activate((Win32WindowModel)window.Identity);
+                    break;
+                case ShellWindowKind.Files:
+                    AppState.Instance.RequestFilesOpen();
+                    break;
+                case ShellWindowKind.Notepad:
+                    AppState.Instance.RequestNotepadOpen();
+                    break;
+                case ShellWindowKind.Settings:
+                    AppState.Instance.RequestSettingsOpen();
+                    break;
+                case ShellWindowKind.Calculator:
+                    AppState.Instance.RequestCalculatorOpen();
+                    break;
+            }
+        }
+
+        private void ApplyWindowLayers(ShellWindowKind? activeKind)
+        {
+            Canvas.SetZIndex(WindowHost, activeKind == ShellWindowKind.WebApp ? 2 : 1);
+            Canvas.SetZIndex(NativeWindowHost, activeKind == ShellWindowKind.Win32App ? 2 : 1);
+            Canvas.SetZIndex(FilesWindowHost, activeKind == ShellWindowKind.Files ? 2 : 1);
+            Canvas.SetZIndex(NotepadWindowHost, activeKind == ShellWindowKind.Notepad ? 2 : 1);
+            Canvas.SetZIndex(SettingsWindowHost, activeKind == ShellWindowKind.Settings ? 2 : 1);
+            Canvas.SetZIndex(CalculatorWindowHost, activeKind == ShellWindowKind.Calculator ? 2 : 1);
+        }
+
+        private void SynchronizeShellWindows()
+        {
+            var descriptors = new List<ShellWindowDescriptor>();
+
+            foreach (WebAppWindowModel window in m_windowManager.Windows)
+            {
+                descriptors.Add(new ShellWindowDescriptor
+                {
+                    Kind = ShellWindowKind.WebApp,
+                    Identity = window,
+                    Title = window.App?.Name ?? "Web app",
+                    Subtitle = "Web app",
+                    FallbackGlyph = "\uE774",
+                    IconSource = CreateImageSource(window.App?.IconUri),
+                    IsActive = window.IsActive && window.Visibility == Visibility.Visible,
+                    IsMinimized = window.Visibility != Visibility.Visible
+                });
+            }
+
+            foreach (Win32WindowModel window in m_nativeWindowManager.Windows)
+            {
+                descriptors.Add(new ShellWindowDescriptor
+                {
+                    Kind = ShellWindowKind.Win32App,
+                    Identity = window,
+                    Title = window.DisplayName,
+                    Subtitle = string.IsNullOrWhiteSpace(window.Status) ? "Desktop app" : window.Status,
+                    FallbackGlyph = "\uE7C3",
+                    IconSource = window.IconSource,
+                    IsActive = window.IsActive && window.Visibility == Visibility.Visible,
+                    IsMinimized = window.Visibility != Visibility.Visible
+                });
+            }
+
+            AddBuiltInWindowDescriptor(
+                descriptors,
+                ShellWindowKind.Files,
+                FilesWindowIdentity,
+                "Files",
+                "File manager",
+                "\uE8B7",
+                m_filesIcon,
+                AppState.Instance.IsFilesOpen,
+                AppState.Instance.IsFilesMinimized);
+            AddBuiltInWindowDescriptor(
+                descriptors,
+                ShellWindowKind.Notepad,
+                NotepadWindowIdentity,
+                "Notepad",
+                "Text editor",
+                "\uE70B",
+                m_notepadIcon,
+                AppState.Instance.IsNotepadOpen,
+                AppState.Instance.IsNotepadMinimized);
+            AddBuiltInWindowDescriptor(
+                descriptors,
+                ShellWindowKind.Settings,
+                SettingsWindowIdentity,
+                "Settings",
+                "System settings",
+                "\uE713",
+                m_settingsIcon,
+                AppState.Instance.IsSettingsOpen,
+                AppState.Instance.IsSettingsMinimized);
+            AddBuiltInWindowDescriptor(
+                descriptors,
+                ShellWindowKind.Calculator,
+                CalculatorWindowIdentity,
+                "Calculator",
+                "Standard calculator",
+                "\uE8EF",
+                m_calculatorIcon,
+                AppState.Instance.IsCalculatorOpen,
+                AppState.Instance.IsCalculatorMinimized);
+
+            m_shellWindowCoordinator.Synchronize(descriptors);
+            TaskViewEmptyState.Visibility = descriptors.Count == 0
+                ? Visibility.Visible
+                : Visibility.Collapsed;
+        }
+
+        private void AddBuiltInWindowDescriptor(
+            ICollection<ShellWindowDescriptor> descriptors,
+            ShellWindowKind kind,
+            object identity,
+            string title,
+            string subtitle,
+            string fallbackGlyph,
+            ImageSource iconSource,
+            bool isOpen,
+            bool isMinimized)
+        {
+            if (!isOpen) return;
+            descriptors.Add(new ShellWindowDescriptor
+            {
+                Kind = kind,
+                Identity = identity,
+                Title = title,
+                Subtitle = subtitle,
+                FallbackGlyph = fallbackGlyph,
+                IconSource = iconSource,
+                IsActive = m_shellWindowCoordinator.IsActive(kind, identity) && !isMinimized,
+                IsMinimized = isMinimized
+            });
+        }
+
+        private static ImageSource CreateImageSource(string uri)
+        {
+            return !string.IsNullOrWhiteSpace(uri) && Uri.TryCreate(uri, UriKind.Absolute, out Uri iconUri)
+                ? new BitmapImage(iconUri)
+                : null;
         }
 
             private async void LoadBackgroundImage()
@@ -248,90 +517,67 @@ namespace factoryos_10x_shell.Views
             TaskViewOverlay.Visibility = m_windowManager.IsTaskViewOpen
                 ? Visibility.Visible
                 : Visibility.Collapsed;
-            UpdateFilesTaskCard();
-            UpdateNotepadTaskCard();
-            UpdateSettingsTaskCard();
+            SynchronizeShellWindows();
             UpdateNativeInputSuppression();
-        }
-
-        private void UpdateFilesTaskCard()
-        {
-            FilesTaskCard.Visibility = m_windowManager.IsTaskViewOpen && AppState.Instance.IsFilesOpen
-                ? Visibility.Visible : Visibility.Collapsed;
-        }
-
-        private void UpdateNotepadTaskCard()
-        {
-            NotepadTaskCard.Visibility = m_windowManager.IsTaskViewOpen && AppState.Instance.IsNotepadOpen
-                ? Visibility.Visible : Visibility.Collapsed;
-        }
-
-        private void UpdateSettingsTaskCard() => SettingsTaskCard.Visibility = m_windowManager.IsTaskViewOpen && AppState.Instance.IsSettingsOpen ? Visibility.Visible : Visibility.Collapsed;
-        private void SettingsTaskCard_Tapped(object sender, TappedRoutedEventArgs e) { m_windowManager.CloseTaskView(); AppState.Instance.RequestSettingsOpen(); }
-        private void SettingsTaskClose_Click(object sender, RoutedEventArgs e) => SettingsWindow.CloseFromTaskView();
-
-        private void NotepadTaskCard_Tapped(object sender, TappedRoutedEventArgs e)
-        {
-            m_windowManager.CloseTaskView();
-            AppState.Instance.RequestNotepadOpen();
-        }
-
-        private void NotepadTaskClose_Click(object sender, RoutedEventArgs e) => NotepadWindow.CloseFromTaskView();
-
-        private void FilesTaskCard_Click(object sender, RoutedEventArgs e)
-        {
-            m_windowManager.CloseTaskView();
-            AppState.Instance.RequestFilesOpen();
-        }
-
-        private void FilesTaskCard_Tapped(object sender, TappedRoutedEventArgs e)
-        {
-            m_windowManager.CloseTaskView();
-            AppState.Instance.RequestFilesOpen();
-        }
-
-        private void FilesTaskClose_Click(object sender, RoutedEventArgs e)
-        {
-            FilesWindow.CloseFromTaskView();
-        }
-
-        private async void TaskViewWindow_Click(object sender, RoutedEventArgs e)
-        {
-            WebAppWindowModel window = (sender as FrameworkElement)?.Tag as WebAppWindowModel;
-            if (window == null) return;
-
-            await ActivateTaskViewWindowAsync(window);
         }
 
         private async void TaskViewGrid_ItemClick(object sender, ItemClickEventArgs e)
         {
-            if (e.ClickedItem is WebAppWindowModel window)
-                await ActivateTaskViewWindowAsync(window);
+            if (!(e.ClickedItem is ShellWindowItem window)) return;
+            m_windowManager.CloseTaskView();
+            await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => ActivateTaskViewWindow(window));
         }
 
-        private async System.Threading.Tasks.Task ActivateTaskViewWindowAsync(WebAppWindowModel window)
+        private void ActivateTaskViewWindow(ShellWindowItem window)
         {
-            m_windowManager.CloseTaskView();
-            await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => m_windowManager.Activate(window));
+            switch (window.Kind)
+            {
+                case ShellWindowKind.WebApp:
+                    m_windowManager.Activate((WebAppWindowModel)window.Identity);
+                    break;
+                case ShellWindowKind.Win32App:
+                    m_nativeWindowManager.Activate((Win32WindowModel)window.Identity);
+                    break;
+                case ShellWindowKind.Files:
+                    AppState.Instance.RequestFilesOpen();
+                    break;
+                case ShellWindowKind.Notepad:
+                    AppState.Instance.RequestNotepadOpen();
+                    break;
+                case ShellWindowKind.Settings:
+                    AppState.Instance.RequestSettingsOpen();
+                    break;
+                case ShellWindowKind.Calculator:
+                    AppState.Instance.RequestCalculatorOpen();
+                    break;
+            }
         }
 
         private void TaskViewClose_Click(object sender, RoutedEventArgs e)
         {
-            if ((sender as FrameworkElement)?.DataContext is WebAppWindowModel window)
-                m_windowManager.Close(window);
-        }
+            if (!((sender as FrameworkElement)?.DataContext is ShellWindowItem window)) return;
 
-        private async void NativeTaskViewGrid_ItemClick(object sender, ItemClickEventArgs e)
-        {
-            if (!(e.ClickedItem is Win32WindowModel window)) return;
-            m_windowManager.CloseTaskView();
-            await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => m_nativeWindowManager.Activate(window));
-        }
-
-        private void NativeTaskViewClose_Click(object sender, RoutedEventArgs e)
-        {
-            if ((sender as FrameworkElement)?.DataContext is Win32WindowModel window)
-                m_nativeWindowManager.Close(window);
+            switch (window.Kind)
+            {
+                case ShellWindowKind.WebApp:
+                    m_windowManager.Close((WebAppWindowModel)window.Identity);
+                    break;
+                case ShellWindowKind.Win32App:
+                    m_nativeWindowManager.Close((Win32WindowModel)window.Identity);
+                    break;
+                case ShellWindowKind.Files:
+                    FilesWindow.CloseFromTaskView();
+                    break;
+                case ShellWindowKind.Notepad:
+                    NotepadWindow.CloseFromTaskView();
+                    break;
+                case ShellWindowKind.Settings:
+                    SettingsWindow.CloseFromTaskView();
+                    break;
+                case ShellWindowKind.Calculator:
+                    CalculatorWindow.CloseFromTaskView();
+                    break;
+            }
         }
 
         private void TaskViewOverlay_PointerPressed(object sender, PointerRoutedEventArgs e)

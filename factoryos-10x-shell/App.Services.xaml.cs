@@ -19,6 +19,7 @@ using factoryos_10x_shell.Library.Services.Input;
 using factoryos_10x_shell.Services.Input;
 using factoryos_10x_shell.Library.Services.WebApps;
 using factoryos_10x_shell.Services.WebApps;
+using factoryos_10x_shell.Services.Windowing;
 
 namespace factoryos_10x_shell
 {
@@ -46,6 +47,7 @@ namespace factoryos_10x_shell
 .AddSingleton<IAppHelper>(provider => provider.GetRequiredService<AppHelper>())
                 .AddSingleton<IWebAppService, WebAppService>()
                 .AddSingleton<IWindowManagerService, WindowManagerService>()
+                .AddSingleton<ShellWindowCoordinator>()
                 .AddSingleton<IDispatcherService, DispatcherService>()
                 .AddSingleton<IBatteryService, BatteryService>()
                 .AddSingleton<INetworkService, NetworkService>()

@@ -116,5 +116,20 @@ namespace factoryos_10x_shell.Services.Helpers
         }
         public void ActivateSettings() => OnSettingsActivated?.Invoke();
         public void RequestWallpaper(string uri) => OnWallpaperRequested?.Invoke(uri);
+
+        public bool IsCalculatorOpen { get; private set; }
+        public bool IsCalculatorMinimized { get; private set; }
+        public event Action OnCalculatorRequested;
+        public event Action OnCalculatorStateChanged;
+        public event Action OnCalculatorActivated;
+
+        public void RequestCalculatorOpen() => OnCalculatorRequested?.Invoke();
+        public void SetCalculatorWindowState(bool isOpen, bool isMinimized)
+        {
+            IsCalculatorOpen = isOpen;
+            IsCalculatorMinimized = isMinimized;
+            OnCalculatorStateChanged?.Invoke();
+        }
+        public void ActivateCalculator() => OnCalculatorActivated?.Invoke();
     }
 }

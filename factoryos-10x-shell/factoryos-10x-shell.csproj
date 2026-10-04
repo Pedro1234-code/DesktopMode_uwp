@@ -146,6 +146,9 @@
     <Compile Include="Controls\SettingsWindow.xaml.cs">
       <DependentUpon>SettingsWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Controls\CalculatorWindow.xaml.cs">
+      <DependentUpon>CalculatorWindow.xaml</DependentUpon>
+    </Compile>
     <Compile Include="Controls\WebAppWindow.xaml.cs">
       <DependentUpon>WebAppWindow.xaml</DependentUpon>
     </Compile>
@@ -168,6 +171,7 @@
     <Compile Include="Services\WebApps\WindowManagerService.cs" />
     <Compile Include="Services\GuestRuntime\Win32WindowModel.cs" />
     <Compile Include="Services\GuestRuntime\Win32WindowManagerService.cs" />
+    <Compile Include="Services\Windowing\ShellWindowCoordinator.cs" />
     <Compile Include="Services\Managers\ActionCenterManagerService.cs" />
     <Compile Include="Services\Managers\NotificationManager.cs" />
     <Compile Include="Views\FallbackErrorPage.xaml.cs">
@@ -349,6 +353,10 @@
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
+    <Page Include="Controls\CalculatorWindow.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
     <Page Include="Controls\WebAppWindow.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
@@ -417,6 +425,13 @@
     </PackageReference>
   </ItemGroup>
   <ItemGroup>
+    <Content Include="..\calculator-main\src\Calculator\Assets\CalculatorAppList.targetsize-48.png">
+      <Link>Assets\Calculator\CalculatorAppList.targetsize-48.png</Link>
+    </Content>
+    <ProjectReference Include="..\calculator-main\src\Calculator\Calculator.csproj">
+      <Project>{3B773403-B0D6-4F9A-948E-512A7A5FB315}</Project>
+      <Name>Calculator</Name>
+    </ProjectReference>
     <ProjectReference Include="..\factoryos-10x-shell.Library\factoryos-10x-shell.Library.csproj">
       <Project>{4345e98b-2f22-4824-9c67-90de0e7ee619}</Project>
       <Name>factoryos-10x-shell.Library</Name>

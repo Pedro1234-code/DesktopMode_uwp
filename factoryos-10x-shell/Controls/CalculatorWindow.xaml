@@ -1,0 +1,31 @@
+<UserControl
+    x:Class="factoryos_10x_shell.Controls.CalculatorWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    Width="900"
+    Height="650">
+    <Border Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" BorderBrush="#FF5A5A5A" BorderThickness="1" CornerRadius="4">
+        <Grid PointerPressed="Root_PointerPressed">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="36" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+            <Grid x:Name="TitleBar" Background="#FF303030" PointerMoved="TitleBar_PointerMoved" PointerPressed="TitleBar_PointerPressed" PointerReleased="TitleBar_PointerReleased">
+                <StackPanel Margin="12,0,150,0" VerticalAlignment="Center" Orientation="Horizontal" Spacing="8">
+                    <Image Width="18" Height="18" Source="ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png" />
+                    <TextBlock VerticalAlignment="Center" FontWeight="SemiBold" Text="Calculator" />
+                </StackPanel>
+                <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                    <Button Click="Minimize_Click" Style="{StaticResource ShellCaptionButtonStyle}"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE921;" /></Button>
+                    <Button Click="Maximize_Click" Style="{StaticResource ShellCaptionButtonStyle}"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE922;" /></Button>
+                    <Button Click="Close_Click" Style="{StaticResource ShellCloseButtonStyle}"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE8BB;" /></Button>
+                </StackPanel>
+            </Grid>
+            <!-- Original Calculator UI; the Shell only supplies its window frame. -->
+            <Frame x:Name="CalculatorFrame" Grid.Row="1" />
+            <Border x:Name="ResizeGrip" Grid.Row="1" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased">
+                <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Text="&#xE76C;" />
+            </Border>
+        </Grid>
+    </Border>
+</UserControl>

@@ -1,0 +1,85 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+
+using OpenQA.Selenium.Appium.Windows;
+
+using System;
+using System.Globalization;
+
+namespace CalculatorUITestFramework
+{
+    public class NumberPad
+    {
+        public WindowsElement Num0Button => session.TryFindElementByAccessibilityId("num0Button");
+        public WindowsElement Num1Button => session.TryFindElementByAccessibilityId("num1Button");
+        public WindowsElement Num2Button => session.TryFindElementByAccessibilityId("num2Button");
+        public WindowsElement Num3Button => session.TryFindElementByAccessibilityId("num3Button");
+        public WindowsElement Num4Button => session.TryFindElementByAccessibilityId("num4Button");
+        public WindowsElement Num5Button => session.TryFindElementByAccessibilityId("num5Button");
+        public WindowsElement Num6Button => session.TryFindElementByAccessibilityId("num6Button");
+        public WindowsElement Num7Button => session.TryFindElementByAccessibilityId("num7Button");
+        public WindowsElement Num8Button => session.TryFindElementByAccessibilityId("num8Button");
+        public WindowsElement Num9Button => session.TryFindElementByAccessibilityId("num9Button");
+        public WindowsElement DecimalButton => session.TryFindElementByAccessibilityId("decimalSeparatorButton");
+        public WindowsElement NegateButton => session.TryFindElementByAccessibilityId("negateButton");
+
+        private WindowsDriver<WindowsElement> session => CalculatorDriver.Instance.CalculatorSession;
+
+        /// <summary>
+        /// Translates a number into the Calculator button clicks.
+        /// </summary>
+        /// <param name="number">Number to be entered into the calculator.</param>
+        public void Input(double number)
+        {
+            string numberStr = number.ToString(CultureInfo.InvariantCulture);
+            if (numberStr.StartsWith("-"))
+            {
+                numberStr = numberStr.Substring(1) + "-";
+            }
+            foreach (char digit in numberStr)
+            {
+                switch (digit)
+                {
+                    case '0':
+                        Num0Button.Click();
+                        break;
+                    case '1':
+                        Num1Button.Click();
+                        break;
+                    case '2':
+                        Num2Button.Click();
+                        break;
+                    case '3':
+                        Num3Button.Click();
+                        break;
+                    case '4':
+                        Num4Button.Click();
+                        break;
+                    case '5':
+                        Num5Button.Click();
+                        break;
+                    case '6':
+                        Num6Button.Click();
+                        break;
+                    case '7':
+                        Num7Button.Click();
+                        break;
+                    case '8':
+                        Num8Button.Click();
+                        break;
+                    case '9':
+                        Num9Button.Click();
+                        break;
+                    case '.':
+                        DecimalButton.Click();
+                        break;
+                    case '-':
+                        NegateButton.Click();
+                        break;
+                    default:
+                        throw (new ArgumentException($"{digit} is not valid"));
+                }
+            }
+        }
+    }
+}

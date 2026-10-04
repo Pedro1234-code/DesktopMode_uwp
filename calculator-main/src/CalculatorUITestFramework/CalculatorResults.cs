@@ -1,0 +1,67 @@
+// Copyright (c) Microsoft Corporation. All rights reserved.
+// Licensed under the MIT License.
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+
+using OpenQA.Selenium.Appium.Windows;
+
+using System;
+
+namespace CalculatorUITestFramework
+{
+    public class CalculatorResults
+    {
+        private WindowsDriver<WindowsElement> session => CalculatorDriver.Instance.CalculatorSession;
+        private WindowsElement CalculatorAlwaysOnTopResults => session.TryFindElementByAccessibilityId("CalculatorAlwaysOnTopResults");
+        private WindowsElement CalculatorResult => session.TryFindElementByAccessibilityId("CalculatorResults");
+        private WindowsElement CalculatorExpression => session.TryFindElementByAccessibilityId("CalculatorExpression");
+
+        /// <summary>
+        /// Gets the text from the display control in AoT mode and removes the narrator text that is not displayed in the UI.
+        /// </summary>
+        /// <returns>The string shown in the UI.</returns>
+        public string GetAoTCalculatorResultText()
+        {
+            return CalculatorAlwaysOnTopResults.Text.Replace("Display is", string.Empty).Trim();
+        }
+
+        /// <summary>
+        /// Gets the text from the display control and removes the narrator text that is not displayed in the UI.
+        /// </summary>
+        /// <returns>The string shown in the UI.</returns>
+        public string GetCalculatorResultText()
+        {
+            return CalculatorResult.Text.Replace("Display is", string.Empty).Trim();
+        }
+
+        /// <summary>
+        /// Gets the text from the Calculator Expression control and removes narrator text that is not displayed in the UI.
+        /// </summary>
+        /// <returns>The string shown in the UI.</returns>
+        public string GetCalculatorExpressionText()
+        {
+            return CalculatorExpression.Text.Replace("Expression is", string.Empty).Trim();
+        }
+
+        /// <summary>
+        /// Verifies that CalculatorResult is not null
+        /// </summary>
+        /// <returns>The string shown in the UI.</returns>
+        public void IsResultsDisplayPresent()
+        {
+            Assert.IsNotNull(CalculatorResult);
+        }
+
+        /// <summary>
+        /// Verifies that Calculator Expression is clear
+        /// </summary>
+        /// <returns>The string shown in the UI.</returns>
+        public void IsResultsExpressionClear()
+        {
+            string source = CalculatorDriver.Instance.CalculatorSession.PageSource;
+            if (source.Contains("CalculatorExpression"))
+            {
+                throw new Exception("The Calculator Expression is not clear");
+            }
+        }
+    }
+}

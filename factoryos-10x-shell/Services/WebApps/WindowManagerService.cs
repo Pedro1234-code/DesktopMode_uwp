@@ -14,6 +14,7 @@ namespace factoryos_10x_shell.Services.WebApps
         private double m_workspaceWidth;
         private double m_workspaceHeight;
         private bool m_isTaskViewOpen;
+        private bool m_changingWindowState;
 
         public ObservableCollection<WebAppWindowModel> Windows { get; } = new ObservableCollection<WebAppWindowModel>();
         public bool IsTaskViewOpen => m_isTaskViewOpen;
@@ -91,42 +92,54 @@ namespace factoryos_10x_shell.Services.WebApps
 
         public void Activate(WebAppWindowModel window)
         {
+            if (window == null || !Windows.Contains(window)) return;
+            m_changingWindowState = true;
             foreach (WebAppWindowModel item in Windows) item.IsActive = item == window;
             window.Visibility = Visibility.Visible;
             window.ZIndex = ++m_nextZIndex;
+            m_changingWindowState = false;
             WindowsChanged?.Invoke(this, EventArgs.Empty);
             CloseTaskView();
         }
 
         public void DeactivateAll()
         {
+            m_changingWindowState = true;
             foreach (WebAppWindowModel item in Windows) item.IsActive = false;
+            m_changingWindowState = false;
             WindowsChanged?.Invoke(this, EventArgs.Empty);
         }
 
         public void Minimize(WebAppWindowModel window)
         {
+            if (window == null || !Windows.Contains(window)) return;
+            m_changingWindowState = true;
             window.IsActive = false;
             window.Visibility = Visibility.Collapsed;
             WebAppWindowModel next = Windows
                 .Where(item => item != window && item.Visibility == Visibility.Visible)
                 .OrderByDescending(item => item.ZIndex)
                 .FirstOrDefault();
-            if (next != null) Activate(next);
+            if (next != null) ActivateCore(next);
+            m_changingWindowState = false;
+            WindowsChanged?.Invoke(this, EventArgs.Empty);
             DesktopFocusRequested?.Invoke(this, EventArgs.Empty);
         }
 
         public void Close(WebAppWindowModel window)
         {
-            if (window == null) return;
+            if (window == null || !Windows.Contains(window)) return;
+            m_changingWindowState = true;
             window.PropertyChanged -= Window_PropertyChanged;
             Windows.Remove(window);
             if (!Windows.Any(window => window.IsActive))
             {
                 WebAppWindowModel next = Windows.Where(window => window.Visibility == Visibility.Visible)
                     .OrderByDescending(window => window.ZIndex).FirstOrDefault();
-                if (next != null) Activate(next);
+                if (next != null) ActivateCore(next);
             }
+            m_changingWindowState = false;
+            WindowsChanged?.Invoke(this, EventArgs.Empty);
             DesktopFocusRequested?.Invoke(this, EventArgs.Empty);
         }
 
@@ -167,11 +180,19 @@ namespace factoryos_10x_shell.Services.WebApps
         {
             // Left/Top change continuously while dragging. These layout-only
             // updates must not recreate taskbar buttons.
-            if (e.PropertyName == nameof(WebAppWindowModel.IsActive) ||
-                e.PropertyName == nameof(WebAppWindowModel.Visibility))
+            if (!m_changingWindowState &&
+                (e.PropertyName == nameof(WebAppWindowModel.IsActive) ||
+                e.PropertyName == nameof(WebAppWindowModel.Visibility)))
             {
                 WindowsChanged?.Invoke(this, EventArgs.Empty);
             }
+        }
+
+        private void ActivateCore(WebAppWindowModel window)
+        {
+            foreach (WebAppWindowModel item in Windows) item.IsActive = item == window;
+            window.Visibility = Visibility.Visible;
+            window.ZIndex = ++m_nextZIndex;
         }
     }
 }

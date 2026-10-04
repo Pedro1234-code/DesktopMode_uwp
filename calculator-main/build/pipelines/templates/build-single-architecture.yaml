@@ -1,0 +1,99 @@
+# This template contains a job to build the app for a single architecture.
+
+parameters:
+  isReleaseBuild: false
+  useReleaseAppxManifest: false
+  platform: ''
+  condition: ''
+
+jobs:
+- job: Build${{ parameters.platform }}
+  displayName: Build ${{ parameters.platform }}
+  condition: ${{ parameters.condition }}
+  pool:
+    type: windows
+  variables:
+    BuildConfiguration: Release
+    BuildPlatform: ${{ parameters.platform }}
+    StageOutputFolder: $(Build.BinariesDirectory)\$(BuildConfiguration)\${{ parameters.platform }}
+    ${{ if eq(parameters.isReleaseBuild, true) }}:
+      ${{ if eq(parameters.useReleaseAppxManifest, true) }}:
+        ExtraMSBuildArgs: '/p:IsStoreBuild=true /p:UseReleaseAppxManifest=true /p:FeatureStagingBranchName=$(Build.SourceBranchName)'
+      ${{ if eq(parameters.useReleaseAppxManifest, false) }}:
+        ExtraMSBuildArgs: '/p:IsStoreBuild=true /p:FeatureStagingBranchName=$(Build.SourceBranchName)'
+    ${{ if eq(parameters.isReleaseBuild, false) }}:
+      ${{ if eq(parameters.useReleaseAppxManifest, true) }}:
+        ExtraMSBuildArgs: '/p:UseReleaseAppxManifest=true /p:FeatureStagingBranchName=$(Build.SourceBranchName)'
+      ${{ if eq(parameters.useReleaseAppxManifest, false) }}:
+        ExtraMSBuildArgs: '/p:FeatureStagingBranchName=$(Build.SourceBranchName)'
+    ${{ if eq(parameters.useReleaseAppxManifest, false) }}:
+      ManifestFileName: 'Package.appxmanifest'
+    ${{ if eq(parameters.useReleaseAppxManifest, true) }}:
+      ManifestFileName: 'Package.Release.appxmanifest'
+
+    # binaries scanning tools are run on this directory and
+    # this directory is uploaded to pipeline artifacts. More info at https://aka.ms/obpipelines/artifacts
+    ob_outputDirectory: $(StageOutputFolder)
+    ob_artifactBaseName: 'drop-${{ parameters.platform }}'
+    # Setting up SDL Tools
+    ob_sdl_prefast_enabled: true
+    ob_sdl_prefast_runDuring: 'Build'
+    ob_sdl_checkCompliantCompilerWarnings: true
+    # Scope BinSkim analysis to our built binaries, excluding third-party DLLs we don't produce PDBs for.
+    ob_sdl_binskim_target: '+:f|$(StageOutputFolder)\Calculator\**\*.dll;+:f|$(StageOutputFolder)\Calculator\**\*.exe;-:f|$(StageOutputFolder)\Calculator\**\clrcompression.dll;-:f|$(StageOutputFolder)\Calculator\**\WebView2Loader.dll;-:f|$(StageOutputFolder)\Calculator\**\Microsoft.Web.WebView2.Core.dll'
+
+  steps:
+  - ${{ if eq(parameters.isReleaseBuild, true) }}:
+    - task: UniversalPackages@0
+      displayName: Download internals package
+      inputs:
+        command: download
+        downloadDirectory: $(Build.SourcesDirectory)
+        vstsFeed: WindowsInboxApps
+        vstsFeedPackage: calculator-internals
+        vstsPackageVersion: 0.0.126
+
+  - task: NuGetAuthenticate@1
+    displayName: NuGet Authenticate
+
+  - task: NuGetToolInstaller@1
+    displayName: Use NuGet 6.x
+    inputs:
+      versionSpec: 6.x
+
+  - task: NuGetCommand@2
+    displayName: Restore packages.config NuGet packages
+    inputs:
+      command: restore
+      restoreSolution: 'src/**/*.vcxproj'
+      feedsToUse: config
+      nugetConfigPath: nuget.config
+      restoreDirectory: $(Build.SourcesDirectory)\src\packages
+
+  - task: PowerShell@2
+    displayName: Set version number in AppxManifest
+    inputs:
+      filePath: $(Build.SourcesDirectory)\build\scripts\UpdateAppxManifestVersion.ps1
+      arguments: '-AppxManifest $(Build.SourcesDirectory)\src\Calculator\$(ManifestFileName) -Version $(Build.BuildNumber)'
+
+  - task: VSBuild@1
+    displayName: 'Build solution src/Calculator.slnx'
+    inputs:
+      solution: src/Calculator.slnx
+      vsVersion: 18.0
+      msbuildArgs: /restore /bl:$(StageOutputFolder)\Calculator.binlog /p:OutDir=$(StageOutputFolder)\ /p:GenerateProjectSpecificOutputFolder=true /p:Version=$(Build.BuildNumber) /t:Publish /p:PublishDir=$(StageOutputFolder)\publish\ $(ExtraMSBuildArgs)
+      platform: $(BuildPlatform)
+      configuration: $(BuildConfiguration)
+      maximumCpuCount: true
+
+  - ${{ if eq(parameters.isReleaseBuild, true) }}:
+    - task: PublishSymbols@2
+      displayName: Publish symbols
+      inputs:
+        symbolsFolder: $(StageOutputFolder)
+        searchPattern: | # index executables to avoid degraded debugging experience - Package ES
+          **/*.pdb
+          **/*.exe
+          **/*.dll
+        symbolServerType: teamServices
+        treatNotIndexedAsWarning: true

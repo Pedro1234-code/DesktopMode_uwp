@@ -30,6 +30,7 @@ using Windows.UI.Xaml.Media;
 using Windows.UI.Xaml.Media.Imaging;
 using factoryos_10x_shell.Library.Services.WebApps;
 using factoryos_10x_shell.Services.Win32;
+using factoryos_10x_shell.Services.Windowing;
 
 
 namespace factoryos_10x_shell.Views
@@ -40,6 +41,7 @@ namespace factoryos_10x_shell.Views
         private readonly IWindowManagerService _windowManager;
         private readonly IWebAppService _webAppService;
         private readonly Win32WindowManagerService _nativeWindowManager;
+        private readonly ShellWindowCoordinator _shellWindowCoordinator;
 
 
         public Default10xBar()
@@ -51,6 +53,7 @@ namespace factoryos_10x_shell.Views
             _windowManager = App.ServiceProvider.GetRequiredService<IWindowManagerService>();
             _webAppService = App.ServiceProvider.GetRequiredService<IWebAppService>();
             _nativeWindowManager = Win32WindowManagerService.Instance;
+            _shellWindowCoordinator = App.ServiceProvider.GetRequiredService<ShellWindowCoordinator>();
 
             AppState.Instance.OnSearchButtonVisibilityChanged += UpdateSearchButtonVisibility;
             AppState.Instance.OnCopilotButtonVisibilityChanged += UpdateCopilotButtonVisibility;
@@ -91,6 +94,8 @@ namespace factoryos_10x_shell.Views
             AppState.Instance.OnFilesStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnNotepadStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnSettingsStateChanged += RefreshInternalTaskbar;
+            AppState.Instance.OnCalculatorStateChanged += RefreshInternalTaskbar;
+            _shellWindowCoordinator.StateChanged += (s, args) => RefreshInternalTaskbar();
             RefreshOpenWebApps();
             RefreshPinnedWebApps();
             RefreshOpenWin32Apps();
@@ -148,6 +153,10 @@ namespace factoryos_10x_shell.Views
                 {
                     stack.Children.Add(CreateSettingsIcon(25));
                 }
+                else if (app.AppId == "CoreShell.Calculator")
+                {
+                    stack.Children.Add(CreateCalculatorIcon(25));
+                }
                 else
                 {
                     stack.Children.Add(new Image { Width = 32, Height = 32, Source = app.IconSource });
@@ -172,6 +181,11 @@ namespace factoryos_10x_shell.Views
                         if (model.AppId == "CoreShell.Settings")
                         {
                             AppState.Instance.RequestSettingsOpen();
+                            return;
+                        }
+                        if (model.AppId == "CoreShell.Calculator")
+                        {
+                            AppState.Instance.RequestCalculatorOpen();
                             return;
                         }
                         bool launched = await _appHelper.LaunchAppAsync(model);
@@ -356,20 +370,28 @@ namespace factoryos_10x_shell.Views
 
         private static Image CreateSettingsIcon(double size) => new Image { Source = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png")), Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
 
+        private static Image CreateCalculatorIcon(double size) => new Image { Source = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png")), Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
+
         private void RefreshInternalTaskbar()
         {
             RefreshFilesTaskbar();
             RefreshPinnedApps();
         }
 
-        private static Brush GetPinnedAppBackground(string appId)
+        private Brush GetPinnedAppBackground(string appId)
         {
             bool isOpen = (appId == "CoreShell.Files" && AppState.Instance.IsFilesOpen)
                 || (appId == "CoreShell.Notepad" && AppState.Instance.IsNotepadOpen)
-                || (appId == "CoreShell.Settings" && AppState.Instance.IsSettingsOpen);
+                || (appId == "CoreShell.Settings" && AppState.Instance.IsSettingsOpen)
+                || (appId == "CoreShell.Calculator" && AppState.Instance.IsCalculatorOpen);
+
+            bool isActive = (appId == "CoreShell.Files" && _shellWindowCoordinator.IsActive(ShellWindowKind.Files, appId))
+                || (appId == "CoreShell.Notepad" && _shellWindowCoordinator.IsActive(ShellWindowKind.Notepad, appId))
+                || (appId == "CoreShell.Settings" && _shellWindowCoordinator.IsActive(ShellWindowKind.Settings, appId))
+                || (appId == "CoreShell.Calculator" && _shellWindowCoordinator.IsActive(ShellWindowKind.Calculator, appId));
 
             return isOpen
-                ? new SolidColorBrush(Color.FromArgb(64, 70, 130, 180))
+                ? new SolidColorBrush(Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180))
                 : new SolidColorBrush(Colors.Transparent);
         }
 
@@ -383,24 +405,31 @@ namespace factoryos_10x_shell.Views
             OpenFilesPanel.Children.Clear();
             if (AppState.Instance.IsFilesOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Files"))
             {
-                var filesButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = new SolidColorBrush(Color.FromArgb(64, 70, 130, 180)), Content = CreateFilesIcon(28) };
+                var filesButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Files"), Content = CreateFilesIcon(28) };
                 ToolTipService.SetToolTip(filesButton, "Files");
                 filesButton.Click += (sender, args) => AppState.Instance.RequestFilesOpen();
                 OpenFilesPanel.Children.Add(filesButton);
             }
             if (AppState.Instance.IsNotepadOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Notepad"))
             {
-                var button = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = new SolidColorBrush(Color.FromArgb(64, 70, 130, 180)), Content = CreateNotepadIcon(27) };
+                var button = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Notepad"), Content = CreateNotepadIcon(27) };
                 ToolTipService.SetToolTip(button, "Notepad");
                 button.Click += (sender, args) => AppState.Instance.RequestNotepadOpen();
                 OpenFilesPanel.Children.Add(button);
             }
             if (AppState.Instance.IsSettingsOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Settings"))
             {
-                var settingsButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = new SolidColorBrush(Color.FromArgb(64, 70, 130, 180)), Content = CreateSettingsIcon(25) };
+                var settingsButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Settings"), Content = CreateSettingsIcon(25) };
                 ToolTipService.SetToolTip(settingsButton, "Settings");
                 settingsButton.Click += (sender, args) => AppState.Instance.RequestSettingsOpen();
                 OpenFilesPanel.Children.Add(settingsButton);
+            }
+            if (AppState.Instance.IsCalculatorOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Calculator"))
+            {
+                var calculatorButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Calculator"), Content = CreateCalculatorIcon(24) };
+                ToolTipService.SetToolTip(calculatorButton, "Calculator");
+                calculatorButton.Click += (sender, args) => AppState.Instance.RequestCalculatorOpen();
+                OpenFilesPanel.Children.Add(calculatorButton);
             }
         }
         private void UpdateSearchButtonVisibility(bool isVisible)

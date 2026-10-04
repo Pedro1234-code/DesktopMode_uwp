@@ -62,6 +62,15 @@ namespace factoryos_10x_shell.Library.ViewModels
             settingsIcon.IconGlyph = null;
             settingsIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
 
+            StartIconModel calculatorIcon = m_appHelper.StartIcons.FirstOrDefault(app => app.AppId == "CoreShell.Calculator");
+            if (calculatorIcon == null)
+            {
+                calculatorIcon = new StartIconModel { AppId = "CoreShell.Calculator", IconName = "Calculator" };
+                m_appHelper.StartIcons.Insert(3, calculatorIcon);
+            }
+            calculatorIcon.IconGlyph = null;
+            calculatorIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
+
             AppsListGridHeight = 310;
             AppsListToggleContent = "Show all";
         }

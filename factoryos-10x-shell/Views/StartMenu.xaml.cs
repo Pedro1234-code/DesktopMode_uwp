@@ -85,6 +85,12 @@ namespace factoryos_10x_shell.Views
                     startManager.RequestStartVisibilityChange(false);
                     return;
                 }
+                if (model.AppId == "CoreShell.Calculator")
+                {
+                    AppState.Instance.RequestCalculatorOpen();
+                    startManager.RequestStartVisibilityChange(false);
+                    return;
+                }
                 await appHelper.LaunchAppAsync(model);
 
             }
