@@ -15,7 +15,7 @@ namespace CalculatorApp.Utils
         protected override object ProvideValue()
         {
             var resourceString = AppResourceProvider.GetInstance().GetResourceString(this.Name);
-            return Enum.Parse(typeof(MyVirtualKey), resourceString);
+            return Enum.TryParse(resourceString, out MyVirtualKey key) ? key : MyVirtualKey.None;
         }
     }
 }

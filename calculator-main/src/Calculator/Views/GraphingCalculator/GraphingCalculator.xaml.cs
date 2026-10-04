@@ -13,7 +13,6 @@ using GraphControl;
 using System;
 
 using Windows.ApplicationModel.DataTransfer;
-using Windows.ApplicationModel.Resources;
 using Windows.Foundation;
 using Windows.Storage;
 using Windows.System;
@@ -394,14 +393,14 @@ namespace CalculatorApp
         // data to be shared. We will request the current graph image from the grapher as a stream that will pass to the share request.
         private void OnDataRequested(DataTransferManager sender, DataRequestedEventArgs args)
         {
-            var resourceLoader = ResourceLoader.GetForCurrentView();
+            var resourceLoader = AppResourceProvider.GetInstance();
 
             try
             {
                 string rawHtml;
                 string equationHtml;
 
-                rawHtml = "<p><img src='graph.png' width='600' alt='" + resourceLoader.GetString("GraphImageAltText") + "'></p>";
+                rawHtml = "<p><img src='graph.png' width='600' alt='" + resourceLoader.GetResourceString("GraphImageAltText") + "'></p>";
 
                 var equations = ViewModel.Equations;
                 bool hasEquations = false;
@@ -409,7 +408,7 @@ namespace CalculatorApp
                 if (equations.Count > 0)
                 {
                     equationHtml = "<span style=\"color: rgb(68, 114, 196); font-style: bold; font-size : 13pt;\">"
-                                   + resourceLoader.GetString("EquationsShareHeader") + "</span>"
+                                   + resourceLoader.GetResourceString("EquationsShareHeader") + "</span>"
                                    + "<table cellpadding=\"0\" cellspacing=\"0\" >";
 
                     foreach (var equation in equations)
@@ -447,7 +446,7 @@ namespace CalculatorApp
                     var localizedSeperator = LocalizationSettings.GetInstance().GetListSeparatorWinRT() + " ";
 
                     rawHtml += "<br><span style=\"color: rgb(68, 114, 196); font-style: bold; font-size: 13pt;\">"
-                               + resourceLoader.GetString("VariablesShareHeader")
+                               + resourceLoader.GetResourceString("VariablesShareHeader")
                                + "</span><br><div style=\"margin: 4pt 0pt 0pt 0pt;\">";
 
                     for (int i = 0; i < variables.Count; i++)
@@ -476,7 +475,7 @@ namespace CalculatorApp
                 DataPackage dataPackage = new DataPackage();
                 var html = HtmlFormatHelper.CreateHtmlFormat(rawHtml);
 
-                requestData.Properties.Title = resourceLoader.GetString("ShareActionTitle");
+                requestData.Properties.Title = resourceLoader.GetResourceString("ShareActionTitle");
 
                 requestData.SetHtmlFormat(html);
 
@@ -867,11 +866,11 @@ namespace CalculatorApp
         private void ShowShareError()
         {
             // Something went wrong, notify the user.
-            var resourceLoader = ResourceLoader.GetForCurrentView();
+            var resourceLoader = AppResourceProvider.GetInstance();
             var errDialog = new ContentDialog
             {
-                Content = resourceLoader.GetString("ShareActionErrorMessage"),
-                CloseButtonText = resourceLoader.GetString("ShareActionErrorOk")
+                Content = resourceLoader.GetResourceString("ShareActionErrorMessage"),
+                CloseButtonText = resourceLoader.GetResourceString("ShareActionErrorOk")
             };
             _ = errDialog.ShowAsync();
         }

@@ -266,7 +266,7 @@ namespace CalculatorApp.ViewModel
             {
                 TraceLogger.GetInstance().LogWindowCreated(
                     _mode,
-                    ApplicationView.GetApplicationViewIdForWindow(CoreWindow.GetForCurrentThread()));
+                    Utils.GetWindowId());
             }
             OnPropertyChanged(nameof(ClearMemoryVisibility));
         }

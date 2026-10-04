@@ -425,6 +425,9 @@
     </PackageReference>
   </ItemGroup>
   <ItemGroup>
+    <PRIResource Include="..\calculator-main\src\Calculator\Resources\**\*.resw">
+      <Link>Resources\%(RecursiveDir)%(Filename)%(Extension)</Link>
+    </PRIResource>
     <Content Include="..\calculator-main\src\Calculator\Assets\CalculatorAppList.targetsize-48.png">
       <Link>Assets\Calculator\CalculatorAppList.targetsize-48.png</Link>
     </Content>

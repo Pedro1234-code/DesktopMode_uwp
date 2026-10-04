@@ -6,7 +6,6 @@ using CalculatorApp.ViewModel;
 using CalculatorApp.ViewModel.Common;
 
 using System;
-using Windows.ApplicationModel.Resources;
 using Windows.Foundation;
 using Windows.Globalization.NumberFormatting;
 using Windows.UI.Core;
@@ -926,16 +925,16 @@ namespace CalculatorApp
 
         private string GetMemoryPivotItemUiaString(bool isEmpty)
         {
-            var loader = ResourceLoader.GetForCurrentView();
-            var label = loader.GetString("MemoryLabel/Text");
-            return isEmpty ? $"{loader.GetString("MemoryPaneEmpty/Text")} {label}" : label;
+            var resources = AppResourceProvider.GetInstance();
+            var label = resources.GetResourceString("MemoryLabel/Text");
+            return isEmpty ? $"{resources.GetResourceString("MemoryPaneEmpty/Text")} {label}" : label;
         }
 
         private string GetHistoryPivotItemUiaString(bool isEmpty)
         {
-            var loader = ResourceLoader.GetForCurrentView();
-            var label = loader.GetString("HistoryLabel/Text");
-            return isEmpty ? $"{loader.GetString("HistoryEmpty/Text")} {label}" : label;
+            var resources = AppResourceProvider.GetInstance();
+            var label = resources.GetResourceString("HistoryLabel/Text");
+            return isEmpty ? $"{resources.GetResourceString("HistoryEmpty/Text")} {label}" : label;
         }
     }
 }

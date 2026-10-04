@@ -87,20 +87,17 @@
         </VisualStateManager.VisualStateGroups>
         <StackPanel Visibility="Collapsed">
             <!--
-                These buttons are only here to serve as the target for copy/paste commands
-                they are not to be shown, only to have the command and shortcut assigned to them.
+                The standalone app reads these keys from its own PRI resources. When the
+                page is hosted by DesktopMode that resource map is not the app map, so keep
+                the standard Calculator shortcuts explicit and independent of PRI lookup.
             -->
-            <Button x:Name="CopyButton"
-                    common:KeyboardShortcutManager.VirtualKeyControlChord="{utils:ResourceVirtualKey Name=copyButton/[using:CalculatorApp.Common]KeyboardShortcutManager/VirtualKeyControlChord}"
+            <Button common:KeyboardShortcutManager.VirtualKeyControlChord="C"
                     Command="{x:Bind ViewModel.CopyCommand}"/>
-            <Button x:Name="PasteButton"
-                    common:KeyboardShortcutManager.VirtualKeyControlChord="{utils:ResourceVirtualKey Name=pasteButton/[using:CalculatorApp.Common]KeyboardShortcutManager/VirtualKeyControlChord}"
+            <Button common:KeyboardShortcutManager.VirtualKeyControlChord="V"
                     Command="{x:Bind ViewModel.PasteCommand}"/>
-            <Button x:Name="CopyButtonAlternate"
-                    common:KeyboardShortcutManager.VirtualKeyControlChord="{utils:ResourceVirtualKey Name=copyButtonAlternate/[using:CalculatorApp.Common]KeyboardShortcutManager/VirtualKeyControlChord}"
+            <Button common:KeyboardShortcutManager.VirtualKeyControlChord="Insert"
                     Command="{x:Bind ViewModel.CopyCommand}"/>
-            <Button x:Name="PasteButtonAlternate"
-                    common:KeyboardShortcutManager.VirtualKeyShiftChord="{utils:ResourceVirtualKey Name=pasteButtonAlternate/[using:CalculatorApp.Common]KeyboardShortcutManager/VirtualKeyShiftChord}"
+            <Button common:KeyboardShortcutManager.VirtualKeyShiftChord="Insert"
                     Command="{x:Bind ViewModel.PasteCommand}"/>
         </StackPanel>
 

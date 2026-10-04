@@ -36,8 +36,28 @@ namespace CalculatorApp.ViewModel.Common
 
         public static AppResourceProvider GetInstance() => s_instance.Value;
 
-        public string GetResourceString(string key) => _stringResLoader?.GetString(key) ?? key;
+        public string GetResourceString(string key)
+        {
+            try
+            {
+                return _stringResLoader?.GetString(key) ?? key;
+            }
+            catch
+            {
+                return key;
+            }
+        }
 
-        public string GetCEngineString(string key) => _cEngineStringResLoader?.GetString(key) ?? "";
+        public string GetCEngineString(string key)
+        {
+            try
+            {
+                return _cEngineStringResLoader?.GetString(key) ?? string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
     }
 }

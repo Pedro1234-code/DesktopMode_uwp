@@ -52,6 +52,7 @@ namespace factoryos_10x_shell
         public App()
         {
             this.InitializeComponent();
+            this.UnhandledException += OnUnhandledException;
             this.Suspending += OnSuspending;
             this.Resuming += OnResuming;
             ApplicationView.PreferredLaunchWindowingMode = ApplicationViewWindowingMode.FullScreen;
@@ -108,22 +109,32 @@ namespace factoryos_10x_shell
                 Window.Current.Activate();
             }
 
-            Application.Current.UnhandledException += async (sender, e) =>
-            {
-                e.Handled = true;
-
-                await Windows.ApplicationModel.Core.CoreApplication.MainView.CoreWindow.Dispatcher.RunAsync(
-                    Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
-                    {
-                        Frame rootFrame = Window.Current.Content as Frame;
-                        rootFrame.Navigate(typeof(Views.FallbackErrorPage), e.Exception);
-                    });
-            };
-
-
             ApplicationView.PreferredLaunchWindowingMode = ApplicationViewWindowingMode.Maximized;
 
 
+        }
+
+        private void OnUnhandledException(object sender, Windows.UI.Xaml.UnhandledExceptionEventArgs e)
+        {
+            // This event already runs on the XAML UI thread. An async event lambda can
+            // turn failures in the error page into a second RoReportUnhandledError and
+            // hide the exception which brought us here.
+            e.Handled = true;
+            Debug.WriteLine($"Unhandled XAML exception: {e.Exception}");
+
+            try
+            {
+                if (Window.Current.Content is Frame rootFrame &&
+                    !(rootFrame.Content is Views.FallbackErrorPage))
+                {
+                    rootFrame.Navigate(typeof(Views.FallbackErrorPage), e.Exception);
+                }
+            }
+            catch (Exception fallbackException)
+            {
+                // Reporting an error must not create another unhandled exception.
+                Debug.WriteLine($"Could not display FallbackErrorPage: {fallbackException}");
+            }
         }
 
 

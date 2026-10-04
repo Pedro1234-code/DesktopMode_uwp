@@ -4,6 +4,7 @@ using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Input;
 using Windows.UI.Xaml.Media;
+using Windows.UI.Xaml.Navigation;
 using factoryos_10x_shell.Services.Helpers;
 
 namespace factoryos_10x_shell.Controls
@@ -22,15 +23,20 @@ namespace factoryos_10x_shell.Controls
         private double m_restoreTop;
         private double m_restoreWidth;
         private double m_restoreHeight;
+        private bool m_calculatorLoaded;
 
         public CalculatorWindow()
         {
             InitializeComponent();
-            CalculatorFrame.Navigate(typeof(CalculatorApp.MainPage));
+            CalculatorFrame.NavigationFailed += CalculatorFrame_NavigationFailed;
         }
 
         public void Open()
         {
+            if (!m_calculatorLoaded)
+            {
+                m_calculatorLoaded = CalculatorFrame.Navigate(typeof(CalculatorApp.MainPage));
+            }
             Visibility = Visibility.Visible;
             AppState.Instance.SetCalculatorWindowState(true, false);
             AppState.Instance.ActivateCalculator();
@@ -53,6 +59,31 @@ namespace factoryos_10x_shell.Controls
         }
 
         private void Root_PointerPressed(object sender, PointerRoutedEventArgs e) => AppState.Instance.ActivateCalculator();
+
+        private void CalculatorFrame_NavigationFailed(object sender, NavigationFailedEventArgs e)
+        {
+            e.Handled = true;
+            m_calculatorLoaded = false;
+
+            var errorPanel = new StackPanel
+            {
+                Margin = new Thickness(32),
+                Spacing = 12
+            };
+            errorPanel.Children.Add(new TextBlock
+            {
+                Text = "Calculator could not be loaded",
+                FontSize = 24,
+                FontWeight = Windows.UI.Text.FontWeights.SemiBold
+            });
+            errorPanel.Children.Add(new TextBlock
+            {
+                Text = e.Exception?.ToString() ?? "Unknown Calculator navigation error.",
+                TextWrapping = TextWrapping.Wrap,
+                IsTextSelectionEnabled = true
+            });
+            CalculatorFrame.Content = errorPanel;
+        }
 
         private void Maximize_Click(object sender, RoutedEventArgs e)
         {

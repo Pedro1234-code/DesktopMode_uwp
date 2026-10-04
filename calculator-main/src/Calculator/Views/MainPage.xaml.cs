@@ -509,48 +509,62 @@ namespace CalculatorApp
         {
             if (m_calculator == null)
             {
-                var calcVM = ViewModel.CalculatorViewModel;
-
-                // In C#, CalculatorViewModel is lazily created in OnModeChanged.
-                // If EnsureCalculator is called before mode is set, force creation.
-                if (calcVM == null)
+                var stage = "creating the Calculator control";
+                try
                 {
-                    ViewModel.Mode = ViewMode.Standard;
-                    calcVM = ViewModel.CalculatorViewModel;
+                    var calcVM = ViewModel.CalculatorViewModel;
+
+                    // In C#, CalculatorViewModel is lazily created in OnModeChanged.
+                    // If EnsureCalculator is called before mode is set, force creation.
+                    if (calcVM == null)
+                    {
+                        stage = "initializing the standard view model";
+                        ViewModel.Mode = ViewMode.Standard;
+                        calcVM = ViewModel.CalculatorViewModel;
+                    }
+
+                    stage = "creating the Calculator XAML tree";
+                    m_calculator = new Calculator();
+                    stage = "attaching the Calculator view model";
+                    m_calculator.ViewModel = calcVM;
+                    m_calculator.Name = "Calculator";
+                    m_calculator.DataContext = calcVM;
+                    Binding isStandardBinding = new Binding
+                    {
+                        Path = new PropertyPath("IsStandard")
+                    };
+                    m_calculator.SetBinding(Calculator.IsStandardProperty, isStandardBinding);
+                    Binding isScientificBinding = new Binding
+                    {
+                        Path = new PropertyPath("IsScientific")
+                    };
+                    m_calculator.SetBinding(Calculator.IsScientificProperty, isScientificBinding);
+                    Binding isProgramerBinding = new Binding
+                    {
+                        Path = new PropertyPath("IsProgrammer")
+                    };
+                    m_calculator.SetBinding(Calculator.IsProgrammerProperty, isProgramerBinding);
+                    Binding isAlwaysOnTopBinding = new Binding
+                    {
+                        Path = new PropertyPath("IsAlwaysOnTop")
+                    };
+                    m_calculator.SetBinding(Calculator.IsAlwaysOnTopProperty, isAlwaysOnTopBinding);
+                    m_calculator.Style = CalculatorBaseStyle;
+
+                    stage = "placing the Calculator in its DesktopMode host";
+                    CalcHolder.Child = m_calculator;
+
+                    // Calculator's "default" state is visible, but if we get delay loaded
+                    // when in converter, we should not be visible. This is not a problem for converter
+                    // since its default state is hidden.
+                    stage = "applying the initial Calculator mode";
+                    ShowHideControls(ViewModel.Mode);
                 }
-
-                m_calculator = new Calculator();
-                m_calculator.ViewModel = calcVM;
-                m_calculator.Name = "Calculator";
-                m_calculator.DataContext = calcVM;
-                Binding isStandardBinding = new Binding
+                catch (Exception ex)
                 {
-                    Path = new PropertyPath("IsStandard")
-                };
-                m_calculator.SetBinding(Calculator.IsStandardProperty, isStandardBinding);
-                Binding isScientificBinding = new Binding
-                {
-                    Path = new PropertyPath("IsScientific")
-                };
-                m_calculator.SetBinding(Calculator.IsScientificProperty, isScientificBinding);
-                Binding isProgramerBinding = new Binding
-                {
-                    Path = new PropertyPath("IsProgrammer")
-                };
-                m_calculator.SetBinding(Calculator.IsProgrammerProperty, isProgramerBinding);
-                Binding isAlwaysOnTopBinding = new Binding
-                {
-                    Path = new PropertyPath("IsAlwaysOnTop")
-                };
-                m_calculator.SetBinding(Calculator.IsAlwaysOnTopProperty, isAlwaysOnTopBinding);
-                m_calculator.Style = CalculatorBaseStyle;
-
-                CalcHolder.Child = m_calculator;
-
-                // Calculator's "default" state is visible, but if we get delay loaded
-                // when in converter, we should not be visible. This is not a problem for converter
-                // since its default state is hidden.
-                ShowHideControls(ViewModel.Mode);
+                    m_calculator = null;
+                    throw new InvalidOperationException($"Calculator initialization failed while {stage}.", ex);
+                }
             }
 
             if (m_dateCalculator != null)

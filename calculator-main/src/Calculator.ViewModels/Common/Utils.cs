@@ -36,13 +36,19 @@ namespace CalculatorApp.ViewModel.Common
 
         public static int GetWindowId()
         {
-            int windowId = -1;
-            var window = CoreWindow.GetForCurrentThread();
-            if (window != null)
+            try
             {
-                windowId = ApplicationView.GetApplicationViewIdForWindow(window);
+                // The original standalone app maps its CoreWindow back to an
+                // ApplicationView. When Calculator is hosted inside DesktopMode that
+                // association can fail with E_INVALIDARG. The current shell view id is
+                // sufficient for Calculator's shortcut dictionaries and telemetry.
+                return ApplicationView.GetForCurrentView().Id;
             }
-            return windowId;
+            catch
+            {
+                // DesktopMode has a single XAML view, so a stable fallback key is safe.
+                return 0;
+            }
         }
 
         public static void RunOnUIThreadNonblocking(Action function, CoreDispatcher currentDispatcher)
