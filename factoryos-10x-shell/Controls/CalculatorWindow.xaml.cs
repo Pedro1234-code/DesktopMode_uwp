@@ -33,19 +33,37 @@ namespace factoryos_10x_shell.Controls
 
         public void Open()
         {
+            CalculatorApp.MainPage.SetDiagnosticStage("opening the DesktopMode Calculator window");
+            // The original Calculator focuses its result control from Loaded. Its visual
+            // tree must already be visible when Frame.Navigate raises that event;
+            // focusing a descendant of a collapsed host fails with E_INVALIDARG.
+            Visibility = Visibility.Visible;
+
             if (!m_calculatorLoaded)
             {
+                CalculatorApp.MainPage.SetDiagnosticStage("navigating the Calculator frame");
                 m_calculatorLoaded = CalculatorFrame.Navigate(typeof(CalculatorApp.MainPage));
             }
-            Visibility = Visibility.Visible;
+            CalculatorApp.MainPage.SetDiagnosticStage("registering the Calculator window state");
             AppState.Instance.SetCalculatorWindowState(true, false);
+            CalculatorApp.MainPage.SetDiagnosticStage("activating the Calculator window layer");
             AppState.Instance.ActivateCalculator();
+            CalculatorApp.MainPage.SetDiagnosticStage("Calculator window opened successfully");
         }
 
         public void CloseFromTaskView() => Close();
 
         private void Close()
         {
+            if (CalculatorFrame.Content is CalculatorApp.MainPage calculatorPage)
+            {
+                calculatorPage.UnregisterEventHandlers();
+            }
+
+            CalculatorFrame.Content = null;
+            CalculatorFrame.BackStack.Clear();
+            CalculatorFrame.ForwardStack.Clear();
+            m_calculatorLoaded = false;
             Visibility = Visibility.Collapsed;
             AppState.Instance.SetCalculatorWindowState(false, false);
         }

@@ -11,7 +11,16 @@ namespace CalculatorApp.ViewModel.Common.Automation
     {
         private UIElement _announcementElement;
 
-        private static DependencyProperty s_announcementProperty;
+        // Register the property as part of the type itself. The original standalone
+        // Calculator registered it from CalculatorApp.App, but that App constructor is
+        // never executed when the UI is hosted by DesktopMode. That left the field null
+        // and every x:Bind update failed in DependencyObject.SetValue with E_INVALIDARG.
+        public static readonly DependencyProperty AnnouncementProperty =
+            DependencyProperty.Register(
+                nameof(Announcement),
+                typeof(NarratorAnnouncement),
+                typeof(NarratorNotifier),
+                new PropertyMetadata(null, OnAnnouncementChanged));
 
         public NarratorNotifier()
         {
@@ -23,25 +32,21 @@ namespace CalculatorApp.ViewModel.Common.Automation
             set => SetAnnouncement(this, value);
         }
 
-        public static DependencyProperty AnnouncementProperty => s_announcementProperty;
-
         public static NarratorAnnouncement GetAnnouncement(DependencyObject element)
         {
-            return (NarratorAnnouncement)element.GetValue(s_announcementProperty);
+            return (NarratorAnnouncement)element.GetValue(AnnouncementProperty);
         }
 
         public static void SetAnnouncement(DependencyObject element, NarratorAnnouncement value)
         {
-            element.SetValue(s_announcementProperty, value);
+            element.SetValue(AnnouncementProperty, value);
         }
 
         public static void RegisterDependencyProperties()
         {
-            s_announcementProperty = DependencyProperty.Register(
-                "Announcement",
-                typeof(NarratorAnnouncement),
-                typeof(NarratorNotifier),
-                new PropertyMetadata(null, OnAnnouncementChanged));
+            // Kept for source compatibility with the standalone Calculator App.
+            // Referencing this type has already initialized AnnouncementProperty.
+            _ = AnnouncementProperty;
         }
 
         public void Announce(NarratorAnnouncement announcement)

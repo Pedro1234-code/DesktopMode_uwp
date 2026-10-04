@@ -249,6 +249,20 @@ namespace CalculatorApp
                 KeyboardShortcutManager.RegisterNewAppViewId();
             }
 
+            internal static void Uninitialize()
+            {
+                var coreWindow = Window.Current?.CoreWindow;
+                if (coreWindow != null)
+                {
+                    coreWindow.CharacterReceived -= OnCharacterReceivedHandler;
+                    coreWindow.KeyDown -= OnKeyDownHandler;
+                    coreWindow.KeyUp -= OnKeyUpHandler;
+                    coreWindow.Dispatcher.AcceleratorKeyActivated -= OnAcceleratorKeyActivated;
+                }
+
+                OnWindowClosed(Utilities.GetWindowId());
+            }
+
             // Sometimes, like with popups, escape is treated as special and even
             // though it is handled we get it passed through to us. In those cases
             // we need to be able to ignore it (looking at e->Handled isn't sufficient
@@ -841,4 +855,3 @@ namespace CalculatorApp
         }
     }
 }
-

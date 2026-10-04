@@ -41,13 +41,17 @@ namespace CalculatorApp
 
         public Calculator()
         {
+            MainPage.SetDiagnosticStage("initializing Calculator control fields");
             m_doAnimate = false;
             m_isLastAnimatedInScientific = false;
             m_isLastAnimatedInProgrammer = false;
             m_resultAnimate = false;
 
+            MainPage.SetDiagnosticStage("creating Calculator font resources");
             SetFontSizeResources();
+            MainPage.SetDiagnosticStage("loading Calculator control XAML");
             InitializeComponent();
+            MainPage.SetDiagnosticStage("loading Calculator control resource strings");
             LoadResourceStrings();
 
             if (LocalizationSettings.GetInstance().IsRtlLayout())
@@ -206,6 +210,12 @@ namespace CalculatorApp
 
         public void UnregisterEventHandlers()
         {
+            SizeChanged -= Calculator_SizeChanged;
+            if (ViewModel != null)
+            {
+                ViewModel.PropertyChanged -= OnCalcPropertyChanged;
+                ViewModel.HideMemoryClicked -= OnHideMemoryClicked;
+            }
             ExpressionText.UnregisterEventHandlers();
             AlwaysOnTopResults.UnregisterEventHandlers();
         }
@@ -228,13 +238,30 @@ namespace CalculatorApp
 
         public void SetDefaultFocus()
         {
-            if (!IsAlwaysOnTop)
+            // DesktopMode can construct this control under a temporarily hidden window.
+            // UWP throws E_INVALIDARG when Focus is requested before the hosted control
+            // is loaded and visible, whereas the standalone Calculator never has that
+            // intermediate state.
+            if (!IsLoaded || Visibility != Visibility.Visible)
             {
-                Results.Focus(FocusState.Programmatic);
+                return;
             }
-            else
+
+            try
             {
-                AlwaysOnTopResults.Focus(FocusState.Programmatic);
+                if (!IsAlwaysOnTop)
+                {
+                    Results?.Focus(FocusState.Programmatic);
+                }
+                else
+                {
+                    AlwaysOnTopResults?.Focus(FocusState.Programmatic);
+                }
+            }
+            catch (ArgumentException)
+            {
+                // Focus is a convenience here, not a prerequisite for initialization.
+                // The user can still focus the Calculator through pointer/controller input.
             }
         }
 
@@ -246,26 +273,49 @@ namespace CalculatorApp
 
         private void OnLoaded(object sender, RoutedEventArgs e)
         {
+            MainPage.SetDiagnosticStage("running Calculator control Loaded");
             ViewModel.PropertyChanged += OnCalcPropertyChanged;
             ViewModel.HideMemoryClicked += OnHideMemoryClicked;
 
+            MainPage.SetDiagnosticStage("initializing Calculator history");
             InitializeHistoryView(ViewModel.HistoryVM);
-            string historyPaneName= AppResourceProvider.GetInstance().GetResourceString("HistoryPane");
-            HistoryFlyout.FlyoutPresenterStyle.Setters.Add(new Setter(AutomationProperties.NameProperty, historyPaneName));
+            MainPage.SetDiagnosticStage("creating Calculator flyout styles");
+            string historyPaneName = AppResourceProvider.GetInstance().GetResourceString("HistoryPane");
+            HistoryFlyout.FlyoutPresenterStyle = CreateNamedFlyoutPresenterStyle(
+                HistoryFlyout.FlyoutPresenterStyle,
+                historyPaneName);
             string memoryPaneName = AppResourceProvider.GetInstance().GetResourceString("MemoryPane");
-            MemoryFlyout.FlyoutPresenterStyle.Setters.Add(new Setter(AutomationProperties.NameProperty, memoryPaneName));
+            MemoryFlyout.FlyoutPresenterStyle = CreateNamedFlyoutPresenterStyle(
+                MemoryFlyout.FlyoutPresenterStyle,
+                memoryPaneName);
+            MainPage.SetDiagnosticStage("applying Calculator error visual state");
             OnIsInErrorPropertyChanged();
 
             // In the Shell there is no standalone Calculator application view to register.
             // Load memory after the original control has completed its first layout pass.
             WeakReference weakThis = new WeakReference(this);
+            MainPage.SetDiagnosticStage("scheduling Calculator memory restoration");
             _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
             {
                 if (weakThis.Target is Calculator refThis)
                 {
+                    MainPage.SetDiagnosticStage("restoring Calculator memory");
                     refThis.GetMemory();
+                    MainPage.SetDiagnosticStage("Calculator memory restored successfully");
                 }
             });
+        }
+
+        private static Style CreateNamedFlyoutPresenterStyle(Style baseStyle, string automationName)
+        {
+            // A resource style may already be sealed once the hosted control is loaded.
+            // Derive a per-flyout style instead of mutating the shared resource in place.
+            var style = new Style(typeof(FlyoutPresenter))
+            {
+                BasedOn = baseStyle
+            };
+            style.Setters.Add(new Setter(AutomationProperties.NameProperty, automationName ?? string.Empty));
+            return style;
         }
 
         private void LoadResourceStrings()

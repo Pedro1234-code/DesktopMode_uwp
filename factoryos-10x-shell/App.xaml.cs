@@ -120,14 +120,20 @@ namespace factoryos_10x_shell
             // turn failures in the error page into a second RoReportUnhandledError and
             // hide the exception which brought us here.
             e.Handled = true;
-            Debug.WriteLine($"Unhandled XAML exception: {e.Exception}");
+            string calculatorStage = CalculatorApp.MainPage.DiagnosticStage;
+            Debug.WriteLine($"Unhandled XAML exception during '{calculatorStage}': {e.Exception}");
+
+            Exception exceptionWithContext = new InvalidOperationException(
+                $"Unhandled exception during: {calculatorStage}. " +
+                $"Original HRESULT: 0x{e.Exception.HResult:X8}.",
+                e.Exception);
 
             try
             {
                 if (Window.Current.Content is Frame rootFrame &&
                     !(rootFrame.Content is Views.FallbackErrorPage))
                 {
-                    rootFrame.Navigate(typeof(Views.FallbackErrorPage), e.Exception);
+                    rootFrame.Navigate(typeof(Views.FallbackErrorPage), exceptionWithContext);
                 }
             }
             catch (Exception fallbackException)

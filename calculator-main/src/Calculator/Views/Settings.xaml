@@ -58,8 +58,9 @@
                 Style="{StaticResource SquareIconButtonStyle}"
                 FontSize="12"
                 AutomationProperties.Name="{utils:ResourceString Name=TitleBarBackButton/[using:Windows.UI.Xaml.Automation]AutomationProperties/Name}"
-                Click="BackButton_Click"
-                Content="&#xE72B;"/>
+                Click="BackButton_Click">
+            <FontIcon FontFamily="Segoe MDL2 Assets" FontSize="12" Glyph="&#xE72B;"/>
+        </Button>
 
         <Grid Grid.Row="1"
               Height="{StaticResource HamburgerHeight}"

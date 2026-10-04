@@ -29,6 +29,14 @@ namespace CalculatorApp
 {
     public sealed partial class MainPage : wuxc.Page
     {
+        public static string DiagnosticStage { get; private set; } = "Calculator has not started loading";
+
+        public static void SetDiagnosticStage(string stage)
+        {
+            DiagnosticStage = stage ?? "Unknown Calculator stage";
+            System.Diagnostics.Debug.WriteLine($"Calculator stage: {DiagnosticStage}");
+        }
+
         public static readonly DependencyProperty NavViewCategoriesSourceProperty =
             DependencyProperty.Register(nameof(NavViewCategoriesSource), typeof(List<object>), typeof(MainPage), new PropertyMetadata(default));
 
@@ -42,16 +50,23 @@ namespace CalculatorApp
 
         public MainPage()
         {
+            SetDiagnosticStage("creating ApplicationViewModel");
             ViewModel = new ApplicationViewModel();
+            SetDiagnosticStage("creating navigation categories");
             InitializeNavViewCategoriesSource();
+            SetDiagnosticStage("loading MainPage XAML");
             InitializeComponent();
 
+            SetDiagnosticStage("initializing keyboard shortcuts");
             KeyboardShortcutManager.Initialize();
 
+            SetDiagnosticStage("subscribing Calculator lifecycle events");
             Application.Current.Suspending += App_Suspending;
             ViewModel.PropertyChanged += OnAppPropertyChanged;
+            SetDiagnosticStage("creating accessibility settings");
             m_accessibilitySettings = new AccessibilitySettings();
 
+            SetDiagnosticStage("reading integrated display information");
             if (Utilities.GetIntegratedDisplaySize(out var sizeInInches))
             {
                 if (sizeInInches < 7.0) // If device's display size (diagonal length) is less than 7 inches then keep the calc always in Portrait mode only
@@ -64,8 +79,11 @@ namespace CalculatorApp
 
         public void UnregisterEventHandlers()
         {
+            Application.Current.Suspending -= App_Suspending;
+            ViewModel.PropertyChanged -= OnAppPropertyChanged;
             SizeChanged -= MainPage_SizeChanged;
             m_accessibilitySettings.HighContrastChanged -= OnHighContrastChanged;
+            KeyboardShortcutManager.Uninitialize();
 
             if (m_calculator != null)
             {
@@ -122,6 +140,7 @@ namespace CalculatorApp
 
         protected override void OnNavigatedTo(NavigationEventArgs e)
         {
+            SetDiagnosticStage("reading the saved Calculator mode");
             var initialMode = ViewMode.Standard;
             var localSettings = ApplicationData.Current.LocalSettings;
             if (localSettings.Values.ContainsKey(nameof(ApplicationViewModel.Mode)))
@@ -131,6 +150,7 @@ namespace CalculatorApp
 
             if (e.Parameter == null)
             {
+                SetDiagnosticStage("initializing the Calculator view model");
                 ViewModel.Initialize(initialMode);
                 return;
             }
@@ -317,6 +337,7 @@ namespace CalculatorApp
 
         private void OnNavLoaded(object sender, RoutedEventArgs e)
         {
+            SetDiagnosticStage("loading the Calculator navigation view");
             if (NavView.SelectedItem == null)
             {
                 SelectNavigationItemByModel();
@@ -479,20 +500,27 @@ namespace CalculatorApp
 
         private void OnPageLoaded(object sender, RoutedEventArgs args)
         {
+            SetDiagnosticStage("loading the Calculator page");
             if (m_converter == null && m_calculator == null && m_dateCalculator == null && m_graphingCalculator == null)
             {
                 // We have just launched into our default mode (standard calc) so ensure calc is loaded
+                SetDiagnosticStage("ensuring the standard Calculator control");
                 EnsureCalculator();
+                SetDiagnosticStage("selecting standard Calculator mode");
                 ViewModel.CalculatorViewModel.IsStandard = true;
             }
 
+            SetDiagnosticStage("subscribing page layout and accessibility events");
             SizeChanged += MainPage_SizeChanged;
             m_accessibilitySettings.HighContrastChanged += OnHighContrastChanged;
+            SetDiagnosticStage("applying the Calculator page visual state");
             UpdateViewState();
 
+            SetDiagnosticStage("setting Calculator accessibility labels");
             SetHeaderAutomationName();
+            SetDiagnosticStage("setting initial Calculator focus");
             SetDefaultFocus();
-
+            SetDiagnosticStage("Calculator page loaded successfully");
         }
 
         private void App_Suspending(object sender, Windows.ApplicationModel.SuspendingEventArgs e)

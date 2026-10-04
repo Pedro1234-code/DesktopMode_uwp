@@ -193,7 +193,7 @@
             </Popup.ChildTransitions>
 
             <Grid x:Name="PopupContent" x:Load="false">
-                <local:Settings BackButtonClick="Settings_BackButtonClick" TitleBarHeight="{x:Bind DoubleToGridLength(AppTitleBar.Height), Mode=OneWay}"/>
+                <local:Settings BackButtonClick="Settings_BackButtonClick" TitleBarHeight="44"/>
             </Grid>
         </Popup>
     </Grid>
