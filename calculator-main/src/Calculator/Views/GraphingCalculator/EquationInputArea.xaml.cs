@@ -306,7 +306,7 @@ namespace CalculatorApp
             else
             {
                 object themeDictionaryName = "Light";
-                if (IsMatchAppTheme && Application.Current.RequestedTheme == ApplicationTheme.Dark)
+            if (IsMatchAppTheme && ThemeHelper.IsDarkTheme)
                 {
                     themeDictionaryName = "Default";
                 }

@@ -41,6 +41,9 @@ namespace factoryos_10x_shell
         private readonly bool m_useXboxDesktopScale;
         private bool m_isNativeMouseCursorHidden;
         private int m_popupCursorRequests;
+        private bool m_hasOpenXamlPopup;
+        private bool m_isWindowActive = true;
+        private bool m_hasMouseInput;
         private bool m_altTabHeld;
 
         public MainPage()
@@ -78,6 +81,8 @@ namespace factoryos_10x_shell
 
             Loaded += MainPage_Loaded;
             Window.Current.SizeChanged += Window_SizeChanged;
+            Window.Current.Activated += Window_Activated;
+            CompositionTarget.Rendering += CompositionTarget_Rendering;
 
         }
 
@@ -121,21 +126,8 @@ namespace factoryos_10x_shell
             Canvas.SetTop(MouseCursor, e.Snapshot.Y / scale);
             MouseCursor.Width = logicalCursorSize;
             MouseCursor.Height = logicalCursorSize;
-            if (m_popupCursorRequests > 0)
-            {
-                MouseCursor.Visibility = Visibility.Collapsed;
-                return;
-            }
-
-            MouseCursor.Visibility = Visibility.Visible;
-
-            if (!m_isNativeMouseCursorHidden)
-            {
-                // Match Bandit Launcher: the Windows cursor is hidden and our image is
-                // the only visible pointer. XAML controls still receive normal input.
-                Window.Current.CoreWindow.PointerCursor = null;
-                m_isNativeMouseCursorHidden = true;
-            }
+            m_hasMouseInput = true;
+            UpdateCursorPresentation();
         }
 
         // Flyouts and ContentDialogs are rendered in the UWP popup layer, above the
@@ -148,17 +140,50 @@ namespace factoryos_10x_shell
         private void SetPopupCursorVisibilityCore(bool isPopupOpen)
         {
             m_popupCursorRequests = Math.Max(0, m_popupCursorRequests + (isPopupOpen ? 1 : -1));
-            if (m_popupCursorRequests > 0)
+            UpdateCursorPresentation();
+        }
+
+        private void CompositionTarget_Rendering(object sender, object e)
+        {
+            bool hasOpenPopup = VisualTreeHelper.GetOpenPopups(Window.Current).Count > 0;
+            if (m_hasOpenXamlPopup == hasOpenPopup) return;
+
+            m_hasOpenXamlPopup = hasOpenPopup;
+            UpdateCursorPresentation();
+        }
+
+        private void Window_Activated(object sender, WindowActivatedEventArgs e)
+        {
+            bool isActive = e.WindowActivationState != CoreWindowActivationState.Deactivated;
+            if (m_isWindowActive == isActive) return;
+
+            m_isWindowActive = isActive;
+            UpdateCursorPresentation();
+        }
+
+        private void UpdateCursorPresentation()
+        {
+            bool useSystemCursor = m_popupCursorRequests > 0 || m_hasOpenXamlPopup || !m_isWindowActive;
+            if (useSystemCursor)
             {
                 MouseCursor.Visibility = Visibility.Collapsed;
-                Window.Current.CoreWindow.PointerCursor = new CoreCursor(CoreCursorType.Arrow, 0);
-                m_isNativeMouseCursorHidden = false;
+                if (m_isNativeMouseCursorHidden)
+                {
+                    Window.Current.CoreWindow.PointerCursor = new CoreCursor(CoreCursorType.Arrow, 0);
+                    m_isNativeMouseCursorHidden = false;
+                }
             }
             else
             {
-                Window.Current.CoreWindow.PointerCursor = null;
-                m_isNativeMouseCursorHidden = true;
-                MouseCursor.Visibility = Visibility.Visible;
+                if (!m_isNativeMouseCursorHidden)
+                {
+                    // Match Bandit Launcher: the Windows cursor is hidden and our image
+                    // is the only visible pointer while interacting with the Shell layer.
+                    Window.Current.CoreWindow.PointerCursor = null;
+                    m_isNativeMouseCursorHidden = true;
+                }
+
+                MouseCursor.Visibility = m_hasMouseInput ? Visibility.Visible : Visibility.Collapsed;
             }
         }
 

@@ -56,6 +56,8 @@ namespace CalculatorApp
             InitializeNavViewCategoriesSource();
             SetDiagnosticStage("loading MainPage XAML");
             InitializeComponent();
+            ThemeHelper.SetThemeRoot(this);
+            ThemeHelper.InitializeAppTheme();
 
             SetDiagnosticStage("initializing keyboard shortcuts");
             KeyboardShortcutManager.Initialize();
@@ -84,6 +86,7 @@ namespace CalculatorApp
             SizeChanged -= MainPage_SizeChanged;
             m_accessibilitySettings.HighContrastChanged -= OnHighContrastChanged;
             KeyboardShortcutManager.Uninitialize();
+            ThemeHelper.ClearThemeRoot(this);
 
             if (m_calculator != null)
             {

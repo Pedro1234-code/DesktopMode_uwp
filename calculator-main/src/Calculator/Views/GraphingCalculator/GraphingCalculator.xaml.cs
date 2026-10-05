@@ -756,7 +756,7 @@ namespace CalculatorApp
                 return;
             }
 
-            if (IsMatchAppTheme && Application.Current.RequestedTheme == ApplicationTheme.Dark)
+            if (IsMatchAppTheme && ThemeHelper.IsDarkTheme)
             {
                 VisualStateManager.GoToState(this, "GrapherDarkTheme", true);
             }

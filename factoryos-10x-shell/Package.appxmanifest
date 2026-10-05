@@ -42,7 +42,7 @@
         Description="Shell for Windows MobileOS project. Fork from Pdawg FactoryOS 10X shell."
         BackgroundColor="transparent">
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" Square71x71Logo="Assets\SmallTile.png" Square310x310Logo="Assets\LargeTile.png"/>
-        <uap:SplashScreen Image="Assets\SplashScreen.png" />
+        <uap:SplashScreen Image="Assets\SplashScreen.png"  BackgroundColor="#000000"/>
       </uap:VisualElements>
       <Extensions>
         <uap5:Extension Category="windows.appExecutionAlias">
