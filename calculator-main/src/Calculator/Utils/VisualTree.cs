@@ -10,7 +10,7 @@ using Windows.UI.Xaml.Media;
 // Original version here:
 // https://raw.githubusercontent.com/windows-toolkit/WindowsCommunityToolkit/master/Microsoft.Toolkit.Uwp.UI/Extensions/Tree/VisualTree.cs
 
-namespace Calculator.Utils
+namespace CalculatorApp.Utils
 {
     /// <summary>
     /// Defines a collection of extensions methods for UI.
@@ -131,4 +131,3 @@ namespace Calculator.Utils
         }
     }
 }
-

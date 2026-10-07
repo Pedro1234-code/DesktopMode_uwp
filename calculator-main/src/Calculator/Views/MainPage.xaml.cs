@@ -19,6 +19,7 @@ using Microsoft.UI.Xaml.Controls;
 using CalculatorApp.Common;
 using CalculatorApp.Converters;
 using CalculatorApp.JsonUtils;
+using CalculatorApp.Utils;
 using CalculatorApp.ViewModel;
 using CalculatorApp.ViewModel.Common;
 using CalculatorApp.ViewModel.Common.Automation;

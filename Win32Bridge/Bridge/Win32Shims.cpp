@@ -7,6 +7,7 @@
 #include "Bridge/CommonControlsShims.h"
 #include "Bridge/Comdlg32Shims.h"
 #include "Bridge/OleShims.h"
+#include "Bridge/MprShims.h"
 #include "Bridge/MsvcrtShims.h"
 #include "Bridge/Shell32Shims.h"
 #include "Bridge\\Kernel32Shims.h"
@@ -136,6 +137,8 @@ ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
     if (commonDialogResolution.targetAddress != 0) return commonDialogResolution;
     const auto oleResolution = ResolveOleImport(canonical);
     if (oleResolution.targetAddress != 0) return oleResolution;
+    const auto mprResolution = ResolveMprImport(canonical);
+    if (mprResolution.targetAddress != 0) return mprResolution;
     const auto shellResolution = ResolveShell32Import(canonical);
     if (shellResolution.targetAddress != 0) return shellResolution;
     const auto msvcrtResolution = ResolveMsvcrtImport(canonical);

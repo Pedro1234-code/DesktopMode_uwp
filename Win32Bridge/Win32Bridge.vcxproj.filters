@@ -154,6 +154,7 @@
     <ClCompile Include="Bridge\GuestRegistry.cpp" />
     <ClCompile Include="Bridge\GuestResources.cpp" />
     <ClCompile Include="Bridge\MsvcrtShims.cpp" />
+    <ClCompile Include="Bridge\MprShims.cpp" />
     <ClCompile Include="Bridge\OleShims.cpp" />
     <ClCompile Include="Bridge\Shell32Shims.cpp" />
     <ClCompile Include="Bridge\GuestModule.cpp" />
@@ -168,6 +169,7 @@
     <ClInclude Include="Bridge\GuestRegistry.h" />
     <ClInclude Include="Bridge\GuestResources.h" />
     <ClInclude Include="Bridge\MsvcrtShims.h" />
+    <ClInclude Include="Bridge\MprShims.h" />
     <ClInclude Include="Bridge\OleShims.h" />
     <ClInclude Include="Bridge\Shell32Shims.h" />
     <ClInclude Include="Bridge\GuestModule.h" />

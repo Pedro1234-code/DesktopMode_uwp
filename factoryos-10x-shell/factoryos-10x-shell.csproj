@@ -438,6 +438,11 @@
       <Project>{3B773403-B0D6-4F9A-948E-512A7A5FB315}</Project>
       <Name>Calculator</Name>
     </ProjectReference>
+    <ProjectReference Include="..\calculator-main\src\GraphControl\GraphControl.vcxproj">
+      <Project>{e727a92b-f149-492c-8117-c039a298719b}</Project>
+      <Name>GraphControl</Name>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+    </ProjectReference>
     <ProjectReference Include="..\factoryos-10x-shell.Library\factoryos-10x-shell.Library.csproj">
       <Project>{4345e98b-2f22-4824-9c67-90de0e7ee619}</Project>
       <Name>factoryos-10x-shell.Library</Name>

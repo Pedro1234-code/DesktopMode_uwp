@@ -784,6 +784,7 @@
       <Project>{e727a92b-f149-492c-8117-c039a298719b}</Project>
       <Name>GraphControl</Name>
       <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+      <Private>false</Private>
     </ProjectReference>
     <ProjectReference Include="..\TraceLogging.Managed\TraceLogging.Managed.csproj">
       <Project>{3E4B3AB2-A1E0-4B28-B191-7B423E00B5A1}</Project>

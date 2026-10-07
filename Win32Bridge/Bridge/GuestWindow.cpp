@@ -821,6 +821,7 @@ namespace
     constexpr UINT ToolbarSetButtonWidth = 0x043b;
     constexpr UINT ToolbarInsertButtonW = 0x0443;
     constexpr UINT ToolbarHitTest = 0x0445;
+    constexpr UINT ToolbarGetMaxSize = 0x0453;
     constexpr UINT RebarSetBarInfo = 0x0404;
     constexpr UINT RebarInsertBandW = 0x040a;
     constexpr UINT RebarSetBandInfoW = 0x040b;
@@ -3205,6 +3206,7 @@ bool GuestWindowManager::IsGuestWindowEnabledInternal(HWND window) const
         }
 
         HWND parent = nullptr;
+        bool isChild = false;
         {
             std::lock_guard<std::mutex> guard(record->lock);
             if (record->destroyed || !record->enabled)
@@ -3212,8 +3214,14 @@ bool GuestWindowManager::IsGuestWindowEnabledInternal(HWND window) const
                 return false;
             }
             parent = record->parent;
+            isChild = (record->style & GuestAbi::WsChild) != 0;
         }
-        current = parent;
+
+        // For WS_CHILD windows, enabled state is inherited from the real
+        // parent hierarchy.  A WS_POPUP uses the same retained edge only as
+        // its owner/composition anchor: disabling that owner for a modal
+        // dialog must not disable the popup dialog or its controls as well.
+        current = isChild ? parent : nullptr;
     }
     return true;
 }
@@ -3689,8 +3697,13 @@ BOOL GuestWindowManager::SetGuestWindowMenuBar(HWND window, BOOL visible, DWORD*
         const bool requested = visible != FALSE;
         changed = topLevel && record->menuBar != requested;
         record->menuBar = topLevel && requested;
-        width = record->surface.Width();
+        const GuestMetrics::NonClientMetrics nonClient =
+            GuestMetrics::NonClientForEmbeddedWindow(
+                record->style, record->extendedStyle, false);
+        width = (std::max)(0, record->surface.Width() -
+            nonClient.left - nonClient.right);
         height = (std::max)(0, record->surface.Height() -
+            nonClient.top - nonClient.bottom -
             (record->menuBar ? GuestMetrics::MenuHeight : 0));
     }
     if (changed)
@@ -5774,6 +5787,25 @@ BOOL GuestWindowManager::SetGuestWindowPos(
             flags };
         CallWindowProcedure(record, GuestAbi::WmWindowPosChanged, 0,
             reinterpret_cast<LPARAM>(&completed));
+    }
+
+    if (becameVisible && !parent)
+    {
+        // A top-level window can be shown through SetWindowPos or
+        // SetWindowPlacement without passing through ShowWindow.  Do not
+        // depend on the guest procedure forwarding WM_WINDOWPOSCHANGED to
+        // DefWindowProc before its first frame: finish the initial client
+        // layout synchronously, with menu/non-client chrome excluded.
+        RECT client{};
+        if (GetGuestClientRect(window, &client, nullptr))
+        {
+            const int clientWidth = (std::max)(0L, client.right - client.left);
+            const int clientHeight = (std::max)(0L, client.bottom - client.top);
+            CallWindowProcedure(record, GuestAbi::WmSize, GuestAbi::SizeRestored,
+                GuestAbi::MakeMouseLParam(
+                    static_cast<WORD>((std::min)(clientWidth, 0xffff)),
+                    static_cast<WORD>((std::min)(clientHeight, 0xffff))));
+        }
     }
 
     if ((changedSize || becameVisible || (flags & GuestSwpFrameChanged) != 0) &&
@@ -8263,6 +8295,24 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             std::lock_guard<std::mutex> guard(window->lock);
             return MAKELONG(window->toolbarButtonWidth, window->toolbarButtonHeight);
         }
+        if (message == ToolbarGetMaxSize)
+        {
+            SIZE result{};
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                result.cx = ToolbarContentWidth(
+                    window->toolbarButtonStyles,
+                    window->toolbarBitmaps,
+                    window->toolbarButtonStates,
+                    window->toolbarCommands.size(),
+                    window->toolbarButtonWidth,
+                    &window->toolbarButtonTexts);
+                result.cy = (std::min)(GuestMetrics::MaximumControlStripHeight,
+                    (std::max)(GuestMetrics::StatusBarMinimumHeight,
+                        window->toolbarButtonHeight + 2 * GuestMetrics::Border));
+            }
+            return TryWriteGuestValue(reinterpret_cast<SIZE*>(lParam), result) ? TRUE : FALSE;
+        }
         if (message == ToolbarGetItemRect || message == ToolbarGetRect)
         {
             RECT result = {};
@@ -9904,7 +9954,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 clientWidth = (std::max)(0, clientWidth -
                     nonClient.left - nonClient.right);
                 clientHeight = (std::max)(0, clientHeight -
-                    nonClient.top - nonClient.bottom);
+                    nonClient.top - nonClient.bottom -
+                    ((!window->parent && window->menuBar) ?
+                        GuestMetrics::MenuHeight : 0));
             }
             CallWindowProcedure(window, GuestAbi::WmSize, GuestAbi::SizeRestored,
                 GuestAbi::MakeMouseLParam(
@@ -13188,7 +13240,9 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
                 clientWidth = (std::max)(0, clientWidth -
                     nonClient.left - nonClient.right);
                 clientHeight = (std::max)(0, clientHeight -
-                    nonClient.top - nonClient.bottom);
+                    nonClient.top - nonClient.bottom -
+                    ((!record->parent && record->menuBar) ?
+                        GuestMetrics::MenuHeight : 0));
             }
             CallWindowProcedure(record, GuestAbi::WmSize, GuestAbi::SizeRestored,
                 GuestAbi::MakeMouseLParam(
@@ -15158,6 +15212,8 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
         bool resized = false;
         int resizedWidth = 0;
         int resizedHeight = 0;
+        int resizedClientWidth = 0;
+        int resizedClientHeight = 0;
         {
             std::lock_guard<std::mutex> guard(root->lock);
             if (root->destroyed || root->parent)
@@ -15185,14 +15241,23 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
             root->updateRect = RECT{};
             resizedWidth = newWidth;
             resizedHeight = newHeight;
+            const GuestMetrics::NonClientMetrics nonClient =
+                GuestMetrics::NonClientForEmbeddedWindow(
+                    root->style, root->extendedStyle, false);
+            resizedClientWidth = (std::max)(0, newWidth -
+                nonClient.left - nonClient.right);
+            resizedClientHeight = (std::max)(0, newHeight -
+                nonClient.top - nonClient.bottom -
+                (root->menuBar ? GuestMetrics::MenuHeight : 0));
             resized = true;
         }
         if (resized)
         {
             m_gdi.ResetClip(dc);
             PostGuestMessage(handle, GuestAbi::WmSize, GuestAbi::SizeRestored,
-                GuestAbi::MakeMouseLParam(SignedCoordinateWord(resizedWidth),
-                    SignedCoordinateWord(resizedHeight)), nullptr);
+                GuestAbi::MakeMouseLParam(
+                    static_cast<WORD>((std::min)(resizedClientWidth, 0xffff)),
+                    static_cast<WORD>((std::min)(resizedClientHeight, 0xffff))), nullptr);
             InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
             RuntimeDiagnostics::Record(L"VIEWPORT: resized default-bound root to " +
                 std::to_wstring(resizedWidth) + L"x" +

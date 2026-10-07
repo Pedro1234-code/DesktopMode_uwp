@@ -3457,7 +3457,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
         SetGuestLastError(ERROR_NOT_SUPPORTED);
         return FALSE;
     }
-    if (inheritHandles && (startupInfo->dwFlags & STARTF_USESTDHANDLES) != 0 &&
+    constexpr DWORD StartfUseStdHandles = 0x00000100;
+    if (inheritHandles && (startupInfo->dwFlags & StartfUseStdHandles) != 0 &&
         (startupInfo->hStdInput || startupInfo->hStdOutput || startupInfo->hStdError))
     {
         SetGuestLastError(ERROR_NOT_SUPPORTED);
