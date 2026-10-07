@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge\\CommonControlsShims.h"
+#include "Bridge\\ActivationContext.h"
 #include "Bridge\\DialogResources.h"
 #include "Bridge\\GuestWindow.h"
 #include "Bridge\\Kernel32Shims.h"
@@ -2197,6 +2198,7 @@ struct GuestWindowManager::WindowRecord final
     UINT_PTR controlId = 0;
     std::vector<BYTE> extraBytes;
     MiniGdi::ObjectHandle controlFont = MiniGdi::InvalidObject;
+    bool visualStyles = false;
     HICON staticIcon = nullptr;
     MiniGdi::Surface staticImage;
     int controlTextWidth = GuestMetrics::TextWidth;
@@ -2806,6 +2808,10 @@ HWND GuestWindowManager::CreateGuestWindow(
     window->instance = instance;
     window->parent = parent;
     window->controlId = parent ? reinterpret_cast<UINT_PTR>(menu) : 0;
+    // Comctl32 binds a control to the activation context in effect when the
+    // window is created. Preserve that choice even if a nested context is
+    // activated later while the control is being painted.
+    window->visualStyles = CurrentGuestUsesVisualStyles();
     window->editCaret = window->title.size();
     window->editSelectionAnchor = window->editCaret;
     window->editSelectionEnd = window->editCaret;
@@ -10050,6 +10056,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         std::wstring text;
         DWORD style = 0;
         bool enabled = false;
+        bool visualStyles = false;
         bool pressed = false;
         size_t caret = 0;
         size_t selectionAnchor = 0;
@@ -10137,6 +10144,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             text = window->title;
             style = window->style;
             enabled = window->enabled;
+            visualStyles = window->visualStyles;
             pressed = window->buttonPressed || window->buttonKeyboardPressed;
             caret = window->editCaret;
             selectionAnchor = window->editSelectionAnchor;
@@ -10258,13 +10266,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             if (controlKind == BuiltinControlKind::Button)
             {
                 const MiniGdi::Color fill = enabled
-                    ? (pressed ? MiniGdi::MakeColor(214, 214, 214) : MiniGdi::MakeColor(240, 240, 240))
+                    ? (pressed ? MiniGdi::MakeColor(214, 214, 214) :
+                        (visualStyles ? MiniGdi::MakeColor(250, 250, 250) : MiniGdi::MakeColor(240, 240, 240)))
                     : MiniGdi::MakeColor(235, 235, 235);
                 MiniGdi::DrawRectangle(
                     *surface,
                     fullRect,
                     fill,
-                    focused ? MiniGdi::MakeColor(0, 120, 215) : MiniGdi::MakeColor(96, 96, 96));
+                    focused && visualStyles ? MiniGdi::MakeColor(0, 120, 215) : MiniGdi::MakeColor(96, 96, 96));
             }
             else if (controlKind == BuiltinControlKind::Edit)
             {
@@ -10272,7 +10281,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     *surface,
                     fullRect,
                     MiniGdi::OpaqueWhite,
-                    focused ? MiniGdi::MakeColor(0, 120, 215) : MiniGdi::MakeColor(128, 128, 128));
+                    focused && visualStyles ? MiniGdi::MakeColor(0, 120, 215) : MiniGdi::MakeColor(128, 128, 128));
             }
             else if (controlKind == BuiltinControlKind::ListView)
             {

@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge/DialogResources.h"
+#include "Bridge/ApiSet.h"
 #include "Bridge\\Win32Shims.h"
 #include "Bridge\\Gdi32Shims.h"
 #include "Bridge/Advapi32Shims.h"
@@ -116,61 +117,62 @@ ImportResolution ResolveAuxiliaryImport(const ImportedSymbol& symbol)
 
 ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
 {
-    auto resolution = CompatibilityCatalog::Resolve(symbol);
-    const auto versionResolution = ResolveVersionImport(symbol);
+    ImportedSymbol canonical = symbol;
+    canonical.library = ApiSetHostLibrary(symbol.library);
+    auto resolution = CompatibilityCatalog::Resolve(canonical);
+    const auto versionResolution = ResolveVersionImport(canonical);
     if (versionResolution.targetAddress != 0) return versionResolution;
-    if (_wcsicmp(symbol.library.c_str(), L"kernel32.dll") == 0 ||
-        _wcsicmp(symbol.library.c_str(), L"kernelbase.dll") == 0 ||
-        _wcsicmp(symbol.library.c_str(), L"ntdll.dll") == 0 ||
-        _wcsnicmp(symbol.library.c_str(), L"api-ms-win-core-", 16) == 0)
+    if (_wcsicmp(canonical.library.c_str(), L"kernel32.dll") == 0 ||
+        _wcsicmp(canonical.library.c_str(), L"kernelbase.dll") == 0 ||
+        _wcsicmp(canonical.library.c_str(), L"ntdll.dll") == 0)
     {
-        return ResolveKernel32Import(symbol);
+        return ResolveKernel32Import(canonical);
     }
-    const auto registryResolution = ResolveAdvapi32Import(symbol);
+    const auto registryResolution = ResolveAdvapi32Import(canonical);
     if (registryResolution.targetAddress != 0) return registryResolution;
-    const auto commonControlsResolution = ResolveCommonControlsImport(symbol);
+    const auto commonControlsResolution = ResolveCommonControlsImport(canonical);
     if (commonControlsResolution.targetAddress != 0) return commonControlsResolution;
-    const auto commonDialogResolution = ResolveComdlg32Import(symbol);
+    const auto commonDialogResolution = ResolveComdlg32Import(canonical);
     if (commonDialogResolution.targetAddress != 0) return commonDialogResolution;
-    const auto oleResolution = ResolveOleImport(symbol);
+    const auto oleResolution = ResolveOleImport(canonical);
     if (oleResolution.targetAddress != 0) return oleResolution;
-    const auto shellResolution = ResolveShell32Import(symbol);
+    const auto shellResolution = ResolveShell32Import(canonical);
     if (shellResolution.targetAddress != 0) return shellResolution;
-    const auto msvcrtResolution = ResolveMsvcrtImport(symbol);
+    const auto msvcrtResolution = ResolveMsvcrtImport(canonical);
     if (msvcrtResolution.targetAddress != 0) return msvcrtResolution;
-    const auto auxiliaryResolution = ResolveAuxiliaryImport(symbol);
+    const auto auxiliaryResolution = ResolveAuxiliaryImport(canonical);
     if (auxiliaryResolution.targetAddress != 0) return auxiliaryResolution;
 
-    const auto gdiResolution = ResolveGdi32Import(symbol);
+    const auto gdiResolution = ResolveGdi32Import(canonical);
     if (gdiResolution.targetAddress != 0)
     {
         return gdiResolution;
     }
 
-    const auto userResolution = ResolveUser32Import(symbol);
+    const auto userResolution = ResolveUser32Import(canonical);
     if (userResolution.targetAddress != 0)
     {
         return userResolution;
     }
 
-    if (!IsUserLibrary(symbol.library))
+    if (!IsUserLibrary(canonical.library))
     {
         return resolution;
     }
 
-    if (_wcsicmp(symbol.name.c_str(), L"messageboxw") == 0)
+    if (_wcsicmp(canonical.name.c_str(), L"messageboxw") == 0)
     {
         resolution.targetAddress = MessageBoxWAdapterAddress();
     }
-    else if (_wcsicmp(symbol.name.c_str(), L"getcursorpos") == 0)
+    else if (_wcsicmp(canonical.name.c_str(), L"getcursorpos") == 0)
     {
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCursorPos);
     }
-    else if (_wcsicmp(symbol.name.c_str(), L"getasynckeystate") == 0)
+    else if (_wcsicmp(canonical.name.c_str(), L"getasynckeystate") == 0)
     {
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetAsyncKeyState);
     }
-    else if (_wcsicmp(symbol.name.c_str(), L"getkeystate") == 0)
+    else if (_wcsicmp(canonical.name.c_str(), L"getkeystate") == 0)
     {
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetKeyState);
     }

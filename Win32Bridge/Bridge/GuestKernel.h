@@ -37,6 +37,9 @@ namespace Bridge
         bool ReleaseSemaphore(HANDLE guestHandle, LONG releaseCount, LPLONG previousCount, DWORD* win32Error);
         DWORD WaitForSingleObject(HANDLE guestHandle, DWORD milliseconds, DWORD* win32Error);
         DWORD WaitForMultipleObjects(DWORD count, const HANDLE* handles, bool waitAll, DWORD milliseconds, DWORD* win32Error);
+        HANDLE CreateCompletionObject(DWORD objectId, bool process, DWORD* win32Error);
+        bool CompleteObject(HANDLE guestHandle, DWORD exitCode, DWORD* win32Error);
+        bool GetExitCode(HANDLE guestHandle, bool process, LPDWORD exitCode, DWORD* win32Error) const;
 
         // This is intentionally separate from storage's CloseFile: Kernel32's
         // CloseHandle shim tries this table first, then its existing file path.
@@ -48,7 +51,9 @@ namespace Bridge
         {
             Event,
             Mutex,
-            Semaphore
+            Semaphore,
+            Process,
+            Thread
         };
 
         struct ObjectRecord
@@ -73,6 +78,9 @@ namespace Bridge
             // Semaphore state.
             LONG semaphoreCount = 0;
             LONG semaphoreMaximum = 0;
+
+            DWORD objectId = 0;
+            DWORD exitCode = STILL_ACTIVE;
         };
 
         static constexpr size_t MaximumHandles = 1024;

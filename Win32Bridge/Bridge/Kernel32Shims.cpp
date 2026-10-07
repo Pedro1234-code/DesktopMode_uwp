@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "Bridge/ApiSet.h"
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge/ActivationContext.h"
 #include "Bridge\\GuestKernel.h"
@@ -457,7 +458,9 @@ namespace
 
     const BridgeSystemModule* FindBridgeSystemModule(LPCWSTR requestedName)
     {
-        const wchar_t* fileName = FileNameFromPath(requestedName);
+        if (!requestedName) return nullptr;
+        const std::wstring canonical = ApiSetHostLibrary(requestedName);
+        const wchar_t* fileName = FileNameFromPath(canonical.c_str());
         if (!fileName || !*fileName)
         {
             return nullptr;
@@ -471,18 +474,6 @@ namespace
             }
         }
 
-        if (_wcsnicmp(fileName, L"api-ms-win-core-version-", 24) == 0)
-        {
-            for (const auto& candidate : BridgeSystemModules)
-                if (_wcsicmp(candidate.library, L"version.dll") == 0) return &candidate;
-        }
-
-        // Other API-set DLLs are aliases for the bridge's kernel layer. This keeps
-        // dynamic API-set probes from reaching the host loader.
-        if (_wcsnicmp(fileName, L"api-ms-win-core-", 16) == 0)
-        {
-            return &BridgeSystemModules[0];
-        }
         return nullptr;
     }
 
@@ -2370,6 +2361,24 @@ GuestCommandLineScope::GuestCommandLineScope(
     if (threadId) g_guestThreadId = threadId;
 }
 
+BOOL WINAPI Win32Bridge::Bridge::BridgeDisableThreadLibraryCalls(HMODULE module)
+{
+    GuestModuleLoader* loader = CurrentGuestModuleLoader();
+    if (!loader)
+    {
+        SetGuestLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    DWORD error = ERROR_SUCCESS;
+    if (!loader->DisableThreadNotifications(module, &error))
+    {
+        SetGuestLastError(error);
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
 GuestCommandLineScope::~GuestCommandLineScope()
 {
     g_guestCommandLine = std::move(m_previous);
@@ -3422,11 +3431,11 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
 BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
     LPCWSTR applicationName,
     LPWSTR commandLine,
-    LPSECURITY_ATTRIBUTES,
-    LPSECURITY_ATTRIBUTES,
-    BOOL,
+    LPSECURITY_ATTRIBUTES processAttributes,
+    LPSECURITY_ATTRIBUTES threadAttributes,
+    BOOL inheritHandles,
     DWORD creationFlags,
-    LPVOID,
+    LPVOID environment,
     LPCWSTR currentDirectory,
     LPSTARTUPINFOW startupInfo,
     LPPROCESS_INFORMATION processInformation)
@@ -3435,6 +3444,23 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
     if (!processInformation || !startupInfo || startupInfo->cb < sizeof(STARTUPINFOW))
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if ((processAttributes && processAttributes->nLength < sizeof(SECURITY_ATTRIBUTES)) ||
+        (threadAttributes && threadAttributes->nLength < sizeof(SECURITY_ATTRIBUTES)))
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (environment)
+    {
+        SetGuestLastError(ERROR_NOT_SUPPORTED);
+        return FALSE;
+    }
+    if (inheritHandles && (startupInfo->dwFlags & STARTF_USESTDHANDLES) != 0 &&
+        (startupInfo->hStdInput || startupInfo->hStdOutput || startupInfo->hStdError))
+    {
+        SetGuestLastError(ERROR_NOT_SUPPORTED);
         return FALSE;
     }
 
@@ -3449,9 +3475,13 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
         return FALSE;
     }
 
-    std::wstring executable = applicationName ? applicationName : L"";
     const std::wstring fullCommandLine = commandLine ? commandLine : L"";
-    if (executable.empty())
+    std::vector<std::wstring> executableCandidates;
+    if (applicationName && *applicationName)
+    {
+        executableCandidates.emplace_back(applicationName);
+    }
+    else
     {
         size_t cursor = fullCommandLine.find_first_not_of(L" \t");
         if (cursor == std::wstring::npos)
@@ -3467,20 +3497,39 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
                 SetGuestLastError(ERROR_INVALID_PARAMETER);
                 return FALSE;
             }
-            executable = fullCommandLine.substr(cursor + 1, end - cursor - 1);
+            executableCandidates.emplace_back(
+                fullCommandLine.substr(cursor + 1, end - cursor - 1));
         }
         else
         {
-            const size_t end = fullCommandLine.find_first_of(L" \t", cursor);
-            executable = fullCommandLine.substr(cursor, end - cursor);
+            // CreateProcess probes each whitespace-delimited prefix when the
+            // executable is not quoted.  This preserves the Win32 ambiguity
+            // rules for paths such as "C:\\Program Files\\tool arg" rather
+            // than assuming that the first token is always the image name.
+            size_t end = cursor;
+            while (end < fullCommandLine.size())
+            {
+                end = fullCommandLine.find_first_of(L" \t", end);
+                const size_t candidateEnd = end == std::wstring::npos
+                    ? fullCommandLine.size() : end;
+                if (candidateEnd > cursor)
+                    executableCandidates.emplace_back(
+                        fullCommandLine.substr(cursor, candidateEnd - cursor));
+                if (end == std::wstring::npos) break;
+                end = fullCommandLine.find_first_not_of(L" \t", end);
+                if (end == std::wstring::npos) break;
+            }
         }
     }
-    const size_t separator = executable.find_last_of(L"\\/");
-    const size_t dot = executable.find_last_of(L'.');
-    if (dot == std::wstring::npos ||
-        (separator != std::wstring::npos && dot < separator))
+    for (std::wstring& candidate : executableCandidates)
     {
-        executable += L".exe";
+        const size_t separator = candidate.find_last_of(L"\\/");
+        const size_t dot = candidate.find_last_of(L'.');
+        if (dot == std::wstring::npos ||
+            (separator != std::wstring::npos && dot < separator))
+        {
+            candidate += L".exe";
+        }
     }
 
     GuestRuntime* runtime = CurrentGuestRuntime();
@@ -3489,19 +3538,106 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
         SetGuestLastError(ERROR_INVALID_FUNCTION);
         return FALSE;
     }
-    DWORD error = ERROR_SUCCESS;
-    const std::wstring effectiveCommandLine = fullCommandLine.empty()
-        ? L"\"" + executable + L"\""
-        : fullCommandLine;
-    if (!runtime->LaunchChildProcess(
-        executable.c_str(), effectiveCommandLine.c_str(), currentDirectory,
-        processInformation, &error))
+    if (currentDirectory)
     {
-        SetGuestLastError(error);
+        GuestStorageContext* storage = CurrentGuestStorageContext();
+        DWORD directoryError = ERROR_SUCCESS;
+        const DWORD attributes = storage
+            ? storage->GetGuestFileAttributes(currentDirectory, &directoryError)
+            : INVALID_FILE_ATTRIBUTES;
+        if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+        {
+            SetGuestLastError(directoryError == ERROR_SUCCESS ? ERROR_DIRECTORY : directoryError);
+            return FALSE;
+        }
+    }
+    DWORD error = ERROR_FILE_NOT_FOUND;
+    for (const std::wstring& executable : executableCandidates)
+    {
+        const std::wstring effectiveCommandLine = fullCommandLine.empty()
+            ? L"\"" + executable + L"\""
+            : fullCommandLine;
+        if (runtime->LaunchChildProcess(
+            executable.c_str(), effectiveCommandLine.c_str(), currentDirectory,
+            processInformation, &error))
+        {
+            SetGuestLastError(ERROR_SUCCESS);
+            return TRUE;
+        }
+        if (applicationName || (error != ERROR_FILE_NOT_FOUND &&
+            error != ERROR_PATH_NOT_FOUND && error != ERROR_MOD_NOT_FOUND))
+        {
+            break;
+        }
+    }
+    SetGuestLastError(error);
+    return FALSE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessA(
+    LPCSTR applicationName, LPSTR commandLine, LPSECURITY_ATTRIBUTES processAttributes,
+    LPSECURITY_ATTRIBUTES threadAttributes, BOOL inheritHandles, DWORD creationFlags,
+    LPVOID environment, LPCSTR currentDirectory, LPSTARTUPINFOA startupInfo,
+    LPPROCESS_INFORMATION processInformation)
+{
+    if (processInformation) ZeroMemory(processInformation, sizeof(*processInformation));
+    if (!startupInfo || startupInfo->cb < sizeof(STARTUPINFOA))
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    SetGuestLastError(ERROR_SUCCESS);
-    return TRUE;
+    const auto widen = [](LPCSTR value, std::wstring* output) -> bool
+    {
+        output->clear();
+        if (!value) return true;
+        const int required = MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, value, -1, nullptr, 0);
+        if (required <= 0) return false;
+        output->resize(static_cast<size_t>(required));
+        if (MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS,
+            value, -1, &(*output)[0], required) != required) return false;
+        output->resize(static_cast<size_t>(required - 1));
+        return true;
+    };
+    std::wstring application, command, directory;
+    if (!widen(applicationName, &application) || !widen(commandLine, &command) ||
+        !widen(currentDirectory, &directory))
+    {
+        SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return FALSE;
+    }
+    STARTUPINFOW wide{};
+    wide.cb = sizeof(wide);
+    wide.dwFlags = startupInfo->dwFlags;
+    wide.wShowWindow = startupInfo->wShowWindow;
+    wide.hStdInput = startupInfo->hStdInput;
+    wide.hStdOutput = startupInfo->hStdOutput;
+    wide.hStdError = startupInfo->hStdError;
+    std::vector<wchar_t> mutableCommand(command.begin(), command.end());
+    mutableCommand.push_back(L'\0');
+    return BridgeCreateProcessW(
+        applicationName ? application.c_str() : nullptr,
+        commandLine ? mutableCommand.data() : nullptr,
+        processAttributes, threadAttributes, inheritHandles, creationFlags,
+        environment, currentDirectory ? directory.c_str() : nullptr,
+        &wide, processInformation);
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetExitCodeProcess(HANDLE process, LPDWORD exitCode)
+{
+    GuestKernelContext* kernel = CurrentGuestKernelContext();
+    DWORD error = ERROR_INVALID_HANDLE;
+    const BOOL result = kernel && kernel->GetExitCode(process, true, exitCode, &error) ? TRUE : FALSE;
+    SetGuestLastError(error);
+    return result;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetExitCodeThread(HANDLE thread, LPDWORD exitCode)
+{
+    GuestKernelContext* kernel = CurrentGuestKernelContext();
+    DWORD error = ERROR_INVALID_HANDLE;
+    const BOOL result = kernel && kernel->GetExitCode(thread, false, exitCode, &error) ? TRUE : FALSE;
+    SetGuestLastError(error);
+    return result;
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateThread(
@@ -3642,6 +3778,12 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateFileMappingW);
     else if (_wcsicmp(symbol.name.c_str(), L"createprocessw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateProcessW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createprocessa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateProcessA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getexitcodeprocess") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetExitCodeProcess);
+    else if (_wcsicmp(symbol.name.c_str(), L"getexitcodethread") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetExitCodeThread);
     else if (_wcsicmp(symbol.name.c_str(), L"createthread") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateThread);
     else if (_wcsicmp(symbol.name.c_str(), L"raiseexception") == 0)
@@ -3844,6 +3986,8 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetProcAddress);
     else if (_wcsicmp(symbol.name.c_str(), L"freelibrary") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeLibrary);
+    else if (_wcsicmp(symbol.name.c_str(), L"disablethreadlibrarycalls") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDisableThreadLibraryCalls);
     else if (_wcsicmp(symbol.name.c_str(), L"getcommandlinew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCommandLineW);
     else if (_wcsicmp(symbol.name.c_str(), L"outputdebugstringw") == 0)

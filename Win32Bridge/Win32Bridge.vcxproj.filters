@@ -17,6 +17,9 @@
     <ClInclude Include="Bridge\CompatibilityCatalog.h">
       <Filter>Bridge</Filter>
     </ClInclude>
+    <ClInclude Include="Bridge\ApiSet.h">
+      <Filter>Bridge</Filter>
+    </ClInclude>
     <ClInclude Include="Bridge\Gdi32Shims.h">
       <Filter>Bridge</Filter>
     </ClInclude>

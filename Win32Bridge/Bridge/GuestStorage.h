@@ -12,6 +12,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace Win32Bridge
@@ -100,6 +101,10 @@ namespace Bridge
             Windows::Storage::Streams::IRandomAccessStream^ stream,
             bool readable,
             bool writable,
+            const std::wstring& canonicalPath,
+            DWORD desiredAccess,
+            DWORD shareMode,
+            bool deleteOnClose,
             HANDLE* guestHandle,
             DWORD* win32Error);
         bool AddFind(
@@ -130,6 +135,7 @@ namespace Bridge
         std::wstring m_initialCurrentDirectory;
         mutable std::mutex m_handlesLock;
         std::unordered_map<ULONG_PTR, std::shared_ptr<FileRecord>> m_files;
+        std::unordered_set<std::wstring> m_deletePending;
         std::unordered_map<ULONG_PTR, std::shared_ptr<FindRecord>> m_finds;
         ULONG_PTR m_nextHandle = FirstHandleToken;
         mutable std::mutex m_metadataLock;

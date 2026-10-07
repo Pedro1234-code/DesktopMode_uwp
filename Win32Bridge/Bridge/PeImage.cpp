@@ -118,6 +118,127 @@ namespace
             rva >= directory.VirtualAddress &&
             static_cast<ULONGLONG>(rva) < static_cast<ULONGLONG>(directory.VirtualAddress) + directory.Size;
     }
+
+    struct DelayImportDescriptor final
+    {
+        DWORD attributes;
+        DWORD name;
+        DWORD moduleHandle;
+        DWORD importAddressTable;
+        DWORD importNameTable;
+        DWORD boundImportAddressTable;
+        DWORD unloadImportAddressTable;
+        DWORD timeStamp;
+    };
+
+    bool DelayFieldToRva(
+        DWORD value,
+        bool fieldsAreRvas,
+        ULONGLONG imageBase,
+        DWORD* rva)
+    {
+        if (!rva) return false;
+        if (value == 0)
+        {
+            *rva = 0;
+            return true;
+        }
+        if (fieldsAreRvas)
+        {
+            *rva = value;
+            return true;
+        }
+        if (value < imageBase || static_cast<ULONGLONG>(value) - imageBase > MAXDWORD)
+            return false;
+        *rva = static_cast<DWORD>(static_cast<ULONGLONG>(value) - imageBase);
+        return true;
+    }
+
+    bool AppendImportThunks(
+        const ImageReader& reader,
+        const IMAGE_OPTIONAL_HEADER64& optionalHeader,
+        const std::vector<IMAGE_SECTION_HEADER>& sections,
+        const std::wstring& library,
+        DWORD lookupTableRva,
+        DWORD addressTableRva,
+        bool delayLoaded,
+        bool thunkValuesAreVas,
+        std::vector<ImportedSymbol>* imports,
+        PeImageInfo* result)
+    {
+        size_t thunkOffset = 0;
+        if (!imports || lookupTableRva == 0 || addressTableRva == 0 ||
+            !RvaToOffset(reader, optionalHeader, sections, lookupTableRva, &thunkOffset))
+        {
+            SetError(result, delayLoaded
+                ? L"A delay-import thunk points outside the image."
+                : L"An import thunk points outside the image.");
+            return false;
+        }
+
+        for (size_t thunkIndex = 0; thunkIndex < 65536; ++thunkIndex)
+        {
+            IMAGE_THUNK_DATA64 thunk{};
+            const size_t currentThunkOffset = thunkOffset + thunkIndex * sizeof(thunk);
+            if (!reader.Read(currentThunkOffset, &thunk))
+            {
+                SetError(result, delayLoaded
+                    ? L"A delay-import thunk table is truncated."
+                    : L"An import thunk table is truncated.");
+                return false;
+            }
+            if (thunk.u1.AddressOfData == 0) return true;
+
+            ImportedSymbol symbol{};
+            symbol.library = library;
+            symbol.delayLoaded = delayLoaded;
+            const ULONGLONG iatRva = static_cast<ULONGLONG>(addressTableRva) +
+                thunkIndex * sizeof(ULONGLONG);
+            if (iatRva > MAXDWORD)
+            {
+                SetError(result, L"An import address table entry exceeds the PE address space.");
+                return false;
+            }
+            symbol.iatRva = static_cast<DWORD>(iatRva);
+            symbol.importedByOrdinal = (thunk.u1.Ordinal & IMAGE_ORDINAL_FLAG64) != 0;
+            if (symbol.importedByOrdinal)
+            {
+                symbol.ordinal = static_cast<WORD>(thunk.u1.Ordinal & 0xffff);
+            }
+            else
+            {
+                ULONGLONG nameValue = thunk.u1.AddressOfData;
+                if (thunkValuesAreVas)
+                {
+                    if (nameValue < optionalHeader.ImageBase ||
+                        nameValue - optionalHeader.ImageBase > MAXDWORD)
+                    {
+                        SetError(result, L"A delay-import name has an invalid address.");
+                        return false;
+                    }
+                    nameValue -= optionalHeader.ImageBase;
+                }
+                size_t nameOffset = 0;
+                if (nameValue > MAXDWORD ||
+                    !RvaToOffset(reader, optionalHeader, sections,
+                        static_cast<DWORD>(nameValue), &nameOffset) ||
+                    !reader.Contains(nameOffset, sizeof(WORD)) ||
+                    !reader.ReadAsciiString(nameOffset + sizeof(WORD), &symbol.name))
+                {
+                    SetError(result, delayLoaded
+                        ? L"A delay-import function name is malformed."
+                        : L"An imported function name is malformed.");
+                    return false;
+                }
+            }
+            imports->push_back(std::move(symbol));
+        }
+
+        SetError(result, delayLoaded
+            ? L"A delay-import thunk table has no terminator."
+            : L"An import thunk table has no terminator.");
+        return false;
+    }
 }
 
 bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
@@ -262,94 +383,123 @@ bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
     }
 
     const IMAGE_DATA_DIRECTORY importDirectory = optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    if (importDirectory.VirtualAddress == 0 || importDirectory.Size == 0)
+    if (importDirectory.VirtualAddress != 0 && importDirectory.Size != 0)
     {
-        result->valid = true;
-        return true;
-    }
-
-    size_t importOffset = 0;
-    if (!RvaToOffset(reader, optionalHeader, sections, importDirectory.VirtualAddress, &importOffset))
-    {
-        SetError(result, L"The PE import directory points outside the image.");
-        return false;
-    }
-
-    const size_t maximumDescriptors = importDirectory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR) + 1;
-    for (size_t descriptorIndex = 0; descriptorIndex < maximumDescriptors; ++descriptorIndex)
-    {
-        IMAGE_IMPORT_DESCRIPTOR descriptor{};
-        const size_t descriptorOffset = importOffset + descriptorIndex * sizeof(descriptor);
-        if (!reader.Read(descriptorOffset, &descriptor))
+        size_t importOffset = 0;
+        if (!RvaToOffset(reader, optionalHeader, sections, importDirectory.VirtualAddress, &importOffset))
         {
-            SetError(result, L"The PE import descriptor table is truncated.");
+            SetError(result, L"The PE import directory points outside the image.");
             return false;
         }
 
-        if (descriptor.Name == 0 && descriptor.OriginalFirstThunk == 0 && descriptor.FirstThunk == 0)
+        bool terminated = false;
+        const size_t maximumDescriptors = importDirectory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR) + 1;
+        for (size_t descriptorIndex = 0; descriptorIndex < maximumDescriptors; ++descriptorIndex)
         {
-            result->valid = true;
-            return true;
-        }
-
-        size_t libraryOffset = 0;
-        std::wstring library;
-        if (!RvaToOffset(reader, optionalHeader, sections, descriptor.Name, &libraryOffset) ||
-            !reader.ReadAsciiString(libraryOffset, &library))
-        {
-            SetError(result, L"An imported DLL name is malformed.");
-            return false;
-        }
-
-        const DWORD thunkRva = descriptor.OriginalFirstThunk ? descriptor.OriginalFirstThunk : descriptor.FirstThunk;
-        size_t thunkOffset = 0;
-        if (!RvaToOffset(reader, optionalHeader, sections, thunkRva, &thunkOffset))
-        {
-            SetError(result, L"An import thunk points outside the image.");
-            return false;
-        }
-
-        for (size_t thunkIndex = 0; thunkIndex < 65536; ++thunkIndex)
-        {
-            IMAGE_THUNK_DATA64 thunk{};
-            const size_t currentThunkOffset = thunkOffset + thunkIndex * sizeof(thunk);
-            if (!reader.Read(currentThunkOffset, &thunk) || thunk.u1.AddressOfData == 0)
+            IMAGE_IMPORT_DESCRIPTOR descriptor{};
+            const size_t descriptorOffset = importOffset + descriptorIndex * sizeof(descriptor);
+            if (!reader.Read(descriptorOffset, &descriptor))
             {
+                SetError(result, L"The PE import descriptor table is truncated.");
+                return false;
+            }
+            if (descriptor.Name == 0 && descriptor.OriginalFirstThunk == 0 && descriptor.FirstThunk == 0)
+            {
+                terminated = true;
                 break;
             }
 
-            ImportedSymbol symbol{};
-            symbol.library = library;
-            const ULONGLONG iatRva = static_cast<ULONGLONG>(descriptor.FirstThunk) +
-                thunkIndex * sizeof(ULONGLONG);
-            if (iatRva > MAXDWORD)
+            size_t libraryOffset = 0;
+            std::wstring library;
+            if (!RvaToOffset(reader, optionalHeader, sections, descriptor.Name, &libraryOffset) ||
+                !reader.ReadAsciiString(libraryOffset, &library))
             {
-                SetError(result, L"An import address table entry exceeds the PE address space.");
+                SetError(result, L"An imported DLL name is malformed.");
                 return false;
             }
-            symbol.iatRva = static_cast<DWORD>(iatRva);
-            symbol.importedByOrdinal = (thunk.u1.Ordinal & IMAGE_ORDINAL_FLAG64) != 0;
-            if (symbol.importedByOrdinal)
-            {
-                symbol.ordinal = static_cast<WORD>(thunk.u1.Ordinal & 0xffff);
-            }
-            else
-            {
-                size_t nameOffset = 0;
-                const DWORD nameRva = static_cast<DWORD>(thunk.u1.AddressOfData);
-                if (!RvaToOffset(reader, optionalHeader, sections, nameRva, &nameOffset) ||
-                    !reader.Contains(nameOffset, sizeof(WORD)) ||
-                    !reader.ReadAsciiString(nameOffset + sizeof(WORD), &symbol.name))
-                {
-                    SetError(result, L"An imported function name is malformed.");
-                    return false;
-                }
-            }
-
-            result->imports.push_back(symbol);
+            const DWORD lookup = descriptor.OriginalFirstThunk
+                ? descriptor.OriginalFirstThunk : descriptor.FirstThunk;
+            if (!AppendImportThunks(reader, optionalHeader, sections, library,
+                lookup, descriptor.FirstThunk, false, false, &result->imports, result))
+                return false;
+        }
+        if (!terminated)
+        {
+            SetError(result, L"The import descriptor table has no terminator.");
+            return false;
         }
     }
 
-    SetError(result, L"The import descriptor table has no terminator.");
-    return false;
+    const IMAGE_DATA_DIRECTORY delayDirectory =
+        optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+    if (delayDirectory.VirtualAddress != 0 && delayDirectory.Size != 0)
+    {
+        size_t delayOffset = 0;
+        if (!RvaToOffset(reader, optionalHeader, sections,
+            delayDirectory.VirtualAddress, &delayOffset))
+        {
+            SetError(result, L"The PE delay-import directory points outside the image.");
+            return false;
+        }
+
+        bool terminated = false;
+        const size_t maximumDescriptors = delayDirectory.Size / sizeof(DelayImportDescriptor) + 1;
+        for (size_t descriptorIndex = 0; descriptorIndex < maximumDescriptors; ++descriptorIndex)
+        {
+            DelayImportDescriptor descriptor{};
+            const size_t descriptorOffset = delayOffset + descriptorIndex * sizeof(descriptor);
+            if (!reader.Read(descriptorOffset, &descriptor))
+            {
+                SetError(result, L"The PE delay-import descriptor table is truncated.");
+                return false;
+            }
+            if (descriptor.attributes == 0 && descriptor.name == 0 &&
+                descriptor.importAddressTable == 0 && descriptor.importNameTable == 0)
+            {
+                terminated = true;
+                break;
+            }
+            if ((descriptor.attributes & ~1u) != 0)
+            {
+                SetError(result, L"The PE delay-import descriptor uses unsupported attributes.");
+                return false;
+            }
+
+            const bool fieldsAreRvas = (descriptor.attributes & 1u) != 0;
+            DWORD nameRva = 0;
+            DWORD iatRva = 0;
+            DWORD intRva = 0;
+            if (!DelayFieldToRva(descriptor.name, fieldsAreRvas,
+                    optionalHeader.ImageBase, &nameRva) ||
+                !DelayFieldToRva(descriptor.importAddressTable, fieldsAreRvas,
+                    optionalHeader.ImageBase, &iatRva) ||
+                !DelayFieldToRva(descriptor.importNameTable, fieldsAreRvas,
+                    optionalHeader.ImageBase, &intRva))
+            {
+                SetError(result, L"The PE delay-import descriptor contains an invalid VA.");
+                return false;
+            }
+            if (intRva == 0) intRva = iatRva;
+
+            size_t libraryOffset = 0;
+            std::wstring library;
+            if (!RvaToOffset(reader, optionalHeader, sections, nameRva, &libraryOffset) ||
+                !reader.ReadAsciiString(libraryOffset, &library))
+            {
+                SetError(result, L"A delay-imported DLL name is malformed.");
+                return false;
+            }
+            if (!AppendImportThunks(reader, optionalHeader, sections, library,
+                intRva, iatRva, true, !fieldsAreRvas, &result->imports, result))
+                return false;
+        }
+        if (!terminated)
+        {
+            SetError(result, L"The delay-import descriptor table has no terminator.");
+            return false;
+        }
+    }
+
+    result->valid = true;
+    return true;
 }

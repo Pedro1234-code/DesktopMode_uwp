@@ -1,4 +1,5 @@
 #include "Bridge\\CompatibilityCatalog.h"
+#include "Bridge/ApiSet.h"
 
 #include <cwctype>
 
@@ -187,7 +188,7 @@ ImportResolution CompatibilityCatalog::Resolve(const ImportedSymbol& symbol)
         return { ImportDisposition::Unsupported, L"Ordinal imports need an explicit catalog entry." };
     }
 
-    const std::wstring library = Lowercase(symbol.library);
+    const std::wstring library = Lowercase(ApiSetHostLibrary(symbol.library));
     const std::wstring name = Lowercase(symbol.name);
     if (IsUserFamily(library) && name == L"messageboxw")
     {

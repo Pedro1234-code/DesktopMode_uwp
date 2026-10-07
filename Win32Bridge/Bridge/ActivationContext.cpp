@@ -14,6 +14,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace Win32Bridge::Bridge;
 
@@ -54,7 +55,7 @@ namespace
     std::atomic<ULONG_PTR> g_nextCookie{ 1 };
     std::mutex g_contextLock;
     std::unordered_map<ULONG_PTR, std::shared_ptr<ContextRecord>> g_contexts;
-    thread_local HANDLE g_processContext = nullptr;
+    std::atomic<ULONG_PTR> g_processContext{ 0 };
     thread_local std::vector<ActiveRecord> g_activeContexts;
 
     std::wstring Lower(std::wstring value)
@@ -69,6 +70,20 @@ namespace
         const auto last = std::find_if(value.rbegin(), value.rend(), [](wchar_t c) { return !iswspace(c); }).base();
         if (first >= last) return {};
         return std::wstring(first, last);
+    }
+
+    std::wstring DirectoryOf(const std::wstring& path)
+    {
+        const size_t separator = path.find_last_of(L"\\/");
+        return separator == std::wstring::npos ? std::wstring{} : path.substr(0, separator);
+    }
+
+    std::wstring JoinPath(const std::wstring& directory, const std::wstring& leaf)
+    {
+        if (directory.empty()) return leaf;
+        if (leaf.empty()) return directory;
+        return directory.back() == L'\\' || directory.back() == L'/'
+            ? directory + leaf : directory + L"\\" + leaf;
     }
 
     bool DecodeXml(const BYTE* bytes, size_t size, std::wstring* xml)
@@ -177,6 +192,29 @@ namespace
         return original.substr(attributeStart, end - attributeStart);
     }
 
+    GuestAssemblyIdentity IdentityFromTag(const std::wstring& original, const std::wstring& lower)
+    {
+        GuestAssemblyIdentity identity;
+        identity.name = Attribute(original, lower, L"assemblyidentity", L"name");
+        identity.version = Attribute(original, lower, L"assemblyidentity", L"version");
+        identity.processorArchitecture = Attribute(original, lower, L"assemblyidentity", L"processorarchitecture");
+        identity.publicKeyToken = Attribute(original, lower, L"assemblyidentity", L"publickeytoken");
+        identity.language = Attribute(original, lower, L"assemblyidentity", L"language");
+        identity.type = Attribute(original, lower, L"assemblyidentity", L"type");
+        return identity;
+    }
+
+    bool IdentityMatches(const GuestAssemblyIdentity& requested, const GuestAssemblyIdentity& candidate)
+    {
+        const auto equal = [](const std::wstring& left, const std::wstring& right)
+        { return left.empty() || left == L"*" || _wcsicmp(left.c_str(), right.c_str()) == 0; };
+        return !requested.name.empty() && _wcsicmp(requested.name.c_str(), candidate.name.c_str()) == 0 &&
+            equal(requested.version, candidate.version) &&
+            equal(requested.processorArchitecture, candidate.processorArchitecture) &&
+            equal(requested.publicKeyToken, candidate.publicKeyToken) &&
+            equal(requested.language, candidate.language) && equal(requested.type, candidate.type);
+    }
+
     std::wstring ElementText(const std::wstring& original, const std::wstring& lower, const std::wstring& localName)
     {
         size_t start = 0;
@@ -226,24 +264,31 @@ namespace
         const std::wstring lower = Lower(info->xml);
         if (lower.find(L"<assembly") == std::wstring::npos) return false;
 
-        const std::wstring identityName = Attribute(info->xml, lower, L"assemblyidentity", L"name");
-        const std::wstring identityVersion = Attribute(info->xml, lower, L"assemblyidentity", L"version");
-        info->assemblyIdentity = identityName;
-        if (!identityVersion.empty()) info->assemblyIdentity += L",version=" + identityVersion;
-
         size_t identitySearch = 0;
         size_t identityStart = 0;
         size_t identityEnd = 0;
+        bool rootIdentity = true;
         while (FindElementRange(lower, L"assemblyidentity", identitySearch, &identityStart, &identityEnd))
         {
             const std::wstring tagOriginal = info->xml.substr(identityStart, identityEnd - identityStart + 1);
             const std::wstring tagLower = lower.substr(identityStart, identityEnd - identityStart + 1);
-            const std::wstring name = Lower(Attribute(tagOriginal, tagLower, L"assemblyidentity", L"name"));
-            const std::wstring version = Lower(Attribute(tagOriginal, tagLower, L"assemblyidentity", L"version"));
+            const GuestAssemblyIdentity identity = IdentityFromTag(tagOriginal, tagLower);
+            const std::wstring name = Lower(identity.name);
+            const std::wstring version = Lower(identity.version);
+            if (rootIdentity)
+            {
+                info->identity = identity;
+                info->assemblyIdentity = identity.name;
+                if (!identity.version.empty()) info->assemblyIdentity += L",version=" + identity.version;
+                rootIdentity = false;
+            }
+            else
+            {
+                info->dependencies.push_back(identity);
+            }
             if (name == L"microsoft.windows.common-controls" && version.rfind(L"6.", 0) == 0)
             {
                 info->commonControlsV6 = true;
-                break;
             }
             identitySearch = identityEnd + 1;
         }
@@ -274,6 +319,119 @@ namespace
         return true;
     }
 
+    void ParseAssemblyFiles(const GuestManifestInfo& manifest, const std::wstring& directory,
+        GuestAssemblyInfo* assembly)
+    {
+        if (!assembly) return;
+        const std::wstring lower = Lower(manifest.xml);
+        size_t cursor = 0, start = 0, end = 0;
+        while (FindElementRange(lower, L"file", cursor, &start, &end))
+        {
+            const std::wstring tag = manifest.xml.substr(start, end - start + 1);
+            const std::wstring tagLower = lower.substr(start, end - start + 1);
+            const std::wstring name = Attribute(tag, tagLower, L"file", L"name");
+            if (!name.empty()) assembly->files.push_back({ name, JoinPath(directory, name) });
+            cursor = end + 1;
+        }
+    }
+
+    bool ReadManifestFile(GuestStorageContext* storage, const std::wstring& path, GuestManifestInfo* manifest)
+    {
+        std::vector<BYTE> bytes;
+        DWORD error = ERROR_SUCCESS;
+        return storage && storage->ReadAllBytes(path.c_str(), &bytes, &error) &&
+            ParseManifest(bytes.data(), bytes.size(), path, manifest);
+    }
+
+    bool FindAssemblyManifest(GuestStorageContext* storage, const GuestAssemblyIdentity& identity,
+        const std::wstring& applicationDirectory, GuestManifestInfo* manifest)
+    {
+        const std::wstring localName = identity.name + L".manifest";
+        const std::wstring localCandidates[] = {
+            JoinPath(applicationDirectory, localName),
+            JoinPath(JoinPath(applicationDirectory, identity.name), localName)
+        };
+        for (const auto& candidate : localCandidates)
+        {
+            GuestManifestInfo parsed;
+            if (ReadManifestFile(storage, candidate, &parsed) && IdentityMatches(identity, parsed.identity))
+            {
+                *manifest = std::move(parsed);
+                return true;
+            }
+        }
+
+        WIN32_FIND_DATAW data{};
+        HANDLE find = INVALID_HANDLE_VALUE;
+        DWORD error = ERROR_SUCCESS;
+        if (!storage->FindFirstGuestFile(L"C:\\Windows\\WinSxS\\Manifests\\*.manifest", &data, &find, &error))
+            return false;
+        bool found = false;
+        do
+        {
+            GuestManifestInfo parsed;
+            const std::wstring candidate = JoinPath(L"C:\\Windows\\WinSxS\\Manifests", data.cFileName);
+            if (ReadManifestFile(storage, candidate, &parsed) && IdentityMatches(identity, parsed.identity))
+            {
+                *manifest = std::move(parsed);
+                found = true;
+                break;
+            }
+        } while (storage->FindNextGuestFile(find, &data, &error));
+        storage->CloseFindHandle(find, nullptr);
+        return found;
+    }
+
+    void ResolveAssemblies(ContextRecord* record)
+    {
+        if (!record) return;
+        GuestStorageContext* storage = CurrentGuestStorageContext();
+        if (!storage) return;
+        const std::wstring applicationDirectory = record->manifest.assemblyDirectory.empty()
+            ? DirectoryOf(record->manifest.source) : record->manifest.assemblyDirectory;
+        std::unordered_set<std::wstring> visited;
+        std::vector<GuestAssemblyIdentity> pending = record->manifest.dependencies;
+        for (size_t index = 0; index < pending.size(); ++index)
+        {
+            const GuestAssemblyIdentity dependency = pending[index];
+            const std::wstring key = Lower(dependency.name + L"," + dependency.version + L"," +
+                dependency.processorArchitecture + L"," + dependency.publicKeyToken + L"," + dependency.language);
+            if (dependency.name.empty() || !visited.emplace(key).second) continue;
+
+            GuestAssemblyInfo assembly;
+            assembly.identity = dependency;
+            GuestManifestInfo dependentManifest;
+            if (FindAssemblyManifest(storage, dependency, applicationDirectory, &dependentManifest))
+            {
+                assembly.identity = dependentManifest.identity;
+                assembly.manifestPath = dependentManifest.source;
+                assembly.directory = DirectoryOf(dependentManifest.source);
+                if (Lower(assembly.directory) == Lower(L"C:\\Windows\\WinSxS\\Manifests"))
+                {
+                    std::wstring leaf = dependentManifest.source.substr(assembly.directory.size() + 1);
+                    const size_t suffix = Lower(leaf).rfind(L".manifest");
+                    if (suffix != std::wstring::npos) leaf.erase(suffix);
+                    assembly.directory = JoinPath(L"C:\\Windows\\WinSxS", leaf);
+                }
+                ParseAssemblyFiles(dependentManifest, assembly.directory, &assembly);
+                pending.insert(pending.end(), dependentManifest.dependencies.begin(), dependentManifest.dependencies.end());
+            }
+            else if (_wcsicmp(dependency.name.c_str(), L"Microsoft.Windows.Common-Controls") == 0 &&
+                dependency.version.rfind(L"6.", 0) == 0)
+            {
+                assembly.virtualAssembly = true;
+                assembly.directory = L"C:\\Windows\\WinSxS\\Virtual\\Microsoft.Windows.Common-Controls";
+                assembly.files.push_back({ L"comctl32.dll", L"C:\\Windows\\System32\\comctl32.dll" });
+            }
+            else
+            {
+                RuntimeDiagnostics::Record(L"SXS: unresolved assembly " + dependency.name + L" " + dependency.version + L".");
+                continue;
+            }
+            record->manifest.assemblies.push_back(std::move(assembly));
+        }
+    }
+
     std::shared_ptr<ContextRecord> Lookup(HANDLE handle)
     {
         if (!handle || handle == INVALID_HANDLE_VALUE) return {};
@@ -285,6 +443,7 @@ namespace
     HANDLE Store(std::shared_ptr<ContextRecord> record)
     {
         if (!record) return INVALID_HANDLE_VALUE;
+        ResolveAssemblies(record.get());
         std::lock_guard<std::mutex> guard(g_contextLock);
         ULONG_PTR token = g_nextContext.fetch_add(1);
         while (token == 0 || token == reinterpret_cast<ULONG_PTR>(INVALID_HANDLE_VALUE) || g_contexts.count(token))
@@ -324,7 +483,8 @@ namespace
 
     HANDLE CurrentHandle()
     {
-        return g_activeContexts.empty() ? g_processContext : g_activeContexts.back().context;
+        return g_activeContexts.empty()
+            ? reinterpret_cast<HANDLE>(g_processContext.load()) : g_activeContexts.back().context;
     }
 
     template<typename T>
@@ -348,8 +508,40 @@ const GuestManifestInfo* Win32Bridge::Bridge::CurrentGuestManifest()
     return record ? &record->manifest : nullptr;
 }
 
+bool Win32Bridge::Bridge::CurrentGuestUsesVisualStyles()
+{
+    const GuestManifestInfo* manifest = CurrentGuestManifest();
+    return manifest && manifest->commonControlsV6;
+}
+
+bool Win32Bridge::Bridge::ResolveGuestActivationContextModule(LPCWSTR moduleName, std::wstring* path)
+{
+    if (!moduleName || !path) return false;
+    std::wstring requested = moduleName;
+    const size_t separator = requested.find_last_of(L"\\/");
+    if (separator != std::wstring::npos) requested.erase(0, separator + 1);
+    const GuestManifestInfo* manifest = CurrentGuestManifest();
+    if (!manifest) return false;
+    for (auto assembly = manifest->assemblies.rbegin(); assembly != manifest->assemblies.rend(); ++assembly)
+    {
+        for (const auto& file : assembly->files)
+        {
+            std::wstring name = file.name;
+            const size_t fileSeparator = name.find_last_of(L"\\/");
+            if (fileSeparator != std::wstring::npos) name.erase(0, fileSeparator + 1);
+            if (_wcsicmp(name.c_str(), requested.c_str()) == 0)
+            {
+                *path = file.sourcePath;
+                RuntimeDiagnostics::Record(L"SXS: " + requested + L" -> " + *path + L".");
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 GuestActivationContextScope::GuestActivationContextScope()
-    : m_previous(g_processContext)
+    : m_previous(reinterpret_cast<HANDLE>(g_processContext.load()))
 {
     std::vector<GuestResourceIdentifier> names;
     if (EnumerateGuestResourceNames(nullptr, MAKEINTRESOURCEW(24), &names) != GuestResourceStatus::Success || names.empty())
@@ -361,7 +553,7 @@ GuestActivationContextScope::GuestActivationContextScope()
     const std::wstring source = storage ? storage->ModulePath() : L"<embedded process manifest>";
     if (!LoadManifestResource(nullptr, resourceName, 0, false, source, &record)) return;
     m_context = Store(std::move(record));
-    g_processContext = m_context;
+    g_processContext.store(reinterpret_cast<ULONG_PTR>(m_context));
     RuntimeDiagnostics::Record(L"MANIFEST: activated the embedded process manifest.");
 }
 
@@ -370,7 +562,7 @@ GuestActivationContextScope::~GuestActivationContextScope()
     for (const ActiveRecord& active : g_activeContexts)
         BridgeReleaseActCtx(active.context);
     g_activeContexts.clear();
-    g_processContext = m_previous;
+    g_processContext.store(reinterpret_cast<ULONG_PTR>(m_previous));
     if (m_context && m_context != INVALID_HANDLE_VALUE) BridgeReleaseActCtx(m_context);
 }
 
@@ -434,8 +626,11 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateActCtxW(const GuestActCtxW* conte
             return INVALID_HANDLE_VALUE;
         }
     }
+    if ((context->dwFlags & kActCtxAssemblyDirectoryValid) != 0 && context->lpAssemblyDirectory)
+        record->manifest.assemblyDirectory = context->lpAssemblyDirectory;
     const HANDLE handle = Store(std::move(record));
-    if ((context->dwFlags & kActCtxSetProcessDefault) != 0) g_processContext = handle;
+    if ((context->dwFlags & kActCtxSetProcessDefault) != 0)
+        g_processContext.store(reinterpret_cast<ULONG_PTR>(handle));
     BridgeSetLastError(ERROR_SUCCESS);
     return handle;
 }
@@ -592,7 +787,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeQueryActCtxW(
         auto* info = static_cast<ACTIVATION_CONTEXT_DETAILED_INFORMATION*>(buffer);
         *info = ACTIVATION_CONTEXT_DETAILED_INFORMATION{};
         info->ulFormatVersion = 1;
-        info->ulAssemblyCount = 1;
+        info->ulAssemblyCount = static_cast<ULONG>(1 + record->manifest.assemblies.size());
         info->ulRootManifestPathType = ACTIVATION_CONTEXT_PATH_TYPE_WIN32_FILE;
         info->ulRootManifestPathChars = static_cast<DWORD>(record->manifest.source.size());
         auto* text = reinterpret_cast<wchar_t*>(info + 1);

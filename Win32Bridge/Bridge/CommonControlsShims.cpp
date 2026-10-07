@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge/CommonControlsShims.h"
+#include "Bridge/ActivationContext.h"
 #include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestWindow.h"
 #include "Bridge/User32Shims.h"
@@ -17,6 +18,35 @@
 // shims: MiniGdi is nested under this namespace, while the backing store below
 // itself remains translation-unit private.
 using namespace Win32Bridge::Bridge;
+
+namespace
+{
+    HANDLE WINAPI BridgeOpenThemeData(HWND window, LPCWSTR)
+    {
+        if (!CurrentGuestUsesVisualStyles()) return nullptr;
+        const ULONG_PTR value = reinterpret_cast<ULONG_PTR>(window);
+        return reinterpret_cast<HANDLE>((value ? value : 1) | static_cast<ULONG_PTR>(1));
+    }
+
+    HRESULT WINAPI BridgeCloseThemeData(HANDLE theme) { return theme ? S_OK : E_HANDLE; }
+    BOOL WINAPI BridgeIsThemeActive() { return CurrentGuestUsesVisualStyles() ? TRUE : FALSE; }
+    BOOL WINAPI BridgeIsAppThemed() { return BridgeIsThemeActive(); }
+    HRESULT WINAPI BridgeSetWindowTheme(HWND, LPCWSTR, LPCWSTR) { return S_OK; }
+
+    HRESULT WINAPI BridgeDrawThemeBackground(HANDLE theme, HDC, int, int, const RECT*, const RECT*)
+    {
+        // GuestWindow already paints built-in controls according to the
+        // active context. Do not let callers overlay a classic fallback.
+        return theme && CurrentGuestUsesVisualStyles() ? S_OK : E_HANDLE;
+    }
+
+    HRESULT WINAPI BridgeGetThemeColor(HANDLE theme, int, int, int property, COLORREF* color)
+    {
+        if (!theme || !color || !CurrentGuestUsesVisualStyles()) return E_HANDLE;
+        *color = property == 3803 /* TMT_TEXTCOLOR */ ? RGB(0, 0, 0) : RGB(240, 240, 240);
+        return S_OK;
+    }
+}
 
 void WINAPI Win32Bridge::Bridge::BridgeInitCommonControls()
 {
@@ -423,6 +453,21 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
             : reinterpret_cast<ULONGLONG>(&BridgeCommonControlOrdinal345);
         resolution.disposition = ImportDisposition::NeedsBridge;
         resolution.note = L"Common-controls bootstrap: uses bridge-owned controls rather than a desktop DLL.";
+    }
+    else if (_wcsicmp(symbol.library.c_str(), L"uxtheme.dll") == 0 && !symbol.importedByOrdinal)
+    {
+        if (_wcsicmp(symbol.name.c_str(), L"openthemedata") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOpenThemeData);
+        else if (_wcsicmp(symbol.name.c_str(), L"closethemedata") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCloseThemeData);
+        else if (_wcsicmp(symbol.name.c_str(), L"isthemeactive") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsThemeActive);
+        else if (_wcsicmp(symbol.name.c_str(), L"isappthemed") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsAppThemed);
+        else if (_wcsicmp(symbol.name.c_str(), L"setwindowtheme") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowTheme);
+        else if (_wcsicmp(symbol.name.c_str(), L"drawthemebackground") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawThemeBackground);
+        else if (_wcsicmp(symbol.name.c_str(), L"getthemecolor") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetThemeColor);
+        if (resolution.targetAddress)
+        {
+            resolution.disposition = ImportDisposition::NeedsBridge;
+            resolution.note = L"Activation-context-aware virtual theme API.";
+        }
     }
     else if (_wcsicmp(symbol.library.c_str(), L"comctl32.dll") == 0 && !symbol.importedByOrdinal)
     {

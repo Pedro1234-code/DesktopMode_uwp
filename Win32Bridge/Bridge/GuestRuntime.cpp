@@ -235,23 +235,21 @@ bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportR
         RuntimeDiagnostics::Record(L"PREPARE FAILED: import binding.");
         return false;
     }
-    if (m_bindings.unresolved != 0)
+    // Keep a writable materialization until Run establishes guest scopes and
+    // the DLL loader. Imports that are not bridge APIs are resolved there from
+    // actual guest DLLs, including ordinal and delay-import entries.
+    if (!m_runtime.CopyFrom(m_mapped, error))
     {
-        SetError(error, std::to_wstring(m_bindings.unresolved) +
-            L" guest imports are still unresolved; execution was not attempted.");
-        RuntimeDiagnostics::Record(L"PREPARE FAILED: " + std::to_wstring(m_bindings.unresolved) + L" unresolved main imports.");
-        return false;
-    }
-    if (!m_runtime.CopyFrom(m_mapped, error) || !m_runtime.FinalizeProtections(m_mapped, error))
-    {
-        RuntimeDiagnostics::Record(L"PREPARE FAILED: image copy or final page protections.");
+        RuntimeDiagnostics::Record(L"PREPARE FAILED: initial image copy.");
         return false;
     }
 
     m_ready = true;
     RuntimeDiagnostics::Record(
         L"PREPARE OK: main image reserved; " + std::to_wstring(m_bindings.bound) +
-        L" imports bound; entry RVA " + std::to_wstring(m_mapped.entryPointRva) + L".");
+        L" bridge imports bound, " + std::to_wstring(m_bindings.unresolved) +
+        L" imports deferred to the guest DLL loader; entry RVA " +
+        std::to_wstring(m_mapped.entryPointRva) + L".");
     return true;
 }
 
@@ -335,6 +333,65 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
         }
     }
 
+    const ImportResolver fullResolver = [this](const ImportedSymbol& symbol)
+    {
+        return m_modules->ResolveImport(symbol);
+    };
+    BindingReport finalBindings;
+    std::wstring bindingError;
+    if (!ImportBinder::Bind(
+            &m_mapped, m_metadata, fullResolver, &finalBindings, &bindingError) ||
+        finalBindings.unresolved != 0)
+    {
+        if (m_storage) m_storage->CloseAll();
+        m_kernel->CloseAll();
+        m_modules->ReleaseAll();
+        m_bindings = std::move(finalBindings);
+        SetError(error, bindingError.empty()
+            ? std::to_wstring(m_bindings.unresolved) +
+                L" guest imports remain unresolved after DLL loading."
+            : bindingError);
+        RuntimeDiagnostics::Record(
+            L"RUN FAILED: final import binding left " +
+            std::to_wstring(m_bindings.unresolved) + L" unresolved imports.");
+        return false;
+    }
+    m_bindings = std::move(finalBindings);
+    if (!m_runtime.CopyFrom(m_mapped, &bindingError) ||
+        !m_runtime.FinalizeProtections(m_mapped, &bindingError))
+    {
+        if (m_storage) m_storage->CloseAll();
+        m_kernel->CloseAll();
+        m_modules->ReleaseAll();
+        SetError(error, bindingError);
+        RuntimeDiagnostics::Record(
+            L"RUN FAILED: final image copy or page protections: " + bindingError);
+        return false;
+    }
+    RuntimeDiagnostics::Record(
+        L"RUN: final import binding completed; " +
+        std::to_wstring(m_bindings.bound) + L" regular/delay imports bound.");
+
+    std::wstring tlsError;
+    if (!m_runtime.NotifyTls(DLL_PROCESS_ATTACH, &tlsError))
+    {
+        if (m_storage) m_storage->CloseAll();
+        m_kernel->CloseAll();
+        m_modules->ReleaseAll();
+        SetError(error, L"The main image TLS process-attach notification failed: " + tlsError);
+        RuntimeDiagnostics::Record(L"RUN FAILED: main-image TLS process attach: " + tlsError);
+        return false;
+    }
+    bool mainTlsAttached = true;
+    const auto detachMainTls = [&]()
+    {
+        if (!mainTlsAttached) return;
+        std::wstring ignored;
+        if (!m_runtime.NotifyTls(DLL_PROCESS_DETACH, &ignored) && !ignored.empty())
+            RuntimeDiagnostics::Record(L"TLS: main-image process detach failed: " + ignored);
+        mainTlsAttached = false;
+    };
+
     using GuestEntryPoint = int(WINAPI*)();
     const auto entryPoint = reinterpret_cast<GuestEntryPoint>(m_runtime.Base() + m_mapped.entryPointRva);
     try
@@ -355,6 +412,7 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
             }
             m_kernel->CloseAll();
             m_modules->ReleaseAll();
+            detachMainTls();
             SetError(error, L"The guest raised a structured exception: " +
                 exceptionDescription + L".");
             RuntimeDiagnostics::Record(L"RUN FAILED: guest structured exception " +
@@ -367,6 +425,7 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
         }
         m_kernel->CloseAll();
         m_modules->ReleaseAll();
+        detachMainTls();
         RuntimeDiagnostics::Record(L"RUN: guest returned exit code " + std::to_wstring(*exitCode) + L".");
         return true;
     }
@@ -378,6 +437,7 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
         }
         m_kernel->CloseAll();
         m_modules->ReleaseAll();
+        detachMainTls();
         SetError(error, L"The guest raised an unhandled WinRT exception.");
         RuntimeDiagnostics::Record(L"RUN FAILED: guest raised a WinRT exception; HRESULT " +
             std::to_wstring(static_cast<unsigned long>(exception->HResult)) + L".");
@@ -391,6 +451,7 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
         }
         m_kernel->CloseAll();
         m_modules->ReleaseAll();
+        detachMainTls();
         SetError(error, L"The guest raised an unhandled C++ exception.");
         RuntimeDiagnostics::Record(L"RUN FAILED: guest raised an unhandled C++ exception.");
         return false;
@@ -441,7 +502,6 @@ bool GuestRuntime::LaunchChildProcess(
     // The registry is machine/user state, not process-private state. Sharing
     // one synchronized logical context also prevents two cooperative guests
     // from overwriting each other's persisted hive snapshots.
-    child->SetRegistryContext(m_registry);
     child->SetWindowManager(m_windows);
     child->SetModuleSourceFolder(m_modules->ModuleSourceFolder());
     child->SetCommandLine(commandLine ? commandLine : executableName);
@@ -456,15 +516,18 @@ bool GuestRuntime::LaunchChildProcess(
             L"PROCESS FAILED: child preparation failed for " + logicalPath + L": " + prepareError);
         return false;
     }
+    child->SetRegistryContext(m_registry);
 
     const std::shared_ptr<GuestKernelContext> completionKernel = m_kernel;
-    HANDLE processHandle = completionKernel->CreateEvent(true, false, nullptr, &errorCode);
+    const DWORD processId = g_nextGuestProcessId.fetch_add(1);
+    const DWORD threadId = g_nextGuestProcessId.fetch_add(1);
+    HANDLE processHandle = completionKernel->CreateCompletionObject(processId, true, &errorCode);
     if (!processHandle)
     {
         if (win32Error) *win32Error = errorCode;
         return false;
     }
-    HANDLE threadHandle = completionKernel->CreateEvent(true, false, nullptr, &errorCode);
+    HANDLE threadHandle = completionKernel->CreateCompletionObject(threadId, false, &errorCode);
     if (!threadHandle)
     {
         completionKernel->CloseHandle(processHandle, nullptr);
@@ -472,8 +535,6 @@ bool GuestRuntime::LaunchChildProcess(
         return false;
     }
 
-    const DWORD processId = g_nextGuestProcessId.fetch_add(1);
-    const DWORD threadId = g_nextGuestProcessId.fetch_add(1);
     child->SetProcessId(processId);
     child->SetMainThreadId(threadId);
     processInformation->hProcess = processHandle;
@@ -482,25 +543,41 @@ bool GuestRuntime::LaunchChildProcess(
     processInformation->dwThreadId = threadId;
 
     RuntimeDiagnostics::Record(
-        L"PROCESS: entering a cooperative child guest for " + logicalPath + L".");
-    const HWND previousForeground = m_windows->GetGuestForegroundWindow();
+        L"PROCESS: created asynchronous cooperative child guest for " + logicalPath + L".");
+    const std::shared_ptr<GuestWindowManager> childWindows = m_windows;
+    const HWND previousForeground = childWindows->GetGuestForegroundWindow();
     DWORD activationError = ERROR_SUCCESS;
-    const HWND previousFocus = m_windows->GetGuestFocus(&activationError);
-    int exitCode = -1;
-    std::wstring childError;
-    const bool completed = child->Run(&exitCode, &childError);
-    // A process owns its USER objects. Purge the child's window/DC/message
-    // state before releasing its mapped image, then reactivate the caller.
-    m_windows->DestroyGuestWindowsForProcess(
-        processId, previousForeground, previousFocus);
-    DWORD ignored = ERROR_SUCCESS;
-    completionKernel->SetEvent(threadHandle, &ignored);
-    completionKernel->SetEvent(processHandle, &ignored);
-    RuntimeDiagnostics::Record(
-        completed
-            ? L"PROCESS: child returned from " + logicalPath +
-                L" with exit code " + std::to_wstring(exitCode) + L"."
-            : L"PROCESS FAILED: child stopped in " + logicalPath + L": " + childError);
+    const HWND previousFocus = childWindows->GetGuestFocus(&activationError);
+    try
+    {
+        std::thread([child, completionKernel, childWindows, processHandle, threadHandle,
+            processId, logicalPath, previousForeground, previousFocus]()
+        {
+            int exitCode = static_cast<int>(ERROR_PROCESS_ABORTED);
+            std::wstring childError;
+            const bool completed = child->Run(&exitCode, &childError);
+            childWindows->DestroyGuestWindowsForProcess(
+                processId, previousForeground, previousFocus);
+            const DWORD reportedExitCode = completed
+                ? static_cast<DWORD>(exitCode) : ERROR_PROCESS_ABORTED;
+            DWORD ignored = ERROR_SUCCESS;
+            completionKernel->CompleteObject(threadHandle, reportedExitCode, &ignored);
+            completionKernel->CompleteObject(processHandle, reportedExitCode, &ignored);
+            RuntimeDiagnostics::Record(
+                completed
+                    ? L"PROCESS: child returned from " + logicalPath +
+                        L" with exit code " + std::to_wstring(exitCode) + L"."
+                    : L"PROCESS FAILED: child stopped in " + logicalPath + L": " + childError);
+        }).detach();
+    }
+    catch (const std::system_error&)
+    {
+        completionKernel->CloseHandle(threadHandle, nullptr);
+        completionKernel->CloseHandle(processHandle, nullptr);
+        ZeroMemory(processInformation, sizeof(*processInformation));
+        if (win32Error) *win32Error = ERROR_NOT_ENOUGH_MEMORY;
+        return false;
+    }
     if (win32Error) *win32Error = ERROR_SUCCESS;
     return true;
 }
@@ -527,15 +604,16 @@ HANDLE GuestRuntime::LaunchThread(
         return nullptr;
     }
 
+    const DWORD assignedThreadId = g_nextGuestProcessId.fetch_add(1);
     DWORD errorCode = ERROR_SUCCESS;
-    HANDLE completion = m_kernel->CreateEvent(true, false, nullptr, &errorCode);
+    HANDLE completion = m_kernel->CreateCompletionObject(
+        assignedThreadId, false, &errorCode);
     if (!completion)
     {
         if (win32Error) *win32Error = errorCode;
         return nullptr;
     }
 
-    const DWORD assignedThreadId = g_nextGuestProcessId.fetch_add(1);
     const std::shared_ptr<GuestKernelContext> kernel = m_kernel;
     const std::shared_ptr<GuestModuleLoader> modules = m_modules;
     const std::shared_ptr<GuestRegistryContext> registry = m_registry;
@@ -574,9 +652,21 @@ HANDLE GuestRuntime::LaunchThread(
 
             DWORD exitCode = 0;
             GuestExceptionDetails exception;
-            if (!InvokeGuestThreadEntry(
+            std::wstring tlsError;
+            bool modulesThreadAttached =
+                modules->NotifyThread(DLL_THREAD_ATTACH, &tlsError);
+            bool mainThreadAttached = modulesThreadAttached &&
+                runtime->m_runtime.NotifyTls(DLL_THREAD_ATTACH, &tlsError);
+            if (!mainThreadAttached)
+            {
+                exitCode = ERROR_DLL_INIT_FAILED;
+                RuntimeDiagnostics::Record(
+                    L"THREAD FAILED: TLS/DLL thread attach notification: " + tlsError);
+            }
+            else if (!InvokeGuestThreadEntry(
                 startAddress, parameter, &exitCode, &exception))
             {
+                exitCode = ERROR_PROCESS_ABORTED;
                 const std::wstring exceptionDescription = DescribeGuestException(
                     exception,
                     imageBase,
@@ -587,8 +677,20 @@ HANDLE GuestRuntime::LaunchThread(
                     L"THREAD FAILED: guest structured exception " +
                     exceptionDescription + L".");
             }
+            if (modulesThreadAttached)
+            {
+                std::wstring detachError;
+                if (!modules->NotifyThread(DLL_THREAD_DETACH, &detachError) && !detachError.empty())
+                    RuntimeDiagnostics::Record(L"THREAD: DLL thread detach failed: " + detachError);
+            }
+            if (mainThreadAttached)
+            {
+                std::wstring detachError;
+                if (!runtime->m_runtime.NotifyTls(DLL_THREAD_DETACH, &detachError) && !detachError.empty())
+                    RuntimeDiagnostics::Record(L"THREAD: main-image TLS thread detach failed: " + detachError);
+            }
             DWORD ignored = ERROR_SUCCESS;
-            kernel->SetEvent(completion, &ignored);
+            kernel->CompleteObject(completion, exitCode, &ignored);
             if (SUCCEEDED(apartment)) RoUninitialize();
         }).detach();
     }

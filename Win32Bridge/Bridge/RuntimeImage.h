@@ -23,6 +23,7 @@ namespace Bridge
         static bool Reserve(size_t size, ULONGLONG preferredBase, RuntimeImage* image, std::wstring* error);
         bool CopyFrom(const MappedPeImage& image, std::wstring* error);
         bool FinalizeProtections(const MappedPeImage& image, std::wstring* error);
+        bool NotifyTls(DWORD reason, std::wstring* error) const;
         void Release();
 
     private:
@@ -31,6 +32,7 @@ namespace Bridge
         size_t m_size = 0;
         PRUNTIME_FUNCTION m_functionTable = nullptr;
         DWORD m_functionEntryCount = 0;
+        mutable DWORD m_tlsIndex = TLS_OUT_OF_INDEXES;
     };
 }
 }

@@ -936,6 +936,14 @@ namespace
         modal.window = root;
         g_activeModalDialog = &modal;
 
+        // DialogBox disables an enabled owner for the lifetime of the modal
+        // loop and restores exactly that state afterwards. Nested modal
+        // dialogs therefore disable their immediate owner without
+        // accidentally re-enabling an owner disabled by an outer loop.
+        const bool ownerWasEnabled = parent && manager->IsGuestWindow(parent) &&
+            manager->IsGuestWindowEnabled(parent, nullptr) != FALSE;
+        if (ownerWasEnabled) manager->EnableGuestWindow(parent, FALSE, nullptr);
+
         const LRESULT initializeFocus = manager->SendGuestMessage(root, WM_INITDIALOG,
             reinterpret_cast<WPARAM>(initialFocus), initParameter, &error);
         if (!modal.ended && manager->IsGuestWindow(root))
@@ -991,7 +999,11 @@ namespace
         }
 
         if (manager->IsGuestWindow(root)) manager->DestroyGuestWindow(root, &error);
-        if (parent && manager->IsGuestWindow(parent)) manager->SetGuestFocus(parent, nullptr);
+        if (ownerWasEnabled && parent && manager->IsGuestWindow(parent))
+            manager->EnableGuestWindow(parent, TRUE, nullptr);
+        if (parent && manager->IsGuestWindow(parent) &&
+            manager->IsGuestWindowEnabled(parent, nullptr))
+            manager->SetGuestFocus(parent, nullptr);
         g_activeModalDialog = modal.previous;
         BridgeSetLastError(ERROR_SUCCESS);
         return modal.result;

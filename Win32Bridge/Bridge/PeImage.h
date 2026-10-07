@@ -15,6 +15,7 @@ namespace Bridge
         std::wstring name;
         WORD ordinal = 0;
         bool importedByOrdinal = false;
+        bool delayLoaded = false;
         DWORD iatRva = 0;
     };
 

@@ -180,6 +180,62 @@ HANDLE GuestKernelContext::CreateSemaphore(LONG initialCount, LONG maximumCount,
     return handle;
 }
 
+HANDLE GuestKernelContext::CreateCompletionObject(
+    DWORD objectId, bool process, DWORD* win32Error)
+{
+    auto object = std::make_shared<ObjectRecord>(
+        process ? ObjectKind::Process : ObjectKind::Thread);
+    object->manualReset = true;
+    object->objectId = objectId;
+    HANDLE handle = nullptr;
+    if (!AddObject(object, &handle, win32Error)) return nullptr;
+    return handle;
+}
+
+bool GuestKernelContext::CompleteObject(HANDLE guestHandle, DWORD exitCode, DWORD* win32Error)
+{
+    const auto object = Lookup(guestHandle);
+    if (!object)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(object->lock);
+        if (object->closed || (object->kind != ObjectKind::Process && object->kind != ObjectKind::Thread))
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return false;
+        }
+        object->exitCode = exitCode;
+        object->signaled = true;
+    }
+    object->stateChanged.notify_all();
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestKernelContext::GetExitCode(
+    HANDLE guestHandle, bool process, LPDWORD exitCode, DWORD* win32Error) const
+{
+    const auto object = Lookup(guestHandle);
+    if (!object || !exitCode)
+    {
+        SetWin32Error(win32Error, object ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE);
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(object->lock);
+    const ObjectKind expected = process ? ObjectKind::Process : ObjectKind::Thread;
+    if (object->closed || object->kind != expected)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    *exitCode = object->signaled ? object->exitCode : STILL_ACTIVE;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
 bool GuestKernelContext::SetEvent(HANDLE guestHandle, DWORD* win32Error)
 {
     const auto object = Lookup(guestHandle);
@@ -327,7 +383,8 @@ DWORD GuestKernelContext::WaitForSingleObject(HANDLE guestHandle, DWORD millisec
             {
                 return true;
             }
-            if (object->kind == ObjectKind::Event)
+            if (object->kind == ObjectKind::Event || object->kind == ObjectKind::Process ||
+                object->kind == ObjectKind::Thread)
             {
                 return object->signaled;
             }
@@ -371,7 +428,8 @@ DWORD GuestKernelContext::WaitForSingleObject(HANDLE guestHandle, DWORD millisec
         return WAIT_FAILED;
     }
 
-    if (object->kind == ObjectKind::Event)
+    if (object->kind == ObjectKind::Event || object->kind == ObjectKind::Process ||
+        object->kind == ObjectKind::Thread)
     {
         if (!object->manualReset)
         {

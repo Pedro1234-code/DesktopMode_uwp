@@ -86,6 +86,9 @@ namespace Bridge
     BOOL WINAPI BridgeFindCloseChangeNotification(HANDLE changeHandle);
     HANDLE WINAPI BridgeCreateFileMappingW(HANDLE file, LPSECURITY_ATTRIBUTES attributes, DWORD protection, DWORD maximumSizeHigh, DWORD maximumSizeLow, LPCWSTR name);
     BOOL WINAPI BridgeCreateProcessW(LPCWSTR applicationName, LPWSTR commandLine, LPSECURITY_ATTRIBUTES processAttributes, LPSECURITY_ATTRIBUTES threadAttributes, BOOL inheritHandles, DWORD creationFlags, LPVOID environment, LPCWSTR currentDirectory, LPSTARTUPINFOW startupInfo, LPPROCESS_INFORMATION processInformation);
+    BOOL WINAPI BridgeCreateProcessA(LPCSTR applicationName, LPSTR commandLine, LPSECURITY_ATTRIBUTES processAttributes, LPSECURITY_ATTRIBUTES threadAttributes, BOOL inheritHandles, DWORD creationFlags, LPVOID environment, LPCSTR currentDirectory, LPSTARTUPINFOA startupInfo, LPPROCESS_INFORMATION processInformation);
+    BOOL WINAPI BridgeGetExitCodeProcess(HANDLE process, LPDWORD exitCode);
+    BOOL WINAPI BridgeGetExitCodeThread(HANDLE thread, LPDWORD exitCode);
     HANDLE WINAPI BridgeCreateThread(LPSECURITY_ATTRIBUTES attributes, SIZE_T stackSize, LPTHREAD_START_ROUTINE startAddress, LPVOID parameter, DWORD creationFlags, LPDWORD threadId);
     void WINAPI BridgeRaiseException(DWORD exceptionCode, DWORD exceptionFlags, DWORD argumentCount, const ULONG_PTR* arguments);
     BOOL WINAPI BridgeCreateDirectoryW(LPCWSTR path, LPSECURITY_ATTRIBUTES securityAttributes);
@@ -212,6 +215,7 @@ namespace Bridge
     HMODULE WINAPI BridgeLoadLibraryExW(LPCWSTR fileName, HANDLE file, DWORD flags);
     FARPROC WINAPI BridgeGetProcAddress(HMODULE module, LPCSTR nameOrOrdinal);
     BOOL WINAPI BridgeFreeLibrary(HMODULE module);
+    BOOL WINAPI BridgeDisableThreadLibraryCalls(HMODULE module);
     LPWSTR WINAPI BridgeGetCommandLineW();
     void WINAPI BridgeOutputDebugStringW(LPCWSTR message);
     BOOL WINAPI BridgeIsDebuggerPresent();

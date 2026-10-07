@@ -1,5 +1,6 @@
 #include "Bridge\\RuntimeImage.h"
 
+#include <algorithm>
 #include <cstring>
 #include <vector>
 
@@ -35,6 +36,22 @@ namespace
             return PAGE_READWRITE;
         }
         return PAGE_READONLY;
+    }
+
+    bool InvokeTlsCallback(
+        PIMAGE_TLS_CALLBACK callback,
+        BYTE* module,
+        DWORD reason)
+    {
+        __try
+        {
+            callback(module, reason, nullptr);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
     }
 }
 
@@ -182,8 +199,197 @@ bool RuntimeImage::RegisterUnwindMetadata(std::wstring* error)
     return true;
 }
 
+bool RuntimeImage::NotifyTls(DWORD reason, std::wstring* error) const
+{
+    if (!m_base || m_size < sizeof(IMAGE_DOS_HEADER))
+    {
+        SetError(error, L"The runtime image is unavailable for TLS notification.");
+        return false;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m_base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+        !Contains(m_size, static_cast<size_t>(dos->e_lfanew), sizeof(IMAGE_NT_HEADERS64)))
+    {
+        SetError(error, L"The mapped PE headers are invalid for TLS notification.");
+        return false;
+    }
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m_base + dos->e_lfanew);
+    if (headers->Signature != IMAGE_NT_SIGNATURE ||
+        headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        headers->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_TLS)
+        return true;
+
+    const IMAGE_DATA_DIRECTORY directory =
+        headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    if (directory.VirtualAddress == 0 || directory.Size == 0) return true;
+    if (directory.Size < sizeof(IMAGE_TLS_DIRECTORY64) ||
+        !Contains(m_size, directory.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64)))
+    {
+        SetError(error, L"The PE TLS directory is malformed.");
+        return false;
+    }
+
+    const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(
+        m_base + directory.VirtualAddress);
+    const ULONG_PTR base = reinterpret_cast<ULONG_PTR>(m_base);
+    const auto inImageAddress = [base, this](ULONGLONG address, size_t bytes, size_t* offset)
+    {
+        if (address < base || address - base > m_size) return false;
+        const size_t value = static_cast<size_t>(address - base);
+        if (!Contains(m_size, value, bytes)) return false;
+        if (offset) *offset = value;
+        return true;
+    };
+
+    if (reason == DLL_PROCESS_ATTACH || reason == DLL_THREAD_ATTACH)
+    {
+        if (m_tlsIndex == TLS_OUT_OF_INDEXES)
+        {
+            m_tlsIndex = TlsAlloc();
+            if (m_tlsIndex == TLS_OUT_OF_INDEXES)
+            {
+                SetError(error, L"TlsAlloc failed for the mapped PE image.");
+                return false;
+            }
+            size_t indexOffset = 0;
+            if (!inImageAddress(tls->AddressOfIndex, sizeof(DWORD), &indexOffset))
+            {
+                TlsFree(m_tlsIndex);
+                m_tlsIndex = TLS_OUT_OF_INDEXES;
+                SetError(error, L"The PE TLS index slot lies outside the mapped image.");
+                return false;
+            }
+            ULONG oldProtection = 0;
+            if (!VirtualProtectFromApp(
+                    m_base + indexOffset, sizeof(m_tlsIndex), PAGE_READWRITE, &oldProtection))
+            {
+                TlsFree(m_tlsIndex);
+                m_tlsIndex = TLS_OUT_OF_INDEXES;
+                SetError(error, L"The PE TLS index slot could not be made writable.");
+                return false;
+            }
+            memcpy(m_base + indexOffset, &m_tlsIndex, sizeof(m_tlsIndex));
+            ULONG ignoredProtection = 0;
+            if (!VirtualProtectFromApp(
+                    m_base + indexOffset, sizeof(m_tlsIndex), oldProtection, &ignoredProtection))
+            {
+                TlsFree(m_tlsIndex);
+                m_tlsIndex = TLS_OUT_OF_INDEXES;
+                SetError(error, L"The PE TLS index-slot protection could not be restored.");
+                return false;
+            }
+        }
+
+        size_t rawOffset = 0;
+        size_t rawBytes = 0;
+        if (tls->EndAddressOfRawData < tls->StartAddressOfRawData)
+        {
+            SetError(error, L"The PE TLS template range is malformed.");
+            return false;
+        }
+        const ULONGLONG rawLength = tls->EndAddressOfRawData - tls->StartAddressOfRawData;
+        if (rawLength > static_cast<ULONGLONG>(SIZE_MAX) ||
+            (rawLength != 0 && !inImageAddress(
+                tls->StartAddressOfRawData, static_cast<size_t>(rawLength), &rawOffset)))
+        {
+            SetError(error, L"The PE TLS template lies outside the mapped image.");
+            return false;
+        }
+        rawBytes = static_cast<size_t>(rawLength);
+        const ULONGLONG allocation64 = rawLength + tls->SizeOfZeroFill;
+        if (allocation64 < rawLength || allocation64 > 64ull * 1024ull * 1024ull)
+        {
+            SetError(error, L"The PE TLS allocation exceeds the safety limit.");
+            return false;
+        }
+        const SIZE_T allocation = static_cast<SIZE_T>(allocation64 == 0 ? 1 : allocation64);
+        void* block = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, allocation);
+        if (!block)
+        {
+            SetError(error, L"The PE TLS data block could not be allocated.");
+            return false;
+        }
+        if (rawBytes != 0) memcpy(block, m_base + rawOffset, rawBytes);
+        if (!TlsSetValue(m_tlsIndex, block))
+        {
+            HeapFree(GetProcessHeap(), 0, block);
+            SetError(error, L"TlsSetValue failed for the mapped PE image.");
+            return false;
+        }
+    }
+
+    const auto releaseThreadStorage = [this, reason]()
+    {
+        if (m_tlsIndex == TLS_OUT_OF_INDEXES) return;
+        void* block = TlsGetValue(m_tlsIndex);
+        if (block) HeapFree(GetProcessHeap(), 0, block);
+        TlsSetValue(m_tlsIndex, nullptr);
+        if (reason == DLL_PROCESS_DETACH)
+        {
+            TlsFree(m_tlsIndex);
+            m_tlsIndex = TLS_OUT_OF_INDEXES;
+        }
+    };
+
+    if (tls->AddressOfCallBacks == 0)
+    {
+        if (reason == DLL_PROCESS_DETACH || reason == DLL_THREAD_DETACH)
+            releaseThreadStorage();
+        return true;
+    }
+    const ULONG_PTR callbacksAddress = static_cast<ULONG_PTR>(tls->AddressOfCallBacks);
+    if (callbacksAddress < base || callbacksAddress - base >= m_size)
+    {
+        SetError(error, L"The PE TLS callback array lies outside the mapped image.");
+        return false;
+    }
+
+    const size_t callbacksOffset = callbacksAddress - base;
+    constexpr size_t MaximumTlsCallbacks = 4096;
+    for (size_t index = 0; index < MaximumTlsCallbacks; ++index)
+    {
+        const size_t entryOffset = callbacksOffset + index * sizeof(ULONGLONG);
+        if (entryOffset < callbacksOffset || !Contains(m_size, entryOffset, sizeof(ULONGLONG)))
+        {
+            SetError(error, L"The PE TLS callback array has no in-image terminator.");
+            return false;
+        }
+        ULONGLONG callbackValue = 0;
+        memcpy(&callbackValue, m_base + entryOffset, sizeof(callbackValue));
+        if (callbackValue == 0)
+        {
+            if (reason == DLL_PROCESS_DETACH || reason == DLL_THREAD_DETACH)
+                releaseThreadStorage();
+            return true;
+        }
+        const ULONG_PTR callbackAddress = static_cast<ULONG_PTR>(callbackValue);
+        if (callbackAddress < base || callbackAddress - base >= m_size)
+        {
+            SetError(error, L"A PE TLS callback lies outside the mapped image.");
+            return false;
+        }
+        if (!InvokeTlsCallback(
+            reinterpret_cast<PIMAGE_TLS_CALLBACK>(callbackAddress), m_base, reason))
+        {
+            SetError(error, L"A PE TLS callback raised a structured exception.");
+            return false;
+        }
+    }
+
+    SetError(error, L"The PE TLS callback array exceeds the safety limit.");
+    return false;
+}
+
 void RuntimeImage::Release()
 {
+    if (m_tlsIndex != TLS_OUT_OF_INDEXES)
+    {
+        void* block = TlsGetValue(m_tlsIndex);
+        if (block) HeapFree(GetProcessHeap(), 0, block);
+        TlsSetValue(m_tlsIndex, nullptr);
+        TlsFree(m_tlsIndex);
+        m_tlsIndex = TLS_OUT_OF_INDEXES;
+    }
     if (m_functionTable)
     {
         RtlDeleteFunctionTable(m_functionTable);

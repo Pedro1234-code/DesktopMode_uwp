@@ -141,6 +141,7 @@
     <ClInclude Include="RuntimeHost.h" />
     <ClInclude Include="RuntimeSession.h" />
     <ClInclude Include="Bridge\CompatibilityCatalog.h" />
+    <ClInclude Include="Bridge\ApiSet.h" />
     <ClInclude Include="Bridge\Advapi32Shims.h" />
     <ClInclude Include="Bridge\ActivationContext.h" />
     <ClInclude Include="Bridge\CommonControlsShims.h" />

@@ -106,6 +106,11 @@ namespace Bridge
     void WINAPI BridgePostQuitMessage(int exitCode);
     BOOL WINAPI BridgeGetMessageW(GuestAbi::Message* message, HWND window, UINT minimumMessage, UINT maximumMessage);
     BOOL WINAPI BridgePeekMessageW(GuestAbi::Message* message, HWND window, UINT minimumMessage, UINT maximumMessage, UINT removeMessage);
+    BOOL WINAPI BridgeWaitMessage();
+    DWORD WINAPI BridgeMsgWaitForMultipleObjectsEx(DWORD count, const HANDLE* handles,
+        DWORD milliseconds, DWORD wakeMask, DWORD flags);
+    DWORD WINAPI BridgeMsgWaitForMultipleObjects(DWORD count, const HANDLE* handles,
+        BOOL waitAll, DWORD milliseconds, DWORD wakeMask);
     BOOL WINAPI BridgeTranslateMessage(const GuestAbi::Message* message);
     LRESULT WINAPI BridgeDispatchMessageW(const GuestAbi::Message* message);
     BOOL WINAPI BridgeInvalidateRect(HWND window, const RECT* rect, BOOL erase);

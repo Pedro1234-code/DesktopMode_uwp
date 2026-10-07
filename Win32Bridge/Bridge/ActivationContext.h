@@ -9,6 +9,31 @@ namespace Win32Bridge
 {
 namespace Bridge
 {
+    struct GuestAssemblyIdentity final
+    {
+        std::wstring name;
+        std::wstring version;
+        std::wstring processorArchitecture;
+        std::wstring publicKeyToken;
+        std::wstring language;
+        std::wstring type;
+    };
+
+    struct GuestAssemblyFile final
+    {
+        std::wstring name;
+        std::wstring sourcePath;
+    };
+
+    struct GuestAssemblyInfo final
+    {
+        GuestAssemblyIdentity identity;
+        std::wstring manifestPath;
+        std::wstring directory;
+        std::vector<GuestAssemblyFile> files;
+        bool virtualAssembly = false;
+    };
+
     // The Windows SDK hides ACTCTXA/W from AppContainer builds even though
     // guest desktop binaries still pass this ABI to our emulated kernel32.
     // Keep a bridge-owned copy instead of exposing desktop-only host APIs.
@@ -42,7 +67,11 @@ namespace Bridge
     {
         std::wstring xml;
         std::wstring source;
+        std::wstring assemblyDirectory;
         std::wstring assemblyIdentity;
+        GuestAssemblyIdentity identity;
+        std::vector<GuestAssemblyIdentity> dependencies;
+        std::vector<GuestAssemblyInfo> assemblies;
         std::wstring dpiAwareness;
         std::vector<GUID> supportedOperatingSystems;
         ACTCTX_REQUESTED_RUN_LEVEL runLevel = ACTCTX_RUN_LEVEL_UNSPECIFIED;
@@ -52,6 +81,8 @@ namespace Bridge
     };
 
     const GuestManifestInfo* CurrentGuestManifest();
+    bool CurrentGuestUsesVisualStyles();
+    bool ResolveGuestActivationContextModule(LPCWSTR moduleName, std::wstring* path);
 
     class GuestActivationContextScope final
     {

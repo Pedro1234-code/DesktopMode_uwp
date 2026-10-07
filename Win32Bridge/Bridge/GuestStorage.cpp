@@ -359,14 +359,20 @@ namespace
 
 struct GuestStorageContext::FileRecord final
 {
-    FileRecord(IRandomAccessStream^ value, bool canRead, bool canWrite)
-        : stream(value), readable(canRead), writable(canWrite)
+    FileRecord(IRandomAccessStream^ value, bool canRead, bool canWrite,
+        std::wstring path, DWORD access, DWORD sharing, bool removeOnClose)
+        : stream(value), readable(canRead), writable(canWrite), canonicalPath(std::move(path)),
+          desiredAccess(access), shareMode(sharing), deleteOnClose(removeOnClose)
     {
     }
 
     Platform::Agile<IRandomAccessStream^> stream;
     bool readable;
     bool writable;
+    std::wstring canonicalPath;
+    DWORD desiredAccess = 0;
+    DWORD shareMode = 0;
+    bool deleteOnClose = false;
     // Protected by lock.  Closing first removes the handle from the shared
     // table, then marks this record closed before releasing its stream.  An
     // I/O operation that already retained the record therefore cannot race a
@@ -550,6 +556,10 @@ bool GuestStorageContext::AddFile(
     IRandomAccessStream^ stream,
     bool readable,
     bool writable,
+    const std::wstring& canonicalPath,
+    DWORD desiredAccess,
+    DWORD shareMode,
+    bool deleteOnClose,
     HANDLE* guestHandle,
     DWORD* win32Error)
 {
@@ -559,7 +569,8 @@ bool GuestStorageContext::AddFile(
         return false;
     }
 
-    auto record = std::make_shared<FileRecord>(stream, readable, writable);
+    auto record = std::make_shared<FileRecord>(stream, readable, writable,
+        canonicalPath, desiredAccess, shareMode, deleteOnClose);
     std::lock_guard<std::mutex> guard(m_handlesLock);
     ULONG_PTR token = 0;
     if (!AllocateHandleLocked(&token))
@@ -757,7 +768,7 @@ void GuestStorageContext::MoveAttributeOverrides(
 bool GuestStorageContext::CreateFile(
     LPCWSTR fileName,
     DWORD desiredAccess,
-    DWORD,
+    DWORD shareMode,
     DWORD creationDisposition,
     DWORD flagsAndAttributes,
     HANDLE,
@@ -771,8 +782,7 @@ bool GuestStorageContext::CreateFile(
     }
     *guestHandle = INVALID_HANDLE_VALUE;
 
-    if ((flagsAndAttributes & FILE_FLAG_OVERLAPPED) != 0 ||
-        (flagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE) != 0)
+    if ((flagsAndAttributes & FILE_FLAG_OVERLAPPED) != 0)
     {
         SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
         return false;
@@ -795,6 +805,42 @@ bool GuestStorageContext::CreateFile(
             *win32Error = ERROR_INVALID_NAME;
         }
         return false;
+    }
+
+    const DWORD supportedSharing = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    if ((shareMode & ~supportedSharing) != 0)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const bool deleteAccess = (desiredAccess & DELETE) != 0 ||
+        (flagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE) != 0;
+    {
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        if (m_deletePending.find(MetadataKey(path.canonical)) != m_deletePending.end())
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
+        for (const auto& entry : m_files)
+        {
+            const auto& existing = entry.second;
+            if (!existing || _wcsicmp(existing->canonicalPath.c_str(), path.canonical.c_str()) != 0)
+                continue;
+            const bool existingReads = HasReadAccess(existing->desiredAccess);
+            const bool existingWrites = HasWriteAccess(existing->desiredAccess);
+            const bool existingDeletes = (existing->desiredAccess & DELETE) != 0 || existing->deleteOnClose;
+            if ((readable && (existing->shareMode & FILE_SHARE_READ) == 0) ||
+                (writable && (existing->shareMode & FILE_SHARE_WRITE) == 0) ||
+                (deleteAccess && (existing->shareMode & FILE_SHARE_DELETE) == 0) ||
+                (existingReads && (shareMode & FILE_SHARE_READ) == 0) ||
+                (existingWrites && (shareMode & FILE_SHARE_WRITE) == 0) ||
+                (existingDeletes && (shareMode & FILE_SHARE_DELETE) == 0))
+            {
+                SetWin32Error(win32Error, ERROR_SHARING_VIOLATION);
+                return false;
+            }
+        }
     }
 
     StorageFolder^ parent = nullptr;
@@ -835,7 +881,10 @@ bool GuestStorageContext::CreateFile(
             stream->Size = 0;
             stream->Seek(0);
         }
-        if (!AddFile(stream, readable || !writable, writable, guestHandle, win32Error))
+        if (!AddFile(stream, readable || !writable, writable, path.canonical,
+            desiredAccess, shareMode,
+            (flagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE) != 0,
+            guestHandle, win32Error))
         {
             return false;
         }
@@ -988,12 +1037,14 @@ bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWOR
             error == ERROR_SUCCESS ? ERROR_WRITE_FAULT : error);
         return false;
     }
+
 }
 
 bool GuestStorageContext::CloseFile(HANDLE guestHandle, DWORD* win32Error)
 {
     const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
     std::shared_ptr<FileRecord> record;
+    bool removeFile = false;
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
         const auto found = m_files.find(token);
@@ -1003,7 +1054,20 @@ bool GuestStorageContext::CloseFile(HANDLE guestHandle, DWORD* win32Error)
             return false;
         }
         record = found->second;
+        const std::wstring key = MetadataKey(record->canonicalPath);
+        if (record->deleteOnClose) m_deletePending.insert(key);
         m_files.erase(found);
+        bool stillOpen = false;
+        for (const auto& entry : m_files)
+        {
+            if (entry.second && _wcsicmp(entry.second->canonicalPath.c_str(),
+                record->canonicalPath.c_str()) == 0)
+            {
+                stillOpen = true;
+                break;
+            }
+        }
+        if (!stillOpen && m_deletePending.erase(key) != 0) removeFile = true;
     }
 
     try
@@ -1024,6 +1088,15 @@ bool GuestStorageContext::CloseFile(HANDLE guestHandle, DWORD* win32Error)
             return false;
         }
         delete stream;
+        if (removeFile)
+        {
+            DWORD deleteError = ERROR_SUCCESS;
+            if (!DeleteGuestFile(record->canonicalPath.c_str(), &deleteError))
+            {
+                SetWin32Error(win32Error, deleteError);
+                return false;
+            }
+        }
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return true;
     }
@@ -1314,6 +1387,30 @@ bool GuestStorageContext::DeleteGuestFile(LPCWSTR path, DWORD* win32Error)
         return false;
     }
 
+    {
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        bool open = false;
+        for (const auto& entry : m_files)
+        {
+            const auto& record = entry.second;
+            if (!record || _wcsicmp(record->canonicalPath.c_str(), resolved.canonical.c_str()) != 0)
+                continue;
+            if ((record->shareMode & FILE_SHARE_DELETE) == 0)
+            {
+                SetWin32Error(win32Error, ERROR_SHARING_VIOLATION);
+                return false;
+            }
+            open = true;
+        }
+        if (open)
+        {
+            m_deletePending.insert(MetadataKey(resolved.canonical));
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+        m_deletePending.erase(MetadataKey(resolved.canonical));
+    }
+
     StorageFolder^ parent = nullptr;
     std::wstring leaf;
     if (!GetParentFolder(resolved, &parent, &leaf, win32Error))
@@ -1369,6 +1466,28 @@ bool GuestStorageContext::MoveGuestPath(
             *win32Error = ERROR_ACCESS_DENIED;
         }
         return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        for (const auto& entry : m_files)
+        {
+            const auto& record = entry.second;
+            if (!record) continue;
+            const bool sourceOpen = _wcsicmp(record->canonicalPath.c_str(), source.canonical.c_str()) == 0;
+            const bool destinationOpen = _wcsicmp(record->canonicalPath.c_str(), destination.canonical.c_str()) == 0;
+            if ((sourceOpen || destinationOpen) && (record->shareMode & FILE_SHARE_DELETE) == 0)
+            {
+                SetWin32Error(win32Error, ERROR_SHARING_VIOLATION);
+                return false;
+            }
+        }
+        if (m_deletePending.count(MetadataKey(source.canonical)) != 0 ||
+            m_deletePending.count(MetadataKey(destination.canonical)) != 0)
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
     }
 
     StorageFolder^ sourceParent = nullptr;
@@ -1752,9 +1871,27 @@ std::wstring GuestStorageContext::TempPath() const
 void GuestStorageContext::CloseAll()
 {
     std::unordered_map<ULONG_PTR, std::shared_ptr<FileRecord>> files;
+    std::unordered_set<std::wstring> removePaths;
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
         files.swap(m_files);
+        for (const auto& entry : files)
+        {
+            if (entry.second && entry.second->deleteOnClose)
+                m_deletePending.insert(MetadataKey(entry.second->canonicalPath));
+        }
+        for (const auto& pending : m_deletePending)
+        {
+            for (const auto& entry : files)
+            {
+                if (entry.second && MetadataKey(entry.second->canonicalPath) == pending)
+                {
+                    removePaths.insert(entry.second->canonicalPath);
+                    break;
+                }
+            }
+        }
+        m_deletePending.clear();
         m_finds.clear();
         m_nextHandle = FirstHandleToken;
     }
@@ -1781,6 +1918,11 @@ void GuestStorageContext::CloseAll()
         {
             // Process teardown semantics: a failed close must not keep a guest alive.
         }
+    }
+    for (const auto& path : removePaths)
+    {
+        DWORD ignored = ERROR_SUCCESS;
+        DeleteGuestFile(path.c_str(), &ignored);
     }
 }
 

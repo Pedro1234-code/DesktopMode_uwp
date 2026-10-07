@@ -3312,6 +3312,63 @@ UINT WINAPI Win32Bridge::Bridge::BridgeGetMenuState(HMENU menu, UINT item, UINT 
     return result;
 }
 
+BOOL WINAPI Win32Bridge::Bridge::BridgeWaitMessage()
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return FALSE;
+    GuestAbi::Message message{};
+    while (!manager->PeekGuestMessage(&message, nullptr, 0, 0, 0))
+        BridgeSleep(1);
+    BridgeSetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeMsgWaitForMultipleObjectsEx(
+    DWORD count, const HANDLE* handles, DWORD milliseconds, DWORD wakeMask, DWORD flags)
+{
+    constexpr DWORD supportedFlags = MWMO_WAITALL | MWMO_ALERTABLE | MWMO_INPUTAVAILABLE;
+    if (count > MAXIMUM_WAIT_OBJECTS - 1 || (count != 0 && !handles) ||
+        (flags & ~supportedFlags) != 0)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return WAIT_FAILED;
+    }
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return WAIT_FAILED;
+    const ULONGLONG started = GetTickCount64();
+    for (;;)
+    {
+        GuestAbi::Message message{};
+        const bool inputReady = wakeMask != 0 &&
+            manager->PeekGuestMessage(&message, nullptr, 0, 0, 0) != FALSE;
+        const bool waitAll = (flags & MWMO_WAITALL) != 0;
+        DWORD objectResult = WAIT_TIMEOUT;
+        if (count != 0)
+            objectResult = BridgeWaitForMultipleObjects(count, handles, waitAll ? TRUE : FALSE, 0);
+        const bool objectsReady = count == 0 || objectResult != WAIT_TIMEOUT;
+        if (waitAll)
+        {
+            if (inputReady && objectsReady) return WAIT_OBJECT_0;
+        }
+        else
+        {
+            if (objectResult != WAIT_TIMEOUT) return objectResult;
+            if (inputReady) return WAIT_OBJECT_0 + count;
+        }
+        if (milliseconds == 0) return WAIT_TIMEOUT;
+        if (milliseconds != INFINITE && GetTickCount64() - started >= milliseconds)
+            return WAIT_TIMEOUT;
+        BridgeSleep(1);
+    }
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeMsgWaitForMultipleObjects(
+    DWORD count, const HANDLE* handles, BOOL waitAll, DWORD milliseconds, DWORD wakeMask)
+{
+    return BridgeMsgWaitForMultipleObjectsEx(count, handles, milliseconds, wakeMask,
+        waitAll ? MWMO_WAITALL : 0);
+}
+
 int WINAPI Win32Bridge::Bridge::BridgeGetMenuStringW(
     HMENU menu, UINT item, LPWSTR text, int count, UINT flags)
 {
@@ -3850,6 +3907,12 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMessageW);
     else if (_wcsicmp(symbol.name.c_str(), L"peekmessagew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePeekMessageW);
+    else if (_wcsicmp(symbol.name.c_str(), L"waitmessage") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWaitMessage);
+    else if (_wcsicmp(symbol.name.c_str(), L"msgwaitformultipleobjectsex") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMsgWaitForMultipleObjectsEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"msgwaitformultipleobjects") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMsgWaitForMultipleObjects);
     else if (_wcsicmp(symbol.name.c_str(), L"translatemessage") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTranslateMessage);
     else if (_wcsicmp(symbol.name.c_str(), L"dispatchmessagew") == 0)

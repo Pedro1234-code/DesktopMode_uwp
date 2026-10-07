@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <agile.h>
 #include <windows.storage.h>
@@ -32,12 +33,15 @@ namespace Bridge
             HMODULE* module,
             DWORD* win32Error,
             DWORD searchFlags = 0);
+        ImportResolution ResolveImport(const ImportedSymbol& symbol, DWORD searchFlags = 0);
         bool GetModuleHandle(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error) const;
         bool GetModulePath(HMODULE module, std::wstring* path, DWORD* win32Error) const;
         FARPROC GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, DWORD* win32Error);
         bool GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const;
         bool DescribeAddress(ULONG_PTR address, std::wstring* description) const;
         bool FreeLibrary(HMODULE module, DWORD* win32Error);
+        bool DisableThreadNotifications(HMODULE module, DWORD* win32Error);
+        bool NotifyThread(DWORD reason, std::wstring* error);
         void ReleaseAll();
         bool ReadExecutableBytes(
             LPCWSTR requestedName,
@@ -68,12 +72,15 @@ namespace Bridge
         bool ReadAuthorizedModuleBytes(
             const std::wstring& relativeName,
             std::vector<BYTE>* bytes) const;
+        bool NotifyModule(const std::shared_ptr<Module>& module, DWORD reason,
+            std::wstring* error) const;
 
         std::shared_ptr<GuestStorageContext> m_storage;
         ImportResolver m_resolver;
         Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
         mutable std::mutex m_lock;
         std::vector<std::shared_ptr<Module>> m_modules;
+        std::unordered_map<std::wstring, HMODULE> m_importModules;
     };
 
     GuestModuleLoader* CurrentGuestModuleLoader();
