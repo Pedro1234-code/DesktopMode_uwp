@@ -664,6 +664,14 @@ bool EngineView::Resolve() {
       Log::Write(L"view: the engine can now ask for the whole screen");
     }
   }
+  if (!set_window_drag_) {
+    set_window_drag_ = reinterpret_cast<SetWindowDragSinkFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_window_drag_sink"));
+    if (set_window_drag_) {
+      set_window_drag_(&WindowDragChanged);
+      Log::Write(L"window: Firefox draggable regions connected to DesktopMode");
+    }
+  }
   if (!set_file_picker_) {
     set_file_picker_ = reinterpret_cast<SetFilePickerSinkFn>(
         ::GetProcAddress(xul, "gecko_w10m_set_file_picker_sink"));
@@ -835,9 +843,14 @@ void EngineView::GivePanelToEngine() {
     panel_size_fn_(fullWidth_, fullHeight_);
   }
   if (panel_scale_fn_) {
-    // The chain is in physical pixels; XAML would show them as logical ones,
-    // scaled up by this, unless ANGLE undoes it on the chain.
-    panel_scale_fn_(panel_.CompositionScaleX(), panel_.CompositionScaleY());
+    // This must describe the coordinate system used to size the chain, not
+    // necessarily the monitor's CompositionScale. The standalone host passes
+    // the physical scale here. DesktopMode deliberately constructs this view
+    // with 1.0 because the panel is nested below the Shell's own transform.
+    // Using CompositionScale here would reintroduce the Xbox 2x mismatch after
+    // viewport and input had already been converted to logical coordinates.
+    const float frameScale = static_cast<float>(rawPerView_);
+    panel_scale_fn_(frameScale, frameScale);
   }
   if (!panel_fn_) {
     return;
@@ -851,7 +864,8 @@ void EngineView::GivePanelToEngine() {
     Log::Write(L"view: the engine has the panel, " +
                std::to_wstring(fullWidth_) + L"x" +
                std::to_wstring(fullHeight_) + L", size entry point " +
-               std::wstring(panel_size_fn_ ? L"found" : L"missing"));
+               std::wstring(panel_size_fn_ ? L"found" : L"missing") +
+               L", framebuffer scale " + std::to_wstring(rawPerView_));
   }
 }
 
@@ -870,21 +884,32 @@ void EngineView::PushSize() {
     width = screenWidth_;
     height = screenHeight_;
   }
+
+  PushSizePixels(width, height);
+}
+
+void EngineView::PushSizePixels(int32_t width, int32_t height) {
   if (width <= 0 || height <= 0) {
     return;
   }
 
-  // Giving the panel to ANGLE is independent of a resize. On the initial
-  // layout these dimensions usually equal the values captured from the window
-  // in the constructor; returning first left EGL with no panel until the user
-  // physically resized the window.
+  const bool changed = !sizeSent_ || width != fullWidth_ || height != fullHeight_;
+  if (changed) {
+    // GivePanelToEngine also publishes the swap-chain size. Update these first,
+    // otherwise ANGLE receives the previous window dimensions and leaves stale
+    // pixels around the newly sized panel.
+    fullWidth_ = width;
+    fullHeight_ = height;
+  }
+
+  // Giving the panel to ANGLE is independent of a Gecko widget resize. It must
+  // also run when the dimensions did not change, because the exports can become
+  // available after XAML's initial layout notification.
   GivePanelToEngine();
 
-  if (sizeSent_ && width == fullWidth_ && height == fullHeight_) {
+  if (!changed) {
     return;
   }
-  fullWidth_ = width;
-  fullHeight_ = height;
 
   // The panel goes first and goes every time. ANGLE needs its size on the
   // render thread, where XAML cannot be asked for anything, and it needs the
@@ -1110,10 +1135,15 @@ void EngineView::VideoLayerShow(int32_t visible) {
 }
 
 void EngineView::FullscreenChanged(int32_t on) {
-  // Gecko hides its own chrome. Entering ApplicationView fullscreen here
-  // would incorrectly fullscreen the complete DesktopMode shell.
-  Log::Write(on ? L"fullscreen: contained in the DesktopMode window"
-                : L"fullscreen: Firefox chrome restored");
+  // Do not enter ApplicationView fullscreen: Firefox is one window inside the
+  // DesktopMode shell. Ask the virtual window to cover the desktop instead.
+  DrmBridge::DispatchWindowCommand(on ? 7 : 8);
+  Log::Write(on ? L"fullscreen: asking the Firefox window to cover DesktopMode"
+                : L"fullscreen: asking the Firefox window to restore");
+}
+
+void EngineView::WindowDragChanged(int32_t on) {
+  DrmBridge::DispatchWindowCommand(on ? 5 : 6);
 }
 
 void EngineView::OpenUrl(std::wstring_view url) {
@@ -1756,6 +1786,14 @@ void EngineView::SetScreen(double viewWidth, double viewHeight) {
   if (screen_fn_) {
     screen_fn_(width, height);
   }
+}
+
+void EngineView::SetViewport(double viewWidth, double viewHeight) {
+  const int32_t width =
+      static_cast<int32_t>(viewWidth * rawPerView_ + 0.5);
+  const int32_t height =
+      static_cast<int32_t>(viewHeight * rawPerView_ + 0.5);
+  PushSizePixels(width, height);
 }
 
 void EngineView::SetDpi(double dpi) {

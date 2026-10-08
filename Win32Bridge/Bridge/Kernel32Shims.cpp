@@ -11,6 +11,7 @@
 #include "Bridge\\Win32Shims.h"
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <cwctype>
@@ -2161,6 +2162,7 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetVersion()
 }
 
 #include "Bridge/Kernel32LocaleShims.inl"
+#include "Bridge/Kernel32CoreShims.inl"
 
 void WINAPI Win32Bridge::Bridge::BridgeGetStartupInfoA(LPSTARTUPINFOA startupInfo)
 {
@@ -4048,6 +4050,93 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"ntquerylicensevalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeNtQueryLicenseValue);
     else if (_wcsicmp(symbol.name.c_str(), L"winsqmincrementdword") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWinSqmIncrementDWORD);
     else if (_wcsicmp(symbol.name.c_str(), L"winsqmaddtostream") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWinSqmAddToStream);
+
+    if (_wcsicmp(symbol.name.c_str(), L"acquiresrwlockexclusive") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAcquireSRWLockExclusive);
+    else if (_wcsicmp(symbol.name.c_str(), L"releasesrwlockexclusive") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReleaseSRWLockExclusive);
+    else if (_wcsicmp(symbol.name.c_str(), L"tryacquiresrwlockexclusive") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTryAcquireSRWLockExclusive);
+    else if (_wcsicmp(symbol.name.c_str(), L"sleepconditionvariablesrw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSleepConditionVariableSRW);
+    else if (_wcsicmp(symbol.name.c_str(), L"wakeallconditionvariable") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWakeAllConditionVariable);
+    else if (_wcsicmp(symbol.name.c_str(), L"initializecriticalsectionandspincount") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitializeCriticalSectionAndSpinCount);
+    else if (_wcsicmp(symbol.name.c_str(), L"initializecriticalsectionex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitializeCriticalSectionEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"initoncebegininitialize") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitOnceBeginInitialize);
+    else if (_wcsicmp(symbol.name.c_str(), L"initoncecomplete") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitOnceComplete);
+    else if (_wcsicmp(symbol.name.c_str(), L"initializeslisthead") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitializeSListHead);
+    else if (_wcsicmp(symbol.name.c_str(), L"tlsalloc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTlsAlloc);
+    else if (_wcsicmp(symbol.name.c_str(), L"tlsfree") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTlsFree);
+    else if (_wcsicmp(symbol.name.c_str(), L"tlsgetvalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTlsGetValue);
+    else if (_wcsicmp(symbol.name.c_str(), L"tlssetvalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTlsSetValue);
+    else if (_wcsicmp(symbol.name.c_str(), L"flsalloc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsAlloc);
+    else if (_wcsicmp(symbol.name.c_str(), L"flsfree") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsFree);
+    else if (_wcsicmp(symbol.name.c_str(), L"flsgetvalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsGetValue);
+    else if (_wcsicmp(symbol.name.c_str(), L"flssetvalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsSetValue);
+    else if (_wcsicmp(symbol.name.c_str(), L"heaprealloc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeHeapReAlloc);
+    else if (_wcsicmp(symbol.name.c_str(), L"heapsize") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeHeapSize);
+    else if (_wcsicmp(symbol.name.c_str(), L"encodepointer") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEncodePointer);
+    else if (_wcsicmp(symbol.name.c_str(), L"decodepointer") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDecodePointer);
+    else if (_wcsicmp(symbol.name.c_str(), L"waitforsingleobjectex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWaitForSingleObjectEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"sleepex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSleepEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"arefileapisansi") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAreFileApisANSI);
+    else if (_wcsicmp(symbol.name.c_str(), L"getnativesysteminfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetNativeSystemInfo);
+    else if (_wcsicmp(symbol.name.c_str(), L"getproductinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetProductInfo);
+    else if (_wcsicmp(symbol.name.c_str(), L"getuserdefaultlcid") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetUserDefaultLCID);
+    else if (_wcsicmp(symbol.name.c_str(), L"isvalidcodepage") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsValidCodePage);
+    else if (_wcsicmp(symbol.name.c_str(), L"isvalidlocale") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsValidLocale);
+    else if (_wcsicmp(symbol.name.c_str(), L"comparestringordinal") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCompareStringOrdinal);
+    else if (_wcsicmp(symbol.name.c_str(), L"comparestringw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCompareStringW);
+    else if (_wcsicmp(symbol.name.c_str(), L"comparestringex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCompareStringEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"lcmapstringw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLCMapStringW);
+    else if (_wcsicmp(symbol.name.c_str(), L"lcmapstringa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLCMapStringA);
+    else if (_wcsicmp(symbol.name.c_str(), L"lcmapstringex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLCMapStringEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"lstrcmpia") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLstrcmpiA);
+    else if (_wcsicmp(symbol.name.c_str(), L"lstrcpyw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLstrcpyW);
+    else if (_wcsicmp(symbol.name.c_str(), L"lstrcpynw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLstrcpynW);
+    else if (_wcsicmp(symbol.name.c_str(), L"lstrcpyna") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLstrcpynA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getconsoleoutputcp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetConsoleOutputCP);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcpinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCPInfo);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcommandlinea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCommandLineA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getenvironmentstringsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetEnvironmentStringsW);
+    else if (_wcsicmp(symbol.name.c_str(), L"freeenvironmentstringsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeEnvironmentStringsW);
+    else if (_wcsicmp(symbol.name.c_str(), L"setenvironmentvariablew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetEnvironmentVariableW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createthreadpoolwork") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateThreadpoolWork);
+    else if (_wcsicmp(symbol.name.c_str(), L"submitthreadpoolwork") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSubmitThreadpoolWork);
+    else if (_wcsicmp(symbol.name.c_str(), L"closethreadpoolwork") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCloseThreadpoolWork);
+    else if (_wcsicmp(symbol.name.c_str(), L"freelibrarywhencallbackreturns") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeLibraryWhenCallbackReturns);
+    else if (_wcsicmp(symbol.name.c_str(), L"registerapplicationrestart") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterApplicationRestart);
+    else if (_wcsicmp(symbol.name.c_str(), L"unregisterapplicationrestart") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnregisterApplicationRestart);
+    else if (_wcsicmp(symbol.name.c_str(), L"getapplicationrestartsettings") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetApplicationRestartSettings);
+    else if (_wcsicmp(symbol.name.c_str(), L"queueuserapc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueueUserAPC);
+    else if (_wcsicmp(symbol.name.c_str(), L"terminatethread") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTerminateThread);
+    else if (_wcsicmp(symbol.name.c_str(), L"setstdhandle") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetStdHandle);
+    else if (_wcsicmp(symbol.name.c_str(), L"cancelio") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCancelIo);
+    else if (_wcsicmp(symbol.name.c_str(), L"readdirectorychangesw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReadDirectoryChangesW);
+    else if (_wcsicmp(symbol.name.c_str(), L"readconsolew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReadConsoleW);
+    else if (_wcsicmp(symbol.name.c_str(), L"writeconsolew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWriteConsoleW);
+    else if (_wcsicmp(symbol.name.c_str(), L"copyfilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCopyFileW);
+    else if (_wcsicmp(symbol.name.c_str(), L"findfirstfileexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindFirstFileExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getfileattributesexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFileAttributesExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getfiletype") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFileType);
+    else if (_wcsicmp(symbol.name.c_str(), L"getfinalpathnamebyhandlew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFinalPathNameByHandleW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getfileinformationbyhandleex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFileInformationByHandleEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"getlongpathnamew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLongPathNameW);
+    else if (_wcsicmp(symbol.name.c_str(), L"replacefilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReplaceFileW);
+    else if (_wcsicmp(symbol.name.c_str(), L"queryfullprocessimagenamew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueryFullProcessImageNameW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getmodulehandleexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetModuleHandleExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getlocaleinfoa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLocaleInfoA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getlocaleinfoex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLocaleInfoEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"getstringtypew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetStringTypeW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getstringtypeexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetStringTypeExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getstringtypeexa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetStringTypeExA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdateformatex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDateFormatEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettimeformatex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTimeFormatEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettimezoneinformation") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTimeZoneInformation);
+    else if (_wcsicmp(symbol.name.c_str(), L"systemtimetotzspecificlocaltime") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSystemTimeToTzSpecificLocalTime);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumsystemlocalesw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumSystemLocalesW);
+    else if (_wcsicmp(symbol.name.c_str(), L"formatmessagea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFormatMessageA);
+    else if (_wcsicmp(symbol.name.c_str(), L"rtlpctofileheader") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRtlPcToFileHeader);
+    else if (_wcsicmp(symbol.name.c_str(), L"rtlunwind") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRtlUnwind);
+    else if (_wcsicmp(symbol.name.c_str(), L"rtlunwindex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRtlUnwindEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"exitprocess") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExitProcess);
+    else if (_wcsicmp(symbol.name.c_str(), L"exitthread") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExitThread);
 
     if (resolution.targetAddress != 0)
     {

@@ -12,12 +12,14 @@ namespace winrt::DesktopMode::Gecko::implementation
     {
         GeckoHost();
 
-        Windows::UI::Xaml::UIElement Content() const;
+        Windows::Foundation::IInspectable Content() const;
         bool IsStarted() const noexcept;
 
         void Start(double width, double height);
         void SetViewport(double width, double height);
+        void SetScreen(double width, double height);
         void SetActive(bool active);
+        int32_t TakeWindowCommand() noexcept;
         void OpenUrl(hstring const& url);
         void Suspend();
         void Resume();

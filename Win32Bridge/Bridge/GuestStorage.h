@@ -47,6 +47,7 @@ namespace Bridge
         bool SetFilePointer(HANDLE guestHandle, LARGE_INTEGER distance, LARGE_INTEGER* newPosition, DWORD moveMethod, DWORD* win32Error);
         bool SetEndOfFile(HANDLE guestHandle, DWORD* win32Error);
         bool FlushFile(HANDLE guestHandle, DWORD* win32Error);
+        bool GetFilePath(HANDLE guestHandle, std::wstring* path, DWORD* win32Error) const;
 
         // Internal module loading uses the same virtual filesystem as guest
         // CreateFile calls. It never exposes a host path to a PE.

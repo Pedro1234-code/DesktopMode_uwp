@@ -12,6 +12,8 @@
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <algorithm>
+#include <atomic>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -945,6 +947,7 @@ namespace
     std::unordered_map<ULONG_PTR, HMENU> g_windowMenus;
     ULONG_PTR g_nextMenu = 0x7fff5000;
     UINT g_nextClipboardFormat = 0xc000;
+    std::unordered_map<UINT, HANDLE> g_clipboardData;
 
     VirtualMenu* FindMenuLocked(HMENU menu)
     {
@@ -1734,6 +1737,15 @@ bool Win32Bridge::Bridge::CopyGuestIconPixels(HICON icon, MiniGdi::Surface* dest
     if (found == g_guestIcons.end()) return false;
     *destination = found->second;
     return true;
+}
+
+HICON Win32Bridge::Bridge::StoreGuestIconPixels(const MiniGdi::Surface& source)
+{
+    if (source.Empty()) return nullptr;
+    std::lock_guard<std::mutex> guard(g_iconLock);
+    const ULONG_PTR token = g_nextGuestIcon++;
+    g_guestIcons.emplace(token, source);
+    return reinterpret_cast<HICON>(token);
 }
 
 HICON Win32Bridge::Bridge::CreateGuestShellIcon(bool directory, int size)
@@ -3021,12 +3033,16 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCloseClipboard()
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeEmptyClipboard()
 {
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    g_clipboardData.clear();
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
-HANDLE WINAPI Win32Bridge::Bridge::BridgeSetClipboardData(UINT, HANDLE memory)
+HANDLE WINAPI Win32Bridge::Bridge::BridgeSetClipboardData(UINT format, HANDLE memory)
 {
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    g_clipboardData[format] = memory;
     BridgeSetLastError(ERROR_SUCCESS);
     return memory;
 }
@@ -4081,6 +4097,99 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"isiconic") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsIconic);
     else if (_wcsicmp(symbol.name.c_str(), L"isclipboardformatavailable") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsClipboardFormatAvailable);
     else if (_wcsicmp(symbol.name.c_str(), L"setactivewindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetActiveWindow);
+    else if (_wcsicmp(symbol.name.c_str(), L"equalrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEqualRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"setrectempty") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetRectEmpty);
+    else if (_wcsicmp(symbol.name.c_str(), L"inflaterect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInflateRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"offsetrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOffsetRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"ptinrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePtInRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"intersectrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIntersectRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"charlowerw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCharLowerW);
+    else if (_wcsicmp(symbol.name.c_str(), L"ischaralphaw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsCharAlphaW);
+    else if (_wcsicmp(symbol.name.c_str(), L"ischaralphanumericw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsCharAlphaNumericW);
+    else if (_wcsicmp(symbol.name.c_str(), L"ischarlowerw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsCharLowerW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdoubleclicktime") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDoubleClickTime);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcaretblinktime") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCaretBlinkTime);
+    else if (_wcsicmp(symbol.name.c_str(), L"getwindowtexta") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowTextA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdlgitemtexta") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDlgItemTextA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdlgitemint") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDlgItemInt);
+    else if (_wcsicmp(symbol.name.c_str(), L"setdlgitemint") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetDlgItemInt);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadstringa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadStringA);
+    else if (_wcsicmp(symbol.name.c_str(), L"messageboxa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMessageBoxA);
+    else if (_wcsicmp(symbol.name.c_str(), L"appendmenua") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAppendMenuA);
+    else if (_wcsicmp(symbol.name.c_str(), L"wsprintfw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWsPrintfW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclassnamew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassNameW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclassnamea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassNameA);
+    else if (_wcsicmp(symbol.name.c_str(), L"findwindowexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindWindowExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"ischild") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsChild);
+    else if (_wcsicmp(symbol.name.c_str(), L"setparent") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetParent);
+    else if (_wcsicmp(symbol.name.c_str(), L"getwindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindow);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumchildwindows") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumChildWindows);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumthreadwindows") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumThreadWindows);
+    else if (_wcsicmp(symbol.name.c_str(), L"getactivewindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetActiveWindow);
+    else if (_wcsicmp(symbol.name.c_str(), L"getlastactivepopup") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLastActivePopup);
+    else if (_wcsicmp(symbol.name.c_str(), L"bringwindowtotop") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBringWindowToTop);
+    else if (_wcsicmp(symbol.name.c_str(), L"getwindowthreadprocessid") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowThreadProcessId);
+    else if (_wcsicmp(symbol.name.c_str(), L"setpropw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetPropW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getpropw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPropW);
+    else if (_wcsicmp(symbol.name.c_str(), L"removepropw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRemovePropW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createcaret") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateCaret);
+    else if (_wcsicmp(symbol.name.c_str(), L"destroycaret") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDestroyCaret);
+    else if (_wcsicmp(symbol.name.c_str(), L"setcaretpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetCaretPos);
+    else if (_wcsicmp(symbol.name.c_str(), L"showcaret") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShowCaret);
+    else if (_wcsicmp(symbol.name.c_str(), L"hidecaret") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeHideCaret);
+    else if (_wcsicmp(symbol.name.c_str(), L"showcursor") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShowCursor);
+    else if (_wcsicmp(symbol.name.c_str(), L"getkeyboardstate") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetKeyboardState);
+    else if (_wcsicmp(symbol.name.c_str(), L"getmessagetime") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMessageTime);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclipboarddata") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipboardData);
+    else if (_wcsicmp(symbol.name.c_str(), L"addclipboardformatlistener") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAddClipboardFormatListener);
+    else if (_wcsicmp(symbol.name.c_str(), L"removeclipboardformatlistener") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRemoveClipboardFormatListener);
+    else if (_wcsicmp(symbol.name.c_str(), L"setclipboardviewer") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetClipboardViewer);
+    else if (_wcsicmp(symbol.name.c_str(), L"changeclipboardchain") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeChangeClipboardChain);
+    else if (_wcsicmp(symbol.name.c_str(), L"monitorfrompoint") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMonitorFromPoint);
+    else if (_wcsicmp(symbol.name.c_str(), L"monitorfromrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMonitorFromRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumdisplaymonitors") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumDisplayMonitors);
+    else if (_wcsicmp(symbol.name.c_str(), L"systemparametersinfoa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSystemParametersInfoA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getwindowdc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowDC);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdcex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDCEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"validaterect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeValidateRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"redrawwindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRedrawWindow);
+    else if (_wcsicmp(symbol.name.c_str(), L"trackmouseevent") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTrackMouseEvent);
+    else if (_wcsicmp(symbol.name.c_str(), L"notifywinevent") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeNotifyWinEvent);
+    else if (_wcsicmp(symbol.name.c_str(), L"begindeferwindowpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBeginDeferWindowPos);
+    else if (_wcsicmp(symbol.name.c_str(), L"deferwindowpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDeferWindowPos);
+    else if (_wcsicmp(symbol.name.c_str(), L"enddeferwindowpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndDeferWindowPos);
+    else if (_wcsicmp(symbol.name.c_str(), L"setwindowshookexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowsHookExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"unhookwindowshookex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnhookWindowsHookEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"callnexthookex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCallNextHookEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"setscrollinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetScrollInfo);
+    else if (_wcsicmp(symbol.name.c_str(), L"getscrollinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetScrollInfo);
+    else if (_wcsicmp(symbol.name.c_str(), L"getscrollpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetScrollPos);
+    else if (_wcsicmp(symbol.name.c_str(), L"getscrollrange") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetScrollRange);
+    else if (_wcsicmp(symbol.name.c_str(), L"setscrollrange") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetScrollRange);
+    else if (_wcsicmp(symbol.name.c_str(), L"showscrollbar") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShowScrollBar);
+    else if (_wcsicmp(symbol.name.c_str(), L"scrollwindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeScrollWindow);
+    else if (_wcsicmp(symbol.name.c_str(), L"setlayeredwindowattributes") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetLayeredWindowAttributes);
+    else if (_wcsicmp(symbol.name.c_str(), L"lockwindowupdate") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLockWindowUpdate);
+    else if (_wcsicmp(symbol.name.c_str(), L"flashwindowex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlashWindowEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"insertmenuw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInsertMenuW);
+    else if (_wcsicmp(symbol.name.c_str(), L"modifymenuw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeModifyMenuW);
+    else if (_wcsicmp(symbol.name.c_str(), L"setmenuitembitmaps") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetMenuItemBitmaps);
+    else if (_wcsicmp(symbol.name.c_str(), L"framerect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFrameRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"drawfocusrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawFocusRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"drawedge") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawEdge);
+    else if (_wcsicmp(symbol.name.c_str(), L"drawframecontrol") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawFrameControl);
+    else if (_wcsicmp(symbol.name.c_str(), L"toascii") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeToAscii);
+    else if (_wcsicmp(symbol.name.c_str(), L"dialogboxindirectparamw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDialogBoxIndirectParamW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createdialogindirectparamw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDialogIndirectParamW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createacceleratortablew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateAcceleratorTableW);
+    else if (_wcsicmp(symbol.name.c_str(), L"destroyacceleratortable") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDestroyAcceleratorTable);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcomboboxinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetComboBoxInfo);
+    else if (_wcsicmp(symbol.name.c_str(), L"getmenubarinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMenuBarInfo);
+    else if (_wcsicmp(symbol.name.c_str(), L"getupdatergn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetUpdateRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"mouse_event") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMouseEvent);
+    else if (_wcsicmp(symbol.name.c_str(), L"createiconindirect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateIconIndirect);
+    else if (_wcsicmp(symbol.name.c_str(), L"geticoninfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetIconInfo);
+    else if (_wcsicmp(symbol.name.c_str(), L"unregisterclassw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnregisterClassW);
 
     if (resolution.targetAddress != 0)
     {

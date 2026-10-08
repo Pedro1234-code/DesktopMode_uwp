@@ -35,13 +35,15 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
-    <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
     <GeckoW10mObj Condition="'$(GeckoW10mObj)'==''">C:\rw-obj</GeckoW10mObj>
     <GeckoW10mSource Condition="'$(GeckoW10mSource)'==''">C:\firefox-source\engine\firefox</GeckoW10mSource>
     <GeckoW10mClangCl Condition="'$(GeckoW10mClangCl)'==''">C:\Program Files\LLVM\bin\clang-cl.exe</GeckoW10mClangCl>
     <CppWinRTOptimized>true</CppWinRTOptimized>
     <CppWinRTRootNamespaceAutoMerge>true</CppWinRTRootNamespaceAutoMerge>
     <CppWinRTGenerateWindowsMetadata>true</CppWinRTGenerateWindowsMetadata>
+    <GeneratedFilesDir>$(ProjectDir)$(Platform)\$(Configuration)\Generated Files</GeneratedFilesDir>
+    <GeckoCppWinRTTool>$(WindowsSdkDir)bin\$(WindowsTargetPlatformVersion)\x64\cppwinrt.exe</GeckoCppWinRTTool>
+    <GeckoWinmd>$(OutDir)DesktopMode.Gecko.winmd</GeckoWinmd>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)'=='Debug'">
     <GeckoW10mBootstrapFlags>/Od /MDd /D_DEBUG /D_ITERATOR_DEBUG_LEVEL=2</GeckoW10mBootstrapFlags>
@@ -52,23 +54,27 @@
   <ItemDefinitionGroup>
     <ClCompile>
       <LanguageStandard>stdcpp17</LanguageStandard>
+      <CompileAsWinRT>false</CompileAsWinRT>
       <PrecompiledHeader>Use</PrecompiledHeader>
       <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
-      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir);$(GeneratedFilesDir);$(GeneratedFilesDir)\DesktopMode\Gecko;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>_WINRT_DLL;GECKO_W10M;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <AdditionalLibraryDirectories>$(GeckoW10mObj)\dist\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <AdditionalDependencies>mozglue.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <GenerateWindowsMetadata>true</GenerateWindowsMetadata>
+      <ModuleDefinitionFile>GeckoShellHost.def</ModuleDefinitionFile>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <Midl Include="GeckoHost.idl" />
+    <Midl Include="DesktopMode.Gecko.idl" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="pch.h" />
     <ClInclude Include="GeckoHost.h" />
+    <ClInclude Include="DesktopMode.Gecko.GeckoHost.h" />
     <ClInclude Include="client\DownloadBroker.h" />
     <ClInclude Include="client\DrmBridge.h" />
     <ClInclude Include="client\EngineView.h" />
@@ -83,6 +89,7 @@
     </ClCompile>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="GeckoHost.cpp" />
+    <ClCompile Include="$(GeneratedFilesDir)\module.g.cpp" />
     <ClCompile Include="client\DownloadBroker.cpp" />
     <ClCompile Include="client\DrmBridge.cpp" />
     <ClCompile Include="client\EngineView.cpp" />
@@ -103,12 +110,20 @@
     </None>
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.Windows.CppWinRT" Version="3.0.260818.1" />
+    <None Include="GeckoShellHost.def" />
   </ItemGroup>
   <ItemGroup>
     <SDKReference Include="Microsoft.VCLibs.Desktop, Version=14.0" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="GenerateGeckoCppWinRT"
+          AfterTargets="Midl"
+          BeforeTargets="ClCompile"
+          Inputs="$(GeckoWinmd)"
+          Outputs="$(GeneratedFilesDir)\module.g.cpp;$(GeneratedFilesDir)\DesktopMode\Gecko\GeckoHost.g.h;$(GeneratedFilesDir)\DesktopMode\Gecko\GeckoHost.g.cpp">
+    <MakeDir Directories="$(GeneratedFilesDir)" />
+    <Exec Command="&quot;$(GeckoCppWinRTTool)&quot; -input &quot;$(GeckoWinmd)&quot; -reference $(WindowsTargetPlatformVersion) -output &quot;$(GeneratedFilesDir)&quot; -component -optimize" />
+  </Target>
   <PropertyGroup>
     <BuiltProjectOutputGroupDependsOn>
       $(BuiltProjectOutputGroupDependsOn);

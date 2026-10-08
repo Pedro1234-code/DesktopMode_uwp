@@ -11,6 +11,7 @@
 #include <winrt/Windows.UI.Xaml.Media.Imaging.h>
 
 #include "client/DownloadBroker.h"
+#include "client/DrmBridge.h"
 #include "client/Log.h"
 #include "engine/GeckoRuntimeHost.h"
 
@@ -31,10 +32,11 @@ namespace
     // The DesktopMode integration intentionally owns one runtime and lets
     // Firefox provide its own tabs inside that one internal window.
     std::atomic<bool> g_runtimeStarted{ false };
+    std::atomic<int32_t> g_windowCommand{ 0 };
     std::once_flag g_memoryHooks;
     std::atomic<unsigned long long> g_lastMemoryPressure{ 0 };
 
-    SolidColorBrush Brush(Color color)
+    SolidColorBrush MakeSolidColorBrush(Color color)
     {
         SolidColorBrush brush;
         brush.Color(color);
@@ -131,13 +133,17 @@ namespace winrt::DesktopMode::Gecko::implementation
 {
     GeckoHost::GeckoHost()
     {
+        gecko_w10m::client::DrmBridge::SetWindowCommandSink([](int32_t command)
+        {
+            g_windowCommand.store(command);
+        });
         root_ = Grid();
-        root_.Background(Brush(ColorHelper::FromArgb(255, 28, 27, 34)));
+        root_.Background(MakeSolidColorBrush(ColorHelper::FromArgb(255, 28, 27, 34)));
     }
 
-    UIElement GeckoHost::Content() const
+    Windows::Foundation::IInspectable GeckoHost::Content() const
     {
-        return root_;
+        return root_.as<Windows::Foundation::IInspectable>();
     }
 
     bool GeckoHost::IsStarted() const noexcept
@@ -177,20 +183,35 @@ namespace winrt::DesktopMode::Gecko::implementation
             gecko_w10m::client::Log::Write(
                 L"boot: embedded DesktopMode Firefox host starting");
             InitializeMemoryPressure();
-            gecko_w10m::client::DownloadBroker::Initialize(localState);
+            const std::wstring downloadDirectory =
+                gecko_w10m::client::DownloadBroker::Initialize(localState);
             std::thread([] { gecko_w10m::client::Log::Mirror(); }).detach();
 
+            double displayPixelsPerViewPixel = 1.0;
             if (ApiInformation::IsPropertyPresent(
                     L"Windows.Graphics.Display.DisplayInformation",
                     L"RawPixelsPerViewPixel"))
             {
-                rawPerView_ = DisplayInformation::GetForCurrentView()
-                                  .RawPixelsPerViewPixel();
+                displayPixelsPerViewPixel = DisplayInformation::GetForCurrentView()
+                                                .RawPixelsPerViewPixel();
             }
-            if (!(rawPerView_ > 0))
+            if (!(displayPixelsPerViewPixel > 0))
             {
-                rawPerView_ = 1.0;
+                displayPixelsPerViewPixel = 1.0;
             }
+
+            // Render at the display's physical density so Firefox remains
+            // sharp on Xbox. The original embedded host used the panel's
+            // CompositionScale when presenting this buffer; a panel nested
+            // below DesktopMode's transform reports a scale that does not
+            // describe the framebuffer, which made a 2x chain appear clipped.
+            // EngineView now passes this exact value to ANGLE, whose inverse
+            // transform fits the physical buffer into the logical XAML panel.
+            // Input uses the same value after undoing the Shell transform.
+            rawPerView_ = displayPixelsPerViewPixel;
+            gecko_w10m::client::Log::Write(
+                L"view: embedded framebuffer scale " +
+                std::to_wstring(rawPerView_));
 
             const int pixelWidth = static_cast<int>(width * rawPerView_ + 0.5);
             const int pixelHeight = static_cast<int>(height * rawPerView_ + 0.5);
@@ -201,9 +222,8 @@ namespace winrt::DesktopMode::Gecko::implementation
             {
                 cssScale = pixelWidth / kNarrowestChromeCss;
             }
-            // Unlike the standalone host, this surface already lives below
-            // MainPage's 70% Xbox desktop transform. Applying that factor to
-            // Gecko again would shrink the browser chrome twice.
+            // MainPage's 70% Xbox transform is a separate, outer desktop
+            // transform. It must not be folded into Gecko's device/CSS scale.
 
             engineView_ = std::make_unique<gecko_w10m::client::EngineView>(
                 pixelWidth, pixelHeight, rawPerView_, true, false);
@@ -222,7 +242,8 @@ namespace winrt::DesktopMode::Gecko::implementation
             engineView_->EnableMouse();
 
             started_ = gecko_w10m::engine::StartGeckoRuntime(
-                localState, pixelWidth, pixelHeight, cssScale);
+                localState, downloadDirectory, pixelWidth, pixelHeight,
+                cssScale);
             if (!started_)
             {
                 engineView_->Stop();
@@ -261,7 +282,7 @@ namespace winrt::DesktopMode::Gecko::implementation
         root_.Children().Append(engineView_->Surface());
 
         splash_ = Grid();
-        splash_.Background(Brush(ColorHelper::FromArgb(255, 28, 27, 34)));
+        splash_.Background(MakeSolidColorBrush(ColorHelper::FromArgb(255, 28, 27, 34)));
         Image logo;
         logo.Width(96);
         logo.Height(96);
@@ -302,6 +323,15 @@ namespace winrt::DesktopMode::Gecko::implementation
         {
             return;
         }
+        engineView_->SetViewport(width, height);
+    }
+
+    void GeckoHost::SetScreen(double width, double height)
+    {
+        if (!engineView_ || width <= 0 || height <= 0)
+        {
+            return;
+        }
         engineView_->SetScreen(width, height);
     }
 
@@ -323,6 +353,11 @@ namespace winrt::DesktopMode::Gecko::implementation
         {
             engineView_->Stop();
         }
+    }
+
+    int32_t GeckoHost::TakeWindowCommand() noexcept
+    {
+        return g_windowCommand.exchange(0);
     }
 
     void GeckoHost::OpenUrl(hstring const& url)

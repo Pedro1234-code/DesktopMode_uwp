@@ -147,6 +147,11 @@ HWND WINAPI BridgeFindTextW(PVOID) { SetCommonDialogError(0); return nullptr; }
 HWND WINAPI BridgeReplaceTextW(PVOID) { SetCommonDialogError(0); return nullptr; }
 BOOL WINAPI BridgePageSetupDlgW(PVOID) { SetCommonDialogError(0); return FALSE; }
 BOOL WINAPI BridgeChooseFontW(PVOID) { SetCommonDialogError(0); return FALSE; }
+BOOL WINAPI BridgeChooseColorW(PVOID) { SetCommonDialogError(0); return FALSE; }
+// Printing is intentionally unavailable in the sandbox.  Report the same
+// observable result as a user-cancelled common dialog, rather than inventing a
+// printer or allowing the guest to reach the host print subsystem.
+BOOL WINAPI BridgePrintDlgW(PVOID) { SetCommonDialogError(0); return FALSE; }
 HRESULT WINAPI BridgePrintDlgExW(PVOID) { SetCommonDialogError(0); return E_NOTIMPL; }
 short WINAPI BridgeGetFileTitleW(LPCWSTR path, LPWSTR title, WORD capacity)
 {
@@ -186,7 +191,9 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveComdlg32Import
     else if (IsName(symbol.name, L"replacetextw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReplaceTextW);
     else if (IsName(symbol.name, L"pagesetupdlgw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePageSetupDlgW);
     else if (IsName(symbol.name, L"choosefontw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeChooseFontW);
+    else if (IsName(symbol.name, L"choosecolorw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeChooseColorW);
     else if (IsName(symbol.name, L"getfiletitlew")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFileTitleW);
+    else if (IsName(symbol.name, L"printdlgw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePrintDlgW);
     else if (IsName(symbol.name, L"printdlgexw")) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePrintDlgExW);
 
     if (resolution.targetAddress)

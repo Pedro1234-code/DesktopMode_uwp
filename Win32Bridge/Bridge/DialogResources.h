@@ -51,6 +51,8 @@ namespace Bridge
     };
 
     INT_PTR ShowGuestDialogFromResource(HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC procedure, LPARAM initParameter);
+    INT_PTR ShowGuestDialogFromTemplate(HINSTANCE instance, const void* templateData,
+        HWND parent, DLGPROC procedure, LPARAM initParameter, bool modal, HWND* createdWindow);
     INT_PTR ShowGuestDialogFromResourceWithStyles(HINSTANCE instance, LPCWSTR templateName,
         HWND parent, DLGPROC procedure, LPARAM initParameter,
         DWORD stylesToAdd, DWORD stylesToRemove, LPCWSTR titleOverride);

@@ -18,6 +18,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace Win32Bridge
 {
@@ -46,6 +47,7 @@ namespace Bridge
 
         ATOM RegisterGuestClass(const GuestAbi::WndClassExW* windowClass, DWORD* win32Error);
         ATOM RegisterGuestClass(const GuestAbi::WndClassW* windowClass, DWORD* win32Error);
+        BOOL UnregisterGuestClass(LPCWSTR className, HINSTANCE instance, DWORD* win32Error);
         HWND CreateGuestWindow(
             DWORD extendedStyle,
             LPCWSTR className,
@@ -87,6 +89,13 @@ namespace Bridge
         BOOL ReleaseGuestCapture(DWORD* win32Error);
         HWND GetGuestCapture(DWORD* win32Error);
         HWND GetGuestParent(HWND window, DWORD* win32Error) const;
+        HWND SetGuestParent(HWND window, HWND parent, DWORD* win32Error);
+        BOOL IsGuestChild(HWND parent, HWND window) const;
+        int GetGuestClassName(HWND window, LPWSTR buffer, int count, DWORD* win32Error) const;
+        HWND FindGuestWindowEx(HWND parent, HWND after, LPCWSTR className, LPCWSTR title,
+            DWORD* win32Error) const;
+        HWND GetGuestWindowRelationship(HWND window, UINT command, DWORD* win32Error) const;
+        std::vector<HWND> SnapshotGuestWindows(HWND parent, bool descendants) const;
         HWND ChildGuestWindowFromPoint(HWND parent, POINT point, UINT flags, DWORD* win32Error) const;
         HWND GuestWindowFromPoint(POINT point, DWORD* win32Error) const;
         HWND GetGuestDlgItem(HWND parent, int identifier, DWORD* win32Error) const;

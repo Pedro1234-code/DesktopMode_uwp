@@ -31,6 +31,17 @@ UINT WINAPI Win32Bridge::Bridge::BridgeSysStringLen(BSTR value) { return ::SysSt
 UINT WINAPI Win32Bridge::Bridge::BridgeSysStringByteLen(BSTR value) { return ::SysStringByteLen(value); }
 HRESULT WINAPI Win32Bridge::Bridge::BridgeVariantClear(VARIANTARG* value) { return value ? ::VariantClear(value) : E_INVALIDARG; }
 HRESULT WINAPI Win32Bridge::Bridge::BridgeVariantCopy(VARIANTARG* destination, const VARIANTARG* source) { return destination && source ? ::VariantCopy(destination, source) : E_INVALIDARG; }
+HRESULT WINAPI BridgeCLSIDFromProgID(LPCOLESTR progId, LPCLSID clsid)
+{
+    if (!clsid) return E_POINTER;
+    *clsid = CLSID_NULL;
+    if (!progId || !*progId) return CO_E_CLASSSTRING;
+    // COM registration belongs to the guest registry.  Until that registry is
+    // connected to the class factory, fail explicitly instead of consulting or
+    // leaking the host machine's COM catalogue.
+    RuntimeDiagnostics::Record(L"COM: CLSIDFromProgID has no guest registration for " + std::wstring(progId));
+    return REGDB_E_CLASSNOTREG;
+}
 
 ImportResolution Win32Bridge::Bridge::ResolveOleImport(const ImportedSymbol& symbol)
 {
@@ -49,6 +60,7 @@ ImportResolution Win32Bridge::Bridge::ResolveOleImport(const ImportedSymbol& sym
         else if (Name(symbol.name, L"registerdragdrop")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterDragDrop);
         else if (Name(symbol.name, L"revokedragdrop")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRevokeDragDrop);
         else if (Name(symbol.name, L"dodragdrop")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDoDragDrop);
+        else if (Name(symbol.name, L"clsidfromprogid")) result.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCLSIDFromProgID);
     }
     else if (Name(symbol.library, L"oleaut32.dll") && symbol.importedByOrdinal)
     {

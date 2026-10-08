@@ -672,6 +672,31 @@ std::shared_ptr<GuestStorageContext::FindRecord> GuestStorageContext::LookupFind
     return found == m_finds.end() ? nullptr : found->second;
 }
 
+bool GuestStorageContext::GetFilePath(
+    HANDLE guestHandle, std::wstring* path, DWORD* win32Error) const
+{
+    if (!path)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const auto record = LookupFile(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(record->lock);
+    if (record->closed)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    *path = record->canonicalPath;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
 DWORD GuestStorageContext::ApplyAttributeOverride(
     const std::wstring& canonicalPath,
     DWORD attributes) const

@@ -96,7 +96,7 @@
   <ItemDefinitionGroup>
     <Link>
       <ModuleDefinitionFile>Win32Bridge.def</ModuleDefinitionFile>
-      <AdditionalDependencies>dwrite.lib;windowscodecs.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>dwrite.lib;windowscodecs.lib;ole32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
@@ -143,6 +143,7 @@
     <ClInclude Include="Bridge\CompatibilityCatalog.h" />
     <ClInclude Include="Bridge\ApiSet.h" />
     <ClInclude Include="Bridge\Advapi32Shims.h" />
+    <ClInclude Include="Bridge\CryptoShims.h" />
     <ClInclude Include="Bridge\ActivationContext.h" />
     <ClInclude Include="Bridge\CommonControlsShims.h" />
     <ClInclude Include="Bridge\Comdlg32Shims.h" />
@@ -177,6 +178,7 @@
       <PrecompiledHeader>NotUsing</PrecompiledHeader>
     </ClCompile>
     <ClCompile Include="Bridge\Advapi32Shims.cpp" />
+    <ClCompile Include="Bridge\CryptoShims.cpp" />
     <ClCompile Include="Bridge\ActivationContext.cpp" />
     <ClCompile Include="Bridge\CommonControlsShims.cpp" />
     <ClCompile Include="Bridge\Comdlg32Shims.cpp" />

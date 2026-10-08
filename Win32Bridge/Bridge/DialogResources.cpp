@@ -1915,6 +1915,44 @@ INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResource(
         procedure, initParameter, 0, 0, nullptr);
 }
 
+INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromTemplate(
+    HINSTANCE instance, const void* templateData, HWND parent, DLGPROC procedure,
+    LPARAM initParameter, bool modal, HWND* createdWindow)
+{
+    if (!templateData || !procedure)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return -1;
+    }
+    MEMORY_BASIC_INFORMATION memory{};
+    if (::VirtualQuery(templateData, &memory, sizeof(memory)) != sizeof(memory) ||
+        memory.State != MEM_COMMIT)
+    {
+        BridgeSetLastError(ERROR_INVALID_ADDRESS);
+        return -1;
+    }
+    const auto begin = reinterpret_cast<ULONG_PTR>(templateData);
+    const auto regionEnd = reinterpret_cast<ULONG_PTR>(memory.BaseAddress) + memory.RegionSize;
+    if (begin >= regionEnd)
+    {
+        BridgeSetLastError(ERROR_INVALID_ADDRESS);
+        return -1;
+    }
+    constexpr size_t MaximumDialogTemplateSize = 1024 * 1024;
+    const size_t available = (std::min)(static_cast<size_t>(regionEnd - begin),
+        MaximumDialogTemplateSize);
+    DialogTemplate dialog;
+    if (!ParseDialog(static_cast<const BYTE*>(templateData), available, &dialog))
+    {
+        BridgeSetLastError(ERROR_INVALID_DATA);
+        return -1;
+    }
+    RuntimeDiagnostics::Record(L"DIALOG INDIRECT: parsed template with " +
+        std::to_wstring(dialog.items.size()) + L" control(s).");
+    return RunGuestDialog(instance, dialog, parent, procedure, initParameter,
+        modal, createdWindow);
+}
+
 INT_PTR Win32Bridge::Bridge::ShowGuestPropertySheet(
     const GuestPropertySheetDescriptor& descriptor)
 {

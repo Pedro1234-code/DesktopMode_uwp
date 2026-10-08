@@ -53,6 +53,7 @@ namespace factoryos_10x_shell.Views
         private readonly Win32WindowManagerService m_nativeWindowManager;
         private readonly ShellWindowCoordinator m_shellWindowCoordinator;
         private bool m_coordinatingActivation;
+        private Visibility m_taskbarVisibilityBeforeFirefoxFullscreen = Visibility.Visible;
         private readonly BitmapImage m_filesIcon = new BitmapImage(new Uri("ms-appx:///Assets/Files/files.png"));
         private readonly BitmapImage m_notepadIcon = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
         private readonly BitmapImage m_settingsIcon = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
@@ -96,6 +97,7 @@ namespace factoryos_10x_shell.Views
             this.PointerPressed += OnPointerPressed;
 
             TaskbarFrame.Navigate(typeof(Default10xBar));
+            FirefoxWindow.FullscreenChanged += FirefoxWindow_FullscreenChanged;
             StartMenuFrame.Navigate(typeof(StartMenu));
             ActionCenterFrame.Navigate(typeof(ActionCenterHome));
 
@@ -179,6 +181,20 @@ namespace factoryos_10x_shell.Views
         private void FirefoxActivated()
         {
             ActivateShellWindow(ShellWindowKind.Firefox, FirefoxWindowIdentity);
+        }
+
+        private void FirefoxWindow_FullscreenChanged(bool fullscreen)
+        {
+            if (fullscreen)
+            {
+                m_taskbarVisibilityBeforeFirefoxFullscreen = TaskbarFrame.Visibility;
+                TaskbarFrame.Visibility = Visibility.Collapsed;
+            }
+            else
+            {
+                TaskbarFrame.Visibility = m_taskbarVisibilityBeforeFirefoxFullscreen;
+            }
+            Canvas.SetZIndex(FirefoxWindowHost, fullscreen ? 40 : 2);
         }
 
         private void WebWindowsChanged(object sender, EventArgs e)
@@ -366,7 +382,10 @@ namespace factoryos_10x_shell.Views
             Canvas.SetZIndex(NotepadWindowHost, activeKind == ShellWindowKind.Notepad ? 2 : 1);
             Canvas.SetZIndex(SettingsWindowHost, activeKind == ShellWindowKind.Settings ? 2 : 1);
             Canvas.SetZIndex(CalculatorWindowHost, activeKind == ShellWindowKind.Calculator ? 2 : 1);
-            Canvas.SetZIndex(FirefoxWindowHost, activeKind == ShellWindowKind.Firefox ? 2 : 1);
+            Canvas.SetZIndex(
+                FirefoxWindowHost,
+                FirefoxWindow.IsFullscreen ? 40 :
+                activeKind == ShellWindowKind.Firefox ? 2 : 1);
             FirefoxWindow.SetWindowActive(activeKind == ShellWindowKind.Firefox);
         }
 

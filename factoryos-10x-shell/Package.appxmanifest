@@ -80,4 +80,12 @@
     <DeviceCapability Name="webcam"/>
     <DeviceCapability Name="location"/>
   </Capabilities>
+  <Extensions>
+    <Extension Category="windows.activatableClass.inProcessServer">
+      <InProcessServer>
+        <Path>DesktopMode.Gecko.dll</Path>
+        <ActivatableClass ActivatableClassId="DesktopMode.Gecko.GeckoHost" ThreadingModel="both" />
+      </InProcessServer>
+    </Extension>
+  </Extensions>
 </Package>

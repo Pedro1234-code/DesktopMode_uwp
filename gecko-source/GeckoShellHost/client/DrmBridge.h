@@ -20,10 +20,17 @@ namespace gecko_w10m::client {
 // challenge: "challenge" (base64), "uri", "headers" {name:value}.
 class DrmBridge {
  public:
+  using WindowCommandSink = void (*)(int32_t command);
+
   // Called by the engine, on its main thread, with each message. Work goes
   // to a worker thread; replies come back through the reply function.
   static void OnMessage(const char* json);
   static void SetReply(void (*reply)(const char*));
+  static void SetWindowCommandSink(WindowCommandSink sink);
+  // Used by native engine callbacks (fullscreen and draggable chrome) that
+  // need the same serialized path to DesktopMode as the Firefox chrome
+  // buttons.
+  static void DispatchWindowCommand(int32_t command);
 };
 
 }  // namespace gecko_w10m::client

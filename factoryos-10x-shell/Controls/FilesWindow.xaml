@@ -2,99 +2,163 @@
     x:Class="factoryos_10x_shell.Controls.FilesWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-    Width="900"
-    Height="580">
-    <Border Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" BorderBrush="#FF5A5A5A" BorderThickness="1" CornerRadius="4">
+    xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
+    Width="960"
+    Height="620"
+    KeyDown="FilesWindow_KeyDown">
+    <UserControl.Resources>
+        <ResourceDictionary>
+        <ResourceDictionary.ThemeDictionaries>
+            <ResourceDictionary x:Key="Dark">
+                <AcrylicBrush x:Key="FilesBackdropBrush" BackgroundSource="Backdrop" FallbackColor="#FF202020" TintColor="#FF202020" TintLuminosityOpacity="0.82" TintOpacity="0.42" />
+                <AcrylicBrush x:Key="NavigationViewDefaultPaneBackground" BackgroundSource="Backdrop" FallbackColor="#FF252525" TintColor="#FF202020" TintLuminosityOpacity="0.9" TintOpacity="0.24" />
+                <SolidColorBrush x:Key="FilesToolbarBrush" Color="#22FFFFFF" />
+                <SolidColorBrush x:Key="FilesAddressBrush" Color="#18FFFFFF" />
+                <SolidColorBrush x:Key="FilesFileAreaBrush" Color="#D91E1E1E" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackground" Color="Transparent" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackgroundSelected" Color="#24FFFFFF" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackgroundPointerOver" Color="#18FFFFFF" />
+            </ResourceDictionary>
+            <ResourceDictionary x:Key="Light">
+                <AcrylicBrush x:Key="FilesBackdropBrush" BackgroundSource="Backdrop" FallbackColor="#FFF3F3F3" TintColor="#FFF3F3F3" TintLuminosityOpacity="0.92" TintOpacity="0.48" />
+                <AcrylicBrush x:Key="NavigationViewDefaultPaneBackground" BackgroundSource="Backdrop" FallbackColor="#FFF7F7F7" TintColor="#FFF3F3F3" TintLuminosityOpacity="0.94" TintOpacity="0.32" />
+                <SolidColorBrush x:Key="FilesToolbarBrush" Color="#55FFFFFF" />
+                <SolidColorBrush x:Key="FilesAddressBrush" Color="#72FFFFFF" />
+                <SolidColorBrush x:Key="FilesFileAreaBrush" Color="#D9FCFCFC" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackground" Color="Transparent" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackgroundSelected" Color="#82FFFFFF" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackgroundPointerOver" Color="#66FFFFFF" />
+            </ResourceDictionary>
+            <ResourceDictionary x:Key="HighContrast">
+                <SolidColorBrush x:Key="FilesBackdropBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                <SolidColorBrush x:Key="NavigationViewDefaultPaneBackground" Color="{ThemeResource SystemColorWindowColor}" />
+                <SolidColorBrush x:Key="FilesToolbarBrush" Color="Transparent" />
+                <SolidColorBrush x:Key="FilesAddressBrush" Color="Transparent" />
+                <SolidColorBrush x:Key="FilesFileAreaBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackground" Color="Transparent" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackgroundSelected" Color="{ThemeResource SystemColorHighlightColor}" />
+                <SolidColorBrush x:Key="TabViewItemHeaderBackgroundPointerOver" Color="{ThemeResource SystemColorButtonFaceColor}" />
+            </ResourceDictionary>
+        </ResourceDictionary.ThemeDictionaries>
+        <Style x:Key="FilesToolbarButtonStyle" TargetType="Button">
+            <Setter Property="Height" Value="34" />
+            <Setter Property="MinWidth" Value="34" />
+            <Setter Property="Padding" Value="9,0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+        </Style>
+        <Style x:Key="FilesIconButtonStyle" TargetType="Button" BasedOn="{StaticResource FilesToolbarButtonStyle}">
+            <Setter Property="Width" Value="34" />
+            <Setter Property="Padding" Value="0" />
+        </Style>
+        </ResourceDictionary>
+    </UserControl.Resources>
+    <Border Background="{ThemeResource FilesBackdropBrush}" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="1" CornerRadius="8">
         <Grid PointerPressed="Root_PointerPressed">
             <Grid.RowDefinitions>
-                <RowDefinition Height="36" />
+                <RowDefinition Height="40" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
-            <Grid x:Name="TitleBar" Background="#FF303030" PointerPressed="TitleBar_PointerPressed" PointerMoved="TitleBar_PointerMoved" PointerReleased="TitleBar_PointerReleased">
-                <TextBlock Margin="12,0" VerticalAlignment="Center" Foreground="White" FontWeight="SemiBold" Text="Files" />
-                <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
-                <Button Style="{StaticResource ShellCaptionButtonStyle}" Click="Minimize_Click"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE921;" /></Button>
-                <Button Style="{StaticResource ShellCaptionButtonStyle}" Click="Maximize_Click"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE922;" /></Button>
-                <Button Style="{StaticResource ShellCloseButtonStyle}" Click="Close_Click">
-                    <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Foreground="White" Text="&#xE8BB;" />
-                </Button>
+            <Grid x:Name="TitleBar" Background="Transparent">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="42" />
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <Border Background="Transparent" DoubleTapped="TitleBar_DoubleTapped" PointerPressed="TitleBar_PointerPressed" PointerMoved="TitleBar_PointerMoved" PointerReleased="TitleBar_PointerReleased" ToolTipService.ToolTip="Files">
+                    <PathIcon Width="17" Height="17" Data="M2.5 1C1.11929 1 0 2.11929 0 3.5V12.5C0 13.8807 1.11929 15 2.5 15H13.5C14.8807 15 16 13.8807 16 12.5V5.5C16 4.11929 14.8807 3 13.5 3H7.70711L6.21967 1.51256C5.89148 1.18437 5.44636 1 4.98223 1H2.5ZM1 3.5C1 2.67157 1.67157 2 2.5 2H4.98223C5.18115 2 5.37191 2.07902 5.51256 2.21967L6.79289 3.5L5.43934 4.85355C5.34557 4.94732 5.21839 5 5.08579 5H1V3.5ZM1 6H5.08579C5.48361 6 5.86514 5.84196 6.14645 5.56066L7.70711 4H13.5C14.3284 4 15 4.67157 15 5.5V12.5C15 13.3284 14.3284 14 13.5 14H2.5C1.67157 14 1 13.3284 1 12.5V6Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" />
+                </Border>
+                <muxc:TabView x:Name="FilesTabs" Grid.Column="1" Height="40" Background="Transparent" CanReorderTabs="True" IsAddTabButtonVisible="True" AddTabButtonClick="FilesTabs_AddTabButtonClick" SelectionChanged="FilesTabs_SelectionChanged" TabCloseRequested="FilesTabs_TabCloseRequested">
+                    <muxc:TabView.TabStripFooter>
+                        <Border MinWidth="72" Height="40" Background="Transparent" DoubleTapped="TitleBar_DoubleTapped" PointerPressed="TitleBar_PointerPressed" PointerMoved="TitleBar_PointerMoved" PointerReleased="TitleBar_PointerReleased" />
+                    </muxc:TabView.TabStripFooter>
+                </muxc:TabView>
+                <StackPanel Grid.Column="2" Orientation="Horizontal">
+                    <Button Style="{StaticResource ShellCaptionButtonStyle}" Click="Minimize_Click"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Text="&#xE921;" /></Button>
+                    <Button Style="{StaticResource ShellCaptionButtonStyle}" Click="Maximize_Click"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Text="&#xE922;" /></Button>
+                    <Button Style="{StaticResource ShellCloseButtonStyle}" Click="Close_Click"><TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Text="&#xE8BB;" /></Button>
                 </StackPanel>
             </Grid>
-            <Grid Grid.Row="1">
-                <NavigationView x:Name="LocationsNavigation"
-                                AlwaysShowHeader="False"
-                                CompactPaneLength="48"
-                                IsBackButtonVisible="Collapsed"
-                                IsPaneOpen="True"
-                                IsSettingsVisible="False"
-                                OpenPaneLength="180"
-                                PaneDisplayMode="Left"
-                                ItemInvoked="LocationsNavigation_ItemInvoked">
-                    <NavigationView.MenuItems>
-                        <NavigationViewItem x:Name="HomeNavigationItem" Content="Home" Tag="Home"><NavigationViewItem.Icon><SymbolIcon Symbol="Home" /></NavigationViewItem.Icon></NavigationViewItem>
-                        <NavigationViewItem Content="Downloads" Tag="Downloads"><NavigationViewItem.Icon><SymbolIcon Symbol="Download" /></NavigationViewItem.Icon></NavigationViewItem>
-                        <NavigationViewItem Content="Documents" Tag="Documents"><NavigationViewItem.Icon><SymbolIcon Symbol="Document" /></NavigationViewItem.Icon></NavigationViewItem>
-                        <NavigationViewItem Content="Pictures" Tag="Pictures"><NavigationViewItem.Icon><SymbolIcon Symbol="Pictures" /></NavigationViewItem.Icon></NavigationViewItem>
-                        <NavigationViewItem Content="Videos" Tag="Videos"><NavigationViewItem.Icon><SymbolIcon Symbol="Video" /></NavigationViewItem.Icon></NavigationViewItem>
-                        <NavigationViewItem Content="Music" Tag="Music"><NavigationViewItem.Icon><SymbolIcon Symbol="Audio" /></NavigationViewItem.Icon></NavigationViewItem>
-                        <NavigationViewItemSeparator />
-                        <NavigationViewItem x:Name="RemovableMediaItem" Content="Removable media" Tag="Removable media"><NavigationViewItem.Icon><FontIcon FontFamily="Segoe MDL2 Assets" Glyph="&#xE88E;" /></NavigationViewItem.Icon></NavigationViewItem>
-                    </NavigationView.MenuItems>
-                    <Grid Padding="18">
+            <NavigationView x:Name="LocationsNavigation" Grid.Row="1" Background="Transparent" AlwaysShowHeader="False" CompactModeThresholdWidth="680" CompactPaneLength="48" IsBackButtonVisible="Collapsed" IsPaneOpen="True" IsPaneToggleButtonVisible="True" IsSettingsVisible="False" OpenPaneLength="210" PaneDisplayMode="LeftCompact" ItemInvoked="LocationsNavigation_ItemInvoked">
+                <NavigationView.PaneHeader>
+                    <TextBlock Margin="10,8,0,8" FontSize="12" FontWeight="SemiBold" Opacity="0.65" Text="PLACES" />
+                </NavigationView.PaneHeader>
+                <NavigationView.MenuItems>
+                    <NavigationViewItem x:Name="HomeNavigationItem" Content="Home" Tag="Home"><NavigationViewItem.Icon><BitmapIcon ShowAsMonochrome="False" UriSource="ms-appx:///Assets/Files/FluentIcons/SidebarSections/Home.png" /></NavigationViewItem.Icon></NavigationViewItem>
+                    <NavigationViewItemHeader Content="Pinned" />
+                    <NavigationViewItem Content="Downloads" Tag="Downloads"><NavigationViewItem.Icon><BitmapIcon ShowAsMonochrome="False" UriSource="ms-appx:///Assets/Files/FluentIcons/FolderIcon.png" /></NavigationViewItem.Icon></NavigationViewItem>
+                    <NavigationViewItem Content="Documents" Tag="Documents"><NavigationViewItem.Icon><BitmapIcon ShowAsMonochrome="False" UriSource="ms-appx:///Assets/Files/FluentIcons/FolderIcon.png" /></NavigationViewItem.Icon></NavigationViewItem>
+                    <NavigationViewItem Content="Pictures" Tag="Pictures"><NavigationViewItem.Icon><BitmapIcon ShowAsMonochrome="False" UriSource="ms-appx:///Assets/Files/FluentIcons/FolderIcon.png" /></NavigationViewItem.Icon></NavigationViewItem>
+                    <NavigationViewItem Content="Videos" Tag="Videos"><NavigationViewItem.Icon><BitmapIcon ShowAsMonochrome="False" UriSource="ms-appx:///Assets/Files/FluentIcons/FolderIcon.png" /></NavigationViewItem.Icon></NavigationViewItem>
+                    <NavigationViewItem Content="Music" Tag="Music"><NavigationViewItem.Icon><BitmapIcon ShowAsMonochrome="False" UriSource="ms-appx:///Assets/Files/FluentIcons/FolderIcon.png" /></NavigationViewItem.Icon></NavigationViewItem>
+                    <NavigationViewItemHeader Content="Storage" />
+                    <NavigationViewItem x:Name="RemovableMediaItem" Content="Removable media" Tag="Removable media"><NavigationViewItem.Icon><BitmapIcon ShowAsMonochrome="False" UriSource="ms-appx:///Assets/Files/FluentIcons/SidebarSections/Drives.png" /></NavigationViewItem.Icon></NavigationViewItem>
+                </NavigationView.MenuItems>
+                <Grid Background="{ThemeResource FilesFileAreaBrush}">
                     <Grid.RowDefinitions>
-                        <RowDefinition Height="36" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="52" />
+                        <RowDefinition Height="48" />
+                        <RowDefinition Height="32" />
                         <RowDefinition Height="*" />
+                        <RowDefinition Height="30" />
                     </Grid.RowDefinitions>
-                    <StackPanel Orientation="Horizontal" Spacing="8">
-                        <Button Width="32" Height="30" Padding="0" Click="Back_Click" ToolTipService.ToolTip="Back"><TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE72B;" /></Button>
-                        <Button Width="32" Height="30" Padding="0" Click="Up_Click" ToolTipService.ToolTip="Up (..)"><TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE74A;" /></Button>
-                        <Button Width="32" Height="30" Padding="0" Click="Refresh_Click" ToolTipService.ToolTip="Refresh"><TextBlock FontFamily="Segoe MDL2 Assets" Text="&#xE72C;" /></Button>
-                        <Button Height="30" Padding="10,0" Content="New folder" Click="NewFolder_Click" />
-                        <Button Height="30" Padding="10,0" Content="Paste" Click="Paste_Click" />
-                    </StackPanel>
-                    <TextBlock x:Name="PathText" Grid.Row="1" VerticalAlignment="Center" FontSize="16" FontWeight="SemiBold" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" Text="Home" />
-                    <Border Grid.Row="2" Margin="0,12,0,10" Height="1" Background="#22000000" />
-                    <ListView x:Name="ItemsList" Grid.Row="3" IsItemClickEnabled="True" ItemClick="ItemsList_ItemClick" SelectionMode="None">
-                        <ListView.ContextFlyout>
-                            <MenuFlyout Opened="ContextFlyout_Opened" Closed="ContextFlyout_Closed"><MenuFlyoutItem Text="New folder" Click="NewFolder_Click" /><MenuFlyoutItem Text="Paste" Click="Paste_Click" /></MenuFlyout>
-                        </ListView.ContextFlyout>
+                    <Grid Padding="10,7" Background="{ThemeResource FilesToolbarBrush}" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="0,0,0,1">
+                        <StackPanel Orientation="Horizontal" Spacing="2">
+                            <Button Style="{StaticResource FilesToolbarButtonStyle}" Click="NewFolder_Click" ToolTipService.ToolTip="New folder">
+                                <StackPanel Orientation="Horizontal" Spacing="7"><PathIcon Data="m2.5,12c-.83,0-1.5-.67-1.5-1.5v-5.5h4.09c.4,0,.78-.16,1.06-.44l1.56-1.56h4.79c.83,0,1.5.67,1.5,1.5v2.1c.36.18.69.4,1,.66v-2.76c0-1.38-1.12-2.5-2.5-2.5h-4.79l-1.49-1.49c-.33-.33-.77-.51-1.24-.51h-2.48C1.12,0,0,1.12,0,2.5v8c0,1.38,1.12,2.5,2.5,2.5h3.71c-.09-.32-.15-.66-.18-1h-3.52ZM1,2.5c0-.83.67-1.5,1.5-1.5h2.48c.2,0,.39.08.53.22l1.28,1.28-1.35,1.35c-.09.09-.22.15-.35.15H1v-1.5Zm10.5,4.5c-2.49,0-4.5,2.01-4.5,4.5s2.01,4.5,4.5,4.5,4.5-2.01,4.5-4.5-2.01-4.5-4.5-4.5Zm2.35,4.85c-.09.09-.22.15-.35.15h-1.5v1.5c0,.13-.05.26-.15.35s-.22.15-.35.15-.26-.05-.35-.15-.15-.22-.15-.35v-1.5h-1.5c-.13,0-.26-.05-.35-.15-.09-.09-.15-.22-.15-.35s.05-.26.15-.35c.09-.09.22-.15.35-.15h1.5v-1.5c0-.13.05-.26.15-.35.09-.09.22-.15.35-.15s.26.05.35.15c.09.09.15.22.15.35v1.5h1.5c.13,0,.26.05.35.15s.15.22.15.35-.05.26-.15.35Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /><TextBlock VerticalAlignment="Center" Text="New" /></StackPanel>
+                            </Button>
+                            <Rectangle Width="1" Height="20" Margin="5,0" Fill="{ThemeResource SystemControlForegroundBaseLowBrush}" />
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Cut_Click" ToolTipService.ToolTip="Cut"><PathIcon Data="m12.92.77c.15-.23.09-.54-.14-.69-.23-.15-.54-.09-.69.14l-3.48,5.33.6.91L12.92.77Zm-.92,9.23c-.53,0-1.02.14-1.45.37l-1.88-2.87h.01L3.92.23c-.15-.23-.46-.3-.69-.14-.23.15-.3.46-.14.69l4.33,6.62-1.96,2.98c-.43-.24-.93-.37-1.45-.37-1.66,0-3,1.34-3,3s1.34,3,3,3,3-1.34,3-3c0-.77-.29-1.47-.76-2l1.76-2.69,1.76,2.69c-.47.53-.76,1.23-.76,2,0,1.66,1.34,3,3,3s3-1.34,3-3-1.34-3-3-3Zm-8,5c-1.1,0-2-.9-2-2s.9-2,2-2,2,.9,2,2-.9,2-2,2Zm8,0c-1.1,0-2-.9-2-2s.9-2,2-2,2,.9,2,2-.9,2-2,2Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Copy_Click" ToolTipService.ToolTip="Copy"><PathIcon Data="m8.37,13.72c-.25.18-.56.28-.87.28H3.5c-.4,0-.78-.16-1.06-.44-.28-.28-.44-.66-.44-1.06v-6c0-.4.16-.78.44-1.06s.66-.44,1.06-.44h1.5v-1h-1.5c-.66,0-1.3.26-1.77.73-.47.47-.73,1.1-.73,1.77v6c0,.66.26,1.3.73,1.77.47.47,1.1.73,1.77.73h4c.58,0,1.14-.2,1.58-.56.45-.36.75-.87.87-1.44h-1.04c-.1.29-.3.55-.55.72ZM14.27,1.73c-.47-.47-1.1-.73-1.77-.73h-4c-.66,0-1.3.26-1.77.73-.47.47-.73,1.1-.73,1.77v6c0,.66.26,1.3.73,1.77.47.47,1.1.73,1.77.73h4c.33,0,.65-.06.96-.19.3-.13.58-.31.81-.54.23-.23.42-.51.54-.81.13-.3.19-.63.19-.96V3.5c0-.66-.26-1.3-.73-1.77Zm-.27,7.77c0,.4-.16.78-.44,1.06-.28.28-.66.44-1.06.44h-4c-.4,0-.78-.16-1.06-.44-.28-.28-.44-.66-.44-1.06V3.5c0-.4.16-.78.44-1.06s.66-.44,1.06-.44h4c.4,0,.78.16,1.06.44.28.28.44.66.44,1.06v6Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Paste_Click" ToolTipService.ToolTip="Paste"><PathIcon Data="m5.5,14h-3c-.28,0-.5-.22-.5-.5V2.5c0-.28.22-.5.5-.5h1.59c.21.58.76,1,1.41,1h3c.65,0,1.21-.42,1.41-1h1.59c.28,0,.5.22.5.5v1c0,.28.22.5.5.5s.5-.22.5-.5v-1c0-.83-.67-1.5-1.5-1.5h-1.59C9.71.42,9.15,0,8.5,0h-3C4.85,0,4.29.42,4.09,1h-1.59c-.83,0-1.5.67-1.5,1.5v11c0,.83.67,1.5,1.5,1.5h3c.28,0,.5-.22.5-.5s-.22-.5-.5-.5Zm0-13h3c.28,0,.5.22.5.5s-.22.5-.5.5h-3c-.28,0-.5-.22-.5-.5s.22-.5.5-.5Zm8,4h-5c-.83,0-1.5.67-1.5,1.5v8c0,.83.67,1.5,1.5,1.5h5c.83,0,1.5-.67,1.5-1.5V6.5c0-.83-.67-1.5-1.5-1.5Zm.5,9.5c0,.28-.22.5-.5.5h-5c-.28,0-.5-.22-.5-.5V6.5c0-.28.22-.5.5-.5h5c.28,0,.5.22.5.5v8Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Rename_Click" ToolTipService.ToolTip="Rename"><PathIcon Data="m13.5,15h-1.5V1h1.5c.28,0,.5-.22.5-.5S13.78,0,13.5,0h-4C9.22,0,9,.22,9,.5s.22.5.5.5h1.5v14h-1.5c-.28,0-.5.22-.5.5s.22.5.5.5h4c.28,0,.5-.22.5-.5s-.22-.5-.5-.5ZM3,7c-.55,0-1,.45-1,1s.45,1,1,1h5c.55,0,1-.45,1-1s-.45-1-1-1H3Zm7,6H2.5c-.83,0-1.5-.67-1.5-1.5v-7c0-.83.67-1.5,1.5-1.5h7.5v-1H2.5c-1.38,0-2.5,1.12-2.5,2.5v7c0,1.38,1.12,2.5,2.5,2.5h7.5v-1Zm3.5-11h-.5v1h.5c.83,0,1.5.67,1.5,1.5v7c0,.83-.67,1.5-1.5,1.5h-.5v1h.5c1.38,0,2.5-1.12,2.5-2.5v-7c0-1.38-1.12-2.5-2.5-2.5Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Delete_Click" ToolTipService.ToolTip="Delete"><PathIcon Data="m9.5,12.5c.28,0,.5-.22.5-.5v-6c0-.28-.22-.5-.5-.5s-.5.22-.5.5v6c0,.28.22.5.5.5Zm-3,0c.28,0,.5-.22.5-.5v-6c0-.28-.22-.5-.5-.5s-.5.22-.5.5v6c0,.28.22.5.5.5ZM15.5,2h-4.5v-.5C11,.67,10.33,0,9.5,0h-3C5.67,0,5,.67,5,1.5v.5H.5c-.28,0-.5.22-.5.5s.22.5.5.5h1.05l1.19,10.34c.17,1.51,1.46,2.66,2.98,2.66h4.54c1.52,0,2.81-1.14,2.98-2.66l1.19-10.34h1.05c.28,0,.5-.22.5-.5s-.22-.5-.5-.5Zm-9.5-.5c0-.28.22-.5.5-.5h3c.28,0,.5.22.5.5v.5h-4v-.5Zm6.26,11.73c-.12,1.01-.97,1.77-1.99,1.77h-4.54c-1.02,0-1.87-.76-1.99-1.77L2.56,3h10.88l-1.18,10.23Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                        </StackPanel>
+                    </Grid>
+                    <Grid Grid.Row="1" Padding="10,7" Background="{ThemeResource FilesToolbarBrush}" ColumnSpacing="6">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="220" /></Grid.ColumnDefinitions>
+                        <StackPanel Orientation="Horizontal" Spacing="2">
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Back_Click" ToolTipService.ToolTip="Back"><PathIcon Data="m.25,9.05c-.14-.13-.22-.3-.24-.48C0,8.55,0,8.52,0,8.5c0-.03,0-.06,0-.08.02-.17.1-.34.24-.47L7.16,1.63c.2-.19.52-.17.71.03.19.2.17.52-.03.71L1.67,8h13.83c.28,0,.5.22.5.5,0,.28-.22.5-.5.5H1.67s6.17,5.63,6.17,5.63c.2.19.22.5.03.71-.19.2-.5.22-.71.03L.25,9.05Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Forward_Click" ToolTipService.ToolTip="Forward"><PathIcon Data="m8.84,15.37c-.2.19-.52.17-.71-.03-.19-.2-.17-.52.03-.71l6.17-5.63H.5c-.28,0-.5-.22-.5-.5,0-.28.22-.5.5-.5h13.83l-6.17-5.63c-.2-.19-.22-.5-.03-.71.19-.2.5-.22.71-.03l6.92,6.31c.14.13.22.3.24.47,0,.03,0,.06,0,.08s0,.05,0,.08c-.02.18-.1.35-.24.48l-6.92,6.31Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Up_Click" ToolTipService.ToolTip="Up"><PathIcon Data="m.63,7.16c-.19.2-.17.52.03.71.2.19.52.17.71-.03L7,1.67v13.83c0,.28.22.5.5.5s.5-.22.5-.5V1.67l5.63,6.16c.19.2.5.22.71.03.2-.19.22-.5.03-.71L8.05.25c-.13-.14-.3-.22-.47-.24C7.56,0,7.53,0,7.5,0c-.03,0-.05,0-.08,0-.18.02-.35.1-.48.24L.63,7.16Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                            <Button Style="{StaticResource FilesIconButtonStyle}" Click="Refresh_Click" ToolTipService.ToolTip="Refresh"><PathIcon Data="m2,8c0-3.31,2.69-6,6-6,1.78,0,3.37.77,4.47,2h-1.97c-.28,0-.5.22-.5.5s.22.5.5.5h3c.28,0,.5-.22.5-.5V1.5c0-.28-.22-.5-.5-.5s-.5.22-.5.5v1.6c-1.27-1.3-3.04-2.1-5-2.1-3.87,0-7,3.13-7,7s3.13,7,7,7,7-3.13,7-7c0-.18,0-.36-.02-.54-.02-.28-.26-.48-.54-.46-.28.02-.48.26-.46.54.01.15.02.31.02.46,0,3.31-2.69,6-6,6s-6-2.69-6-6Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /></Button>
+                        </StackPanel>
+                        <Border Grid.Column="1" Height="34" Padding="11,0" Background="{ThemeResource FilesAddressBrush}" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="1" CornerRadius="4">
+                            <StackPanel VerticalAlignment="Center" Orientation="Horizontal" Spacing="8"><PathIcon Width="14" Height="14" Data="M2.5 1C1.11929 1 0 2.11929 0 3.5V12.5C0 13.8807 1.11929 15 2.5 15H13.5C14.8807 15 16 13.8807 16 12.5V5.5C16 4.11929 14.8807 3 13.5 3H7.70711L6.21967 1.51256C5.89148 1.18437 5.44636 1 4.98223 1H2.5ZM1 3.5C1 2.67157 1.67157 2 2.5 2H4.98223C5.18115 2 5.37191 2.07902 5.51256 2.21967L6.79289 3.5L5.43934 4.85355C5.34557 4.94732 5.21839 5 5.08579 5H1V3.5ZM1 6H5.08579C5.48361 6 5.86514 5.84196 6.14645 5.56066L7.70711 4H13.5C14.3284 4 15 4.67157 15 5.5V12.5C15 13.3284 14.3284 14 13.5 14H2.5C1.67157 14 1 13.3284 1 12.5V6Z" Foreground="{ThemeResource SystemControlForegroundBaseHighBrush}" /><TextBlock x:Name="PathText" VerticalAlignment="Center" Text="Home" TextTrimming="CharacterEllipsis" /></StackPanel>
+                        </Border>
+                        <Grid Grid.Column="2">
+                            <TextBox x:Name="SearchBox" Height="34" Padding="32,2,10,2" Background="{ThemeResource FilesAddressBrush}" PlaceholderText="Search this folder" TextChanged="SearchBox_TextChanged" />
+                            <PathIcon Width="15" Height="15" Margin="10,0,0,0" HorizontalAlignment="Left" Data="m6.5.99c3.04,0,5.5,2.46,5.5,5.5,0,1.34-.48,2.57-1.27,3.52l4.13,4.13c.2.2.2.51,0,.71-.17.17-.44.19-.64.06l-.07-.06-4.13-4.13c-.95.8-2.18,1.27-3.52,1.27-3.04,0-5.5-2.46-5.5-5.5S3.46.99,6.5.99Zm0,1c-2.49,0-4.5,2.01-4.5,4.5s2.01,4.5,4.5,4.5,4.5-2.01,4.5-4.5S8.99,1.99,6.5,1.99Z" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" />
+                        </Grid>
+                    </Grid>
+                    <Grid Grid.Row="2" Margin="12,0" Padding="42,0,8,0" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="0,0,0,1">
+                        <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="150" /><ColumnDefinition Width="110" /><ColumnDefinition Width="90" /></Grid.ColumnDefinitions>
+                        <TextBlock VerticalAlignment="Center" FontSize="12" Opacity="0.65" Text="Name" />
+                        <TextBlock Grid.Column="1" VerticalAlignment="Center" FontSize="12" Opacity="0.65" Text="Date modified" />
+                        <TextBlock Grid.Column="2" VerticalAlignment="Center" FontSize="12" Opacity="0.65" Text="Type" />
+                        <TextBlock Grid.Column="3" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="12" Opacity="0.65" Text="Size" />
+                    </Grid>
+                    <ListView x:Name="ItemsList" Grid.Row="3" Margin="8,2" Background="Transparent" DoubleTapped="ItemsList_DoubleTapped" KeyDown="ItemsList_KeyDown" SelectionChanged="ItemsList_SelectionChanged" SelectionMode="Extended">
+                        <ListView.ContextFlyout><MenuFlyout Opened="ContextFlyout_Opened" Closed="ContextFlyout_Closed"><MenuFlyoutItem Text="New folder" Click="NewFolder_Click"><MenuFlyoutItem.Icon><PathIcon Data="m2.5,12c-.83,0-1.5-.67-1.5-1.5v-5.5h4.09c.4,0,.78-.16,1.06-.44l1.56-1.56h4.79c.83,0,1.5.67,1.5,1.5v2.1c.36.18.69.4,1,.66v-2.76c0-1.38-1.12-2.5-2.5-2.5h-4.79l-1.49-1.49c-.33-.33-.77-.51-1.24-.51h-2.48C1.12,0,0,1.12,0,2.5v8c0,1.38,1.12,2.5,2.5,2.5h3.71c-.09-.32-.15-.66-.18-1h-3.52ZM1,2.5c0-.83.67-1.5,1.5-1.5h2.48c.2,0,.39.08.53.22l1.28,1.28-1.35,1.35c-.09.09-.22.15-.35.15H1v-1.5Zm10.5,4.5c-2.49,0-4.5,2.01-4.5,4.5s2.01,4.5,4.5,4.5,4.5-2.01,4.5-4.5-2.01-4.5-4.5-4.5Zm2.35,4.85c-.09.09-.22.15-.35.15h-1.5v1.5c0,.13-.05.26-.15.35s-.22.15-.35.15-.26-.05-.35-.15-.15-.22-.15-.35v-1.5h-1.5c-.13,0-.26-.05-.35-.15-.09-.09-.15-.22-.15-.35s.05-.26.15-.35c.09-.09.22-.15.35-.15h1.5v-1.5c0-.13.05-.26.15-.35.09-.09.22-.15.35-.15s.26.05.35.15c.09.09.15.22.15.35v1.5h1.5c.13,0,.26.05.35.15s.15.22.15.35-.05.26-.15.35Z" /></MenuFlyoutItem.Icon></MenuFlyoutItem><MenuFlyoutItem Text="Paste" Click="Paste_Click"><MenuFlyoutItem.Icon><PathIcon Data="m5.5,14h-3c-.28,0-.5-.22-.5-.5V2.5c0-.28.22-.5.5-.5h1.59c.21.58.76,1,1.41,1h3c.65,0,1.21-.42,1.41-1h1.59c.28,0,.5.22.5.5v1c0,.28.22.5.5.5s.5-.22.5-.5v-1c0-.83-.67-1.5-1.5-1.5h-1.59C9.71.42,9.15,0,8.5,0h-3C4.85,0,4.29.42,4.09,1h-1.59c-.83,0-1.5.67-1.5,1.5v11c0,.83.67,1.5,1.5,1.5h3c.28,0,.5-.22.5-.5s-.22-.5-.5-.5Zm0-13h3c.28,0,.5.22.5.5s-.22.5-.5.5h-3c-.28,0-.5-.22-.5-.5s.22-.5.5-.5Zm8,4h-5c-.83,0-1.5.67-1.5,1.5v8c0,.83.67,1.5,1.5,1.5h5c.83,0,1.5-.67,1.5-1.5V6.5c0-.83-.67-1.5-1.5-1.5Zm.5,9.5c0,.28-.22.5-.5.5h-5c-.28,0-.5-.22-.5-.5V6.5c0-.28.22-.5.5-.5h5c.28,0,.5.22.5.5v8Z" /></MenuFlyoutItem.Icon></MenuFlyoutItem></MenuFlyout></ListView.ContextFlyout>
+                        <ListView.ItemContainerStyle><Style TargetType="ListViewItem"><Setter Property="HorizontalContentAlignment" Value="Stretch" /><Setter Property="Padding" Value="0" /><Setter Property="Margin" Value="2,1" /><Setter Property="MinHeight" Value="42" /></Style></ListView.ItemContainerStyle>
                         <ListView.ItemTemplate>
                             <DataTemplate>
-                                <Grid Height="42" Padding="8,0">
-                                    <Grid.ContextFlyout>
-                                        <MenuFlyout Opened="ContextFlyout_Opened" Closed="ContextFlyout_Closed">
-                                            <MenuFlyoutItem Text="Copy" Click="Copy_Click" />
-                                            <MenuFlyoutItem Text="Cut" Click="Cut_Click" />
-                                            <MenuFlyoutItem Text="Paste" Click="Paste_Click" />
-                                            <MenuFlyoutItem Text="Move to..." Click="MoveTo_Click" />
-                                            <MenuFlyoutItem Text="Rename" Click="Rename_Click" />
-                                            <MenuFlyoutSeparator />
-                                            <MenuFlyoutItem Text="Delete" Click="Delete_Click" />
-                                        </MenuFlyout>
-                                    </Grid.ContextFlyout>
-                                    <Grid.ColumnDefinitions>
-                                        <ColumnDefinition Width="34" />
-                                        <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="Auto" />
-                                    </Grid.ColumnDefinitions>
-                                    <Grid Width="24" Height="24" VerticalAlignment="Center">
-                                        <TextBlock VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="18" Foreground="#FF3C78D8" Text="{Binding Glyph}" />
-                                        <Image Width="22" Height="22" HorizontalAlignment="Center" VerticalAlignment="Center" Source="{Binding Thumbnail}" Stretch="Uniform" />
-                                    </Grid>
+                                <Grid Height="42" Padding="9,0">
+                                    <Grid.ContextFlyout><MenuFlyout Opened="ContextFlyout_Opened" Closed="ContextFlyout_Closed"><MenuFlyoutItem Text="Cut" Click="Cut_Click"><MenuFlyoutItem.Icon><PathIcon Data="m12.92.77c.15-.23.09-.54-.14-.69-.23-.15-.54-.09-.69.14l-3.48,5.33.6.91L12.92.77Zm-.92,9.23c-.53,0-1.02.14-1.45.37l-1.88-2.87h.01L3.92.23c-.15-.23-.46-.3-.69-.14-.23.15-.3.46-.14.69l4.33,6.62-1.96,2.98c-.43-.24-.93-.37-1.45-.37-1.66,0-3,1.34-3,3s1.34,3,3,3,3-1.34,3-3c0-.77-.29-1.47-.76-2l1.76-2.69,1.76,2.69c-.47.53-.76,1.23-.76,2,0,1.66,1.34,3,3,3s3-1.34,3-3-1.34-3-3-3Zm-8,5c-1.1,0-2-.9-2-2s.9-2,2-2,2,.9,2,2-.9,2-2,2Zm8,0c-1.1,0-2-.9-2-2s.9-2,2-2,2,.9,2,2-.9,2-2,2Z" /></MenuFlyoutItem.Icon></MenuFlyoutItem><MenuFlyoutItem Text="Copy" Click="Copy_Click"><MenuFlyoutItem.Icon><PathIcon Data="m8.37,13.72c-.25.18-.56.28-.87.28H3.5c-.4,0-.78-.16-1.06-.44-.28-.28-.44-.66-.44-1.06v-6c0-.4.16-.78.44-1.06s.66-.44,1.06-.44h1.5v-1h-1.5c-.66,0-1.3.26-1.77.73-.47.47-.73,1.1-.73,1.77v6c0,.66.26,1.3.73,1.77.47.47,1.1.73,1.77.73h4c.58,0,1.14-.2,1.58-.56.45-.36.75-.87.87-1.44h-1.04c-.1.29-.3.55-.55.72ZM14.27,1.73c-.47-.47-1.1-.73-1.77-.73h-4c-.66,0-1.3.26-1.77.73-.47.47-.73,1.1-.73,1.77v6c0,.66.26,1.3.73,1.77.47.47,1.1.73,1.77.73h4c.33,0,.65-.06.96-.19.3-.13.58-.31.81-.54.23-.23.42-.51.54-.81.13-.3.19-.63.19-.96V3.5c0-.66-.26-1.3-.73-1.77Zm-.27,7.77c0,.4-.16.78-.44,1.06-.28.28-.66.44-1.06.44h-4c-.4,0-.78-.16-1.06-.44-.28-.28-.44-.66-.44-1.06V3.5c0-.4.16-.78.44-1.06s.66-.44,1.06-.44h4c.4,0,.78.16,1.06.44.28.28.44.66.44,1.06v6Z" /></MenuFlyoutItem.Icon></MenuFlyoutItem><MenuFlyoutItem Text="Move to..." Click="MoveTo_Click"><MenuFlyoutItem.Icon><PathIcon Data="m2.5,12c-.83,0-1.5-.67-1.5-1.5v-5.5h4.09c.4,0,.78-.16,1.06-.44l1.56-1.56h4.79c.83,0,1.5.67,1.5,1.5v2.1c.36.18.69.4,1,.66v-2.76c0-1.38-1.12-2.5-2.5-2.5h-4.79l-1.49-1.49c-.33-.33-.77-.51-1.24-.51h-2.48C1.12,0,0,1.12,0,2.5v8c0,1.38,1.12,2.5,2.5,2.5h3.71c-.09-.32-.15-.66-.18-1h-3.52ZM1,2.5c0-.83.67-1.5,1.5-1.5h2.48c.2,0,.39.08.53.22l1.28,1.28-1.35,1.35c-.09.09-.22.15-.35.15H1v-1.5Zm10.5,4.5c-2.49,0-4.5,2.01-4.5,4.5s2.01,4.5,4.5,4.5,4.5-2.01,4.5-4.5-2.01-4.5-4.5-4.5Zm2.5,4.5h0c0,.07-.01.13-.04.19-.02.06-.06.11-.11.16h0s-2,2-2,2c-.2.2-.51.2-.71,0s-.2-.51,0-.71l1.15-1.15h-2.79c-.28,0-.5-.22-.5-.5s.22-.5.5-.5h2.79l-1.15-1.15c-.2-.2-.2-.51,0-.71.2-.2.51-.2.71,0l2,2s.08.1.11.16c.02.06.04.12.04.19h0Z" /></MenuFlyoutItem.Icon></MenuFlyoutItem><MenuFlyoutItem Text="Rename" Click="Rename_Click"><MenuFlyoutItem.Icon><PathIcon Data="m13.5,15h-1.5V1h1.5c.28,0,.5-.22.5-.5S13.78,0,13.5,0h-4C9.22,0,9,.22,9,.5s.22.5.5.5h1.5v14h-1.5c-.28,0-.5.22-.5.5s.22.5.5.5h4c.28,0,.5-.22.5-.5s-.22-.5-.5-.5ZM3,7c-.55,0-1,.45-1,1s.45,1,1,1h5c.55,0,1-.45,1-1s-.45-1-1-1H3Zm7,6H2.5c-.83,0-1.5-.67-1.5-1.5v-7c0-.83.67-1.5,1.5-1.5h7.5v-1H2.5c-1.38,0-2.5,1.12-2.5,2.5v7c0,1.38,1.12,2.5,2.5,2.5h7.5v-1Zm3.5-11h-.5v1h.5c.83,0,1.5.67,1.5,1.5v7c0,.83-.67,1.5-1.5,1.5h-.5v1h.5c1.38,0,2.5-1.12,2.5-2.5v-7c0-1.38-1.12-2.5-2.5-2.5Z" /></MenuFlyoutItem.Icon></MenuFlyoutItem><MenuFlyoutSeparator /><MenuFlyoutItem Text="Delete" Click="Delete_Click"><MenuFlyoutItem.Icon><PathIcon Data="m9.5,12.5c.28,0,.5-.22.5-.5v-6c0-.28-.22-.5-.5-.5s-.5.22-.5.5v6c0,.28.22.5.5.5Zm-3,0c.28,0,.5-.22.5-.5v-6c0-.28-.22-.5-.5-.5s-.5.22-.5.5v6c0,.28.22.5.5.5ZM15.5,2h-4.5v-.5C11,.67,10.33,0,9.5,0h-3C5.67,0,5,.67,5,1.5v.5H.5c-.28,0-.5.22-.5.5s.22.5.5.5h1.05l1.19,10.34c.17,1.51,1.46,2.66,2.98,2.66h4.54c1.52,0,2.81-1.14,2.98-2.66l1.19-10.34h1.05c.28,0,.5-.22.5-.5s-.22-.5-.5-.5Zm-9.5-.5c0-.28.22-.5.5-.5h3c.28,0,.5.22.5.5v.5h-4v-.5Zm6.26,11.73c-.12,1.01-.97,1.77-1.99,1.77h-4.54c-1.02,0-1.87-.76-1.99-1.77L2.56,3h10.88l-1.18,10.23Z" /></MenuFlyoutItem.Icon></MenuFlyoutItem></MenuFlyout></Grid.ContextFlyout>
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="34" /><ColumnDefinition Width="*" /><ColumnDefinition Width="150" /><ColumnDefinition Width="110" /><ColumnDefinition Width="90" /></Grid.ColumnDefinitions>
+                                    <Grid Width="24" Height="24" VerticalAlignment="Center"><FontIcon Width="19" Height="19" FontFamily="Segoe MDL2 Assets" FontSize="18" Glyph="{Binding IconGlyph}" Foreground="#FF3C78D8" Visibility="{Binding IconVisibility}" /><Image Width="22" Height="22" HorizontalAlignment="Center" VerticalAlignment="Center" Source="{Binding Thumbnail}" Stretch="Uniform" /></Grid>
                                     <TextBlock Grid.Column="1" VerticalAlignment="Center" Text="{Binding Name}" TextTrimming="CharacterEllipsis" />
-                                    <TextBlock Grid.Column="2" Margin="20,0,0,0" VerticalAlignment="Center" Foreground="#FF777777" FontSize="12" Text="{Binding Kind}" />
+                                    <TextBlock Grid.Column="2" VerticalAlignment="Center" FontSize="12" Opacity="0.72" Text="{Binding DateModifiedText}" />
+                                    <TextBlock Grid.Column="3" VerticalAlignment="Center" FontSize="12" Opacity="0.72" Text="{Binding Kind}" TextTrimming="CharacterEllipsis" />
+                                    <TextBlock Grid.Column="4" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="12" Opacity="0.72" Text="{Binding SizeText}" />
                                 </Grid>
                             </DataTemplate>
                         </ListView.ItemTemplate>
                     </ListView>
-                    </Grid>
-                </NavigationView>
-                <Border x:Name="ResizeGrip" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased">
-                    <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" Text="&#xE76C;" />
-                </Border>
-            </Grid>
+                    <Grid Grid.Row="4" Padding="14,0" Background="{ThemeResource FilesToolbarBrush}" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="0,1,0,0"><TextBlock x:Name="StatusText" VerticalAlignment="Center" FontSize="12" Opacity="0.72" Text="0 items" /></Grid>
+                </Grid>
+            </NavigationView>
+            <Border x:Name="ResizeGrip" Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased"><TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Opacity="0.5" Text="&#xE76C;" /></Border>
         </Grid>
     </Border>
 </UserControl>

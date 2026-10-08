@@ -19,6 +19,7 @@ using namespace Win32Bridge::Bridge;
 
 namespace
 {
+    constexpr DWORD GuestExitException = 0xE0424242u;
     thread_local GuestRuntime* g_currentGuestRuntime = nullptr;
     std::atomic<unsigned> g_activeGuestRuntimeScopes{ 0 };
     std::atomic<DWORD> g_nextGuestProcessId{ 1000 };
@@ -31,6 +32,9 @@ namespace
         ULONG_PTR stackPointer = 0;
         ULONG_PTR accessOperation = static_cast<ULONG_PTR>(-1);
         ULONG_PTR faultAddress = 0;
+        bool requestedExit = false;
+        bool threadExit = false;
+        DWORD requestedExitCode = 0;
     };
 
     struct CurrentGuestRuntimeScope final
@@ -77,6 +81,13 @@ namespace
             const EXCEPTION_RECORD* record = information->ExceptionRecord;
             details->code = record->ExceptionCode;
             details->address = reinterpret_cast<ULONG_PTR>(record->ExceptionAddress);
+            if (record->ExceptionCode == GuestExitException && record->NumberParameters >= 1)
+            {
+                details->requestedExit = true;
+                details->requestedExitCode = static_cast<DWORD>(record->ExceptionInformation[0]);
+                details->threadExit = record->NumberParameters >= 2 &&
+                    record->ExceptionInformation[1] != 0;
+            }
             if ((record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
                  record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
                 record->NumberParameters >= 2)
@@ -400,24 +411,31 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
         GuestExceptionDetails guestException;
         if (!InvokeGuestEntryPoint(entryPoint, exitCode, &guestException))
         {
-            const std::wstring exceptionDescription = DescribeGuestException(
-                guestException,
-                m_runtime.Base(),
-                m_runtime.Size(),
-                m_storage ? m_storage->ModulePath() : std::wstring(),
-                m_modules.get());
-            if (m_storage)
+            if (guestException.requestedExit)
             {
-                m_storage->CloseAll();
+                *exitCode = static_cast<int>(guestException.requestedExitCode);
             }
-            m_kernel->CloseAll();
-            m_modules->ReleaseAll();
-            detachMainTls();
-            SetError(error, L"The guest raised a structured exception: " +
-                exceptionDescription + L".");
-            RuntimeDiagnostics::Record(L"RUN FAILED: guest structured exception " +
-                exceptionDescription + L".");
-            return false;
+            else
+            {
+                const std::wstring exceptionDescription = DescribeGuestException(
+                    guestException,
+                    m_runtime.Base(),
+                    m_runtime.Size(),
+                    m_storage ? m_storage->ModulePath() : std::wstring(),
+                    m_modules.get());
+                if (m_storage)
+                {
+                    m_storage->CloseAll();
+                }
+                m_kernel->CloseAll();
+                m_modules->ReleaseAll();
+                detachMainTls();
+                SetError(error, L"The guest raised a structured exception: " +
+                    exceptionDescription + L".");
+                RuntimeDiagnostics::Record(L"RUN FAILED: guest structured exception " +
+                    exceptionDescription + L".");
+                return false;
+            }
         }
         if (m_storage)
         {
@@ -666,16 +684,23 @@ HANDLE GuestRuntime::LaunchThread(
             else if (!InvokeGuestThreadEntry(
                 startAddress, parameter, &exitCode, &exception))
             {
-                exitCode = ERROR_PROCESS_ABORTED;
-                const std::wstring exceptionDescription = DescribeGuestException(
-                    exception,
-                    imageBase,
-                    imageSize,
-                    storage ? storage->ModulePath() : std::wstring(),
-                    modules.get());
-                RuntimeDiagnostics::Record(
-                    L"THREAD FAILED: guest structured exception " +
-                    exceptionDescription + L".");
+                if (exception.requestedExit)
+                {
+                    exitCode = exception.requestedExitCode;
+                }
+                else
+                {
+                    exitCode = ERROR_PROCESS_ABORTED;
+                    const std::wstring exceptionDescription = DescribeGuestException(
+                        exception,
+                        imageBase,
+                        imageSize,
+                        storage ? storage->ModulePath() : std::wstring(),
+                        modules.get());
+                    RuntimeDiagnostics::Record(
+                        L"THREAD FAILED: guest structured exception " +
+                        exceptionDescription + L".");
+                }
             }
             if (modulesThreadAttached)
             {

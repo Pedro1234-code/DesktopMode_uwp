@@ -3,6 +3,7 @@
 #include "Bridge/ActivationContext.h"
 #include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestWindow.h"
+#include "Bridge/Gdi32Shims.h"
 #include "Bridge/User32Shims.h"
 #include "Bridge/DialogResources.h"
 #include "Bridge/RuntimeDiagnostics.h"
@@ -44,6 +45,69 @@ namespace
     {
         if (!theme || !color || !CurrentGuestUsesVisualStyles()) return E_HANDLE;
         *color = property == 3803 /* TMT_TEXTCOLOR */ ? RGB(0, 0, 0) : RGB(240, 240, 240);
+        return S_OK;
+    }
+
+    HANDLE WINAPI BridgeBeginBufferedAnimation(
+        HWND, HDC target, const RECT*, int, const void*, const void*, HDC* from, HDC* to)
+    {
+        if (from) *from = target;
+        if (to) *to = target;
+        return target ? reinterpret_cast<HANDLE>(target) : nullptr;
+    }
+
+    HRESULT WINAPI BridgeEndBufferedAnimation(HANDLE buffer, BOOL)
+    {
+        return buffer ? S_OK : E_INVALIDARG;
+    }
+
+    BOOL WINAPI BridgeBufferedPaintRenderAnimation(HWND, HDC) { return FALSE; }
+    HRESULT WINAPI BridgeBufferedPaintStopAllAnimations(HWND) { return S_OK; }
+    HRESULT WINAPI BridgeDrawThemeParentBackground(HWND window, HDC, RECT*)
+    {
+        return window ? S_OK : E_INVALIDARG;
+    }
+    HRESULT WINAPI BridgeDrawThemeTextEx(
+        HANDLE theme, HDC dc, int, int, LPCWSTR text, int count,
+        DWORD flags, LPRECT rect, const void*)
+    {
+        if (!theme || !dc || !text || !rect) return E_INVALIDARG;
+        return BridgeDrawTextW(dc, const_cast<LPWSTR>(text), count, rect, flags) ? S_OK : E_FAIL;
+    }
+    HRESULT WINAPI BridgeEnableThemeDialogTexture(HWND window, DWORD)
+    {
+        return window ? S_OK : E_INVALIDARG;
+    }
+    HRESULT WINAPI BridgeGetThemeBackgroundContentRect(
+        HANDLE theme, HDC, int, int, const RECT* bounding, RECT* content)
+    {
+        if (!theme || !bounding || !content) return E_INVALIDARG;
+        *content = *bounding;
+        return S_OK;
+    }
+    HRESULT WINAPI BridgeGetThemeFont(
+        HANDLE theme, HDC, int, int, int, LOGFONTW* font)
+    {
+        if (!theme || !font) return E_INVALIDARG;
+        ZeroMemory(font, sizeof(*font));
+        font->lfHeight = -12;
+        font->lfWeight = FW_NORMAL;
+        wcscpy_s(font->lfFaceName, L"Segoe UI");
+        return S_OK;
+    }
+    HRESULT WINAPI BridgeGetThemePartSize(
+        HANDLE theme, HDC, int, int, const RECT* bounds, int, SIZE* size)
+    {
+        if (!theme || !size) return E_INVALIDARG;
+        size->cx = bounds ? (std::max)(0L, bounds->right - bounds->left) : 16;
+        size->cy = bounds ? (std::max)(0L, bounds->bottom - bounds->top) : 16;
+        return S_OK;
+    }
+    HRESULT WINAPI BridgeGetThemeTransitionDuration(
+        HANDLE theme, int, int, int, int, DWORD* duration)
+    {
+        if (!theme || !duration) return E_INVALIDARG;
+        *duration = 0;
         return S_OK;
     }
 }
@@ -148,6 +212,195 @@ namespace
     std::mutex g_imageListsLock;
     std::unordered_map<ULONG_PTR, ImageListRecord> g_imageLists;
     ULONG_PTR g_nextImageList = 0x60000000;
+
+    struct GuestImageInfo final
+    {
+        HBITMAP image;
+        HBITMAP mask;
+        int unused1;
+        int unused2;
+        RECT imageRect;
+    };
+
+    struct ImageListDragState final
+    {
+        GuestImageList imageList = nullptr;
+        int image = -1;
+        POINT hotspot{};
+        POINT position{};
+        HWND owner = nullptr;
+        bool visible = false;
+    };
+    ImageListDragState g_dragState;
+
+    using GuestSubclassProc = LRESULT(CALLBACK*)(
+        HWND, UINT, WPARAM, LPARAM, UINT_PTR, DWORD_PTR);
+    struct SubclassEntry final
+    {
+        GuestSubclassProc procedure = nullptr;
+        UINT_PTR identifier = 0;
+        DWORD_PTR referenceData = 0;
+    };
+    struct SubclassWindow final
+    {
+        GuestAbi::WndProc original = nullptr;
+        std::vector<SubclassEntry> entries;
+    };
+    std::mutex g_subclassLock;
+    std::unordered_map<ULONG_PTR, SubclassWindow> g_subclasses;
+    struct SubclassFrame final
+    {
+        HWND window = nullptr;
+        UINT message = 0;
+        WPARAM wParam = 0;
+        LPARAM lParam = 0;
+        std::vector<SubclassEntry> entries;
+        GuestAbi::WndProc original = nullptr;
+        size_t next = 0;
+        SubclassFrame* previous = nullptr;
+    };
+    thread_local SubclassFrame* g_subclassFrame = nullptr;
+
+    LRESULT InvokeSubclassEntry(SubclassFrame* frame, const SubclassEntry& entry)
+    {
+        __try
+        {
+            return entry.procedure(frame->window, frame->message, frame->wParam,
+                frame->lParam, entry.identifier, entry.referenceData);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return 0;
+        }
+    }
+
+    LRESULT WINAPI BridgeDefSubclassProc(
+        HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+
+    LRESULT CALLBACK SubclassDispatcher(
+        HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        SubclassFrame frame;
+        frame.window = window;
+        frame.message = message;
+        frame.wParam = wParam;
+        frame.lParam = lParam;
+        {
+            std::lock_guard<std::mutex> guard(g_subclassLock);
+            const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
+            if (found == g_subclasses.end())
+                return BridgeDefWindowProcW(window, message, wParam, lParam);
+            frame.entries = found->second.entries;
+            frame.original = found->second.original;
+        }
+        frame.previous = g_subclassFrame;
+        g_subclassFrame = &frame;
+        const LRESULT result = BridgeDefSubclassProc(window, message, wParam, lParam);
+        g_subclassFrame = frame.previous;
+        if (message == 0x0082) // WM_NCDESTROY
+        {
+            std::lock_guard<std::mutex> guard(g_subclassLock);
+            g_subclasses.erase(reinterpret_cast<ULONG_PTR>(window));
+        }
+        return result;
+    }
+
+    BOOL WINAPI BridgeSetWindowSubclass(
+        HWND window, GuestSubclassProc procedure, UINT_PTR identifier, DWORD_PTR referenceData)
+    {
+        if (!window || !procedure) return FALSE;
+        std::lock_guard<std::mutex> guard(g_subclassLock);
+        auto& state = g_subclasses[reinterpret_cast<ULONG_PTR>(window)];
+        if (state.entries.empty())
+        {
+            state.original = reinterpret_cast<GuestAbi::WndProc>(
+                BridgeSetWindowLongPtrW(window, -4,
+                    reinterpret_cast<LONG_PTR>(&SubclassDispatcher)));
+        }
+        for (auto& entry : state.entries)
+        {
+            if (entry.procedure == procedure && entry.identifier == identifier)
+            {
+                entry.referenceData = referenceData;
+                return TRUE;
+            }
+        }
+        state.entries.push_back({ procedure, identifier, referenceData });
+        return TRUE;
+    }
+
+    BOOL WINAPI BridgeGetWindowSubclass(
+        HWND window, GuestSubclassProc procedure, UINT_PTR identifier, DWORD_PTR* referenceData)
+    {
+        if (!window || !procedure) return FALSE;
+        std::lock_guard<std::mutex> guard(g_subclassLock);
+        const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
+        if (found == g_subclasses.end()) return FALSE;
+        for (const auto& entry : found->second.entries)
+        {
+            if (entry.procedure == procedure && entry.identifier == identifier)
+            {
+                if (referenceData) *referenceData = entry.referenceData;
+                return TRUE;
+            }
+        }
+        return FALSE;
+    }
+
+    BOOL WINAPI BridgeRemoveWindowSubclass(
+        HWND window, GuestSubclassProc procedure, UINT_PTR identifier)
+    {
+        std::lock_guard<std::mutex> guard(g_subclassLock);
+        const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
+        if (found == g_subclasses.end()) return FALSE;
+        auto& entries = found->second.entries;
+        const auto entry = std::find_if(entries.begin(), entries.end(),
+            [procedure, identifier](const SubclassEntry& item)
+            { return item.procedure == procedure && item.identifier == identifier; });
+        if (entry == entries.end()) return FALSE;
+        entries.erase(entry);
+        if (entries.empty())
+        {
+            BridgeSetWindowLongPtrW(window, -4,
+                reinterpret_cast<LONG_PTR>(found->second.original));
+            g_subclasses.erase(found);
+        }
+        return TRUE;
+    }
+
+    LRESULT WINAPI BridgeDefSubclassProc(
+        HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        SubclassFrame* frame = g_subclassFrame;
+        if (!frame || frame->window != window)
+            return BridgeDefWindowProcW(window, message, wParam, lParam);
+        frame->message = message;
+        frame->wParam = wParam;
+        frame->lParam = lParam;
+        if (frame->next < frame->entries.size())
+            return InvokeSubclassEntry(frame, frame->entries[frame->next++]);
+        return frame->original
+            ? BridgeCallWindowProcW(frame->original, window, message, wParam, lParam)
+            : BridgeDefWindowProcW(window, message, wParam, lParam);
+    }
+
+    int WINAPI BridgeDrawShadowText(HDC dc, LPCWSTR text, UINT count, RECT* rect,
+        DWORD format, COLORREF textColor, COLORREF shadowColor, int offsetX, int offsetY)
+    {
+        if (!dc || !text || !rect) return 0;
+        RECT shadow = *rect;
+        shadow.left += offsetX;
+        shadow.right += offsetX;
+        shadow.top += offsetY;
+        shadow.bottom += offsetY;
+        const COLORREF previous = BridgeSetTextColor(dc, shadowColor);
+        BridgeDrawTextW(dc, const_cast<LPWSTR>(text), static_cast<int>(count), &shadow, format);
+        BridgeSetTextColor(dc, textColor);
+        const int result = BridgeDrawTextW(
+            dc, const_cast<LPWSTR>(text), static_cast<int>(count), rect, format);
+        BridgeSetTextColor(dc, previous);
+        return result;
+    }
 
     MiniGdi::Surface ScaleImage(const MiniGdi::Surface& source, int width, int height)
     {
@@ -419,6 +672,148 @@ INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void* headerPoint
     sheet.flags = header.flags;
     return ShowGuestPropertySheet(sheet);
 }
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeImageListRemove(GuestImageList imageList, int index)
+{
+    std::lock_guard<std::mutex> guard(g_imageListsLock);
+    const auto found = g_imageLists.find(reinterpret_cast<ULONG_PTR>(imageList));
+    if (found == g_imageLists.end()) return FALSE;
+    auto& images = found->second.images;
+    if (index == -1)
+    {
+        images.clear();
+        return TRUE;
+    }
+    if (index < 0 || static_cast<size_t>(index) >= images.size()) return FALSE;
+    images.erase(images.begin() + index);
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeImageListSetIconSize(
+    GuestImageList imageList, int width, int height)
+{
+    if (width <= 0 || height <= 0 || width > 256 || height > 256) return FALSE;
+    std::lock_guard<std::mutex> guard(g_imageListsLock);
+    const auto found = g_imageLists.find(reinterpret_cast<ULONG_PTR>(imageList));
+    if (found == g_imageLists.end()) return FALSE;
+    found->second.width = width;
+    found->second.height = height;
+    // Native ImageList_SetIconSize removes existing images.
+    found->second.images.clear();
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeImageListGetIconSize(
+    GuestImageList imageList, int* width, int* height)
+{
+    if (!width || !height) return FALSE;
+    std::lock_guard<std::mutex> guard(g_imageListsLock);
+    const auto found = g_imageLists.find(reinterpret_cast<ULONG_PTR>(imageList));
+    if (found == g_imageLists.end()) return FALSE;
+    *width = found->second.width;
+    *height = found->second.height;
+    return TRUE;
+}
+
+HICON WINAPI Win32Bridge::Bridge::BridgeImageListGetIcon(
+    GuestImageList imageList, int index, UINT)
+{
+    MiniGdi::Surface image;
+    return CopyGuestImageListImage(imageList, index, &image)
+        ? StoreGuestIconPixels(image) : nullptr;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeImageListDraw(
+    GuestImageList imageList, int index, HDC dc, int x, int y, UINT)
+{
+    MiniGdi::Surface image;
+    if (!CopyGuestImageListImage(imageList, index, &image)) return FALSE;
+    GuestWindowManager* manager = CurrentGuestWindowManager();
+    MiniGdi::Surface* destination = manager ? manager->Gdi().GetSurface(
+        static_cast<MiniGdi::DcHandle>(reinterpret_cast<ULONG_PTR>(dc))) : nullptr;
+    if (!destination) return FALSE;
+    return MiniGdi::CopyRect(*destination, MiniGdi::Point{ x, y }, image,
+        MiniGdi::Rect{ 0, 0, image.Width(), image.Height() }) ? TRUE : FALSE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeImageListGetImageInfo(
+    GuestImageList imageList, int index, void* information)
+{
+    if (!information) return FALSE;
+    MiniGdi::Surface image;
+    if (!CopyGuestImageListImage(imageList, index, &image)) return FALSE;
+    GuestWindowManager* manager = CurrentGuestWindowManager();
+    if (!manager) return FALSE;
+    const MiniGdi::BitmapHandle bitmap = manager->Gdi().CreateBitmap(
+        image.Width(), image.Height(), MiniGdi::Transparent);
+    MiniGdi::Surface* copy = manager->Gdi().GetBitmapSurface(bitmap);
+    if (!bitmap || !copy) return FALSE;
+    *copy = image;
+    GuestImageInfo result{};
+    result.image = reinterpret_cast<HBITMAP>(static_cast<ULONG_PTR>(bitmap));
+    result.imageRect = RECT{ 0, 0, image.Width(), image.Height() };
+    *static_cast<GuestImageInfo*>(information) = result;
+    return TRUE;
+}
+
+BOOL WINAPI BridgeImageListBeginDrag(GuestImageList imageList, int index, int x, int y)
+{
+    MiniGdi::Surface ignored;
+    if (!CopyGuestImageListImage(imageList, index, &ignored)) return FALSE;
+    std::lock_guard<std::mutex> guard(g_imageListsLock);
+    g_dragState = ImageListDragState{};
+    g_dragState.imageList = imageList;
+    g_dragState.image = index;
+    g_dragState.hotspot = POINT{ x, y };
+    g_dragState.visible = true;
+    return TRUE;
+}
+
+void WINAPI BridgeImageListEndDrag()
+{
+    std::lock_guard<std::mutex> guard(g_imageListsLock);
+    g_dragState = ImageListDragState{};
+}
+
+BOOL WINAPI BridgeImageListDragEnter(HWND owner, int x, int y)
+{
+    std::lock_guard<std::mutex> guard(g_imageListsLock);
+    if (!g_dragState.imageList) return FALSE;
+    g_dragState.owner = owner;
+    g_dragState.position = POINT{ x, y };
+    return TRUE;
+}
+
+BOOL WINAPI BridgeImageListDragMove(int x, int y)
+{
+    std::lock_guard<std::mutex> guard(g_imageListsLock);
+    if (!g_dragState.imageList) return FALSE;
+    g_dragState.position = POINT{ x, y };
+    return TRUE;
+}
+
+BOOL WINAPI BridgeImageListDragShowNolock(BOOL visible)
+{
+    std::lock_guard<std::mutex> guard(g_imageListsLock);
+    if (!g_dragState.imageList) return FALSE;
+    g_dragState.visible = visible != FALSE;
+    return TRUE;
+}
+
+struct GuestTrackMouseEvent final
+{
+    DWORD cbSize;
+    DWORD dwFlags;
+    HWND hwndTrack;
+    DWORD dwHoverTime;
+};
+
+BOOL WINAPI BridgeTrackMouseEvent(GuestTrackMouseEvent* event)
+{
+    if (!event || event->cbSize != sizeof(*event) || !event->hwndTrack) return FALSE;
+    // Mouse leave/hover generation is owned by GuestWindow's pointer routing.
+    return TRUE;
+}
 HRESULT WINAPI Win32Bridge::Bridge::BridgeDllGetVersion(GuestDllVersionInfo* versionInfo)
 {
     if (!versionInfo || versionInfo->cbSize < sizeof(GuestDllVersionInfo))
@@ -446,11 +841,19 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
     if (_wcsicmp(symbol.library.c_str(), L"comctl32.dll") == 0 &&
-        symbol.importedByOrdinal && (symbol.ordinal == 17 || symbol.ordinal == 345))
+        symbol.importedByOrdinal && (symbol.ordinal == 17 || symbol.ordinal == 345 ||
+            symbol.ordinal == 381 || (symbol.ordinal >= 410 && symbol.ordinal <= 413)))
     {
-        resolution.targetAddress = symbol.ordinal == 17
-            ? reinterpret_cast<ULONGLONG>(&BridgeInitCommonControls)
-            : reinterpret_cast<ULONGLONG>(&BridgeCommonControlOrdinal345);
+        switch (symbol.ordinal)
+        {
+        case 17: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitCommonControls); break;
+        case 381: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawShadowText); break;
+        case 410: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowSubclass); break;
+        case 411: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowSubclass); break;
+        case 412: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRemoveWindowSubclass); break;
+        case 413: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDefSubclassProc); break;
+        default: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCommonControlOrdinal345); break;
+        }
         resolution.disposition = ImportDisposition::NeedsBridge;
         resolution.note = L"Common-controls bootstrap: uses bridge-owned controls rather than a desktop DLL.";
     }
@@ -463,6 +866,17 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
         else if (_wcsicmp(symbol.name.c_str(), L"setwindowtheme") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowTheme);
         else if (_wcsicmp(symbol.name.c_str(), L"drawthemebackground") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawThemeBackground);
         else if (_wcsicmp(symbol.name.c_str(), L"getthemecolor") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetThemeColor);
+        else if (_wcsicmp(symbol.name.c_str(), L"beginbufferedanimation") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBeginBufferedAnimation);
+        else if (_wcsicmp(symbol.name.c_str(), L"endbufferedanimation") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndBufferedAnimation);
+        else if (_wcsicmp(symbol.name.c_str(), L"bufferedpaintrenderanimation") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBufferedPaintRenderAnimation);
+        else if (_wcsicmp(symbol.name.c_str(), L"bufferedpaintstopallanimations") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBufferedPaintStopAllAnimations);
+        else if (_wcsicmp(symbol.name.c_str(), L"drawthemeparentbackground") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawThemeParentBackground);
+        else if (_wcsicmp(symbol.name.c_str(), L"drawthemetextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawThemeTextEx);
+        else if (_wcsicmp(symbol.name.c_str(), L"enablethemedialogtexture") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnableThemeDialogTexture);
+        else if (_wcsicmp(symbol.name.c_str(), L"getthemebackgroundcontentrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetThemeBackgroundContentRect);
+        else if (_wcsicmp(symbol.name.c_str(), L"getthemefont") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetThemeFont);
+        else if (_wcsicmp(symbol.name.c_str(), L"getthemepartsize") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetThemePartSize);
+        else if (_wcsicmp(symbol.name.c_str(), L"getthemetransitionduration") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetThemeTransitionDuration);
         if (resolution.targetAddress)
         {
             resolution.disposition = ImportDisposition::NeedsBridge;
@@ -477,6 +891,18 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
         else if (_wcsicmp(symbol.name.c_str(), L"imagelist_addmasked") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListAddMasked);
         else if (_wcsicmp(symbol.name.c_str(), L"imagelist_getimagecount") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListGetImageCount);
         else if (_wcsicmp(symbol.name.c_str(), L"imagelist_replaceicon") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListReplaceIcon);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_remove") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListRemove);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_seticonsize") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListSetIconSize);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_geticonsize") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListGetIconSize);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_geticon") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListGetIcon);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_draw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListDraw);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_getimageinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListGetImageInfo);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_begindrag") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListBeginDrag);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_enddrag") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListEndDrag);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_dragenter") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListDragEnter);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_dragmove") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListDragMove);
+        else if (_wcsicmp(symbol.name.c_str(), L"imagelist_dragshownolock") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeImageListDragShowNolock);
+        else if (_wcsicmp(symbol.name.c_str(), L"_trackmouseevent") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTrackMouseEvent);
         else if (_wcsicmp(symbol.name.c_str(), L"createtoolbarex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateToolbarEx);
         else if (_wcsicmp(symbol.name.c_str(), L"createstatuswindoww") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateStatusWindowW);
         else if (_wcsicmp(symbol.name.c_str(), L"propertysheetw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePropertySheetW);

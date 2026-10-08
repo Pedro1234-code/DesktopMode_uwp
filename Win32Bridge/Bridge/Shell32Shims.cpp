@@ -1427,11 +1427,64 @@ UINT WINAPI Win32Bridge::Bridge::BridgeDragQueryFileW(HANDLE, UINT file, LPWSTR,
 {
     return file == 0xffffffffu ? 0 : 0;
 }
+BOOL WINAPI BridgeDragQueryPoint(HANDLE, LPPOINT point)
+{
+    if (point) *point = POINT{};
+    return FALSE;
+}
+HRESULT WINAPI BridgeSHParseDisplayName(
+    LPCWSTR name, PVOID, PVOID* itemIdList, DWORD attributes, DWORD* resolvedAttributes)
+{
+    if (!itemIdList) return E_POINTER;
+    *itemIdList = nullptr;
+    if (!name || !*name) return E_INVALIDARG;
+    const VirtualShellNode node = NodeForGuestPath(name);
+    *itemIdList = CreateVirtualPidl(node, name);
+    if (!*itemIdList) return E_OUTOFMEMORY;
+    if (resolvedAttributes)
+    {
+        DWORD value = 0;
+        if (node == VirtualShellNode::Directory || node == VirtualShellNode::Drive)
+            value |= attributes & 0x20000000u; // SFGAO_FOLDER
+        value |= attributes & 0x40000000u; // SFGAO_FILESYSTEM
+        *resolvedAttributes = value;
+    }
+    return S_OK;
+}
+HRESULT WINAPI BridgeSHOpenFolderAndSelectItems(PVOID folder, UINT count, PVOID*, DWORD)
+{
+    VirtualPidlData data{};
+    return ReadVirtualPidl(folder, &data) && count <= 0xffffu ? S_OK : E_INVALIDARG;
+}
+BOOL WINAPI BridgeShellNotifyIconW(DWORD message, PVOID data)
+{
+    // The bridge has no system notification area.  Accept well-formed add,
+    // modify and delete requests as a virtual tray so applications do not
+    // abort merely because the host shell is intentionally absent.
+    if (!data || message > 4u) return FALSE;
+    return TRUE;
+}
+int WINAPI BridgeSHCreateDirectory(HWND, LPCWSTR path)
+{
+    if (!path || !*path) return ERROR_INVALID_PARAMETER;
+    if (BridgeCreateDirectoryW(path, nullptr)) return ERROR_SUCCESS;
+    const DWORD error = BridgeGetLastError();
+    return error == ERROR_ALREADY_EXISTS ? ERROR_SUCCESS : static_cast<int>(error);
+}
 
 Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveShell32Import(const ImportedSymbol& symbol)
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
-    if (symbol.importedByOrdinal || _wcsicmp(symbol.library.c_str(), L"shell32.dll") != 0) return resolution;
+    if (_wcsicmp(symbol.library.c_str(), L"shell32.dll") != 0) return resolution;
+    if (symbol.importedByOrdinal)
+    {
+        if (symbol.ordinal == 165)
+        {
+            resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHCreateDirectory);
+            resolution.disposition = ImportDisposition::NeedsBridge;
+        }
+        return resolution;
+    }
     if (_wcsicmp(symbol.name.c_str(), L"shbrowseforfolderw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHBrowseForFolderW);
     else if (_wcsicmp(symbol.name.c_str(), L"shgetfileinfow") == 0)
@@ -1463,6 +1516,10 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveShell32Import(
     else if (_wcsicmp(symbol.name.c_str(), L"shcreateitemfromparsingname") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHCreateItemFromParsingName);
     else if (_wcsicmp(symbol.name.c_str(), L"shellaboutw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShellAboutW);
     else if (_wcsicmp(symbol.name.c_str(), L"dragqueryfilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDragQueryFileW);
+    else if (_wcsicmp(symbol.name.c_str(), L"dragquerypoint") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDragQueryPoint);
+    else if (_wcsicmp(symbol.name.c_str(), L"shparsedisplayname") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHParseDisplayName);
+    else if (_wcsicmp(symbol.name.c_str(), L"shopenfolderandselectitems") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSHOpenFolderAndSelectItems);
+    else if (_wcsicmp(symbol.name.c_str(), L"shell_notifyiconw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShellNotifyIconW);
     if (resolution.targetAddress)
     {
         resolution.disposition = ImportDisposition::NeedsBridge;

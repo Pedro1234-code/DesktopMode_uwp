@@ -26,9 +26,10 @@ namespace gecko_w10m::client {
 
 class EngineView {
  public:
-  // The window size in physical pixels and the number of them Windows puts in
-  // a view pixel -- the same two numbers the engine was started with, because
-  // the keyboard is measured in one and the window in the other.
+  // The window size in framebuffer pixels and the number of those pixels used
+  // for one XAML view pixel. A standalone host normally uses the display's raw
+  // scale; an embedded transformed host can use 1.0 so rendering and input
+  // remain in its logical coordinate space.
   // withPanel false makes no SwapChainPanel at all: the one structural thing
   // this shell has that the builds which lived did not.
   EngineView(int32_t pixelWidth, int32_t pixelHeight, double rawPerView,
@@ -54,6 +55,9 @@ class EngineView {
   // The display in view pixels, as the window sees it; sent on to the engine
   // in device pixels so the headless screen turns with the phone.
   void SetScreen(double viewWidth, double viewHeight);
+  // The space assigned to this embedded browser window. Unlike SetScreen,
+  // this resizes Gecko's widget and the ANGLE swap chain together.
+  void SetViewport(double viewWidth, double viewHeight);
   // The display's density. APZ measures how far a finger may wander and still
   // count as a tap against this; left to itself it assumes a 96 dpi monitor
   // and lets a tap move nine pixels, which on this screen is a fifth of a
@@ -71,6 +75,7 @@ class EngineView {
   // through the ordinary resize, so the window and the swap chain change
   // shape together.
   static void FullscreenChanged(int32_t on);
+  static void WindowDragChanged(int32_t on);
   static int32_t PickFile(int32_t mode, const char* title,
                           const char* defaultName, const char* extensions,
                           char* result, int32_t resultCapacity);
@@ -156,6 +161,7 @@ class EngineView {
   void FollowTextInput();
   // Tells the engine how much room the picture has, whenever that changes.
   void PushSize();
+  void PushSizePixels(int32_t width, int32_t height);
   // Runs work on a later turn of the UI loop, never inside the handler that
   // asked for it.
   static void PostToUi(std::function<void()> work);
@@ -187,6 +193,7 @@ class EngineView {
   using OpenUrlFn = int32_t (*)(const char* url);
   using SetLauncherFn = void (*)(void (*)(const char*));
   using SetFullscreenSinkFn = void (*)(void (*)(int32_t));
+  using SetWindowDragSinkFn = void (*)(void (*)(int32_t));
   using SetFilePickerSinkFn = void (*)(int32_t (*)(
       int32_t, const char*, const char*, const char*, char*, int32_t));
   using SetBridgeSinkFn = int32_t (*)(void (*)(const char*));
@@ -230,6 +237,7 @@ class EngineView {
   OpenUrlFn open_url_ = nullptr;
   SetLauncherFn set_launcher_ = nullptr;
   SetFullscreenSinkFn set_fullscreen_ = nullptr;
+  SetWindowDragSinkFn set_window_drag_ = nullptr;
   SetFilePickerSinkFn set_file_picker_ = nullptr;
   SetVideoLayerSinkFn set_video_layer_ = nullptr;
   // The chrome-to-shell message bridge (client/DrmBridge). Armed once the

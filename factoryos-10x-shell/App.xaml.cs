@@ -116,21 +116,30 @@ namespace factoryos_10x_shell
 
         private void OnUnhandledException(object sender, Windows.UI.Xaml.UnhandledExceptionEventArgs e)
         {
-            // This event already runs on the XAML UI thread. An async event lambda can
-            // turn failures in the error page into a second RoReportUnhandledError and
-            // hide the exception which brought us here.
+            // Keep this handler synchronous. Exceptions crossing a native/XAML boundary
+            // can reach it without a Window.Current for the calling thread.
             e.Handled = true;
-            string calculatorStage = CalculatorApp.MainPage.DiagnosticStage;
-            Debug.WriteLine($"Unhandled XAML exception during '{calculatorStage}': {e.Exception}");
+            // This is the Shell-wide handler. The Calculator diagnostic marker may
+            // contain an old value even when the failing control is Files, Firefox,
+            // or another internal app, so it must not label the reported failure.
+            const string diagnosticStage = "Shell XAML operation";
+            Debug.WriteLine($"Unhandled XAML exception during '{diagnosticStage}': {e.Exception}");
 
             Exception exceptionWithContext = new InvalidOperationException(
-                $"Unhandled exception during: {calculatorStage}. " +
+                $"Unhandled exception during: {diagnosticStage}. " +
                 $"Original HRESULT: 0x{e.Exception.HResult:X8}.",
                 e.Exception);
 
             try
             {
-                if (Window.Current.Content is Frame rootFrame &&
+                Window currentWindow = Window.Current;
+                if (currentWindow == null)
+                {
+                    Debug.WriteLine("FallbackErrorPage was not shown because this thread has no Window.Current.");
+                    return;
+                }
+
+                if (currentWindow.Content is Frame rootFrame &&
                     !(rootFrame.Content is Views.FallbackErrorPage))
                 {
                     rootFrame.Navigate(typeof(Views.FallbackErrorPage), exceptionWithContext);

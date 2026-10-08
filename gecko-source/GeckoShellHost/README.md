@@ -28,7 +28,7 @@ architecture files, outside the PRI resource index.
 The component is intentionally x64-only, matching the current Gecko object
 directory and the DesktopMode bundle target. NuGet restore supplies
 `Microsoft.Windows.CppWinRT`, which generates the component projection from
-`GeckoHost.idl`.
+`DesktopMode.Gecko.idl`.
 
 Closing the internal window removes it from Task View/taskbar and stops its
 render/input forwarding, but it does not try to tear down XRE. The embedded

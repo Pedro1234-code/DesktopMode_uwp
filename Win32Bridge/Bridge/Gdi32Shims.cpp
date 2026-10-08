@@ -9,6 +9,9 @@
 #include <algorithm>
 #include <cstring>
 #include <limits>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 
 using namespace Win32Bridge::Bridge;
 
@@ -22,6 +25,7 @@ namespace
     {
         return _wcsicmp(library.c_str(), L"gdi32.dll") == 0 ||
             _wcsicmp(library.c_str(), L"gdi32full.dll") == 0 ||
+            _wcsicmp(library.c_str(), L"msimg32.dll") == 0 ||
             _wcsnicmp(library.c_str(), L"api-ms-win-gdi-", 15) == 0;
     }
 
@@ -1258,6 +1262,46 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"setmapmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetMapMode);
     else if (_wcsicmp(symbol.name.c_str(), L"enumfontsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumFontsW);
     else if (_wcsicmp(symbol.name.c_str(), L"createdcw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDCW);
+    else if (_wcsicmp(symbol.name.c_str(), L"setwindoworgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowOrgEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"offsetwindoworgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOffsetWindowOrgEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"dptolp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDPtoLP);
+    else if (_wcsicmp(symbol.name.c_str(), L"setbrushorgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetBrushOrgEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"setstretchbltmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetStretchBltMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"setrop2") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetROP2);
+    else if (_wcsicmp(symbol.name.c_str(), L"getrop2") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetROP2);
+    else if (_wcsicmp(symbol.name.c_str(), L"settextalign") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetTextAlign);
+    else if (_wcsicmp(symbol.name.c_str(), L"createbitmap") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateBitmap);
+    else if (_wcsicmp(symbol.name.c_str(), L"createpatternbrush") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePatternBrush);
+    else if (_wcsicmp(symbol.name.c_str(), L"patblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePatBlt);
+    else if (_wcsicmp(symbol.name.c_str(), L"createrectrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateRectRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"createrectrgnindirect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateRectRgnIndirect);
+    else if (_wcsicmp(symbol.name.c_str(), L"selectcliprgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSelectClipRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"intersectcliprect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIntersectClipRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"excludecliprect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExcludeClipRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcliprgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"combinergn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCombineRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"savedc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSaveDC);
+    else if (_wcsicmp(symbol.name.c_str(), L"restoredc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRestoreDC);
+    else if (_wcsicmp(symbol.name.c_str(), L"rectvisible") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRectVisible);
+    else if (_wcsicmp(symbol.name.c_str(), L"polyline") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePolyline);
+    else if (_wcsicmp(symbol.name.c_str(), L"polygon") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePolygon);
+    else if (_wcsicmp(symbol.name.c_str(), L"roundrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRoundRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"createhatchbrush") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateHatchBrush);
+    else if (_wcsicmp(symbol.name.c_str(), L"extcreatepen") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtCreatePen);
+    else if (_wcsicmp(symbol.name.c_str(), L"exttextoutw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtTextOutW);
+    else if (_wcsicmp(symbol.name.c_str(), L"exttextouta") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtTextOutA);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettextextentpointw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextExtentPointW);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettextextentpoint32a") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextExtentPoint32A);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettextextentexpointw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextExtentExPointW);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettextextentexpointa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextExtentExPointA);
+    else if (_wcsicmp(symbol.name.c_str(), L"stretchblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStretchBlt);
+    else if (_wcsicmp(symbol.name.c_str(), L"gdialphablend") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGdiAlphaBlend);
+    else if (_wcsicmp(symbol.name.c_str(), L"alphablend") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGdiAlphaBlend);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumfontfamiliesexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumFontFamiliesExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createdibsection") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDIBSection);
+    else if (_wcsicmp(symbol.name.c_str(), L"setdibits") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetDIBits);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdibits") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDIBits);
+    else if (_wcsicmp(symbol.name.c_str(), L"stretchdibits") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStretchDIBits);
 
     if (resolution.targetAddress != 0)
     {

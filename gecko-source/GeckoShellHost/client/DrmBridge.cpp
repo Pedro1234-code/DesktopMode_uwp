@@ -8,6 +8,7 @@
 #include <winrt/Windows.Security.Cryptography.h>
 #include <winrt/Windows.Storage.Streams.h>
 
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <thread>
@@ -26,6 +27,7 @@ using winrt::Windows::Security::Cryptography::CryptographicBuffer;
 using winrt::Windows::Storage::Streams::IBuffer;
 
 void (*gReply)(const char*) = nullptr;
+std::atomic<DrmBridge::WindowCommandSink> gWindowCommandSink{nullptr};
 std::mutex gLock;
 // One license-acquisition request per session, kept until the response.
 std::map<std::wstring, PlayReadyLicenseAcquisitionServiceRequest> gRequests;
@@ -255,6 +257,17 @@ void Handle(std::string json) {
       HandleChallenge(id, msg);
     } else if (op == L"drm.response") {
       HandleResponse(id, msg);
+    } else if (op == L"window.minimize" || op == L"window.maximize" ||
+               op == L"window.restore" || op == L"window.close") {
+      int32_t command = 0;
+      if (op == L"window.minimize") command = 1;
+      if (op == L"window.maximize") command = 2;
+      if (op == L"window.restore") command = 3;
+      if (op == L"window.close") command = 4;
+      if (auto sink = gWindowCommandSink.load()) {
+        sink(command);
+        Log::Write(L"window: chrome requested " + op);
+      }
     } else {
       Send(Failure(id, L"unknown op " + op));
     }
@@ -268,6 +281,16 @@ void Handle(std::string json) {
 }  // namespace
 
 void DrmBridge::SetReply(void (*reply)(const char*)) { gReply = reply; }
+
+void DrmBridge::SetWindowCommandSink(WindowCommandSink sink) {
+  gWindowCommandSink.store(sink);
+}
+
+void DrmBridge::DispatchWindowCommand(int32_t command) {
+  if (auto sink = gWindowCommandSink.load()) {
+    sink(command);
+  }
+}
 
 void DrmBridge::OnMessage(const char* json) {
   if (!json) return;

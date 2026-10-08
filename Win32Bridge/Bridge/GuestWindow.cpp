@@ -2729,6 +2729,54 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassW* windowCla
     return RegisterGuestClass(&expanded, win32Error);
 }
 
+BOOL GuestWindowManager::UnregisterGuestClass(LPCWSTR className, HINSTANCE, DWORD* win32Error)
+{
+    if (!className)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::shared_ptr<WindowClass> target;
+    {
+        std::lock_guard<std::mutex> guard(m_classesLock);
+        if (IsAtomPointer(className))
+        {
+            const auto found = m_classesByAtom.find(static_cast<ATOM>(reinterpret_cast<ULONG_PTR>(className)));
+            if (found != m_classesByAtom.end()) target = found->second;
+        }
+        else
+        {
+            const std::wstring key = std::to_wstring(BridgeGetCurrentProcessId()) + L":" + Lowercase(className);
+            const auto found = m_classes.find(key);
+            if (found != m_classes.end()) target = found->second;
+        }
+    }
+    if (!target)
+    {
+        SetWin32Error(win32Error, ERROR_CLASS_DOES_NOT_EXIST);
+        return FALSE;
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        for (const auto& item : m_windows)
+        {
+            std::lock_guard<std::mutex> windowGuard(item.second->lock);
+            if (!item.second->destroyed && item.second->windowClass == target)
+            {
+                SetWin32Error(win32Error, ERROR_CLASS_HAS_WINDOWS);
+                return FALSE;
+            }
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_classesLock);
+        m_classesByAtom.erase(target->atom);
+        m_classes.erase(std::to_wstring(target->processId) + L":" + target->name);
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
 std::shared_ptr<GuestWindowManager::WindowClass> GuestWindowManager::FindClass(LPCWSTR className) const
 {
     if (!className)
@@ -4185,6 +4233,174 @@ int GuestWindowManager::GetGuestWindowTextLength(HWND window, DWORD* win32Error)
 BOOL GuestWindowManager::IsGuestWindow(HWND window) const
 {
     return FindWindow(window) ? TRUE : FALSE;
+}
+
+std::vector<HWND> GuestWindowManager::SnapshotGuestWindows(HWND parent, bool descendants) const
+{
+    std::vector<std::shared_ptr<WindowRecord>> records;
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        records.reserve(m_windows.size());
+        for (const auto& item : m_windows) records.push_back(item.second);
+    }
+    std::vector<HWND> result;
+    for (const auto& record : records)
+    {
+        HWND candidateParent = nullptr;
+        bool alive = false;
+        {
+            std::lock_guard<std::mutex> guard(record->lock);
+            alive = !record->destroyed;
+            candidateParent = record->parent;
+        }
+        if (!alive) continue;
+        const bool matches = parent
+            ? (descendants ? IsGuestWindowDescendantOrSelf(candidateParent, parent)
+                           : candidateParent == parent)
+            : candidateParent == nullptr;
+        if (matches) result.push_back(record->handle);
+    }
+    std::sort(result.begin(), result.end(), [](HWND left, HWND right)
+    {
+        return reinterpret_cast<ULONG_PTR>(left) < reinterpret_cast<ULONG_PTR>(right);
+    });
+    return result;
+}
+
+BOOL GuestWindowManager::IsGuestChild(HWND parent, HWND window) const
+{
+    return parent && window && window != parent && IsGuestWindowDescendantOrSelf(window, parent);
+}
+
+int GuestWindowManager::GetGuestClassName(HWND window, LPWSTR buffer, int count, DWORD* win32Error) const
+{
+    const auto record = FindWindow(window);
+    if (!record || !buffer || count <= 0)
+    {
+        SetWin32Error(win32Error, record ? ERROR_INVALID_PARAMETER : ERROR_INVALID_WINDOW_HANDLE);
+        return 0;
+    }
+    std::wstring name;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed || !record->windowClass)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return 0;
+        }
+        name = record->windowClass->name;
+    }
+    const size_t copied = (std::min)(name.size(), static_cast<size_t>(count - 1));
+    std::memcpy(buffer, name.data(), copied * sizeof(wchar_t));
+    buffer[copied] = L'\0';
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return static_cast<int>(copied);
+}
+
+HWND GuestWindowManager::FindGuestWindowEx(HWND parent, HWND after, LPCWSTR className,
+    LPCWSTR title, DWORD* win32Error) const
+{
+    const auto candidates = SnapshotGuestWindows(parent, false);
+    bool eligible = after == nullptr;
+    for (const HWND candidate : candidates)
+    {
+        if (!eligible)
+        {
+            eligible = candidate == after;
+            continue;
+        }
+        const auto record = FindWindow(candidate);
+        if (!record) continue;
+        std::wstring candidateClass;
+        std::wstring candidateTitle;
+        {
+            std::lock_guard<std::mutex> guard(record->lock);
+            if (record->destroyed) continue;
+            candidateClass = record->windowClass ? record->windowClass->name : L"";
+            candidateTitle = record->title;
+        }
+        const bool classMatches = !className ||
+            (reinterpret_cast<ULONG_PTR>(className) <= 0xffff
+                ? record->windowClass && record->windowClass->atom == LOWORD(reinterpret_cast<ULONG_PTR>(className))
+                : _wcsicmp(candidateClass.c_str(), className) == 0);
+        if (classMatches && (!title || candidateTitle == title))
+        {
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return candidate;
+        }
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return nullptr;
+}
+
+HWND GuestWindowManager::GetGuestWindowRelationship(HWND window, UINT command, DWORD* win32Error) const
+{
+    constexpr UINT GuestGwHwndFirst = 0;
+    constexpr UINT GuestGwHwndLast = 1;
+    constexpr UINT GuestGwHwndNext = 2;
+    constexpr UINT GuestGwHwndPrev = 3;
+    constexpr UINT GuestGwOwner = 4;
+    constexpr UINT GuestGwChild = 5;
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return nullptr;
+    }
+    HWND parent = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        parent = record->parent;
+    }
+    if (command == GuestGwOwner)
+    {
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return parent;
+    }
+    if (command == GuestGwChild)
+    {
+        const auto children = SnapshotGuestWindows(window, false);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return children.empty() ? nullptr : children.front();
+    }
+    if (command == GuestGwHwndFirst || command == GuestGwHwndLast || command == GuestGwHwndNext || command == GuestGwHwndPrev)
+    {
+        const auto siblings = SnapshotGuestWindows(parent, false);
+        const auto found = std::find(siblings.begin(), siblings.end(), window);
+        if (found == siblings.end()) return nullptr;
+        HWND result = nullptr;
+        if (command == GuestGwHwndFirst && !siblings.empty()) result = siblings.front();
+        else if (command == GuestGwHwndLast && !siblings.empty()) result = siblings.back();
+        else if (command == GuestGwHwndNext && std::next(found) != siblings.end()) result = *std::next(found);
+        else if (command == GuestGwHwndPrev && found != siblings.begin()) result = *std::prev(found);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return result;
+    }
+    SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+    return nullptr;
+}
+
+HWND GuestWindowManager::SetGuestParent(HWND window, HWND parent, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record || (parent && !FindWindow(parent)) || WouldCreateParentCycle(window, parent))
+    {
+        SetWin32Error(win32Error, !record ? ERROR_INVALID_WINDOW_HANDLE : ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    HWND previous = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        previous = record->parent;
+        record->parent = parent;
+        if (parent) record->style |= WS_CHILD;
+        else record->style &= ~WS_CHILD;
+    }
+    RECT bounds{};
+    GetGuestWindowRect(window, &bounds, nullptr);
+    InvalidateGuestRect(window, nullptr, TRUE, nullptr);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return previous;
 }
 
 BOOL GuestWindowManager::IsGuestWindowVisible(HWND window, DWORD* win32Error) const

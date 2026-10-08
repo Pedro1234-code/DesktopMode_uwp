@@ -33,6 +33,12 @@ namespace Bridge
     int WINAPI BridgeImageListAddMasked(GuestImageList imageList, HBITMAP bitmap, COLORREF mask);
     int WINAPI BridgeImageListGetImageCount(GuestImageList imageList);
     int WINAPI BridgeImageListReplaceIcon(GuestImageList imageList, int index, HICON icon);
+    BOOL WINAPI BridgeImageListRemove(GuestImageList imageList, int index);
+    BOOL WINAPI BridgeImageListSetIconSize(GuestImageList imageList, int width, int height);
+    BOOL WINAPI BridgeImageListGetIconSize(GuestImageList imageList, int* width, int* height);
+    HICON WINAPI BridgeImageListGetIcon(GuestImageList imageList, int index, UINT flags);
+    BOOL WINAPI BridgeImageListDraw(GuestImageList imageList, int index, HDC dc, int x, int y, UINT style);
+    BOOL WINAPI BridgeImageListGetImageInfo(GuestImageList imageList, int index, void* information);
     bool CopyGuestImageListImage(GuestImageList imageList, int index, MiniGdi::Surface* destination);
     HWND WINAPI BridgeCreateToolbarEx(HWND parent, DWORD style, UINT identifier, int bitmapCount, HINSTANCE instance, UINT_PTR bitmapId, const void* buttons, int buttonCount, int buttonWidth, int buttonHeight, int bitmapWidth, int bitmapHeight, UINT structureSize);
     HWND WINAPI BridgeCreateStatusWindowW(LONG style, LPCWSTR text, HWND parent, UINT identifier);

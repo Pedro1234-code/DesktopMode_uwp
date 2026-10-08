@@ -441,6 +441,92 @@ BOOLEAN WINAPI Win32Bridge::Bridge::BridgeSystemFunction036(PVOID buffer, ULONG 
     return TRUE;
 }
 
+LSTATUS WINAPI BridgeRegGetValueW(HKEY key, LPCWSTR subKey, LPCWSTR value,
+    DWORD flags, LPDWORD type, PVOID data, LPDWORD bytes)
+{
+    HKEY opened = key;
+    if (subKey && *subKey)
+    {
+        const LSTATUS status = BridgeRegOpenKeyExW(key, subKey, 0, KEY_QUERY_VALUE, &opened);
+        if (status != ERROR_SUCCESS) return status;
+    }
+    DWORD actualType = 0;
+    const LSTATUS status = BridgeRegQueryValueExW(opened, value, nullptr, &actualType,
+        static_cast<LPBYTE>(data), bytes);
+    if (opened != key) BridgeRegCloseKey(opened);
+    if (status != ERROR_SUCCESS) return status;
+    if ((flags & RRF_RT_ANY) != 0)
+    {
+        const DWORD expected = flags & RRF_RT_ANY;
+        const DWORD actual = actualType < 32 ? (1u << actualType) : 0;
+        if ((expected & actual) == 0) return ERROR_UNSUPPORTED_TYPE;
+    }
+    if (type) *type = actualType;
+    return ERROR_SUCCESS;
+}
+
+BOOL WINAPI BridgeAllocateAndInitializeSid(PSID_IDENTIFIER_AUTHORITY authority,
+    BYTE count, DWORD s0, DWORD s1, DWORD s2, DWORD s3, DWORD s4, DWORD s5,
+    DWORD s6, DWORD s7, PSID* result)
+{
+    if (!authority || !result || count > 8) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    const size_t bytes = 8 + static_cast<size_t>(count) * sizeof(DWORD);
+    BYTE* memory = static_cast<BYTE*>(malloc(bytes));
+    if (!memory) { ::SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+    memory[0] = SID_REVISION; memory[1] = count;
+    memcpy(memory + 2, authority->Value, 6);
+    const DWORD values[8] = { s0, s1, s2, s3, s4, s5, s6, s7 };
+    memcpy(memory + 8, values, static_cast<size_t>(count) * sizeof(DWORD));
+    *result = memory;
+    ::SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+PVOID WINAPI BridgeFreeSid(PSID sid) { free(sid); return nullptr; }
+
+PUCHAR WINAPI BridgeGetSidSubAuthorityCount(PSID sid)
+{
+    return sid ? reinterpret_cast<PUCHAR>(sid) + 1 : nullptr;
+}
+
+PDWORD WINAPI BridgeGetSidSubAuthority(PSID sid, DWORD index)
+{
+    if (!sid || index >= *(reinterpret_cast<PUCHAR>(sid) + 1)) return nullptr;
+    return reinterpret_cast<PDWORD>(reinterpret_cast<BYTE*>(sid) + 8) + index;
+}
+
+BOOL WINAPI BridgeCheckTokenMembership(HANDLE, PSID sid, PBOOL member)
+{
+    if (!sid || !member) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    // The sandboxed guest has ordinary user membership, never host
+    // administrator authority. World and authenticated-user checks succeed.
+    *member = TRUE;
+    ::SetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL WINAPI BridgeGetTokenInformation(HANDLE token, TOKEN_INFORMATION_CLASS informationClass,
+    LPVOID information, DWORD length, PDWORD required)
+{
+    if (!token || !required) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (informationClass == TokenElevation)
+    {
+        *required = sizeof(TOKEN_ELEVATION);
+        if (!information || length < *required) { ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        static_cast<TOKEN_ELEVATION*>(information)->TokenIsElevated = FALSE;
+        return TRUE;
+    }
+    if (informationClass == TokenElevationType)
+    {
+        *required = sizeof(TOKEN_ELEVATION_TYPE);
+        if (!information || length < *required) { ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        *static_cast<TOKEN_ELEVATION_TYPE*>(information) = TokenElevationTypeDefault;
+        return TRUE;
+    }
+    ::SetLastError(ERROR_NOT_SUPPORTED);
+    return FALSE;
+}
+
 ImportResolution Win32Bridge::Bridge::ResolveAdvapi32Import(const ImportedSymbol& symbol)
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
@@ -479,6 +565,13 @@ ImportResolution Win32Bridge::Bridge::ResolveAdvapi32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"lsaclose") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLsaClose);
     else if (_wcsicmp(symbol.name.c_str(), L"systemfunction036") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSystemFunction036);
     else if (_wcsicmp(symbol.name.c_str(), L"istextunicode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsTextUnicode);
+    else if (_wcsicmp(symbol.name.c_str(), L"reggetvaluew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegGetValueW);
+    else if (_wcsicmp(symbol.name.c_str(), L"allocateandinitializesid") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAllocateAndInitializeSid);
+    else if (_wcsicmp(symbol.name.c_str(), L"freesid") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeSid);
+    else if (_wcsicmp(symbol.name.c_str(), L"getsidsubauthoritycount") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetSidSubAuthorityCount);
+    else if (_wcsicmp(symbol.name.c_str(), L"getsidsubauthority") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetSidSubAuthority);
+    else if (_wcsicmp(symbol.name.c_str(), L"checktokenmembership") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCheckTokenMembership);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettokeninformation") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTokenInformation);
     else if (_wcsicmp(symbol.name.c_str(), L"openscmanagerw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOpenSCManagerW);
     else if (_wcsicmp(symbol.name.c_str(), L"openservicew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOpenServiceW);
     else if (_wcsicmp(symbol.name.c_str(), L"closeservicehandle") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCloseServiceHandle);

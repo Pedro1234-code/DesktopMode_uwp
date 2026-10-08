@@ -258,6 +258,8 @@ void PickDestination() {
             L"DownloadFolderName", box_value(folder.DisplayName()));
         Log::Write(L"download: destination authorised",
                    std::wstring(folder.Path()));
+        Log::Write(L"download: completed files will be exported through the "
+                   L"authorized StorageFolder");
       } catch (winrt::hresult_error const& error) {
         Log::Write(L"download: could not remember destination",
                    std::wstring(error.message()));
@@ -308,7 +310,7 @@ void RequestDestination() {
 
 }  // namespace
 
-void DownloadBroker::Initialize(std::wstring_view localStatePath) {
+std::wstring DownloadBroker::Initialize(std::wstring_view localStatePath) {
   std::call_once(gInitializeOnce, [localState = std::wstring(localStatePath)] {
     gStagingPath = localState + L"\\profile\\download-staging";
     gUploadStagingPath = localState + L"\\profile\\upload-staging";
@@ -321,6 +323,13 @@ void DownloadBroker::Initialize(std::wstring_view localStatePath) {
     Log::Write(L"download: Gecko staging", gStagingPath);
     std::thread(MonitorDownloads).detach();
   });
+
+  Log::Write(HasDestination()
+                 ? L"download: saved destination available; using staging "
+                   L"and brokered export"
+                 : L"download: destination not chosen; using staging",
+             gStagingPath);
+  return gStagingPath;
 }
 
 int32_t DownloadBroker::PickFile(int32_t mode, const char* title,
