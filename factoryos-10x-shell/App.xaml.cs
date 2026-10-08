@@ -189,16 +189,25 @@ namespace factoryos_10x_shell
             throw new Exception("Failed to load Page " + e.SourcePageType.FullName);
         }
 
-        private void OnSuspending(object sender, SuspendingEventArgs e)
+        private async void OnSuspending(object sender, SuspendingEventArgs e)
         {
             var deferral = e.SuspendingOperation.GetDeferral();
-            // TODO: Save application state and stop any background activity
-            deferral.Complete();
+            try
+            {
+                // Give Firefox chrome time to flush its session and profile.
+                // UWP may terminate the process without a later orderly exit.
+                if (Controls.FirefoxWindow.SuspendRuntime())
+                    await Task.Delay(2000);
+            }
+            finally
+            {
+                deferral.Complete();
+            }
         }
 
         private void OnResuming(object sender, object e)
         {
-            // TODO: Restore application state and resume any background activity
+            Controls.FirefoxWindow.ResumeRuntime();
         }
 
 

@@ -177,13 +177,14 @@ namespace factoryos_10x_shell.Services.Helpers
                 if (string.Equals(appId, "CoreShell.Files", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ||
-                    string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase))
+                    string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase))
                 {
                     loaded.Add(new StartIconModel
                     {
                         AppId = appId,
                         IconName = string.IsNullOrWhiteSpace(iconName)
-                            ? (string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ? "Notepad" : string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ? "Settings" : string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ? "Calculator" : "Files")
+                            ? (string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ? "Notepad" : string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ? "Settings" : string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ? "Calculator" : string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase) ? "Firefox" : "Files")
                             : iconName
                     });
                     continue;

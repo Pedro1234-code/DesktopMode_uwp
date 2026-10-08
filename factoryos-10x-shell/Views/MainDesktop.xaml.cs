@@ -57,11 +57,13 @@ namespace factoryos_10x_shell.Views
         private readonly BitmapImage m_notepadIcon = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
         private readonly BitmapImage m_settingsIcon = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
         private readonly BitmapImage m_calculatorIcon = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
+        private readonly BitmapImage m_firefoxIcon = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
 
         private const string FilesWindowIdentity = "CoreShell.Files";
         private const string NotepadWindowIdentity = "CoreShell.Notepad";
         private const string SettingsWindowIdentity = "CoreShell.Settings";
         private const string CalculatorWindowIdentity = "CoreShell.Calculator";
+        private const string FirefoxWindowIdentity = "CoreShell.Firefox";
 
         public MainDesktop()
         {
@@ -119,6 +121,9 @@ namespace factoryos_10x_shell.Views
             AppState.Instance.OnCalculatorRequested += CalculatorRequested;
             AppState.Instance.OnCalculatorStateChanged += CalculatorStateChanged;
             AppState.Instance.OnCalculatorActivated += CalculatorActivated;
+            AppState.Instance.OnFirefoxRequested += FirefoxRequested;
+            AppState.Instance.OnFirefoxStateChanged += FirefoxStateChanged;
+            AppState.Instance.OnFirefoxActivated += FirefoxActivated;
             AppState.Instance.OnWallpaperRequested += SetWallpaper;
             m_windowManager.WindowsChanged += WebWindowsChanged;
             TaskViewGrid.ItemsSource = m_shellWindowCoordinator.Windows;
@@ -169,6 +174,13 @@ namespace factoryos_10x_shell.Views
             ActivateShellWindow(ShellWindowKind.Calculator, CalculatorWindowIdentity);
         }
 
+        private void FirefoxRequested() => FirefoxWindow.Open();
+
+        private void FirefoxActivated()
+        {
+            ActivateShellWindow(ShellWindowKind.Firefox, FirefoxWindowIdentity);
+        }
+
         private void WebWindowsChanged(object sender, EventArgs e)
         {
             if (m_coordinatingActivation) return;
@@ -214,6 +226,12 @@ namespace factoryos_10x_shell.Views
         }
 
         private void CalculatorStateChanged()
+        {
+            SynchronizeShellWindows();
+            RestoreMostRecentWindow();
+        }
+
+        private void FirefoxStateChanged()
         {
             SynchronizeShellWindows();
             RestoreMostRecentWindow();
@@ -280,6 +298,8 @@ namespace factoryos_10x_shell.Views
                     return AppState.Instance.IsSettingsOpen;
                 case ShellWindowKind.Calculator:
                     return AppState.Instance.IsCalculatorOpen;
+                case ShellWindowKind.Firefox:
+                    return AppState.Instance.IsFirefoxOpen;
                 default:
                     return false;
             }
@@ -303,6 +323,8 @@ namespace factoryos_10x_shell.Views
                     return !AppState.Instance.IsSettingsMinimized;
                 case ShellWindowKind.Calculator:
                     return !AppState.Instance.IsCalculatorMinimized;
+                case ShellWindowKind.Firefox:
+                    return !AppState.Instance.IsFirefoxMinimized;
                 default:
                     return false;
             }
@@ -330,6 +352,9 @@ namespace factoryos_10x_shell.Views
                 case ShellWindowKind.Calculator:
                     AppState.Instance.RequestCalculatorOpen();
                     break;
+                case ShellWindowKind.Firefox:
+                    AppState.Instance.RequestFirefoxOpen();
+                    break;
             }
         }
 
@@ -341,6 +366,8 @@ namespace factoryos_10x_shell.Views
             Canvas.SetZIndex(NotepadWindowHost, activeKind == ShellWindowKind.Notepad ? 2 : 1);
             Canvas.SetZIndex(SettingsWindowHost, activeKind == ShellWindowKind.Settings ? 2 : 1);
             Canvas.SetZIndex(CalculatorWindowHost, activeKind == ShellWindowKind.Calculator ? 2 : 1);
+            Canvas.SetZIndex(FirefoxWindowHost, activeKind == ShellWindowKind.Firefox ? 2 : 1);
+            FirefoxWindow.SetWindowActive(activeKind == ShellWindowKind.Firefox);
         }
 
         private void SynchronizeShellWindows()
@@ -417,6 +444,16 @@ namespace factoryos_10x_shell.Views
                 m_calculatorIcon,
                 AppState.Instance.IsCalculatorOpen,
                 AppState.Instance.IsCalculatorMinimized);
+            AddBuiltInWindowDescriptor(
+                descriptors,
+                ShellWindowKind.Firefox,
+                FirefoxWindowIdentity,
+                "Firefox",
+                "Web browser",
+                "\uE774",
+                m_firefoxIcon,
+                AppState.Instance.IsFirefoxOpen,
+                AppState.Instance.IsFirefoxMinimized);
 
             m_shellWindowCoordinator.Synchronize(descriptors);
             TaskViewEmptyState.Visibility = descriptors.Count == 0
@@ -550,6 +587,9 @@ namespace factoryos_10x_shell.Views
                 case ShellWindowKind.Calculator:
                     AppState.Instance.RequestCalculatorOpen();
                     break;
+                case ShellWindowKind.Firefox:
+                    AppState.Instance.RequestFirefoxOpen();
+                    break;
             }
         }
 
@@ -576,6 +616,9 @@ namespace factoryos_10x_shell.Views
                     break;
                 case ShellWindowKind.Calculator:
                     CalculatorWindow.CloseFromTaskView();
+                    break;
+                case ShellWindowKind.Firefox:
+                    FirefoxWindow.CloseFromTaskView();
                     break;
             }
         }
@@ -740,8 +783,10 @@ namespace factoryos_10x_shell.Views
 
         private void UpdateNativeInputSuppression()
         {
-            m_nativeWindowManager.SetInputSuppressed(
-                m_windowManager.IsTaskViewOpen || m_startManager.IsStartOpen || m_actionManager.IsActionCenterOpen);
+            bool suppressed = m_windowManager.IsTaskViewOpen ||
+                m_startManager.IsStartOpen || m_actionManager.IsActionCenterOpen;
+            m_nativeWindowManager.SetInputSuppressed(suppressed);
+            FirefoxWindow.SetShellInputSuppressed(suppressed);
         }
     }
 }

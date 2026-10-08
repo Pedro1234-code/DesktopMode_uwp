@@ -1,0 +1,17 @@
+namespace DesktopMode.Gecko
+{
+    runtimeclass GeckoHost
+    {
+        GeckoHost();
+
+        Windows.UI.Xaml.UIElement Content{ get; };
+        Boolean IsStarted{ get; };
+
+        void Start(Double width, Double height);
+        void SetViewport(Double width, Double height);
+        void SetActive(Boolean active);
+        void OpenUrl(String url);
+        void Suspend();
+        void Resume();
+    }
+}

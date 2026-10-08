@@ -71,6 +71,15 @@ namespace factoryos_10x_shell.Library.ViewModels
             calculatorIcon.IconGlyph = null;
             calculatorIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
 
+            StartIconModel firefoxIcon = m_appHelper.StartIcons.FirstOrDefault(app => app.AppId == "CoreShell.Firefox");
+            if (firefoxIcon == null)
+            {
+                firefoxIcon = new StartIconModel { AppId = "CoreShell.Firefox", IconName = "Firefox" };
+                m_appHelper.StartIcons.Insert(4, firefoxIcon);
+            }
+            firefoxIcon.IconGlyph = null;
+            firefoxIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
+
             AppsListGridHeight = 310;
             AppsListToggleContent = "Show all";
         }

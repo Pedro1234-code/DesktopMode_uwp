@@ -60,6 +60,8 @@
   </Applications>
   <Capabilities>
     <Capability Name="internetClient" />
+    <Capability Name="internetClientServer" />
+    <Capability Name="privateNetworkClientServer" />
     <rescap:Capability Name="codeGeneration" />
     <uap3:Capability Name="userNotificationListener"/>
     <rescap:Capability Name="packageQuery" />
@@ -72,6 +74,10 @@
     <rescap:Capability Name="inputInjectionBrokered" />
     <uap4:Capability Name="userDataTasks"/>
     <uap:Capability Name="userAccountInformation"/>
+    <uap:Capability Name="picturesLibrary"/>
     <DeviceCapability Name="bluetooth"/>
+    <DeviceCapability Name="microphone"/>
+    <DeviceCapability Name="webcam"/>
+    <DeviceCapability Name="location"/>
   </Capabilities>
 </Package>

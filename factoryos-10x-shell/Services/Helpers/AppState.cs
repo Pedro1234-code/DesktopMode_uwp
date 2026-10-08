@@ -131,5 +131,20 @@ namespace factoryos_10x_shell.Services.Helpers
             OnCalculatorStateChanged?.Invoke();
         }
         public void ActivateCalculator() => OnCalculatorActivated?.Invoke();
+
+        public bool IsFirefoxOpen { get; private set; }
+        public bool IsFirefoxMinimized { get; private set; }
+        public event Action OnFirefoxRequested;
+        public event Action OnFirefoxStateChanged;
+        public event Action OnFirefoxActivated;
+
+        public void RequestFirefoxOpen() => OnFirefoxRequested?.Invoke();
+        public void SetFirefoxWindowState(bool isOpen, bool isMinimized)
+        {
+            IsFirefoxOpen = isOpen;
+            IsFirefoxMinimized = isMinimized;
+            OnFirefoxStateChanged?.Invoke();
+        }
+        public void ActivateFirefox() => OnFirefoxActivated?.Invoke();
     }
 }

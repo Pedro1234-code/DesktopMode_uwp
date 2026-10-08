@@ -1,0 +1,136 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{A7E7C4B1-D5A8-4D51-8E74-C8F860A6F113}</ProjectGuid>
+    <Keyword>WindowsRuntimeComponent</Keyword>
+    <RootNamespace>DesktopMode.Gecko</RootNamespace>
+    <ProjectName>DesktopMode.Gecko</ProjectName>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <MinimumVisualStudioVersion>15.0</MinimumVisualStudioVersion>
+    <AppContainerApplication>true</AppContainerApplication>
+    <ApplicationType>Windows Store</ApplicationType>
+    <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformMinVersion>10.0.18362.0</WindowsTargetPlatformMinVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v145</PlatformToolset>
+    <CppWinRTProjectLanguage>C++/WinRT</CppWinRTProjectLanguage>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
+    <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
+    <WholeProgramOptimization Condition="'$(Configuration)'=='Release'">true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <RestoreProjectStyle>PackageReference</RestoreProjectStyle>
+    <GeckoW10mObj Condition="'$(GeckoW10mObj)'==''">C:\rw-obj</GeckoW10mObj>
+    <GeckoW10mSource Condition="'$(GeckoW10mSource)'==''">C:\firefox-source\engine\firefox</GeckoW10mSource>
+    <GeckoW10mClangCl Condition="'$(GeckoW10mClangCl)'==''">C:\Program Files\LLVM\bin\clang-cl.exe</GeckoW10mClangCl>
+    <CppWinRTOptimized>true</CppWinRTOptimized>
+    <CppWinRTRootNamespaceAutoMerge>true</CppWinRTRootNamespaceAutoMerge>
+    <CppWinRTGenerateWindowsMetadata>true</CppWinRTGenerateWindowsMetadata>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'=='Debug'">
+    <GeckoW10mBootstrapFlags>/Od /MDd /D_DEBUG /D_ITERATOR_DEBUG_LEVEL=2</GeckoW10mBootstrapFlags>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)'!='Debug'">
+    <GeckoW10mBootstrapFlags>/O2 /MD /DNDEBUG /D_ITERATOR_DEBUG_LEVEL=0</GeckoW10mBootstrapFlags>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp17</LanguageStandard>
+      <PrecompiledHeader>Use</PrecompiledHeader>
+      <PrecompiledHeaderFile>pch.h</PrecompiledHeaderFile>
+      <AdditionalIncludeDirectories>$(ProjectDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_WINRT_DLL;GECKO_W10M;NOMINMAX;_CRT_SECURE_NO_WARNINGS;_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalOptions>/bigobj %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(GeckoW10mObj)\dist\lib;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>mozglue.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <Midl Include="GeckoHost.idl" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="pch.h" />
+    <ClInclude Include="GeckoHost.h" />
+    <ClInclude Include="client\DownloadBroker.h" />
+    <ClInclude Include="client\DrmBridge.h" />
+    <ClInclude Include="client\EngineView.h" />
+    <ClInclude Include="client\Log.h" />
+    <ClInclude Include="engine\GeckoRuntimeHost.h" />
+    <ClInclude Include="engine\OverlayProbe.h" />
+    <ClInclude Include="engine\gecko_bootstrap.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="pch.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="GeckoHost.cpp" />
+    <ClCompile Include="client\DownloadBroker.cpp" />
+    <ClCompile Include="client\DrmBridge.cpp" />
+    <ClCompile Include="client\EngineView.cpp" />
+    <ClCompile Include="client\Log.cpp" />
+    <ClCompile Include="engine\GeckoRuntimeHost.cpp" />
+    <ClCompile Include="engine\OverlayProbe.cpp" />
+    <CustomBuild Include="engine\gecko_bootstrap.cpp">
+      <Command>"$(GeckoW10mClangCl)" --target=x86_64-pc-windows-msvc /nologo /c "%(FullPath)" /Fo:"$(IntDir)gecko_bootstrap_$(Configuration).obj" /std:c++20 /EHs-c- /GR- $(GeckoW10mBootstrapFlags) /Zl /utf-8 /DWIN32 /D_WIN32 /DWIN64 /DNOMINMAX /DUNICODE /D_UNICODE /DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP /DXP_WIN /DGECKO_W10M=1 /I"$(GeckoW10mObj)\dist\include" /I"$(GeckoW10mSource)\toolkit\components\startup"</Command>
+      <Outputs>$(IntDir)gecko_bootstrap_$(Configuration).obj</Outputs>
+      <AdditionalInputs>$(GeckoW10mObj)\dist\include\mozilla-config.h;%(AdditionalInputs)</AdditionalInputs>
+      <Message>Compiling embedded Gecko bootstrap with clang-cl</Message>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="$(GeckoW10mObj)\dist\bin\**\*">
+      <Link>%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <DeploymentContent>false</DeploymentContent>
+    </None>
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.Windows.CppWinRT" Version="3.0.260818.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <SDKReference Include="Microsoft.VCLibs.Desktop, Version=14.0" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <PropertyGroup>
+    <BuiltProjectOutputGroupDependsOn>
+      $(BuiltProjectOutputGroupDependsOn);
+      CollectGeckoRuntimeOutputs
+    </BuiltProjectOutputGroupDependsOn>
+  </PropertyGroup>
+  <Target Name="CollectGeckoRuntimeOutputs">
+    <ItemGroup>
+      <_GeckoRuntimeFile Include="$(GeckoW10mObj)\dist\bin\**\*" Exclude="$(GeckoW10mObj)\dist\bin\application.ini" />
+      <_GeckoApplicationIni Include="$(GeckoW10mObj)\dist\bin\application.ini" />
+      <_BuiltProjectOutputGroupOutputIntermediate Include="@(_GeckoRuntimeFile->'%(FullPath)')">
+        <FinalOutputPath>%(_GeckoRuntimeFile.FullPath)</FinalOutputPath>
+        <TargetPath>%(_GeckoRuntimeFile.RecursiveDir)%(_GeckoRuntimeFile.Filename)%(_GeckoRuntimeFile.Extension)</TargetPath>
+      </_BuiltProjectOutputGroupOutputIntermediate>
+      <_BuiltProjectOutputGroupOutputIntermediate Include="@(_GeckoApplicationIni->'%(FullPath)')">
+        <FinalOutputPath>%(_GeckoApplicationIni.FullPath)</FinalOutputPath>
+        <TargetPath>application.ini</TargetPath>
+      </_BuiltProjectOutputGroupOutputIntermediate>
+      <_BuiltProjectOutputGroupOutputIntermediate Include="@(_GeckoApplicationIni->'%(FullPath)')" KeepDuplicates="true">
+        <FinalOutputPath>%(_GeckoApplicationIni.FullPath)</FinalOutputPath>
+        <TargetPath>browser\application.ini</TargetPath>
+      </_BuiltProjectOutputGroupOutputIntermediate>
+    </ItemGroup>
+  </Target>
+</Project>

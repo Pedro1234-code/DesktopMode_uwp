@@ -91,6 +91,12 @@ namespace factoryos_10x_shell.Views
                     startManager.RequestStartVisibilityChange(false);
                     return;
                 }
+                if (model.AppId == "CoreShell.Firefox")
+                {
+                    AppState.Instance.RequestFirefoxOpen();
+                    startManager.RequestStartVisibilityChange(false);
+                    return;
+                }
                 await appHelper.LaunchAppAsync(model);
 
             }

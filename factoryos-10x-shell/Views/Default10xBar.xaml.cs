@@ -95,6 +95,7 @@ namespace factoryos_10x_shell.Views
             AppState.Instance.OnNotepadStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnSettingsStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnCalculatorStateChanged += RefreshInternalTaskbar;
+            AppState.Instance.OnFirefoxStateChanged += RefreshInternalTaskbar;
             _shellWindowCoordinator.StateChanged += (s, args) => RefreshInternalTaskbar();
             RefreshOpenWebApps();
             RefreshPinnedWebApps();
@@ -157,6 +158,10 @@ namespace factoryos_10x_shell.Views
                 {
                     stack.Children.Add(CreateCalculatorIcon(25));
                 }
+                else if (app.AppId == "CoreShell.Firefox")
+                {
+                    stack.Children.Add(CreateFirefoxIcon(26));
+                }
                 else
                 {
                     stack.Children.Add(new Image { Width = 32, Height = 32, Source = app.IconSource });
@@ -186,6 +191,11 @@ namespace factoryos_10x_shell.Views
                         if (model.AppId == "CoreShell.Calculator")
                         {
                             AppState.Instance.RequestCalculatorOpen();
+                            return;
+                        }
+                        if (model.AppId == "CoreShell.Firefox")
+                        {
+                            AppState.Instance.RequestFirefoxOpen();
                             return;
                         }
                         bool launched = await _appHelper.LaunchAppAsync(model);
@@ -372,6 +382,8 @@ namespace factoryos_10x_shell.Views
 
         private static Image CreateCalculatorIcon(double size) => new Image { Source = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png")), Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
 
+        private static Image CreateFirefoxIcon(double size) => new Image { Source = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png")), Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
+
         private void RefreshInternalTaskbar()
         {
             RefreshFilesTaskbar();
@@ -383,12 +395,14 @@ namespace factoryos_10x_shell.Views
             bool isOpen = (appId == "CoreShell.Files" && AppState.Instance.IsFilesOpen)
                 || (appId == "CoreShell.Notepad" && AppState.Instance.IsNotepadOpen)
                 || (appId == "CoreShell.Settings" && AppState.Instance.IsSettingsOpen)
-                || (appId == "CoreShell.Calculator" && AppState.Instance.IsCalculatorOpen);
+                || (appId == "CoreShell.Calculator" && AppState.Instance.IsCalculatorOpen)
+                || (appId == "CoreShell.Firefox" && AppState.Instance.IsFirefoxOpen);
 
             bool isActive = (appId == "CoreShell.Files" && _shellWindowCoordinator.IsActive(ShellWindowKind.Files, appId))
                 || (appId == "CoreShell.Notepad" && _shellWindowCoordinator.IsActive(ShellWindowKind.Notepad, appId))
                 || (appId == "CoreShell.Settings" && _shellWindowCoordinator.IsActive(ShellWindowKind.Settings, appId))
-                || (appId == "CoreShell.Calculator" && _shellWindowCoordinator.IsActive(ShellWindowKind.Calculator, appId));
+                || (appId == "CoreShell.Calculator" && _shellWindowCoordinator.IsActive(ShellWindowKind.Calculator, appId))
+                || (appId == "CoreShell.Firefox" && _shellWindowCoordinator.IsActive(ShellWindowKind.Firefox, appId));
 
             return isOpen
                 ? new SolidColorBrush(Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180))
@@ -430,6 +444,13 @@ namespace factoryos_10x_shell.Views
                 ToolTipService.SetToolTip(calculatorButton, "Calculator");
                 calculatorButton.Click += (sender, args) => AppState.Instance.RequestCalculatorOpen();
                 OpenFilesPanel.Children.Add(calculatorButton);
+            }
+            if (AppState.Instance.IsFirefoxOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Firefox"))
+            {
+                var firefoxButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Firefox"), Content = CreateFirefoxIcon(26) };
+                ToolTipService.SetToolTip(firefoxButton, "Firefox");
+                firefoxButton.Click += (sender, args) => AppState.Instance.RequestFirefoxOpen();
+                OpenFilesPanel.Children.Add(firefoxButton);
             }
         }
         private void UpdateSearchButtonVisibility(bool isVisible)

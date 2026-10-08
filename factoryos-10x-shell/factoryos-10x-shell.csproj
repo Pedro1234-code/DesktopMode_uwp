@@ -149,6 +149,9 @@
     <Compile Include="Controls\CalculatorWindow.xaml.cs">
       <DependentUpon>CalculatorWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Controls\FirefoxWindow.xaml.cs">
+      <DependentUpon>FirefoxWindow.xaml</DependentUpon>
+    </Compile>
     <Compile Include="Controls\WebAppWindow.xaml.cs">
       <DependentUpon>WebAppWindow.xaml</DependentUpon>
     </Compile>
@@ -297,6 +300,7 @@
     <Content Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
     <Content Include="Assets\Files\files.png" />
+    <Content Include="Assets\Firefox\firefox.png" />
     <Content Include="Assets\Notepad\notepad.png" />
     <Content Include="..\Win32Bridge\GuestApps\notepad.exe">
       <Link>GuestRuntimeDefaults\Windows\notepad.exe</Link>
@@ -354,6 +358,10 @@
       <Generator>MSBuild:Compile</Generator>
     </Page>
     <Page Include="Controls\CalculatorWindow.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
+    <Page Include="Controls\FirefoxWindow.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
@@ -451,6 +459,14 @@
       <Project>{4fc5183e-e778-46d3-b30c-012b98d294a9}</Project>
       <Name>Win32Bridge.Runtime</Name>
     </ProjectReference>
+    <ProjectReference Include="..\gecko-source\GeckoShellHost\GeckoShellHost.vcxproj">
+      <Project>{a7e7c4b1-d5a8-4d51-8e74-c8f860a6f113}</Project>
+      <Name>DesktopMode.Gecko</Name>
+      <SkipGetTargetFrameworkProperties>true</SkipGetTargetFrameworkProperties>
+    </ProjectReference>
+  </ItemGroup>
+  <ItemGroup>
+    <SDKReference Include="Microsoft.VCLibs.Desktop, Version=14.0" />
   </ItemGroup>
   <ItemGroup>
     <AppxManifest Include="Package.appxmanifest">

@@ -77,6 +77,9 @@
         <Canvas x:Name="CalculatorWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
             <controls:CalculatorWindow x:Name="CalculatorWindow" Canvas.Left="185" Canvas.Top="70" Visibility="Collapsed" />
         </Canvas>
+        <Canvas x:Name="FirefoxWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
+            <controls:FirefoxWindow x:Name="FirefoxWindow" Canvas.Left="70" Canvas.Top="25" Visibility="Collapsed" />
+        </Canvas>
         <Grid
             x:Name="TaskViewOverlay"
             Margin="0,0,0,50"
