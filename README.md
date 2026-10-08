@@ -69,6 +69,8 @@ Credits to Wine for concept and code used as reference.
 
 Credits to https://github.com/Futur3Sn0w/Windows10x for inspiration and some Icons from there.
 
+Credits to https://github.com/files-community/files/ for Icons and UI for Files internal app.
+
 AI was used in the making of this project.
 
 Distributed under the [MIT License](LICENSE).
