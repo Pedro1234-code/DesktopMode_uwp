@@ -132,6 +132,9 @@
   </PropertyGroup>
   <Target Name="CollectGeckoRuntimeOutputs">
     <ItemGroup>
+      <!-- Keep the complete Gecko runtime payload.  XRE expects the launcher
+           and helper images to be present even though the embedded host does
+           not invoke them directly. -->
       <_GeckoRuntimeFile Include="$(GeckoW10mObj)\dist\bin\**\*" Exclude="$(GeckoW10mObj)\dist\bin\application.ini" />
       <_GeckoApplicationIni Include="$(GeckoW10mObj)\dist\bin\application.ini" />
       <_BuiltProjectOutputGroupOutputIntermediate Include="@(_GeckoRuntimeFile->'%(FullPath)')">

@@ -19,7 +19,9 @@ namespace factoryos_10x_shell.Controls
 {
     public sealed partial class SettingsWindow : UserControl
     {
-        private bool m_dragging, m_resizing, m_maximized, m_initializing;
+        private bool m_dragging, m_resizing, m_maximized;
+        private WindowResizeCorner m_resizeCorner;
+        private bool m_initializing = true;
         private Point m_startPoint;
         private double m_startLeft, m_startTop, m_startWidth, m_startHeight;
         private double m_restoreLeft, m_restoreTop, m_restoreWidth, m_restoreHeight;
@@ -27,11 +29,10 @@ namespace factoryos_10x_shell.Controls
         public SettingsWindow()
         {
             InitializeComponent();
-            m_initializing = true;
-            SearchToggle.IsOn = AppState.Instance.IsSearchButtonVisible;
-            CopilotToggle.IsOn = AppState.Instance.IsCopilotButtonVisible;
             BackgroundToggle.IsOn = AppState.Instance.IsBgChangeButtonVisible;
             Win32SupportToggle.IsOn = Win32WindowManagerService.Instance.IsAppSupportEnabled;
+            AutomaticUpdateCheckToggle.IsOn = UpdateCheckService.IsAutomaticCheckEnabled;
+            CurrentVersionText.Text = UpdateCheckService.CurrentVersion.ToString();
             m_initializing = false;
             PopulateDeviceInformation();
         }
@@ -56,9 +57,9 @@ namespace factoryos_10x_shell.Controls
         private void TitleBar_PointerPressed(object sender, PointerRoutedEventArgs e) { if (m_maximized) return; m_dragging = true; m_startPoint = e.GetCurrentPoint(VisualTreeHelper.GetParent(this) as UIElement).Position; m_startLeft = Canvas.GetLeft(this); m_startTop = Canvas.GetTop(this); TitleBar.CapturePointer(e.Pointer); }
         private void TitleBar_PointerMoved(object sender, PointerRoutedEventArgs e) { if (!m_dragging) return; Point p = e.GetCurrentPoint(VisualTreeHelper.GetParent(this) as UIElement).Position; Canvas.SetLeft(this, Math.Max(0, m_startLeft + p.X - m_startPoint.X)); Canvas.SetTop(this, Math.Max(0, m_startTop + p.Y - m_startPoint.Y)); }
         private void TitleBar_PointerReleased(object sender, PointerRoutedEventArgs e) { m_dragging = false; TitleBar.ReleasePointerCaptures(); }
-        private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e) { if (!m_maximized) { m_resizing = true; m_startPoint = e.GetCurrentPoint(this).Position; m_startWidth = Width; m_startHeight = Height; ResizeGrip.CapturePointer(e.Pointer); } }
-        private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e) { if (m_resizing) { Point p = e.GetCurrentPoint(this).Position; Width = Math.Max(720, m_startWidth + p.X - m_startPoint.X); Height = Math.Max(480, m_startHeight + p.Y - m_startPoint.Y); } }
-        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; ResizeGrip.ReleasePointerCaptures(); }
+        private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e) { if (!m_maximized) { m_resizing = true; m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag); m_startPoint = e.GetCurrentPoint(null).Position; m_startLeft = Canvas.GetLeft(this); m_startTop = Canvas.GetTop(this); m_startWidth = Width; m_startHeight = Height; (sender as UIElement)?.CapturePointer(e.Pointer); } }
+        private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e) { if (m_resizing) { Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint, e.GetCurrentPoint(null).Position, new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 720, 480); Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y); Width = bounds.Width; Height = bounds.Height; } }
+        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; (sender as UIElement)?.ReleasePointerCaptures(); }
 
         private void System_Click(object sender, RoutedEventArgs e) { OpenDetail("System", "About"); }
         private void Personalization_Click(object sender, RoutedEventArgs e) { OpenDetail("Personalization", "Background"); }
@@ -134,7 +135,37 @@ namespace factoryos_10x_shell.Controls
             ForDevelopersPanel.Visibility = page == "For developers" ? Visibility.Visible : Visibility.Collapsed;
             DetailTitle.Text = page;
         }
-        private void CheckForUpdates_Click(object sender, RoutedEventArgs e) => UpdateStatusText.Text = "Update checks are not available yet in CoreShell.";
+        private async void CheckForUpdates_Click(object sender, RoutedEventArgs e)
+        {
+            CheckForUpdatesButton.IsEnabled = false;
+            UpdateStatusText.Text = "Checking for updates...";
+            try
+            {
+                UpdateCheckResult result = await UpdateCheckService.CheckAsync(true);
+                switch (result.Status)
+                {
+                    case UpdateCheckStatus.UpdateAvailable:
+                        UpdateStatusText.Text = string.Format("Version {0} is available.", result.AvailableVersion);
+                        break;
+                    case UpdateCheckStatus.UpToDate:
+                        UpdateStatusText.Text = "You're up to date.";
+                        break;
+                    default:
+                        UpdateStatusText.Text = "We couldn't check for updates. Check your internet connection and try again.";
+                        break;
+                }
+            }
+            finally
+            {
+                CheckForUpdatesButton.IsEnabled = true;
+            }
+        }
+
+        private void AutomaticUpdateCheckToggle_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!m_initializing)
+                UpdateCheckService.IsAutomaticCheckEnabled = AutomaticUpdateCheckToggle.IsOn;
+        }
 
         private async void DismissOnScreenKeyboard()
         {
@@ -221,8 +252,6 @@ namespace factoryos_10x_shell.Controls
             ApplicationData.Current.LocalSettings.Values["CoreShell.AccentColor"] = color;
         }
         private void LauncherSize_Click(object sender, RoutedEventArgs e) => ApplicationData.Current.LocalSettings.Values["CoreShell.LauncherSize"] = (sender as FrameworkElement)?.Tag as string;
-        private void SearchToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) { AppState.Instance.IsSearchButtonVisible = SearchToggle.IsOn; ApplicationData.Current.LocalSettings.Values["IsSearchButtonVisible"] = SearchToggle.IsOn; } }
-        private void CopilotToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) { AppState.Instance.IsCopilotButtonVisible = CopilotToggle.IsOn; ApplicationData.Current.LocalSettings.Values["IsCopilotButtonVisible"] = CopilotToggle.IsOn; } }
         private void BackgroundToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) { AppState.Instance.IsBgChangeButtonVisible = BackgroundToggle.IsOn; ApplicationData.Current.LocalSettings.Values["IsBgChangeButtonVisible"] = BackgroundToggle.IsOn; } }
         private void Win32SupportToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) Win32WindowManagerService.Instance.IsAppSupportEnabled = Win32SupportToggle.IsOn; }
     }

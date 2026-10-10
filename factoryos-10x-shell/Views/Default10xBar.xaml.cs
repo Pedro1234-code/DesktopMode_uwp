@@ -55,12 +55,6 @@ namespace factoryos_10x_shell.Views
             _nativeWindowManager = Win32WindowManagerService.Instance;
             _shellWindowCoordinator = App.ServiceProvider.GetRequiredService<ShellWindowCoordinator>();
 
-            AppState.Instance.OnSearchButtonVisibilityChanged += UpdateSearchButtonVisibility;
-            AppState.Instance.OnCopilotButtonVisibilityChanged += UpdateCopilotButtonVisibility;
-
-            UpdateSearchButtonVisibility(AppState.Instance.IsSearchButtonVisible);
-            UpdateCopilotButtonVisibility(AppState.Instance.IsCopilotButtonVisible);
-
             Loaded += Default10xBar_Loaded; // Chamada após a view estar carregada
         }
 
@@ -451,33 +445,6 @@ namespace factoryos_10x_shell.Views
                 ToolTipService.SetToolTip(firefoxButton, "Firefox");
                 firefoxButton.Click += (sender, args) => AppState.Instance.RequestFirefoxOpen();
                 OpenFilesPanel.Children.Add(firefoxButton);
-            }
-        }
-        private void UpdateSearchButtonVisibility(bool isVisible)
-        {
-            SearchButton.Visibility = isVisible ? Visibility.Visible : Visibility.Collapsed;
-        }
-
-        private void UpdateCopilotButtonVisibility(bool isVisible)
-        {
-            CopilotButton.Visibility = isVisible ? Visibility.Visible : Visibility.Collapsed;
-        }
-
-        private async void CopilotButton_Click(object sender, RoutedEventArgs e)
-        {
-            var packageFamilyName = "MobileOSdev.CopilotPWA_d7x680j9yw8bm";
-            var pm = new Windows.Management.Deployment.PackageManager();
-            var packages = pm.FindPackagesForUser(string.Empty, packageFamilyName);
-
-            var foundPackage = packages.FirstOrDefault();
-            if (foundPackage != null)
-            {
-                var appListEntries = await foundPackage.GetAppListEntriesAsync();
-                var entry = appListEntries.FirstOrDefault();
-                if (entry != null)
-                {
-                    bool success = await entry.LaunchAsync();
-                }
             }
         }
     }

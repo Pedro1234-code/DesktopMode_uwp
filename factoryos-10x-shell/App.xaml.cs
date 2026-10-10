@@ -12,6 +12,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.ServiceModel.Channels;
 using System.Threading.Tasks;
@@ -51,19 +52,18 @@ namespace factoryos_10x_shell
         [Obsolete]
         public App()
         {
+            // The embedded Gecko package contains native helper images whose
+            // base names (firefox, xpcshell, certutil, etc.) can be presented
+            // to CoreCLR's assembly resolver while it scans the AppX root.
+            // They are not managed dependencies and must never be loaded as
+            // assemblies. Returning null here lets the native loader handle
+            // them while avoiding repeated managed load attempts.
+            AppDomain.CurrentDomain.AssemblyResolve += IgnoreNativeGeckoAssemblyProbe;
             this.InitializeComponent();
             this.UnhandledException += OnUnhandledException;
             this.Suspending += OnSuspending;
             this.Resuming += OnResuming;
             ApplicationView.PreferredLaunchWindowingMode = ApplicationViewWindowingMode.FullScreen;
-            if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey("IsSearchButtonVisible"))
-            {
-                AppState.Instance.IsSearchButtonVisible = (bool)Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsSearchButtonVisible"];
-            }
-            if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey("IsCopilotButtonVisible"))
-            {
-                AppState.Instance.IsCopilotButtonVisible = (bool)Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsCopilotButtonVisible"];
-            }
             if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey("IsBgChangeButtonVisible"))
             {
                 AppState.Instance.IsBgChangeButtonVisible = (bool)Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsBgChangeButtonVisible"];
@@ -73,17 +73,36 @@ namespace factoryos_10x_shell
 
         }
 
+        private static Assembly IgnoreNativeGeckoAssemblyProbe(object sender, ResolveEventArgs args)
+        {
+            string simpleName = args?.Name;
+            if (!string.IsNullOrEmpty(simpleName))
+            {
+                int comma = simpleName.IndexOf(',');
+                if (comma >= 0)
+                    simpleName = simpleName.Substring(0, comma);
+
+                switch (simpleName.Trim().ToLowerInvariant())
+                {
+                    case "firefox":
+                    case "certutil":
+                    case "default-browser-agent":
+                    case "nmhproxy":
+                    case "pingsender":
+                    case "pk12util":
+                    case "plugin-container":
+                    case "xpcshell":
+                        return null;
+                }
+            }
+
+            return null;
+        }
+
         protected async override void OnLaunched(LaunchActivatedEventArgs e)
         {
             ConfigureServices();
             PreloadServices();
-            await new RuntimeHost().EnsureDriveRootAsync();
-            IAppHelper appHelper = ServiceProvider.GetRequiredService<IAppHelper>();
-            IBluetoothService btService = ServiceProvider.GetRequiredService<IBluetoothService>();
-
-            await btService.InitializeAsync();
-            await appHelper.LoadAppsAsync();
-            await ServiceProvider.GetRequiredService<IWebAppService>().InitializeAsync();
 
             Frame rootFrame = Window.Current.Content as Frame;
 
@@ -100,6 +119,10 @@ namespace factoryos_10x_shell
                 Window.Current.Content = rootFrame;
             }
 
+            // The desktop must become visible without waiting for optional
+            // discovery, storage preparation, or network-related services.
+            // Those operations can be slow on Xbox and are not required to
+            // render or interact with the Shell itself.
             if (e.PrelaunchActivated == false)
             {
                 if (rootFrame.Content == null)
@@ -110,8 +133,25 @@ namespace factoryos_10x_shell
             }
 
             ApplicationView.PreferredLaunchWindowingMode = ApplicationViewWindowingMode.Maximized;
+            _ = InitializeStartupServicesAsync();
+        }
 
-
+        private async Task InitializeStartupServicesAsync()
+        {
+            try
+            {
+                await new RuntimeHost().EnsureDriveRootAsync();
+                IAppHelper appHelper = ServiceProvider.GetRequiredService<IAppHelper>();
+                await appHelper.LoadAppsAsync();
+                await ServiceProvider.GetRequiredService<IWebAppService>().InitializeAsync();
+            }
+            catch (Exception exception)
+            {
+                // App discovery is supplemental. A package, icon, or runtime
+                // that cannot be inspected must not delay or terminate Shell
+                // startup.
+                Debug.WriteLine($"Deferred startup initialization failed: {exception}");
+            }
         }
 
         private void OnUnhandledException(object sender, Windows.UI.Xaml.UnhandledExceptionEventArgs e)

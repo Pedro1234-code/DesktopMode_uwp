@@ -44,6 +44,7 @@ namespace factoryos_10x_shell.Controls
         private UIElement m_dragSurface;
         private bool m_resizing;
         private bool m_maximized;
+        private WindowResizeCorner m_resizeCorner;
         private Point m_startPoint;
         private double m_startLeft, m_startTop, m_startWidth, m_startHeight;
         private double m_restoreLeft, m_restoreTop, m_restoreWidth, m_restoreHeight;
@@ -80,7 +81,11 @@ namespace factoryos_10x_shell.Controls
                 // Do not parse path markup in code here. XamlBindingHelper.ConvertValue
                 // is not reliable for Geometry on every UWP target (notably Xbox) and
                 // fails with E_INVALIDARG while the window is being opened.
-                IconSource = new Muxc.SymbolIconSource { Symbol = Symbol.Folder },
+                IconSource = new Muxc.BitmapIconSource
+                {
+                    ShowAsMonochrome = false,
+                    UriSource = new Uri("ms-appx:///Assets/Files/Windows11Icons/folders/folder.ico")
+                },
                 Tag = state
             };
             state.TabItem = tab;
@@ -250,17 +255,23 @@ namespace factoryos_10x_shell.Controls
         private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
             if (m_maximized) return;
-            m_resizing = true; m_startPoint = e.GetCurrentPoint(this).Position;
-            m_startWidth = Width; m_startHeight = Height; ResizeGrip.CapturePointer(e.Pointer);
+            m_resizing = true;
+            m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
+            m_startPoint = e.GetCurrentPoint(null).Position;
+            m_startLeft = Canvas.GetLeft(this); m_startTop = Canvas.GetTop(this);
+            m_startWidth = Width; m_startHeight = Height;
+            (sender as UIElement)?.CapturePointer(e.Pointer);
         }
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
-            Point point = e.GetCurrentPoint(this).Position;
-            Width = Math.Max(480, m_startWidth + point.X - m_startPoint.X);
-            Height = Math.Max(320, m_startHeight + point.Y - m_startPoint.Y);
+            Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint,
+                e.GetCurrentPoint(null).Position,
+                new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 480, 320);
+            Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y);
+            Width = bounds.Width; Height = bounds.Height;
         }
-        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; ResizeGrip.ReleasePointerCaptures(); }
+        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; (sender as UIElement)?.ReleasePointerCaptures(); }
         private async void Home_Click(object sender, RoutedEventArgs e)
         {
             m_history.Clear();
@@ -361,13 +372,12 @@ namespace factoryos_10x_shell.Controls
                     {
                         Name = child.Name,
                         Kind = "Folder",
-                        IconGlyph = GetFileIconGlyph("Folder"),
+                        FallbackIcon = CreatePackagedIcon("folders/folder.ico"),
                         Folder = child,
                         DateModifiedText = FormatDate(child.DateCreated)
                     });
                 foreach (StorageFile child in await folder.GetFilesAsync())
                 {
-                    bool isExecutable = string.Equals(child.FileType, ".exe", StringComparison.OrdinalIgnoreCase);
                     BasicProperties properties = await child.GetBasicPropertiesAsync();
                     var entry = new FileEntry
                     {
@@ -375,7 +385,7 @@ namespace factoryos_10x_shell.Controls
                         Kind = string.IsNullOrWhiteSpace(child.DisplayType) ? child.FileType : child.DisplayType,
                         SizeText = FormatSize(properties.Size),
                         DateModifiedText = FormatDate(properties.DateModified),
-                        IconGlyph = GetFileIconGlyph(GetFileIconKind(child, isExecutable)),
+                        FallbackIcon = CreatePackagedIcon(GetFileIconPath(child)),
                         File = child
                     };
                     loadedItems.Add(entry);
@@ -386,8 +396,8 @@ namespace factoryos_10x_shell.Controls
                 if (loadRevision != m_folderLoadRevision || !ReferenceEquals(targetTab, m_activeTab)) return;
                 m_allItems.AddRange(loadedItems);
                 foreach (FileEntry entry in loadedItems.Where(item => item.File != null &&
-                    string.Equals(item.File.FileType, ".exe", StringComparison.OrdinalIgnoreCase)))
-                    _ = LoadExecutableThumbnailAsync(entry);
+                    !string.Equals(item.File.FileType, ".exe", StringComparison.OrdinalIgnoreCase)))
+                    _ = LoadItemThumbnailAsync(entry);
                 ApplyFilter();
             }
             catch (Exception)
@@ -415,9 +425,9 @@ namespace factoryos_10x_shell.Controls
             if (entry.Folder != null) await OpenFolderAsync(entry.Folder, entry.Folder.Name, true);
             else if (entry.File != null && string.Equals(entry.File.FileType, ".exe", StringComparison.OrdinalIgnoreCase))
             {
-                if (entry.Thumbnail == null)
-                    await LoadExecutableThumbnailAsync(entry);
-                Win32WindowManagerService.Instance.Open(entry.File, m_currentFolder, entry.Thumbnail);
+                // Executables always use the packaged Windows icon. Do not ask
+                // the storage provider for an executable thumbnail.
+                Win32WindowManagerService.Instance.Open(entry.File, m_currentFolder);
             }
             else if (entry.File != null && string.Equals(entry.File.FileType, ".txt", StringComparison.OrdinalIgnoreCase))
                 AppState.Instance.RequestNotepadOpen(entry.File);
@@ -446,15 +456,13 @@ namespace factoryos_10x_shell.Controls
         // the navigation path rather than attempting to access an unapproved parent.
         private void Up_Click(object sender, RoutedEventArgs e) => Back_Click(sender, e);
 
-        private static async Task LoadExecutableThumbnailAsync(FileEntry entry)
+        private static async Task LoadItemThumbnailAsync(FileEntry entry)
         {
             if (entry?.File == null || entry.Thumbnail != null) return;
 
             try
             {
                 using (StorageItemThumbnail thumbnail = await entry.File.GetThumbnailAsync(
-                    // ListView asks the shell for a generic list representation.  SingleItem asks
-                    // for the executable's own associated icon, which is what we need here.
                     ThumbnailMode.SingleItem,
                     64,
                     ThumbnailOptions.UseCurrentScale | ThumbnailOptions.ResizeThumbnail))
@@ -468,8 +476,8 @@ namespace factoryos_10x_shell.Controls
             }
             catch
             {
-                // Some file providers and executables have no shell thumbnail.
-                // The Files template leaves the existing placeholder visible.
+                // Some providers do not expose thumbnails. Keep the packaged Windows
+                // 11 icon as the fallback in that case.
             }
         }
 
@@ -525,29 +533,35 @@ namespace factoryos_10x_shell.Controls
             return unit == 0 ? bytes + " B" : value.ToString(value >= 10 ? "0" : "0.0") + " " + units[unit];
         }
 
-        private static string GetFileIconKind(StorageFile file, bool isExecutable)
+        private static string GetFileIconPath(StorageFile file)
         {
-            if (isExecutable) return "Open";
-            string extension = file?.FileType ?? string.Empty;
+            string extension = (file?.FileType ?? string.Empty).ToLowerInvariant();
+            if (extension == ".exe") return "files/windowprogram.ico";
             if (extension.Equals(".zip", StringComparison.OrdinalIgnoreCase) ||
                 extension.Equals(".7z", StringComparison.OrdinalIgnoreCase) ||
-                extension.Equals(".rar", StringComparison.OrdinalIgnoreCase)) return "Zip";
-            if (extension.Equals(".url", StringComparison.OrdinalIgnoreCase)) return "Url";
-            if (extension.Equals(".lnk", StringComparison.OrdinalIgnoreCase)) return "Shortcut";
-            return "File";
+                extension.Equals(".rar", StringComparison.OrdinalIgnoreCase)) return "folders/zip.ico";
+            if (extension == ".png" || extension == ".jpg" || extension == ".jpeg" ||
+                extension == ".gif" || extension == ".bmp" || extension == ".webp") return "files/image.ico";
+            if (extension == ".mp4" || extension == ".mkv" || extension == ".avi" ||
+                extension == ".mov" || extension == ".wmv") return "files/video.ico";
+            if (extension == ".mp3" || extension == ".wav" || extension == ".flac" ||
+                extension == ".m4a" || extension == ".wma") return "files/audio.ico";
+            if (extension == ".doc" || extension == ".docx" || extension == ".rtf")
+                return "files/office/worddocument.ico";
+            if (extension == ".xls" || extension == ".xlsx" || extension == ".csv")
+                return "files/office/excelsheet.ico";
+            if (extension == ".ppt" || extension == ".pptx")
+                return "files/office/powerpointpresent.ico";
+            if (extension == ".txt" || extension == ".log") return "files/text.ico";
+            if (extension == ".ini" || extension == ".config") return "files/configuration.ico";
+            if (extension == ".url" || extension == ".htm" || extension == ".html") return "objects/globe.ico";
+            if (extension == ".lnk") return "files/window.ico";
+            return "files/generic.ico";
         }
 
-        private static string GetFileIconGlyph(string kind)
+        private static BitmapImage CreatePackagedIcon(string relativePath)
         {
-            switch (kind)
-            {
-                case "Folder": return "\uE8B7";
-                case "Zip": return "\uE7B8";
-                case "Url": return "\uE71B";
-                case "Shortcut": return "\uE8AD";
-                case "Open": return "\uE8E5";
-                default: return "\uE8A5";
-            }
+            return new BitmapImage(new Uri("ms-appx:///Assets/Files/Windows11Icons/" + relativePath));
         }
 
         private async void NewFolder_Click(object sender, RoutedEventArgs e)
@@ -734,7 +748,7 @@ namespace factoryos_10x_shell.Controls
         {
             public string Name { get; set; }
             public string Kind { get; set; }
-            public string IconGlyph { get; set; }
+            public ImageSource FallbackIcon { get; set; }
             public string SizeText { get; set; }
             public string DateModifiedText { get; set; }
             public StorageFolder Folder { get; set; }

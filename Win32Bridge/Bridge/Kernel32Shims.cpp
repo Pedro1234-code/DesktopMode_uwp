@@ -11,6 +11,7 @@
 #include "Bridge\\Win32Shims.h"
 
 #include <atomic>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
@@ -4068,6 +4069,7 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"flsalloc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsAlloc);
     else if (_wcsicmp(symbol.name.c_str(), L"flsfree") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsFree);
     else if (_wcsicmp(symbol.name.c_str(), L"flsgetvalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsGetValue);
+    else if (_wcsicmp(symbol.name.c_str(), L"flsgetvalue2") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsGetValue);
     else if (_wcsicmp(symbol.name.c_str(), L"flssetvalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlsSetValue);
     else if (_wcsicmp(symbol.name.c_str(), L"heaprealloc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeHeapReAlloc);
     else if (_wcsicmp(symbol.name.c_str(), L"heapsize") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeHeapSize);

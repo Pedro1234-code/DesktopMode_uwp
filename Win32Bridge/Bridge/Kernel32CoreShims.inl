@@ -125,33 +125,168 @@ BOOL WINAPI BridgeTlsSetValue(DWORD index, LPVOID value)
     return result;
 }
 
+namespace
+{
+    constexpr DWORD MaximumGuestFlsSlots = 128;
+    constexpr unsigned MaximumGuestFlsCallbackPasses = 4;
+
+    struct GuestFlsSlot final
+    {
+        PFLS_CALLBACK_FUNCTION callback = nullptr;
+        ULONG generation = 1;
+        bool active = false;
+    };
+
+    std::mutex g_guestFlsLock;
+    std::array<GuestFlsSlot, MaximumGuestFlsSlots> g_guestFlsSlots{};
+    thread_local PVOID g_guestFlsValues[MaximumGuestFlsSlots]{};
+    thread_local ULONG g_guestFlsGenerations[MaximumGuestFlsSlots]{};
+
+    bool InvokeGuestFlsCallbackSeh(PFLS_CALLBACK_FUNCTION callback, PVOID value)
+    {
+        __try
+        {
+            callback(value);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    ULONG NextGuestFlsGeneration(ULONG generation)
+    {
+        ++generation;
+        return generation == 0 ? 1 : generation;
+    }
+}
+
 DWORD WINAPI BridgeFlsAlloc(PFLS_CALLBACK_FUNCTION callback)
 {
-    const DWORD index = ::FlsAlloc(callback);
-    SetGuestLastError(index == FLS_OUT_OF_INDEXES ? ERROR_NOT_ENOUGH_MEMORY : ERROR_SUCCESS);
-    return index;
+    std::lock_guard<std::mutex> guard(g_guestFlsLock);
+    // Slot zero is reserved by the Windows FLS layout.
+    for (DWORD index = 1; index < MaximumGuestFlsSlots; ++index)
+    {
+        GuestFlsSlot& slot = g_guestFlsSlots[index];
+        if (slot.active) continue;
+        slot.active = true;
+        slot.callback = callback;
+        slot.generation = NextGuestFlsGeneration(slot.generation);
+        SetGuestLastError(ERROR_SUCCESS);
+        return index;
+    }
+    SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+    return FLS_OUT_OF_INDEXES;
 }
 
 BOOL WINAPI BridgeFlsFree(DWORD index)
 {
-    const BOOL result = ::FlsFree(index);
-    SetGuestLastError(result ? ERROR_SUCCESS : ::GetLastError());
-    return result;
+    if (index == 0 || index >= MaximumGuestFlsSlots)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    PFLS_CALLBACK_FUNCTION callback = nullptr;
+    PVOID value = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_guestFlsLock);
+        GuestFlsSlot& slot = g_guestFlsSlots[index];
+        if (!slot.active)
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        if (g_guestFlsGenerations[index] == slot.generation)
+        {
+            value = g_guestFlsValues[index];
+            callback = slot.callback;
+        }
+        g_guestFlsValues[index] = nullptr;
+        g_guestFlsGenerations[index] = 0;
+        slot.active = false;
+        slot.callback = nullptr;
+        slot.generation = NextGuestFlsGeneration(slot.generation);
+    }
+    if (callback && value && !InvokeGuestFlsCallbackSeh(callback, value))
+        RuntimeDiagnostics::Record(L"FLS: guest callback raised an exception while freeing an index.");
+    SetGuestLastError(ERROR_SUCCESS);
+    return TRUE;
 }
 
 PVOID WINAPI BridgeFlsGetValue(DWORD index)
 {
-    ::SetLastError(ERROR_SUCCESS);
-    PVOID value = ::FlsGetValue(index);
-    SetGuestLastError(::GetLastError());
-    return value;
+    if (index == 0 || index >= MaximumGuestFlsSlots)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> guard(g_guestFlsLock);
+    const GuestFlsSlot& slot = g_guestFlsSlots[index];
+    if (!slot.active)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return g_guestFlsGenerations[index] == slot.generation
+        ? g_guestFlsValues[index] : nullptr;
 }
 
 BOOL WINAPI BridgeFlsSetValue(DWORD index, PVOID value)
 {
-    const BOOL result = ::FlsSetValue(index, value);
-    SetGuestLastError(result ? ERROR_SUCCESS : ::GetLastError());
-    return result;
+    if (index == 0 || index >= MaximumGuestFlsSlots)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    std::lock_guard<std::mutex> guard(g_guestFlsLock);
+    const GuestFlsSlot& slot = g_guestFlsSlots[index];
+    if (!slot.active)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    g_guestFlsValues[index] = value;
+    g_guestFlsGenerations[index] = slot.generation;
+    SetGuestLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+void InvokeGuestFlsCallbacksForCurrentThread()
+{
+    for (unsigned pass = 0; pass < MaximumGuestFlsCallbackPasses; ++pass)
+    {
+        std::array<PFLS_CALLBACK_FUNCTION, MaximumGuestFlsSlots> callbacks{};
+        std::array<PVOID, MaximumGuestFlsSlots> values{};
+        bool any = false;
+        {
+            std::lock_guard<std::mutex> guard(g_guestFlsLock);
+            for (DWORD index = 1; index < MaximumGuestFlsSlots; ++index)
+            {
+                const GuestFlsSlot& slot = g_guestFlsSlots[index];
+                if (!slot.active || !slot.callback ||
+                    g_guestFlsGenerations[index] != slot.generation ||
+                    !g_guestFlsValues[index])
+                    continue;
+                callbacks[index] = slot.callback;
+                values[index] = g_guestFlsValues[index];
+                // Clear before invoking, matching FLS destructor semantics and
+                // allowing a callback to install a new value for another pass.
+                g_guestFlsValues[index] = nullptr;
+                any = true;
+            }
+        }
+        if (!any) break;
+        for (DWORD index = 1; index < MaximumGuestFlsSlots; ++index)
+        {
+            if (callbacks[index] &&
+                !InvokeGuestFlsCallbackSeh(callbacks[index], values[index]))
+                RuntimeDiagnostics::Record(
+                    L"FLS: guest callback raised an exception during thread detach.");
+        }
+    }
 }
 
 LPVOID WINAPI BridgeHeapReAlloc(

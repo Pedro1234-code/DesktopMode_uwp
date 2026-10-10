@@ -388,4 +388,17 @@ namespace winrt::DesktopMode::Gecko::implementation
             engineView_->Start();
         }
     }
+
+    void GeckoHost::Close()
+    {
+        active_ = false;
+        if (engineView_)
+        {
+            engineView_->SetInputEnabled(false);
+            engineView_->Stop();
+        }
+        // The Gecko worker may still be unwinding callbacks when the Shell
+        // window is hidden. Keep the view alive until the host itself is
+        // destroyed; releasing it synchronously here races that thread.
+    }
 }

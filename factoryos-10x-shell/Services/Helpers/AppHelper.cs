@@ -31,7 +31,7 @@ namespace factoryos_10x_shell.Services.Helpers
         private DispatcherQueue m_dispatcherQueue;
 
         private Size _logoSize;
-        public ObservableCollection<StartIconModel> StartIcons { get; set; }
+        public ObservableCollection<StartIconModel> StartIcons { get; set; } = new ObservableCollection<StartIconModel>();
         public ObservableCollection<StartIconModel> TaskbarIcons { get; set; } = new ObservableCollection<StartIconModel>();
 
         private List<StartIconModel> _iconCache { get; set; }
@@ -183,7 +183,11 @@ namespace factoryos_10x_shell.Services.Helpers
                     loaded.Add(new StartIconModel
                     {
                         AppId = appId,
-                        IconName = string.IsNullOrWhiteSpace(iconName)
+                        // This is the integrated browser, not a Firefox package entry.
+                        // Keep its Start name stable even for pins saved before the rename.
+                        IconName = string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase)
+                            ? "Strawfox"
+                            : string.IsNullOrWhiteSpace(iconName)
                             ? (string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ? "Notepad" : string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ? "Settings" : string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ? "Calculator" : string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase) ? "Firefox" : "Files")
                             : iconName
                     });
@@ -267,7 +271,20 @@ namespace factoryos_10x_shell.Services.Helpers
                     }
                 }
 
-                StartIcons = new ObservableCollection<StartIconModel>(_iconCache.OrderBy(icon => icon.IconName));
+                // Keep the collection instance stable because StartMenu binds to
+                // it before deferred app discovery completes.  The CoreShell
+                // entries are injected by StartMenuViewModel and must survive
+                // this refresh; clearing them was why the internal apps
+                // disappeared after startup became asynchronous.
+                List<StartIconModel> internalIcons = StartIcons
+                    .Where(icon => icon.AppId != null &&
+                                   icon.AppId.StartsWith("CoreShell.", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                StartIcons.Clear();
+                foreach (StartIconModel icon in internalIcons.OrderBy(icon => icon.AppId))
+                    StartIcons.Add(icon);
+                foreach (StartIconModel icon in _iconCache.OrderBy(icon => icon.IconName))
+                    StartIcons.Add(icon);
             }
             catch (Exception ex)
             {

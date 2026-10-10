@@ -29,7 +29,10 @@
                     <TextBlock x:Name="StatusText" MaxWidth="560" HorizontalAlignment="Center" Text="{Binding Status}" TextAlignment="Center" TextWrapping="Wrap" />
                 </StackPanel>
             </Grid>
-            <Border x:Name="ResizeGrip" Grid.Row="1" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost">
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Tag="TopRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />
+            <Border x:Name="ResizeGrip" Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost">
                 <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="#FFB0B0B0" Text="&#xE76C;" />
             </Border>
         </Grid>

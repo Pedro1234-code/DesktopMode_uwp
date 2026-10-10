@@ -17,5 +17,6 @@ namespace DesktopMode.Gecko
         void OpenUrl(String url);
         void Suspend();
         void Resume();
+        void Close();
     }
 }

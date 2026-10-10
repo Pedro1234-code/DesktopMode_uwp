@@ -4,6 +4,12 @@
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
     Width="900"
     Height="650">
+    <UserControl.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+            </ResourceDictionary.MergedDictionaries>
+        </ResourceDictionary>
+    </UserControl.Resources>
     <Border Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" BorderBrush="#FF5A5A5A" BorderThickness="1" CornerRadius="4">
         <Grid PointerPressed="Root_PointerPressed">
             <Grid.RowDefinitions>
@@ -23,7 +29,10 @@
             </Grid>
             <!-- Original Calculator UI; the Shell only supplies its window frame. -->
             <Frame x:Name="CalculatorFrame" Grid.Row="1" />
-            <Border x:Name="ResizeGrip" Grid.Row="1" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased">
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Tag="TopRight" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomLeft" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased" />
+            <Border x:Name="ResizeGrip" Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomRight" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased">
                 <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Text="&#xE76C;" />
             </Border>
         </Grid>

@@ -28,6 +28,7 @@ namespace factoryos_10x_shell.Controls
         private bool m_wasMaximizedBeforeFullscreen;
         private bool m_isWindowActive;
         private bool m_inputSuppressed;
+        private WindowResizeCorner m_resizeCorner;
         private Point m_startPoint;
         private double m_startWidth;
         private double m_startHeight;
@@ -130,6 +131,21 @@ namespace factoryos_10x_shell.Controls
                         m_host.SetViewport(BrowserSurface.ActualWidth, BrowserSurface.ActualHeight);
                     UpdateGeckoScreen();
                     UpdateHostInput();
+                });
+
+                // MainDesktop is created after the Shell's first activation on
+                // Xbox. The first layout pass can therefore expose an
+                // intermediate window size and never raise another useful
+                // SizeChanged event. Re-read the settled size on the next
+                // low-priority dispatcher pass so Gecko and ANGLE allocate the
+                // framebuffer at the final physical resolution.
+                await Dispatcher.RunAsync(CoreDispatcherPriority.Low, () =>
+                {
+                    if (m_host?.IsStarted != true) return;
+                    BrowserSurface.UpdateLayout();
+                    if (BrowserSurface.ActualWidth <= 0 || BrowserSurface.ActualHeight <= 0) return;
+                    m_host.SetViewport(BrowserSurface.ActualWidth, BrowserSurface.ActualHeight);
+                    UpdateGeckoScreen();
                 });
             }
             catch (Exception exception)
@@ -235,10 +251,13 @@ namespace factoryos_10x_shell.Controls
         private void UpdateGeckoScreen()
         {
             if (m_host?.IsStarted != true) return;
-            Canvas host = VisualTreeHelper.GetParent(this) as Canvas;
-            FrameworkElement desktop = host == null ? null : VisualTreeHelper.GetParent(host) as FrameworkElement;
-            if (desktop?.ActualWidth > 0 && desktop.ActualHeight > 0)
-                m_host.SetScreen(desktop.ActualWidth, desktop.ActualHeight);
+            // Gecko runs inside a virtual Shell window, not directly on the
+            // physical desktop. Its screen rect must match the framebuffer it
+            // owns. Passing the whole DesktopMode canvas here made chrome
+            // popups (notably the hamburger menu) constrain themselves to a
+            // wider screen than the browser window and appear displaced.
+            if (BrowserSurface.ActualWidth > 0 && BrowserSurface.ActualHeight > 0)
+                m_host.SetScreen(BrowserSurface.ActualWidth, BrowserSurface.ActualHeight);
         }
 
         private Point CurrentPointerInHost(Canvas host)
@@ -300,6 +319,9 @@ namespace factoryos_10x_shell.Controls
                 Height = host.ActualHeight;
                 WindowBorder.BorderThickness = new Thickness(0);
                 WindowBorder.CornerRadius = new CornerRadius(0);
+                ResizeGripTopLeft.Visibility = Visibility.Collapsed;
+                ResizeGripTopRight.Visibility = Visibility.Collapsed;
+                ResizeGripBottomLeft.Visibility = Visibility.Collapsed;
                 ResizeGrip.Visibility = Visibility.Collapsed;
             }
             else
@@ -318,6 +340,9 @@ namespace factoryos_10x_shell.Controls
                 }
                 WindowBorder.BorderThickness = new Thickness(1);
                 WindowBorder.CornerRadius = new CornerRadius(4);
+                ResizeGripTopLeft.Visibility = Visibility.Visible;
+                ResizeGripTopRight.Visibility = Visibility.Visible;
+                ResizeGripBottomLeft.Visibility = Visibility.Visible;
                 ResizeGrip.Visibility = Visibility.Visible;
             }
 
@@ -357,24 +382,29 @@ namespace factoryos_10x_shell.Controls
         {
             if (m_maximized) return;
             m_resizing = true;
-            m_startPoint = e.GetCurrentPoint(this).Position;
+            m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
+            m_startPoint = e.GetCurrentPoint(null).Position;
+            m_dragStartLeft = Canvas.GetLeft(this);
+            m_dragStartTop = Canvas.GetTop(this);
             m_startWidth = Width;
             m_startHeight = Height;
-            ResizeGrip.CapturePointer(e.Pointer);
+            (sender as UIElement)?.CapturePointer(e.Pointer);
         }
 
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
-            Point point = e.GetCurrentPoint(this).Position;
-            Width = Math.Max(640, m_startWidth + point.X - m_startPoint.X);
-            Height = Math.Max(480, m_startHeight + point.Y - m_startPoint.Y);
+            Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint,
+                e.GetCurrentPoint(null).Position,
+                new Rect(m_dragStartLeft, m_dragStartTop, m_startWidth, m_startHeight), 640, 480);
+            Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y);
+            Width = bounds.Width; Height = bounds.Height;
         }
 
         private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e)
         {
             m_resizing = false;
-            ResizeGrip.ReleasePointerCaptures();
+            (sender as UIElement)?.ReleasePointerCaptures();
         }
     }
 }

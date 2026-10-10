@@ -26,7 +26,8 @@ namespace Bridge
     public:
         GuestStorageContext(
             Windows::Storage::StorageFolder^ localFolder,
-            const std::wstring& modulePath);
+            const std::wstring& modulePath,
+            Windows::Storage::StorageFolder^ moduleSourceFolder = nullptr);
         ~GuestStorageContext();
 
         bool EnsureLayout(std::wstring* error);
@@ -98,6 +99,15 @@ namespace Bridge
             const GuestPath& path,
             Windows::Storage::StorageFolder^* folder,
             DWORD* win32Error) const;
+        bool GetAuthorizedFolder(
+            const GuestPath& path,
+            Windows::Storage::StorageFolder^* folder) const;
+        bool OpenAuthorizedFile(
+            const GuestPath& path,
+            DWORD desiredAccess,
+            DWORD shareMode,
+            HANDLE* guestHandle,
+            DWORD* win32Error);
         bool AddFile(
             Windows::Storage::Streams::IRandomAccessStream^ stream,
             bool readable,
@@ -131,8 +141,11 @@ namespace Bridge
         static constexpr ULONG_PTR FirstReservedHandleToken = 0x40000000;
 
         Platform::Agile<Windows::Storage::StorageFolder^> m_localFolder;
+        Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
         VirtualPathResolver m_paths;
         std::wstring m_modulePath;
+        std::wstring m_moduleDirectory;
+        size_t m_moduleDirectoryComponentCount = 0;
         std::wstring m_initialCurrentDirectory;
         mutable std::mutex m_handlesLock;
         std::unordered_map<ULONG_PTR, std::shared_ptr<FileRecord>> m_files;

@@ -25,7 +25,10 @@
             </CommandBar>
             <TextBox x:Name="Editor" Grid.Row="2" Margin="16,8" AcceptsReturn="True" TextWrapping="NoWrap" FontFamily="Consolas" FontSize="15" ScrollViewer.VerticalScrollBarVisibility="Auto" ScrollViewer.HorizontalScrollBarVisibility="Auto" TextChanged="Editor_TextChanged" KeyDown="Editor_KeyDown" />
             <Grid Grid.Row="3" Margin="16,0"><TextBlock x:Name="StatusText" VerticalAlignment="Center" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" FontSize="11" Text="Ln 1, Col 1" /></Grid>
-            <Border x:Name="ResizeGrip" Grid.Row="3" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased"><TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Text="&#xE76C;" /></Border>
+            <Border Grid.RowSpan="4" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="4" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Tag="TopRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="4" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" />
+            <Border x:Name="ResizeGrip" Grid.RowSpan="4" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased"><TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Text="&#xE76C;" /></Border>
         </Grid>
     </Border>
 </UserControl>

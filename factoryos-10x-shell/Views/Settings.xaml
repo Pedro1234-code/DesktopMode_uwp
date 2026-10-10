@@ -27,19 +27,8 @@
 
             <TextBlock
                 FontSize="25"
-                Text="Select taskbar buttons"
+                Text="Taskbar"
                 TextWrapping="Wrap" />
-            <ToggleSwitch
-                x:Name="CopilotToggleSwitch"
-                Header="Show Copilot Button"
-                IsOn="True"
-                OffContent="Off"
-                OnContent="On"
-                Toggled="CopilotSwitch_Toggled" />
-            <ToggleSwitch
-                Header="Search button"
-                IsOn="True"
-                Toggled="Search_Toggled" />
             <ToggleSwitch
                 Header="Background button"
                 IsOn="True"

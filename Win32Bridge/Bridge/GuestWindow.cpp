@@ -56,6 +56,31 @@ namespace
         virtual HRESULT STDMETHODCALLTYPE Buffer(unsigned char** value) = 0;
     };
 
+    HRESULT CopyPixelsToBuffer(
+        IBufferByteAccess* access,
+        const void* source,
+        size_t byteCount,
+        DWORD* exceptionCode)
+    {
+        if (exceptionCode) *exceptionCode = ERROR_SUCCESS;
+        if (!access || (!source && byteCount != 0)) return E_POINTER;
+        __try
+        {
+            unsigned char* destination = nullptr;
+            const HRESULT result = access->Buffer(&destination);
+            if (FAILED(result)) return result;
+            if (!destination || reinterpret_cast<ULONG_PTR>(destination) < 0x10000)
+                return E_POINTER;
+            if (byteCount != 0) memcpy(destination, source, byteCount);
+            return S_OK;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (exceptionCode) *exceptionCode = GetExceptionCode();
+            return E_FAIL;
+        }
+    }
+
     thread_local GuestWindowManager* g_currentGuestWindowManager = nullptr;
     thread_local unsigned g_ownerDataDisplayInfoDiagnostics = 0;
     thread_local unsigned g_listViewPopulationDiagnostics = 0;
@@ -1978,54 +2003,66 @@ namespace
         {
             try
             {
-                // Recheck immediately before touching XAML so a frame queued
-                // before Deactivate cannot resurrect an old guest surface.
-                std::lock_guard<std::mutex> guard(presentation->lock);
-                if (presentation->active && presentation->presentQueued &&
-                    presentation->queuedTicket == ticket)
+                Image^ image = nullptr;
+                WriteableBitmap^ bitmap = nullptr;
+                bool currentFrame = false;
                 {
-                    Image^ image = presentation->image.Get();
-                    WriteableBitmap^ bitmap = presentation->bitmap.Get();
-                    if (image)
+                    // Snapshot the agile XAML references, but never hold this
+                    // mutex while invoking COM or copying pixels. A native
+                    // fault at that boundary must not abandon a locked mutex.
+                    std::lock_guard<std::mutex> guard(presentation->lock);
+                    currentFrame = presentation->active && presentation->presentQueued &&
+                        presentation->queuedTicket == ticket;
+                }
+                if (currentFrame)
+                {
+                    image = presentation->image.Get();
+                    bitmap = presentation->bitmap.Get();
+                }
+                if (image)
+                {
+                    if (!bitmap || bitmap->PixelWidth != width || bitmap->PixelHeight != height)
                     {
-                        if (!bitmap || bitmap->PixelWidth != width || bitmap->PixelHeight != height)
+                        bitmap = ref new WriteableBitmap(width, height);
+                        image->Source = bitmap;
+                        Platform::Agile<WriteableBitmap^> agileBitmap(bitmap);
+                        std::lock_guard<std::mutex> guard(presentation->lock);
+                        if (presentation->active && presentation->presentQueued &&
+                            presentation->queuedTicket == ticket)
                         {
-                            bitmap = ref new WriteableBitmap(width, height);
-                            presentation->bitmap = Platform::Agile<WriteableBitmap^>(bitmap);
-                            image->Source = bitmap;
+                            presentation->bitmap = agileBitmap;
                         }
+                    }
 
-                        IBuffer^ pixelBuffer = bitmap->PixelBuffer;
-                        const size_t byteCount = pixels->size() * sizeof(MiniGdi::Color);
-                        ComPtr<IBufferByteAccess> access;
-                        const HRESULT result = pixelBuffer
-                            ? reinterpret_cast<IInspectable*>(pixelBuffer)->QueryInterface(IID_PPV_ARGS(&access))
-                            : E_POINTER;
-                        if (SUCCEEDED(result) && pixelBuffer->Length >= byteCount)
+                    IBuffer^ pixelBuffer = bitmap->PixelBuffer;
+                    const size_t byteCount = pixels->size() * sizeof(MiniGdi::Color);
+                    ComPtr<IBufferByteAccess> access;
+                    const HRESULT result = pixelBuffer
+                        ? reinterpret_cast<IInspectable*>(pixelBuffer)->QueryInterface(IID_PPV_ARGS(&access))
+                        : E_POINTER;
+                    if (SUCCEEDED(result) && pixelBuffer->Length >= byteCount)
+                    {
+                        DWORD nativeException = ERROR_SUCCESS;
+                        if (SUCCEEDED(CopyPixelsToBuffer(
+                            access.Get(), pixels->data(), byteCount, &nativeException)))
                         {
-                            unsigned char* destination = nullptr;
-                            if (SUCCEEDED(access->Buffer(&destination)) &&
-                                reinterpret_cast<ULONG_PTR>(destination) >= 0x10000)
-                            {
-                                memcpy(destination, pixels->data(), byteCount);
-                                bitmap->Invalidate();
-                                frameUploaded = true;
-                            }
-                            else
-                            {
-                                uploadFailure = L"the bitmap pixel buffer was unavailable";
-                            }
+                            bitmap->Invalidate();
+                            frameUploaded = true;
                         }
                         else
                         {
-                            uploadFailure = L"the bitmap pixel-buffer query failed";
+                            uploadFailure = nativeException == ERROR_SUCCESS
+                                ? L"the bitmap pixel buffer was unavailable"
+                                : L"the bitmap pixel copy raised native exception code " +
+                                    std::to_wstring(static_cast<unsigned long>(nativeException));
                         }
                     }
                     else
                     {
-                        uploadFailure = L"the XAML image was unavailable";
+                        uploadFailure = L"the bitmap pixel-buffer query failed";
                     }
                 }
+                else uploadFailure = L"the XAML image was unavailable";
             }
             catch (Exception^ error)
             {
@@ -2083,6 +2120,27 @@ namespace
         }
     }
 
+    struct PresentationCall final
+    {
+        const std::shared_ptr<GuestPresentationState>* presentation = nullptr;
+        std::uint64_t ticket = 0;
+    };
+
+    void ProcessPresentationThunk(void* raw)
+    {
+        const auto* call = static_cast<const PresentationCall*>(raw);
+        if (call && call->presentation)
+            ProcessPresentation(*call->presentation, call->ticket);
+    }
+
+    DWORD ProcessPresentationProtected(
+        const std::shared_ptr<GuestPresentationState>& presentation,
+        std::uint64_t ticket)
+    {
+        PresentationCall call{ &presentation, ticket };
+        return InvokeSehProtected(&ProcessPresentationThunk, &call);
+    }
+
     void QueuePresentation(
         const std::shared_ptr<GuestPresentationState>& presentation,
         std::uint64_t ticket)
@@ -2096,7 +2154,23 @@ namespace
                 dispatcher->RunAsync(CoreDispatcherPriority::Normal,
                     ref new DispatchedHandler([presentation, ticket]()
                 {
-                    ProcessPresentation(presentation, ticket);
+                    const DWORD exception = ProcessPresentationProtected(presentation, ticket);
+                    if (exception != ERROR_SUCCESS)
+                    {
+                        RuntimeDiagnostics::Record(
+                            L"FRAME SEH: presentation raised native exception code " +
+                            std::to_wstring(static_cast<unsigned long>(exception)) + L".");
+                        // Never wait here: if the fault happened in an
+                        // unforeseen locked section, blocking would turn a
+                        // contained rendering failure into a UI deadlock.
+                        if (presentation->lock.try_lock())
+                        {
+                            if (presentation->presentQueued &&
+                                presentation->queuedTicket == ticket)
+                                presentation->presentQueued = false;
+                            presentation->lock.unlock();
+                        }
+                    }
                 }));
                 queued = true;
             }

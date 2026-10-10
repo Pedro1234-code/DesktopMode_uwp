@@ -99,7 +99,10 @@ void SetEngineEnvironment(const wchar_t* name, const wchar_t* value) {
   }();
 
   ::SetEnvironmentVariableW(name, value);
-  if (crtPutEnv) {
+  // _wputenv_s does not accept a null value on all UCRT builds.  A null value
+  // is only used here to remove an inherited variable, which the Win32 call
+  // above already handled.
+  if (crtPutEnv && value != nullptr) {
     crtPutEnv(name, value);
   }
 }
@@ -325,32 +328,12 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   // Not "gecko.log": that is the shell's own log, and two files a suffix
   // apart in the same directory is a way to read the wrong one.
   const std::wstring geckoLog = profile + L"\\gecko-moz.log";
-  // Only when the user turned the verbose logs on (the shell reads the pref
-  // and sets this). Synchronous and at these levels it is over a thousand
-  // lines a second during a video, written by the threads doing the work.
-  // Quiet, the last verbose run's file goes too: it can be tens of megabytes.
-  wchar_t verbose[4] = {};
-  if (!::GetEnvironmentVariableW(L"GECKO_W10M_VERBOSE_LOGS", verbose, 4)) {
-    ::DeleteFileW(geckoLog.c_str());
-    Log("bootstrap: quiet logs, Gecko's own logging stays off");
-  } else {
-    SetEngineEnvironment(
-        L"MOZ_LOG",
-        L"timestamp,sync,nsAppRunner:5,XRE:5,nsComponentManager:5,"
-        L"nsChromeRegistry:5,nsIOService:5,URILoader:5,"
-        // Video: which decoder was asked, what it answered, and where the
-        // pipeline gave up.
-        L"MediaDecoder:4,MediaFormatReader:4,PlatformDecoderModule:5,"
-        L"WMFDecoderModule:5,MediaDemuxer:4,MediaSource:4,HTMLMediaElement:4,"
-        // The start page after a crash opens a channel and never hears back:
-        // the TLS handshake is reported, then "waiting for google.com", and
-        // nsDocumentOpenInfo::OnStartRequest never arrives. These say where
-        // it is standing -- the connection, the cache entry it waits for, or
-        // the response that never comes.
-        L"nsHttp:4,cache2:3,nsSocketTransport:3,nsHostResolver:3");
-    SetEngineEnvironment(L"MOZ_LOG_FILE", geckoLog.c_str());
-    Log("bootstrap: verbose logs, Gecko's own logging goes to gecko-moz.log");
-  }
+  // Mozilla's component logging routinely contains complete request URLs and
+  // therefore doubles as a browsing-history log. Never enable or retain it.
+  ::DeleteFileW(geckoLog.c_str());
+  SetEngineEnvironment(L"MOZ_LOG", nullptr);
+  SetEngineEnvironment(L"MOZ_LOG_FILE", nullptr);
+  Log("bootstrap: Gecko component logging stays off for privacy");
   RedirectStdErrTo(profile + L"\\gecko-stderr.log");
 
   // firefox.exe takes this at the top of main and hands it to Gecko as

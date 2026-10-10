@@ -23,6 +23,7 @@ namespace winrt::DesktopMode::Gecko::implementation
         void OpenUrl(hstring const& url);
         void Suspend();
         void Resume();
+        void Close();
 
     private:
         void BuildVisualTree();

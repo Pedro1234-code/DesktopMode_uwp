@@ -5,6 +5,7 @@
 #include "Bridge\\GuestWin32Abi.h"
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge\\MiniGdi.h"
+#include "Bridge\\RuntimeDiagnostics.h"
 
 #include <algorithm>
 #include <cstring>

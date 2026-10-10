@@ -1106,37 +1106,23 @@ const Surface* GdiContext::GetBitmapSurface(BitmapHandle bitmap) const
 
 bool GdiContext::DeleteObject(ObjectHandle object)
 {
-    if (object == InvalidObject || m_objects.erase(object) == 0)
+    if (object == InvalidObject || m_objects.find(object) == m_objects.end())
     {
         return false;
     }
 
-    // Deleting a selected pen/brush/font restores its built-in default.
-    // Deleting a selected bitmap detaches the memory DC.  Both make dangling
-    // guest GDI handles harmless instead of dereferencing stale host pointers.
-    for (auto& pair : m_dcs)
+    // Win32 does not permit deletion of an object while it is selected into a
+    // DC.  In particular, deleting a selected DIB section would invalidate the
+    // bits pointer previously returned to the guest and can turn a later
+    // Scintilla paint into a host access violation.
+    for (const auto& pair : m_dcs)
     {
-        if (pair.second.pen == object)
-        {
-            pair.second.pen = InvalidObject;
-        }
-        if (pair.second.brush == object)
-        {
-            pair.second.brush = InvalidObject;
-        }
-        if (pair.second.font == object)
-        {
-            pair.second.font = InvalidObject;
-        }
-        if (pair.second.isMemoryDc && pair.second.bitmap == object)
-        {
-            pair.second.bitmap = InvalidObject;
-            pair.second.surface = nullptr;
-            pair.second.clip = Rect{};
-        }
+        if (pair.second.pen == object || pair.second.brush == object ||
+            pair.second.font == object ||
+            (pair.second.isMemoryDc && pair.second.bitmap == object))
+            return false;
     }
-
-    return true;
+    return m_objects.erase(object) != 0;
 }
 
 bool GdiContext::ObjectType(ObjectHandle object, ObjectKind* kind) const

@@ -1467,8 +1467,8 @@ BOOL WINAPI BridgeShellNotifyIconW(DWORD message, PVOID data)
 int WINAPI BridgeSHCreateDirectory(HWND, LPCWSTR path)
 {
     if (!path || !*path) return ERROR_INVALID_PARAMETER;
-    if (BridgeCreateDirectoryW(path, nullptr)) return ERROR_SUCCESS;
-    const DWORD error = BridgeGetLastError();
+    if (Win32Bridge::Bridge::BridgeCreateDirectoryW(path, nullptr)) return ERROR_SUCCESS;
+    const DWORD error = Win32Bridge::Bridge::BridgeGetLastError();
     return error == ERROR_ALREADY_EXISTS ? ERROR_SUCCESS : static_cast<int>(error);
 }
 

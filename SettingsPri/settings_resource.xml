@@ -1,0 +1,288 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<PriInfo>
+	<ResourceMap name="windows.immersivecontrolpanel" version="1.0" primary="true">
+		<Qualifiers>
+			<AlternateForm>LIGHTUNPLATED,UNPLATED</AlternateForm>
+			<Contrast>BLACK,WHITE</Contrast>
+			<Scale>100,125,150,200,400</Scale>
+		</Qualifiers>
+		<ResourceMapSubtree name="Files">
+			<ResourceMapSubtree name="images">
+				<NamedResource name="logo.png" uri="ms-resource://windows.immersivecontrolpanel/Files/images/logo.png">
+					<Candidate qualifiers="Contrast-WHITE, Scale-400" type="Path">
+						<Value>images\logo.contrast-white_scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-200" type="Path">
+						<Value>images\logo.contrast-white_scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-150" type="Path">
+						<Value>images\logo.contrast-white_scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-125" type="Path">
+						<Value>images\logo.contrast-white_scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-100" type="Path">
+						<Value>images\logo.contrast-white_scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE" type="Path">
+						<Value>images\logo.contrast-white.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-400" type="Path">
+						<Value>images\logo.contrast-black_scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-200" type="Path">
+						<Value>images\logo.contrast-black_scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-150" type="Path">
+						<Value>images\logo.contrast-black_scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-125" type="Path">
+						<Value>images\logo.contrast-black_scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-100" type="Path">
+						<Value>images\logo.contrast-black_scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK" type="Path">
+						<Value>images\logo.contrast-black.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-400, AlternateForm-UNPLATED" type="Path">
+						<Value>images\logo.scale-400_altform-unplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-400, AlternateForm-LIGHTUNPLATED" type="Path">
+						<Value>images\logo.scale-400_altform-lightunplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-400" isDefault="true" type="Path">
+						<Value>images\logo.scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-200, AlternateForm-UNPLATED" type="Path">
+						<Value>images\logo.scale-200_altform-unplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-200, AlternateForm-LIGHTUNPLATED" type="Path">
+						<Value>images\logo.scale-200_altform-lightunplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-200" isDefault="true" type="Path">
+						<Value>images\logo.scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-150, AlternateForm-UNPLATED" type="Path">
+						<Value>images\logo.scale-150_altform-unplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-150, AlternateForm-LIGHTUNPLATED" type="Path">
+						<Value>images\logo.scale-150_altform-lightunplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-150" isDefault="true" type="Path">
+						<Value>images\logo.scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-125, AlternateForm-UNPLATED" type="Path">
+						<Value>images\logo.scale-125_altform-unplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-125, AlternateForm-LIGHTUNPLATED" type="Path">
+						<Value>images\logo.scale-125_altform-lightunplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-125" isDefault="true" type="Path">
+						<Value>images\logo.scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-100, AlternateForm-UNPLATED" type="Path">
+						<Value>images\logo.scale-100_altform-unplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-100, AlternateForm-LIGHTUNPLATED" type="Path">
+						<Value>images\logo.scale-100_altform-lightunplated.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-100" isDefault="true" type="Path">
+						<Value>images\logo.scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="AlternateForm-UNPLATED" type="Path">
+						<Value>images\logo.altform-unplated.png</Value>
+					</Candidate>
+					<Candidate type="Path">
+						<Value>images\logo.png</Value>
+					</Candidate>
+				</NamedResource>
+				<NamedResource name="splashscreen.png" uri="ms-resource://windows.immersivecontrolpanel/Files/images/splashscreen.png">
+					<Candidate qualifiers="Contrast-WHITE, Scale-400" type="Path">
+						<Value>images\splashscreen.contrast-white_scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-200" type="Path">
+						<Value>images\splashscreen.contrast-white_scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-150" type="Path">
+						<Value>images\splashscreen.contrast-white_scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-125" type="Path">
+						<Value>images\splashscreen.contrast-white_scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-100" type="Path">
+						<Value>images\splashscreen.contrast-white_scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE" type="Path">
+						<Value>images\splashscreen.contrast-white.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-400" type="Path">
+						<Value>images\splashscreen.contrast-black_scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-200" type="Path">
+						<Value>images\splashscreen.contrast-black_scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-150" type="Path">
+						<Value>images\splashscreen.contrast-black_scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-125" type="Path">
+						<Value>images\splashscreen.contrast-black_scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-100" type="Path">
+						<Value>images\splashscreen.contrast-black_scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK" type="Path">
+						<Value>images\splashscreen.contrast-black.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-400" isDefault="true" type="Path">
+						<Value>images\splashscreen.scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-200" isDefault="true" type="Path">
+						<Value>images\splashscreen.scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-150" isDefault="true" type="Path">
+						<Value>images\splashscreen.scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-125" isDefault="true" type="Path">
+						<Value>images\splashscreen.scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-100" isDefault="true" type="Path">
+						<Value>images\splashscreen.scale-100.png</Value>
+					</Candidate>
+					<Candidate type="Path">
+						<Value>images\splashscreen.png</Value>
+					</Candidate>
+				</NamedResource>
+				<NamedResource name="tilesmall.png" uri="ms-resource://windows.immersivecontrolpanel/Files/images/tilesmall.png">
+					<Candidate qualifiers="Contrast-WHITE, Scale-400" type="Path">
+						<Value>images\tilesmall.contrast-white_scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-200" type="Path">
+						<Value>images\tilesmall.contrast-white_scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-150" type="Path">
+						<Value>images\tilesmall.contrast-white_scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-125" type="Path">
+						<Value>images\tilesmall.contrast-white_scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-100" type="Path">
+						<Value>images\tilesmall.contrast-white_scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE" type="Path">
+						<Value>images\tilesmall.contrast-white.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-400" type="Path">
+						<Value>images\tilesmall.contrast-black_scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-200" type="Path">
+						<Value>images\tilesmall.contrast-black_scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-150" type="Path">
+						<Value>images\tilesmall.contrast-black_scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-125" type="Path">
+						<Value>images\tilesmall.contrast-black_scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-100" type="Path">
+						<Value>images\tilesmall.contrast-black_scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK" type="Path">
+						<Value>images\tilesmall.contrast-black.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-400" isDefault="true" type="Path">
+						<Value>images\tilesmall.scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-200" isDefault="true" type="Path">
+						<Value>images\tilesmall.scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-150" isDefault="true" type="Path">
+						<Value>images\tilesmall.scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-125" isDefault="true" type="Path">
+						<Value>images\tilesmall.scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-100" isDefault="true" type="Path">
+						<Value>images\tilesmall.scale-100.png</Value>
+					</Candidate>
+					<Candidate type="Path">
+						<Value>images\tilesmall.png</Value>
+					</Candidate>
+				</NamedResource>
+				<NamedResource name="tinytile.png" uri="ms-resource://windows.immersivecontrolpanel/Files/images/tinytile.png">
+					<Candidate qualifiers="Contrast-WHITE, Scale-400" type="Path">
+						<Value>images\tinytile.contrast-white_scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-200" type="Path">
+						<Value>images\tinytile.contrast-white_scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-150" type="Path">
+						<Value>images\tinytile.contrast-white_scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-125" type="Path">
+						<Value>images\tinytile.contrast-white_scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE, Scale-100" type="Path">
+						<Value>images\tinytile.contrast-white_scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-WHITE" type="Path">
+						<Value>images\tinytile.contrast-white.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-400" type="Path">
+						<Value>images\tinytile.contrast-black_scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-200" type="Path">
+						<Value>images\tinytile.contrast-black_scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-150" type="Path">
+						<Value>images\tinytile.contrast-black_scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-125" type="Path">
+						<Value>images\tinytile.contrast-black_scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK, Scale-100" type="Path">
+						<Value>images\tinytile.contrast-black_scale-100.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Contrast-BLACK" type="Path">
+						<Value>images\tinytile.contrast-black.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-400" isDefault="true" type="Path">
+						<Value>images\tinytile.scale-400.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-200" isDefault="true" type="Path">
+						<Value>images\tinytile.scale-200.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-150" isDefault="true" type="Path">
+						<Value>images\tinytile.scale-150.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-125" isDefault="true" type="Path">
+						<Value>images\tinytile.scale-125.png</Value>
+					</Candidate>
+					<Candidate qualifiers="Scale-100" isDefault="true" type="Path">
+						<Value>images\tinytile.scale-100.png</Value>
+					</Candidate>
+					<Candidate type="Path">
+						<Value>images\tinytile.png</Value>
+					</Candidate>
+				</NamedResource>
+			</ResourceMapSubtree>
+		</ResourceMapSubtree>
+		<ResourceMapSubtree name="MicrosoftInternalMetadata">
+			<NamedResource name="ContentChecksumValue" uri="ms-resource://windows.immersivecontrolpanel/MicrosoftInternalMetadata/ContentChecksumValue">
+				<Candidate type="String">
+					<Value>3767782273</Value>
+				</Candidate>
+			</NamedResource>
+		</ResourceMapSubtree>
+		<ResourceMapSubtree name="resources">
+			<NamedResource name="Description" uri="ms-resource://windows.immersivecontrolpanel/resources/Description"/>
+			<NamedResource name="DisplayName" uri="ms-resource://windows.immersivecontrolpanel/resources/DisplayName"/>
+			<NamedResource name="PublisherDisplayName" uri="ms-resource://windows.immersivecontrolpanel/resources/PublisherDisplayName"/>
+			<NamedResource name="ShortItemName" uri="ms-resource://windows.immersivecontrolpanel/resources/ShortItemName"/>
+			<NamedResource name="TileDescription" uri="ms-resource://windows.immersivecontrolpanel/resources/TileDescription"/>
+			<NamedResource name="TileDisplayName" uri="ms-resource://windows.immersivecontrolpanel/resources/TileDisplayName"/>
+			<NamedResource name="TileShortcutName" uri="ms-resource://windows.immersivecontrolpanel/resources/TileShortcutName"/>
+			<NamedResource name="VendorName" uri="ms-resource://windows.immersivecontrolpanel/resources/VendorName"/>
+		</ResourceMapSubtree>
+	</ResourceMap>
+</PriInfo>

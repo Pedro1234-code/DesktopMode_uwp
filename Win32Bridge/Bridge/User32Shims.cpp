@@ -54,6 +54,15 @@ namespace
     std::mutex g_cursorLock;
     std::unordered_map<ULONG_PTR, GuestCursorRecord> g_guestCursors;
 
+    // DPI_AWARENESS_CONTEXT is an opaque pseudo-handle on desktop Windows.
+    // The UWP SDK does not consistently expose the typedef/constants, so keep
+    // the ABI as HANDLE and use the documented pseudo-handle values.
+    constexpr LONG_PTR GuestDpiAwarenessSystem = -2;
+    // C++/CX forbids dynamically initialized thread-local pointer data. Keep
+    // the opaque pseudo-handle as its integral representation and cast only at
+    // the ABI boundary.
+    thread_local LONG_PTR g_guestThreadDpiAwareness = GuestDpiAwarenessSystem;
+
 #pragma pack(push, 2)
     struct GuestBitmapFileHeader final
     {
@@ -1852,6 +1861,104 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeAdjustWindowRectEx(LPRECT rect, DWORD, BO
         rect->bottom += GuestMetrics::MenuHeight;
     }
     return TRUE;
+}
+
+namespace
+{
+    constexpr UINT GuestDefaultDpi = 96;
+
+    int ScaleMetricForDpi(int value, UINT dpi)
+    {
+        if (dpi == 0) dpi = GuestDefaultDpi;
+        const std::int64_t scaled = static_cast<std::int64_t>(value) * dpi;
+        const std::int64_t rounded = scaled >= 0
+            ? scaled + GuestDefaultDpi / 2
+            : scaled - GuestDefaultDpi / 2;
+        const std::int64_t result = rounded / GuestDefaultDpi;
+        return static_cast<int>((std::max)(
+            static_cast<std::int64_t>((std::numeric_limits<int>::min)()),
+            (std::min)(static_cast<std::int64_t>((std::numeric_limits<int>::max)()), result)));
+    }
+
+    UINT WINAPI BridgeGetDpiForWindow(HWND window)
+    {
+        if (window && !BridgeIsWindow(window))
+        {
+            BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE);
+            return 0;
+        }
+        BridgeSetLastError(ERROR_SUCCESS);
+        return GuestDefaultDpi;
+    }
+
+    UINT WINAPI BridgeGetDpiForSystem()
+    {
+        BridgeSetLastError(ERROR_SUCCESS);
+        return GuestDefaultDpi;
+    }
+
+    int WINAPI BridgeGetSystemMetricsForDpi(int index, UINT dpi)
+    {
+        if (dpi == 0)
+        {
+            BridgeSetLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        const int metric = BridgeGetSystemMetrics(index);
+        if (BridgeGetLastError() != ERROR_SUCCESS) return 0;
+        BridgeSetLastError(ERROR_SUCCESS);
+        return ScaleMetricForDpi(metric, dpi);
+    }
+
+    BOOL WINAPI BridgeAdjustWindowRectExForDpi(
+        LPRECT rect, DWORD, BOOL hasMenu, DWORD, UINT dpi)
+    {
+        if (!rect || dpi == 0)
+        {
+            BridgeSetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        if (hasMenu) rect->bottom += ScaleMetricForDpi(GuestMetrics::MenuHeight, dpi);
+        BridgeSetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    HANDLE WINAPI BridgeSetThreadDpiAwarenessContext(HANDLE awareness)
+    {
+        if (!awareness)
+        {
+            BridgeSetLastError(ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+        const LONG_PTR previous = g_guestThreadDpiAwareness;
+        g_guestThreadDpiAwareness = reinterpret_cast<LONG_PTR>(awareness);
+        BridgeSetLastError(ERROR_SUCCESS);
+        return reinterpret_cast<HANDLE>(previous);
+    }
+
+    HANDLE WINAPI BridgeGetWindowDpiAwarenessContext(HWND window)
+    {
+        if (window && !BridgeIsWindow(window))
+        {
+            BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE);
+            return nullptr;
+        }
+        BridgeSetLastError(ERROR_SUCCESS);
+        return reinterpret_cast<HANDLE>(GuestDpiAwarenessSystem);
+    }
+
+    BOOL WINAPI BridgeAreDpiAwarenessContextsEqual(HANDLE first, HANDLE second)
+    {
+        BridgeSetLastError(ERROR_SUCCESS);
+        return first == second ? TRUE : FALSE;
+    }
+
+    UINT_PTR WINAPI BridgeSetCoalescableTimer(
+        HWND window, UINT_PTR timerId, UINT elapseMilliseconds,
+        GuestAbi::TimerProc timerProcedure, ULONG)
+    {
+        return BridgeSetTimer(window, timerId, elapseMilliseconds, timerProcedure);
+    }
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeDestroyWindow(HWND window)
@@ -3843,6 +3950,20 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDestroyIcon);
     else if (_wcsicmp(symbol.name.c_str(), L"getsystemmetrics") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetSystemMetrics);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdpiforwindow") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDpiForWindow);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdpiforsystem") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDpiForSystem);
+    else if (_wcsicmp(symbol.name.c_str(), L"getsystemmetricsfordpi") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetSystemMetricsForDpi);
+    else if (_wcsicmp(symbol.name.c_str(), L"adjustwindowrectexfordpi") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAdjustWindowRectExForDpi);
+    else if (_wcsicmp(symbol.name.c_str(), L"setthreaddpiawarenesscontext") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetThreadDpiAwarenessContext);
+    else if (_wcsicmp(symbol.name.c_str(), L"getwindowdpiawarenesscontext") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowDpiAwarenessContext);
+    else if (_wcsicmp(symbol.name.c_str(), L"aredpiawarenesscontextsequal") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAreDpiAwarenessContextsEqual);
     else if (_wcsicmp(symbol.name.c_str(), L"getsyscolor") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetSysColor);
     else if (_wcsicmp(symbol.name.c_str(), L"getsyscolorbrush") == 0)
@@ -3909,6 +4030,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowPos);
     else if (_wcsicmp(symbol.name.c_str(), L"settimer") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetTimer);
+    else if (_wcsicmp(symbol.name.c_str(), L"setcoalescabletimer") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetCoalescableTimer);
     else if (_wcsicmp(symbol.name.c_str(), L"killtimer") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeKillTimer);
     else if (_wcsicmp(symbol.name.c_str(), L"defwindowprocw") == 0)

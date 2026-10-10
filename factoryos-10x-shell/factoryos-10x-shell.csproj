@@ -158,6 +158,7 @@
     <Compile Include="Controls\Win32GuestWindow.xaml.cs">
       <DependentUpon>Win32GuestWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Controls\WindowResize.cs" />
     <Compile Include="Controls\ActionCenterSegmentedToggle.xaml.cs">
       <DependentUpon>ActionCenterSegmentedToggle.xaml</DependentUpon>
     </Compile>
@@ -169,6 +170,7 @@
     </Compile>
     <Compile Include="Services\Hardware\BluetoothService.cs" />
     <Compile Include="Services\Helpers\AppState.cs" />
+    <Compile Include="Services\Helpers\UpdateCheckService.cs" />
     <Compile Include="Services\Input\MouseInputService.cs" />
     <Compile Include="Services\WebApps\WebAppService.cs" />
     <Compile Include="Services\WebApps\WindowManagerService.cs" />
@@ -283,9 +285,6 @@
     <Content Include="Assets\Wide310x150Logo.scale-125.png" />
     <Content Include="Assets\Wide310x150Logo.scale-150.png" />
     <Content Include="Assets\Wide310x150Logo.scale-400.png" />
-    <Content Include="Microsoft-Copilot.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </Content>
     <Content Include="powerDark.png">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
@@ -302,8 +301,8 @@
     <Content Include="Assets\Files\files.png" />
     <Content Include="Assets\Files\FluentIcons\SidebarSections\*.png" />
     <Content Include="Assets\Files\FluentIcons\*.txt" />
-    <Content Include="..\Files-main_reference\src\Files.App\Assets\FolderIcon.png">
-      <Link>Assets\Files\FluentIcons\FolderIcon.png</Link>
+    <Content Include="..\Icons\**\*.ico">
+      <Link>Assets\Files\Windows11Icons\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </Content>
     <Content Include="Assets\Firefox\firefox.png" />
     <Content Include="Assets\Notepad\notepad.png" />
@@ -320,9 +319,6 @@
     <Content Include="Windows10x-js-main\Walls\wall4.jpg" />
     <Content Include="Windows10x-js-main\Walls\wall5.jpg" />
     <Content Include="Windows10x-js-main\Icons\WindowsSettings.png" />
-    <Content Include="search.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
-    </Content>
     <Content Include="taskview.png">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>

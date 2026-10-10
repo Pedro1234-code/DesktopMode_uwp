@@ -12,29 +12,6 @@ namespace factoryos_10x_shell.Services.Helpers
         private static AppState _instance;
         public static AppState Instance => _instance ?? (_instance = new AppState());
 
-        private bool _isSearchButtonVisible = true;
-        public bool IsSearchButtonVisible
-        {
-            get => _isSearchButtonVisible;
-            set
-            {
-                _isSearchButtonVisible = value;
-                OnSearchButtonVisibilityChanged?.Invoke(value);
-            }
-        }
-
-        private bool _isCopilotButtonVisible = true;
-        public bool IsCopilotButtonVisible
-        {
-            get => _isCopilotButtonVisible;
-            set
-            {
-                _isCopilotButtonVisible = value;
-                OnCopilotButtonVisibilityChanged?.Invoke(value);
-            }
-        }
-
-
         private bool _isBgChangeButtonVisible;
         public bool IsBgChangeButtonVisible
         {
@@ -52,8 +29,6 @@ namespace factoryos_10x_shell.Services.Helpers
 
         public event Action<bool> OnBgChangeButtonVisibilityChanged;
 
-        public event Action<bool> OnSearchButtonVisibilityChanged;
-        public event Action<bool> OnCopilotButtonVisibilityChanged;
         public bool IsFilesOpen { get; private set; }
         public bool IsFilesMinimized { get; private set; }
         public event Action<bool> OnFilesRequested;

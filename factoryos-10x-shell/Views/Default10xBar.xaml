@@ -106,24 +106,6 @@
         VerticalAlignment="Bottom"
         Background="{ThemeResource TaskbarAcrylicBrush}">
 
-        <Button
-            x:Name="CopilotButton"
-            Width="60"
-            Height="50"
-            Padding="0"
-            Click="CopilotButton_Click"
-            Style="{StaticResource TaskbarButtonStyle}"
-            ToolTipService.ToolTip="Copilot">
-            <Image
-                Width="26"
-                Height="26"
-                Source="ms-appx:///Microsoft-Copilot.png" />
-        </Button>
-
-
-
-
-
         <StackPanel HorizontalAlignment="Center" Orientation="Horizontal">
             <Button
                 x:Name="StartButton"
@@ -215,25 +197,6 @@
                     </Canvas>
                 </Viewbox>
             </Button>
-
-            <Button
-                x:Name="SearchButton"
-                Width="50"
-                Height="50"
-                Padding="13"
-                Command="{x:Bind Mode=OneWay, Path=ViewModel.SearchButtonClickedCommand}"
-                FontSize="18"
-                Style="{StaticResource TaskbarButtonStyle}"
-                ToolTipService.ToolTip="Search">
-                <Button.Content>
-                    <Image
-                        Width="26"
-                        Height="26"
-                        Source="ms-appx:///search.png"
-                        Stretch="Uniform" />
-                </Button.Content>
-            </Button>
-
 
             <Button
                 x:Name="TaskViewButton"

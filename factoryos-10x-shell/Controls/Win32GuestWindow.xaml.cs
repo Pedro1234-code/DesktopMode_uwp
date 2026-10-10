@@ -28,6 +28,7 @@ namespace factoryos_10x_shell.Controls
         private Point m_resizeStart;
         private double m_startWidth;
         private double m_startHeight;
+        private WindowResizeCorner m_resizeCorner;
         private bool m_resizing;
         private bool m_started;
         private bool m_closed;
@@ -208,21 +209,27 @@ namespace factoryos_10x_shell.Controls
         {
             if (m_window == null || m_window.IsMaximized) return;
             m_resizing = true;
-            m_resizeStart = e.GetCurrentPoint(this).Position;
+            m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
+            m_resizeStart = e.GetCurrentPoint(null).Position;
+            m_startLeft = m_window.Left;
+            m_startTop = m_window.Top;
             m_startWidth = m_window.Width;
             m_startHeight = m_window.Height;
-            ResizeGrip.CapturePointer(e.Pointer);
+            (sender as UIElement)?.CapturePointer(e.Pointer);
         }
 
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
-            Point position = e.GetCurrentPoint(this).Position;
-            m_window.Width = Math.Max(480, m_startWidth + position.X - m_resizeStart.X);
-            m_window.Height = Math.Max(320, m_startHeight + position.Y - m_resizeStart.Y);
+            Rect bounds = WindowResize.Calculate(m_resizeCorner, m_resizeStart,
+                e.GetCurrentPoint(null).Position,
+                new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 480, 320);
+            m_window.Left = bounds.X; m_window.Top = bounds.Y;
+            m_window.Width = bounds.Width; m_window.Height = bounds.Height;
+            UpdateCanvasPosition();
         }
 
-        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; ResizeGrip.ReleasePointerCaptures(); }
+        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; (sender as UIElement)?.ReleasePointerCaptures(); }
         private void ResizeGrip_PointerCaptureLost(object sender, PointerRoutedEventArgs e) => m_resizing = false;
 
         private void MouseInput_InputChanged(object sender, MouseInputChangedEventArgs e)

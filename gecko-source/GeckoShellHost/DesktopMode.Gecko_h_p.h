@@ -6,7 +6,7 @@
  /* File created by MIDL compiler version 8.01.0628 */
 /* at Tue Jan 19 00:14:07 2038
  */
-/* Compiler settings for C:\Users\fcvin\AppData\Local\Temp\DesktopMode.Gecko.idl-16d1211f:
+/* Compiler settings for C:\Users\fcvin\AppData\Local\Temp\DesktopMode.Gecko.idl-4a5e1237:
     Oicf, W1, Zp8, env=Win64 (32b run), target_arch=AMD64 8.01.0628 
     protocol : all , ms_ext, c_ext, robust
     error checks: allocation ref bounds_check enum stub_data 
@@ -97,7 +97,7 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
 
 #if defined(__cplusplus) && !defined(CINTERFACE)
     
-    MIDL_INTERFACE("1bdf20ab-f78a-57f1-a989-9dba315d0118")
+    MIDL_INTERFACE("3eed7c58-c446-5d43-8e92-3b9e1cebfa93")
     __x_ABI_CDesktopMode_CGecko_CIGeckoHost : public IInspectable
     {
     public:
@@ -131,6 +131,8 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
         virtual HRESULT STDMETHODCALLTYPE Suspend( void) = 0;
         
         virtual HRESULT STDMETHODCALLTYPE Resume( void) = 0;
+        
+        virtual HRESULT STDMETHODCALLTYPE Close( void) = 0;
         
     };
     
@@ -223,6 +225,10 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
         HRESULT ( STDMETHODCALLTYPE *Resume )( 
             __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This);
         
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, Close)
+        HRESULT ( STDMETHODCALLTYPE *Close )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This);
+        
         END_INTERFACE
     } __x_ABI_CDesktopMode_CGecko_CIGeckoHostVtbl;
 
@@ -285,6 +291,9 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
 
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_Resume(This)	\
     ( (This)->lpVtbl -> Resume(This) ) 
+
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_Close(This)	\
+    ( (This)->lpVtbl -> Close(This) ) 
 
 #endif /* COBJMACROS */
 

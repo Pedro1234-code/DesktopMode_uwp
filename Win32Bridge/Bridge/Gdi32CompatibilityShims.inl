@@ -3,6 +3,65 @@ namespace
 using GuestAbortProc = BOOL (CALLBACK*)(HDC, int);
 using GuestFontEnumProcW = int (CALLBACK*)(const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM);
 
+// Desktop GDI declares these in wingdi.h, but the UWP SDK projection omits
+// them.  Keep the exact native layout at the guest ABI boundary.
+struct GuestEnumLogFontExW final
+{
+    LOGFONTW logFont;
+    wchar_t fullName[64];
+    wchar_t style[32];
+    wchar_t script[32];
+};
+
+struct GuestNewTextMetricW final
+{
+    TEXTMETRICW textMetric;
+    DWORD flags;
+    UINT sizeEm;
+    UINT cellHeight;
+    UINT averageWidth;
+};
+
+struct GuestFontSignature final
+{
+    DWORD unicodeSubsets[4];
+    DWORD codePages[2];
+};
+
+struct GuestNewTextMetricExW final
+{
+    GuestNewTextMetricW newTextMetric;
+    GuestFontSignature signature;
+};
+
+int InvokeGuestFontEnumProcWSeh(GuestFontEnumProcW callback,
+    const LOGFONTW* font, const TEXTMETRICW* metrics, DWORD type,
+    LPARAM parameter, bool* faulted)
+{
+    *faulted = false;
+    __try
+    {
+        return callback(font, metrics, type, parameter);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        *faulted = true;
+        return 0;
+    }
+}
+
+int InvokeGuestFontEnumProcW(GuestFontEnumProcW callback,
+    const LOGFONTW* font, const TEXTMETRICW* metrics, DWORD type, LPARAM parameter)
+{
+    if (!callback) return 0;
+    bool faulted = false;
+    const int result = InvokeGuestFontEnumProcWSeh(
+        callback, font, metrics, type, parameter, &faulted);
+    if (faulted)
+        RuntimeDiagnostics::Record(L"GDI: guest font-enumeration callback raised an exception.");
+    return result;
+}
+
 struct GuestDcCompatibilityState final
 {
     POINT origin{};
@@ -381,10 +440,38 @@ BOOL WINAPI BridgeGdiAlphaBlend(HDC destination, int x, int y, int width, int he
         sourceX, sourceY, sourceWidth, sourceHeight, SRCCOPY);
 }
 
+int WINAPI BridgeEnumFontsW(
+    HDC dc, LPCWSTR faceName, GuestFontEnumProcW callback, LPARAM parameter);
+
 int WINAPI BridgeEnumFontFamiliesExW(HDC dc, LOGFONTW* font, GuestFontEnumProcW callback,
     LPARAM parameter, DWORD)
 {
-    return BridgeEnumFontsW(dc, font ? font->lfFaceName : nullptr, callback, parameter);
+    UNREFERENCED_PARAMETER(dc);
+    if (!callback) return 0;
+    GuestEnumLogFontExW enumerated{};
+    enumerated.logFont = font ? *font : LOGFONTW{};
+    if (!enumerated.logFont.lfFaceName[0])
+        wcscpy_s(enumerated.logFont.lfFaceName,
+            _countof(enumerated.logFont.lfFaceName), L"Segoe UI");
+    wcscpy_s(enumerated.fullName, _countof(enumerated.fullName),
+        enumerated.logFont.lfFaceName);
+    wcscpy_s(enumerated.style, _countof(enumerated.style),
+        enumerated.logFont.lfItalic ? L"Italic" : L"Regular");
+    wcscpy_s(enumerated.script, _countof(enumerated.script), L"Western");
+    GuestNewTextMetricExW metrics{};
+    metrics.newTextMetric.textMetric.tmHeight = 16;
+    metrics.newTextMetric.textMetric.tmAscent = 13;
+    metrics.newTextMetric.textMetric.tmDescent = 3;
+    metrics.newTextMetric.textMetric.tmAveCharWidth = 8;
+    metrics.newTextMetric.textMetric.tmMaxCharWidth = 16;
+    metrics.newTextMetric.textMetric.tmWeight = enumerated.logFont.lfWeight
+        ? enumerated.logFont.lfWeight : FW_NORMAL;
+    metrics.newTextMetric.textMetric.tmCharSet = enumerated.logFont.lfCharSet == DEFAULT_CHARSET
+        ? ANSI_CHARSET : enumerated.logFont.lfCharSet;
+    metrics.newTextMetric.flags = 0x00000040u; // NTM_REGULAR
+    return InvokeGuestFontEnumProcW(callback,
+        reinterpret_cast<const LOGFONTW*>(&enumerated),
+        reinterpret_cast<const TEXTMETRICW*>(&metrics), TRUETYPE_FONTTYPE, parameter);
 }
 
 bool CopyDibToSurface(const BITMAPINFO* information, const void* bits,
@@ -414,19 +501,70 @@ bool CopyDibToSurface(const BITMAPINFO* information, const void* bits,
     return true;
 }
 
-HBITMAP WINAPI BridgeCreateDIBSection(HDC, const BITMAPINFO* information, UINT,
-    void** bits, HANDLE, DWORD)
+HBITMAP WINAPI BridgeCreateDIBSection(HDC, const BITMAPINFO* information, UINT usage,
+    void** bits, HANDLE section, DWORD offset)
 {
-    if (!information || !bits) return nullptr;
-    const int width = information->bmiHeader.biWidth;
-    const int height = information->bmiHeader.biHeight < 0
-        ? -information->bmiHeader.biHeight : information->bmiHeader.biHeight;
-    HBITMAP bitmap = BridgeCreateBitmap(width, height, 1, information->bmiHeader.biBitCount, nullptr);
+    if (bits) *bits = nullptr;
+    if (!information || !bits)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    const BITMAPINFOHEADER& header = information->bmiHeader;
+    if (header.biSize < sizeof(BITMAPINFOHEADER) || header.biWidth <= 0 ||
+        header.biHeight == 0 || header.biHeight == (std::numeric_limits<LONG>::min)() ||
+        header.biPlanes != 1 || usage != DIB_RGB_COLORS)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    // MiniGdi surfaces deliberately use the native 32-bit BI_RGB byte layout
+    // (BGRA in little-endian memory).  That lets a guest write through ppvBits
+    // and lets the renderer consume the same stable allocation without a
+    // shadow-buffer race.  Other formats require conversion on every guest
+    // write, which cannot be observed through a raw DIB pointer, so do not
+    // pretend they are compatible.
+    if (header.biBitCount != 32 ||
+        (header.biCompression != BI_RGB && header.biCompression != BI_BITFIELDS))
+    {
+        BridgeSetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+
+    // Section-backed DIBs need mapped-section lifetime/offset semantics.  A
+    // private DIB section is fully supported; rejecting the other form avoids
+    // returning a pointer unrelated to the caller's mapping.
+    if (section != nullptr || offset != 0)
+    {
+        BridgeSetLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+
+    const int width = header.biWidth;
+    const int height = header.biHeight < 0 ? -header.biHeight : header.biHeight;
+    const std::uint64_t pixelCount = static_cast<std::uint64_t>(width) *
+        static_cast<std::uint64_t>(height);
+    constexpr std::uint64_t MaximumDibBytes = 256ull * 1024ull * 1024ull;
+    if (pixelCount > MaximumDibBytes / sizeof(MiniGdi::Color))
+    {
+        BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+
+    HBITMAP bitmap = BridgeCreateBitmap(width, height, 1, 32, nullptr);
     GuestWindowManager* manager = CurrentManagerOrFail();
     MiniGdi::Surface* surface = manager && bitmap
         ? manager->Gdi().GetBitmapSurface(FromGuestObject(bitmap)) : nullptr;
-    if (!surface) { *bits = nullptr; return nullptr; }
+    if (!surface)
+    {
+        if (bitmap) BridgeDeleteObject(bitmap);
+        BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
     *bits = surface->Data();
+    BridgeSetLastError(ERROR_SUCCESS);
     return bitmap;
 }
 
@@ -521,19 +659,12 @@ int WINAPI BridgeSetMapMode(HDC, int mode)
 }
 
 int WINAPI BridgeEnumFontsW(
-    HDC, LPCWSTR faceName, GuestFontEnumProcW callback, LPARAM parameter)
+    HDC dc, LPCWSTR faceName, GuestFontEnumProcW callback, LPARAM parameter)
 {
-    if (!callback) return 0;
     LOGFONTW font = {};
     wcscpy_s(font.lfFaceName, faceName && *faceName ? faceName : L"Segoe UI");
-    TEXTMETRICW metrics = {};
-    metrics.tmHeight = 16;
-    metrics.tmAscent = 13;
-    metrics.tmDescent = 3;
-    metrics.tmAveCharWidth = 8;
-    metrics.tmMaxCharWidth = 16;
-    metrics.tmCharSet = DEFAULT_CHARSET;
-    return callback(&font, &metrics, 0, parameter);
+    font.lfCharSet = DEFAULT_CHARSET;
+    return BridgeEnumFontFamiliesExW(dc, &font, callback, parameter, 0);
 }
 
 HDC WINAPI BridgeCreateDCW(LPCWSTR, LPCWSTR, LPCWSTR, const void*)

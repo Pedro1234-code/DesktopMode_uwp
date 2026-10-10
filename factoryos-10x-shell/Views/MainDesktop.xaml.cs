@@ -53,6 +53,7 @@ namespace factoryos_10x_shell.Views
         private readonly Win32WindowManagerService m_nativeWindowManager;
         private readonly ShellWindowCoordinator m_shellWindowCoordinator;
         private bool m_coordinatingActivation;
+        private bool m_startupUpdateCheckStarted;
         private Visibility m_taskbarVisibilityBeforeFirefoxFullscreen = Visibility.Visible;
         private readonly BitmapImage m_filesIcon = new BitmapImage(new Uri("ms-appx:///Assets/Files/files.png"));
         private readonly BitmapImage m_notepadIcon = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
@@ -557,9 +558,13 @@ namespace factoryos_10x_shell.Views
             UpdateWorkspaceBounds();
         }
 
-        private void MainDesktop_Loaded(object sender, RoutedEventArgs e)
+        private async void MainDesktop_Loaded(object sender, RoutedEventArgs e)
         {
             UpdateWorkspaceBounds();
+            if (m_startupUpdateCheckStarted || !UpdateCheckService.IsAutomaticCheckEnabled) return;
+
+            m_startupUpdateCheckStarted = true;
+            await UpdateCheckService.CheckAsync(true);
         }
 
         private void WindowManager_DesktopFocusRequested(object sender, EventArgs e)
@@ -662,7 +667,12 @@ namespace factoryos_10x_shell.Views
 
         private void OnPointerPressed(object sender, PointerRoutedEventArgs args)
         {
-            PointerPoint point = args.GetCurrentPoint(BackgroundWallpaper);
+            // Bounds below are transformed to the XAML root. Read the pointer
+            // in that same coordinate space; BackgroundWallpaper coordinates
+            // are logical desktop coordinates and differ on Xbox because the
+            // whole desktop is scaled to 70%. Mixing both spaces made every
+            // click appear outside Start and dismissed it.
+            PointerPoint point = args.GetCurrentPoint(null);
 
             if (m_actionManager.IsActionCenterOpen)
             {

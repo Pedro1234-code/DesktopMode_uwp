@@ -5,6 +5,8 @@
 #include "pch.h"
 #include "Log.h"
 
+#include <cwctype>
+#include <cwchar>
 #include <mutex>
 
 namespace gecko_w10m::client {
@@ -18,26 +20,6 @@ std::wstring g_path;
 std::vector<std::wstring> g_ring;
 std::function<void(std::wstring)> g_handler;
 bool g_verbose = false;
-
-// Gecko writes a pref the user changed as
-//   user_pref("gecko.debug.verbose_logs", true);
-// and drops the line again when it goes back to its default, false.
-bool ReadVerbosePref(const std::wstring& localState) {
-  std::wstring prefs = localState;
-  if (!prefs.empty() && prefs.back() != L'\\') prefs += L'\\';
-  prefs += L"profile\\prefs.js";
-  FILE* f = _wfopen(prefs.c_str(), L"rb");
-  if (!f) return false;
-  bool verbose = false;
-  char line[512];
-  while (fgets(line, sizeof(line), f)) {
-    if (strstr(line, "\"gecko.debug.verbose_logs\"")) {
-      verbose = strstr(line, "true") != nullptr;
-    }
-  }
-  fclose(f);
-  return verbose;
-}
 
 std::wstring Timestamp() {
   SYSTEMTIME st{};
@@ -60,6 +42,93 @@ std::string ToUtf8(std::wstring_view s) {
   return out;
 }
 
+bool IsLogDelimiter(wchar_t ch) {
+  return iswspace(ch) || ch == L'\'' || ch == L'"' || ch == L'<' ||
+         ch == L'>' || ch == L')' || ch == L']' || ch == L'}';
+}
+
+// Diagnostics must be useful to a developer without becoming a copy of the
+// user's browsing history. Do this at the single writing boundary so the disk
+// log, debugger output, on-screen ring and mirrored copy all agree.
+std::wstring RedactSensitiveText(std::wstring_view input) {
+  std::wstring text(input);
+
+  // URLs themselves are browsing history. Do not retain their host, path,
+  // query or fragment in any diagnostic destination.
+  for (size_t scheme = text.find(L"://"); scheme != std::wstring::npos;) {
+    size_t begin = scheme;
+    while (begin > 0 && !IsLogDelimiter(text[begin - 1])) {
+      --begin;
+    }
+    const size_t end = text.find_first_of(L" \t\r\n\"'<>)]}", scheme + 3);
+    const size_t limit = end == std::wstring::npos ? text.size() : end;
+    text.replace(begin, limit - begin, L"[url redacted]");
+    scheme = text.find(L"://", begin + 14);
+  }
+
+  // Redact common credential fields outside URLs too (JSON, HTTP diagnostics,
+  // and JavaScript exception text). The key remains for diagnosis.
+  std::wstring lower = text;
+  for (wchar_t& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+  const wchar_t* keys[] = {L"access_token", L"refresh_token", L"id_token",
+                           L"authorization", L"cookie", L"session", L"token",
+                           L"sid", L"sig"};
+  for (const wchar_t* key : keys) {
+    const size_t keyLength = wcslen(key);
+    for (size_t at = lower.find(key); at != std::wstring::npos;) {
+      size_t value = at + keyLength;
+      while (value < text.size() && (text[value] == L' ' || text[value] == L'\t' ||
+                                     text[value] == L':' || text[value] == L'=' ||
+                                     text[value] == L'\"')) {
+        ++value;
+      }
+      if (value == at + keyLength || value >= text.size()) {
+        at = lower.find(key, at + keyLength);
+        continue;
+      }
+      size_t end = value;
+      while (end < text.size() && !IsLogDelimiter(text[end]) && text[end] != L'&' &&
+             text[end] != L',' && text[end] != L';') {
+        ++end;
+      }
+      text.replace(value, end - value, L"[redacted]");
+      lower = text;
+      for (wchar_t& ch : lower) ch = static_cast<wchar_t>(towlower(ch));
+      at = lower.find(key, value + 10);
+    }
+  }
+
+  // Mask IPv4 literals. Host names remain intact, while public and LAN
+  // addresses no longer identify a user or their network.
+  for (size_t i = 0; i < text.size();) {
+    if (!iswdigit(text[i]) || (i && (iswalnum(text[i - 1]) || text[i - 1] == L'.'))) {
+      ++i;
+      continue;
+    }
+    size_t p = i;
+    bool valid = true;
+    for (int part = 0; part < 4; ++part) {
+      const size_t begin = p;
+      int value = 0;
+      while (p < text.size() && iswdigit(text[p]) && p - begin < 3) {
+        value = value * 10 + (text[p++] - L'0');
+      }
+      if (p == begin || value > 255 || (p < text.size() && iswdigit(text[p])) ||
+          (part != 3 && (p == text.size() || text[p++] != L'.'))) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid && (p == text.size() || (!iswalnum(text[p]) && text[p] != L'.'))) {
+      text.replace(i, p - i, L"[ip]");
+      i += 4;
+    } else {
+      ++i;
+    }
+  }
+  return text;
+}
+
 }  // namespace
 
 void Log::Mirror() {
@@ -77,9 +146,7 @@ void Log::Mirror() {
     const std::wstring dir = g_path.substr(0, g_path.rfind(L'\\') + 1);
     const wchar_t* names[] = {L"gecko.log",
                               L"profile\\gecko-notes.log",
-                              L"profile\\delay-load-used.log",
-                              L"profile\\gecko-stderr.log",
-                              L"profile\\gecko-moz.log"};
+                              L"profile\\delay-load-used.log"};
     int copied = 0;
     for (const wchar_t* name : names) {
       const std::wstring full = dir + name;
@@ -109,11 +176,10 @@ void Log::Init(std::wstring_view localStatePath) {
 
   g_path.assign(localStatePath);
   if (!g_path.empty() && g_path.back() != L'\\') g_path += L'\\';
-  g_verbose = ReadVerbosePref(g_path);
-  // For the engine bootstrap, which does not link this file: it decides from
-  // this whether Gecko's own logging goes on.
-  ::SetEnvironmentVariableW(L"GECKO_W10M_VERBOSE_LOGS",
-                            g_verbose ? L"1" : nullptr);
+  // Verbose Gecko diagnostics can include request URLs. They remain disabled
+  // even when an older profile still carries the former debug preference.
+  g_verbose = false;
+  ::SetEnvironmentVariableW(L"GECKO_W10M_VERBOSE_LOGS", nullptr);
   g_path += L"gecko.log";
 
   // CreateFile2 is the app-container form of CreateFile; the app's own
@@ -135,7 +201,7 @@ void Log::Init(std::wstring_view localStatePath) {
 }
 
 void Log::Write(std::wstring_view line) {
-  std::wstring stamped = Timestamp() + L"  " + std::wstring(line);
+  std::wstring stamped = Timestamp() + L"  " + RedactSensitiveText(line);
 
   std::function<void(std::wstring)> handler;
   {
@@ -160,7 +226,7 @@ void Log::Write(std::wstring_view line) {
 }
 
 void Log::WriteFromFault(std::wstring_view line) {
-  std::wstring stamped = Timestamp() + L"  " + std::wstring(line);
+  std::wstring stamped = Timestamp() + L"  " + RedactSensitiveText(line);
 
   // try_lock, not lock: if the fault happened while this thread already held
   // the mutex, taking it again is undefined and waiting on it is a deadlock.

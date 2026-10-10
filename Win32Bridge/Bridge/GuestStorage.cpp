@@ -393,8 +393,9 @@ struct GuestStorageContext::FindRecord final
     std::mutex lock;
 };
 
-GuestStorageContext::GuestStorageContext(StorageFolder^ localFolder, const std::wstring& modulePath)
-    : m_localFolder(localFolder)
+GuestStorageContext::GuestStorageContext(StorageFolder^ localFolder, const std::wstring& modulePath,
+    StorageFolder^ moduleSourceFolder)
+    : m_localFolder(localFolder), m_moduleSourceFolder(moduleSourceFolder)
 {
     GuestPath module;
     std::wstring ignored;
@@ -406,6 +407,8 @@ GuestStorageContext::GuestStorageContext(StorageFolder^ localFolder, const std::
         if (lastSeparator != std::wstring::npos &&
             m_paths.Resolve(m_modulePath.substr(0, lastSeparator).c_str(), &current, &ignored))
         {
+            m_moduleDirectory = current.canonical;
+            m_moduleDirectoryComponentCount = current.components.size();
             m_paths.SetCurrentDirectoryPath(current, &ignored);
         }
     }
@@ -518,6 +521,53 @@ bool GuestStorageContext::GetParentFolder(
 bool GuestStorageContext::GetDirectoryFolder(const GuestPath& path, StorageFolder^* folder, DWORD* win32Error) const
 {
     return GetFolder(PhysicalComponents(path), false, folder, win32Error);
+}
+
+bool GuestStorageContext::GetAuthorizedFolder(const GuestPath& path, StorageFolder^* folder) const
+{
+    if (!folder) return false;
+    *folder = nullptr;
+    StorageFolder^ current = m_moduleSourceFolder.Get();
+    const bool sameDirectory = !m_moduleDirectory.empty() &&
+        _wcsicmp(path.canonical.c_str(), m_moduleDirectory.c_str()) == 0;
+    const bool childDirectory = !m_moduleDirectory.empty() &&
+        path.canonical.size() > m_moduleDirectory.size() &&
+        path.canonical[m_moduleDirectory.size()] == L'\\' &&
+        _wcsnicmp(path.canonical.c_str(), m_moduleDirectory.c_str(),
+            m_moduleDirectory.size()) == 0;
+    if (!current || (!sameDirectory && !childDirectory) ||
+        path.components.size() < m_moduleDirectoryComponentCount)
+        return false;
+    try
+    {
+        for (size_t index = m_moduleDirectoryComponentCount; index < path.components.size(); ++index)
+            current = create_task(current->GetFolderAsync(
+                ref new String(path.components[index].c_str()))).get();
+        *folder = current;
+        return true;
+    }
+    catch (...) { return false; }
+}
+
+bool GuestStorageContext::OpenAuthorizedFile(const GuestPath& path, DWORD desiredAccess,
+    DWORD shareMode, HANDLE* guestHandle, DWORD* win32Error)
+{
+    if (HasWriteAccess(desiredAccess) || path.components.size() <= m_moduleDirectoryComponentCount)
+        return false;
+    GuestPath parentPath = path;
+    const std::wstring leaf = parentPath.components.back();
+    parentPath.components.pop_back();
+    parentPath.canonical = parentPath.canonical.substr(0, parentPath.canonical.find_last_of(L'\\'));
+    StorageFolder^ parent = nullptr;
+    if (!GetAuthorizedFolder(parentPath, &parent)) return false;
+    try
+    {
+        StorageFile^ file = create_task(parent->GetFileAsync(ref new String(leaf.c_str()))).get();
+        IRandomAccessStream^ stream = create_task(file->OpenAsync(FileAccessMode::Read)).get();
+        return AddFile(stream, true, false, path.canonical, desiredAccess, shareMode,
+            false, guestHandle, win32Error);
+    }
+    catch (...) { return false; }
 }
 
 bool GuestStorageContext::EnsureLayout(std::wstring* error)
@@ -872,6 +922,9 @@ bool GuestStorageContext::CreateFile(
     std::wstring leaf;
     if (!GetParentFolder(path, &parent, &leaf, win32Error))
     {
+        if (creationDisposition == OPEN_EXISTING &&
+            OpenAuthorizedFile(path, desiredAccess, shareMode, guestHandle, win32Error))
+            return true;
         return false;
     }
 
@@ -926,6 +979,9 @@ bool GuestStorageContext::CreateFile(
     }
     catch (Exception^ exception)
     {
+        if (creationDisposition == OPEN_EXISTING &&
+            OpenAuthorizedFile(path, desiredAccess, shareMode, guestHandle, win32Error))
+            return true;
         SetWin32Error(win32Error, ErrorFromException(exception));
         return false;
     }
@@ -1654,7 +1710,13 @@ DWORD GuestStorageContext::GetGuestFileAttributes(LPCWSTR path, DWORD* win32Erro
     std::wstring leaf;
     if (!GetParentFolder(resolved, &parent, &leaf, win32Error))
     {
-        return INVALID_FILE_ATTRIBUTES;
+        StorageFolder^ authorizedParent = nullptr;
+        GuestPath parentPath = resolved;
+        parentPath.components.pop_back();
+        parentPath.canonical = parentPath.canonical.substr(0, parentPath.canonical.find_last_of(L'\\'));
+        if (!GetAuthorizedFolder(parentPath, &authorizedParent))
+            return INVALID_FILE_ATTRIBUTES;
+        parent = authorizedParent;
     }
 
     try
@@ -1668,6 +1730,21 @@ DWORD GuestStorageContext::GetGuestFileAttributes(LPCWSTR path, DWORD* win32Erro
     }
     catch (Exception^ exception)
     {
+        StorageFolder^ authorizedParent = nullptr;
+        GuestPath parentPath = resolved;
+        parentPath.components.pop_back();
+        parentPath.canonical = parentPath.canonical.substr(0, parentPath.canonical.find_last_of(L'\\'));
+        if (GetAuthorizedFolder(parentPath, &authorizedParent))
+        {
+            try
+            {
+                IStorageItem^ item = create_task(authorizedParent->GetItemAsync(
+                    ref new String(leaf.c_str()))).get();
+                SetWin32Error(win32Error, ERROR_SUCCESS);
+                return MapFileAttributes(item, item->IsOfType(StorageItemTypes::Folder));
+            }
+            catch (...) { }
+        }
         SetWin32Error(win32Error, ErrorFromException(exception));
         return INVALID_FILE_ATTRIBUTES;
     }
@@ -1748,35 +1825,38 @@ bool GuestStorageContext::FindFirstGuestFile(
     }
 
     StorageFolder^ folder = nullptr;
-    if (!GetDirectoryFolder(resolvedDirectory, &folder, win32Error))
-    {
-        return false;
-    }
+    const bool haveLocalFolder = GetDirectoryFolder(resolvedDirectory, &folder, win32Error);
+    StorageFolder^ authorizedFolder = nullptr;
+    const bool haveAuthorizedFolder = GetAuthorizedFolder(resolvedDirectory, &authorizedFolder);
+    if (!haveLocalFolder && !haveAuthorizedFolder) return false;
 
     try
     {
-        auto items = create_task(folder->GetItemsAsync()).get();
         std::vector<WIN32_FIND_DATAW> matches;
-        matches.reserve(items->Size);
-        for (unsigned int index = 0; index < items->Size; ++index)
+        const auto appendMatches = [&](StorageFolder^ source)
         {
-            IStorageItem^ item = items->GetAt(index);
-            const std::wstring name(item->Name->Data());
-            if (!WildcardMatch(pattern, name))
+            if (!source) return true;
+            auto items = create_task(source->GetItemsAsync()).get();
+            for (unsigned int index = 0; index < items->Size; ++index)
             {
-                continue;
+                IStorageItem^ item = items->GetAt(index);
+                const std::wstring name(item->Name->Data());
+                if (!WildcardMatch(pattern, name)) continue;
+                const bool duplicate = std::any_of(matches.begin(), matches.end(),
+                    [&name](const WIN32_FIND_DATAW& entry)
+                    { return _wcsicmp(entry.cFileName, name.c_str()) == 0; });
+                if (duplicate) continue;
+                WIN32_FIND_DATAW entry = {};
+                if (!FillFindData(item, &entry, win32Error)) return false;
+                entry.dwFileAttributes = ApplyAttributeOverride(
+                    ChildCanonicalPath(resolvedDirectory.canonical, name),
+                    entry.dwFileAttributes);
+                matches.push_back(entry);
             }
-
-            WIN32_FIND_DATAW entry = {};
-            if (!FillFindData(item, &entry, win32Error))
-            {
-                return false;
-            }
-            entry.dwFileAttributes = ApplyAttributeOverride(
-                ChildCanonicalPath(resolvedDirectory.canonical, name),
-                entry.dwFileAttributes);
-            matches.push_back(entry);
-        }
+            return true;
+        };
+        if ((haveLocalFolder && !appendMatches(folder)) ||
+            (haveAuthorizedFolder && !appendMatches(authorizedFolder))) return false;
 
         if (matches.empty())
         {

@@ -11,6 +11,7 @@
 
 #include <atomic>
 #include <cwchar>
+#include <fileapifromapp.h>
 #include <roapi.h>
 #include <system_error>
 #include <thread>
@@ -23,6 +24,110 @@ namespace
     thread_local GuestRuntime* g_currentGuestRuntime = nullptr;
     std::atomic<unsigned> g_activeGuestRuntimeScopes{ 0 };
     std::atomic<DWORD> g_nextGuestProcessId{ 1000 };
+    std::atomic<HANDLE> g_nativeExceptionLog{ INVALID_HANDLE_VALUE };
+
+    LONG CALLBACK TraceEscapedNativeException(EXCEPTION_POINTERS* information)
+    {
+        if (!information || !information->ExceptionRecord)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const EXCEPTION_RECORD* record = information->ExceptionRecord;
+        switch (record->ExceptionCode)
+        {
+        case EXCEPTION_ACCESS_VIOLATION:
+        case EXCEPTION_IN_PAGE_ERROR:
+        case EXCEPTION_ILLEGAL_INSTRUCTION:
+        case EXCEPTION_STACK_OVERFLOW:
+        case STATUS_HEAP_CORRUPTION:
+        case STATUS_STACK_BUFFER_OVERRUN:
+            break;
+        default:
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        ULONG_PTR operation = static_cast<ULONG_PTR>(-1);
+        ULONG_PTR target = 0;
+        if ((record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION ||
+             record->ExceptionCode == EXCEPTION_IN_PAGE_ERROR) &&
+            record->NumberParameters >= 2)
+        {
+            operation = record->ExceptionInformation[0];
+            target = record->ExceptionInformation[1];
+        }
+        ULONG_PTR instruction = reinterpret_cast<ULONG_PTR>(record->ExceptionAddress);
+        ULONG_PTR stack = 0;
+#if defined(_M_X64)
+        if (information->ContextRecord)
+        {
+            instruction = static_cast<ULONG_PTR>(information->ContextRecord->Rip);
+            stack = static_cast<ULONG_PTR>(information->ContextRecord->Rsp);
+        }
+#endif
+        wchar_t message[320]{};
+        swprintf_s(message,
+            L"WIN32BRIDGE NATIVE EXCEPTION: code=0x%08lX thread=%lu RIP=0x%llX RSP=0x%llX operation=%llu target=0x%llX\r\n",
+            static_cast<unsigned long>(record->ExceptionCode),
+            static_cast<unsigned long>(::GetCurrentThreadId()),
+            static_cast<unsigned long long>(instruction),
+            static_cast<unsigned long long>(stack),
+            static_cast<unsigned long long>(operation),
+            static_cast<unsigned long long>(target));
+        ::OutputDebugStringW(message);
+        const HANDLE log = g_nativeExceptionLog.load();
+        if (log != INVALID_HANDLE_VALUE && log != nullptr)
+        {
+            DWORD written = 0;
+            const DWORD bytes = static_cast<DWORD>(wcslen(message) * sizeof(wchar_t));
+            ::WriteFile(log, message, bytes, &written, nullptr);
+            ::FlushFileBuffers(log);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    struct NativeExceptionTraceScope final
+    {
+        explicit NativeExceptionTraceScope(const std::wstring& logPath)
+        {
+            if (!logPath.empty())
+            {
+                CREATEFILE2_EXTENDED_PARAMETERS parameters{};
+                parameters.dwSize = sizeof(parameters);
+                parameters.dwFileAttributes = FILE_ATTRIBUTE_NORMAL;
+                log = ::CreateFile2FromAppW(
+                    logPath.c_str(), GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    CREATE_ALWAYS, &parameters);
+                if (log != INVALID_HANDLE_VALUE)
+                {
+                    const wchar_t bom = 0xfeff;
+                    DWORD written = 0;
+                    ::WriteFile(log, &bom, sizeof(bom), &written, nullptr);
+                    g_nativeExceptionLog.store(log);
+                }
+            }
+            using AddHandler = PVOID (WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+            using RemoveHandler = ULONG (WINAPI*)(PVOID);
+            HMODULE kernel = ::GetModuleHandleW(L"kernel32.dll");
+            if (!kernel) return;
+            add = reinterpret_cast<AddHandler>(::GetProcAddress(
+                kernel, "AddVectoredExceptionHandler"));
+            remove = reinterpret_cast<RemoveHandler>(::GetProcAddress(
+                kernel, "RemoveVectoredExceptionHandler"));
+            if (add && remove)
+                handle = add(1, &TraceEscapedNativeException);
+        }
+        ~NativeExceptionTraceScope()
+        {
+            if (handle && remove) remove(handle);
+            g_nativeExceptionLog.store(INVALID_HANDLE_VALUE);
+            if (log != INVALID_HANDLE_VALUE) ::CloseHandle(log);
+        }
+        using AddHandler = PVOID (WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+        using RemoveHandler = ULONG (WINAPI*)(PVOID);
+        AddHandler add = nullptr;
+        RemoveHandler remove = nullptr;
+        PVOID handle = nullptr;
+        HANDLE log = INVALID_HANDLE_VALUE;
+    };
 
     struct GuestExceptionDetails final
     {
@@ -273,6 +378,16 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
         return false;
     }
 
+    std::wstring nativeExceptionLogPath;
+    if (m_storage)
+    {
+        Windows::Storage::StorageFolder^ localFolder = m_storage->LocalFolder();
+        if (localFolder && localFolder->Path)
+            nativeExceptionLogPath = std::wstring(localFolder->Path->Data()) +
+                L"\\Win32Bridge-crash.log";
+    }
+    NativeExceptionTraceScope nativeExceptionTrace(nativeExceptionLogPath);
+
     // Kernel objects are per invocation, just like the current guest storage
     // and window scopes.  They must not survive a later run of the same image.
     m_kernel = std::make_shared<GuestKernelContext>();
@@ -437,6 +552,7 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
                 return false;
             }
         }
+        InvokeGuestFlsCallbacksForCurrentThread();
         if (m_storage)
         {
             m_storage->CloseAll();
@@ -508,7 +624,7 @@ bool GuestRuntime::LaunchChildProcess(
     try
     {
         childStorage = std::make_shared<GuestStorageContext>(
-            m_storage->LocalFolder(), logicalPath);
+            m_storage->LocalFolder(), logicalPath, m_modules->ModuleSourceFolder());
         child = std::make_shared<GuestRuntime>();
     }
     catch (const std::bad_alloc&)
@@ -702,6 +818,7 @@ HANDLE GuestRuntime::LaunchThread(
                         exceptionDescription + L".");
                 }
             }
+            InvokeGuestFlsCallbacksForCurrentThread();
             if (modulesThreadAttached)
             {
                 std::wstring detachError;
@@ -716,6 +833,9 @@ HANDLE GuestRuntime::LaunchThread(
             }
             DWORD ignored = ERROR_SUCCESS;
             kernel->CompleteObject(completion, exitCode, &ignored);
+            RuntimeDiagnostics::Record(
+                L"THREAD: guest thread " + std::to_wstring(assignedThreadId) +
+                L" completed with exit code " + std::to_wstring(exitCode) + L".");
             if (SUCCEEDED(apartment)) RoUninitialize();
         }).detach();
     }

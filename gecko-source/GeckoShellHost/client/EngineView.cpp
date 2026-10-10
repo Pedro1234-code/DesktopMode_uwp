@@ -425,9 +425,6 @@ void EngineView::WireKeyboard() {
       return;
     }
     auto typed = sink_.Text();
-    Log::Write(L"view: the sink changed, " + std::to_wstring(typed.size()) +
-               L" characters, engine " +
-               std::wstring(text_ && typing_ ? L"told" : L"not told"));
     if (typed.empty()) {
       return;
     }
@@ -530,8 +527,6 @@ void EngineView::WireKeyboard() {
     } else {
       return;
     }
-    Log::Write(L"key: down " + std::to_wstring(code) + L", modifiers " +
-               std::to_wstring(mods) + L" sent to the engine");
     args.Handled(true);
   });
 
@@ -973,8 +968,7 @@ void EngineView::FollowTextInput() {
   if (wants) {
     ApplyInputKind(static_cast<int32_t>(state & 0xff));
     const bool focused = sink_.Focus(FocusState::Programmatic);
-    Log::Write(L"view: engine asked for physical keyboard input, sink focus " +
-               std::wstring(focused ? L"taken" : L"refused"));
+    (void)focused;
   } else {
     Log::Write(L"view: engine no longer wants text input");
   }
@@ -1007,10 +1001,9 @@ void EngineView::LaunchSystemUri(const char* utf8) {
         try {
           winrt::Windows::Foundation::Uri uri(winrt::hstring{wide});
           winrt::Windows::System::Launcher::LaunchUriAsync(uri);
-          Log::Write(L"open: asked the system to open " + wide);
+          Log::Write(L"open: requested a system URI");
         } catch (winrt::hresult_error const& error) {
-          Log::Write(L"open: the system refused " + wide,
-                     std::wstring(error.message()));
+          Log::Write(L"open: the system refused a URI", std::wstring(error.message()));
         }
       });
 }
@@ -1160,7 +1153,6 @@ void EngineView::OpenUrl(std::wstring_view url) {
   }
   pendingUrl_ = std::move(utf8);
   lastOpenAttempt_ = 0;
-  Log::Write(L"open: the phone handed us " + std::wstring(url));
 }
 
 void EngineView::Tick() {
@@ -1222,6 +1214,15 @@ void EngineView::Tick() {
       textInputPending_ = false;
       FollowTextInput();
     });
+  }
+
+  // Once ANGLE presents directly into the SwapChainPanel there is no software
+  // bitmap to update. Calling frame_copy anyway takes Gecko's compositor lock
+  // from the Shell UI thread on every XAML frame. Pages that invalidate many
+  // chrome items, such as about:downloads, can then stall the entire Shell
+  // while Gecko rebuilds and paints them.
+  if (g_panelPresenting.load()) {
+    return;
   }
 
   // Ask with the serial we last drew. An unchanged engine answers zero without

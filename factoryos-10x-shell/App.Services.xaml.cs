@@ -60,7 +60,6 @@ namespace factoryos_10x_shell
                 .AddSingleton<MouseInputService>()
                 .AddSingleton<IMouseInputService>(provider => provider.GetRequiredService<MouseInputService>())
                 .AddTransient<IPinManagerService, PinManagerService>()
-                .AddSingleton<IBluetoothService, BluetoothService>()
                 .AddTransient<Default10xBarViewModel>()
                 .AddTransient<MainDesktopViewModel>()
                 .AddTransient<StartMenuViewModel>()

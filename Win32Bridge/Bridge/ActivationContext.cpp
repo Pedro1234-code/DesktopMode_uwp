@@ -543,6 +543,15 @@ bool Win32Bridge::Bridge::ResolveGuestActivationContextModule(LPCWSTR moduleName
 GuestActivationContextScope::GuestActivationContextScope()
     : m_previous(reinterpret_cast<HANDLE>(g_processContext.load()))
 {
+    // The embedded manifest is the process-default activation context.  It is
+    // created by GuestRuntime::Run before guest code can create worker threads;
+    // worker scopes must only provide per-thread active-context cleanup.
+    // Replacing this global handle for every guest thread lets concurrent
+    // destructors restore and release one another's contexts, leaving
+    // g_processContext pointing at an erased ContextRecord.
+    if (m_previous)
+        return;
+
     std::vector<GuestResourceIdentifier> names;
     if (EnumerateGuestResourceNames(nullptr, MAKEINTRESOURCEW(24), &names) != GuestResourceStatus::Success || names.empty())
         return;
@@ -562,8 +571,16 @@ GuestActivationContextScope::~GuestActivationContextScope()
     for (const ActiveRecord& active : g_activeContexts)
         BridgeReleaseActCtx(active.context);
     g_activeContexts.clear();
-    g_processContext.store(reinterpret_cast<ULONG_PTR>(m_previous));
-    if (m_context && m_context != INVALID_HANDLE_VALUE) BridgeReleaseActCtx(m_context);
+    if (m_context && m_context != INVALID_HANDLE_VALUE)
+    {
+        // This is the process-owning scope.  The slot itself owns one
+        // reference, including when the guest replaced it through
+        // ACTCTX_FLAG_SET_PROCESS_DEFAULT.
+        const HANDLE current = reinterpret_cast<HANDLE>(
+            g_processContext.exchange(reinterpret_cast<ULONG_PTR>(m_previous)));
+        if (current && current != INVALID_HANDLE_VALUE)
+            BridgeReleaseActCtx(current);
+    }
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateActCtxW(const GuestActCtxW* context)
@@ -630,7 +647,16 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateActCtxW(const GuestActCtxW* conte
         record->manifest.assemblyDirectory = context->lpAssemblyDirectory;
     const HANDLE handle = Store(std::move(record));
     if ((context->dwFlags & kActCtxSetProcessDefault) != 0)
-        g_processContext.store(reinterpret_cast<ULONG_PTR>(handle));
+    {
+        // The returned handle and the process-default slot have independent
+        // lifetimes.  A caller may ReleaseActCtx(handle) immediately without
+        // invalidating CurrentGuestManifest on another thread.
+        BridgeAddRefActCtx(handle);
+        const HANDLE previous = reinterpret_cast<HANDLE>(
+            g_processContext.exchange(reinterpret_cast<ULONG_PTR>(handle)));
+        if (previous && previous != INVALID_HANDLE_VALUE)
+            BridgeReleaseActCtx(previous);
+    }
     BridgeSetLastError(ERROR_SUCCESS);
     return handle;
 }

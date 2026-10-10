@@ -18,6 +18,7 @@ namespace factoryos_10x_shell.Controls
         private bool m_isDirty;
         private bool m_ignoreTextChanges;
         private bool m_dragging, m_resizing, m_maximized;
+        private WindowResizeCorner m_resizeCorner;
         private Point m_startPoint;
         private double m_startLeft, m_startTop, m_startWidth, m_startHeight;
         private double m_restoreLeft, m_restoreTop, m_restoreWidth, m_restoreHeight;
@@ -91,9 +92,9 @@ namespace factoryos_10x_shell.Controls
             Canvas.SetLeft(this, Math.Max(0, m_startLeft + point.X - m_startPoint.X)); Canvas.SetTop(this, Math.Max(0, m_startTop + point.Y - m_startPoint.Y));
         }
         private void TitleBar_PointerReleased(object sender, PointerRoutedEventArgs e) { m_dragging = false; TitleBar.ReleasePointerCaptures(); }
-        private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e) { if (!m_maximized) { m_resizing = true; m_startPoint = e.GetCurrentPoint(this).Position; m_startWidth = Width; m_startHeight = Height; ResizeGrip.CapturePointer(e.Pointer); } }
-        private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e) { if (m_resizing) { Point p = e.GetCurrentPoint(this).Position; Width = Math.Max(480, m_startWidth + p.X - m_startPoint.X); Height = Math.Max(320, m_startHeight + p.Y - m_startPoint.Y); } }
-        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; ResizeGrip.ReleasePointerCaptures(); }
+        private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e) { if (!m_maximized) { m_resizing = true; m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag); m_startPoint = e.GetCurrentPoint(null).Position; m_startLeft = Canvas.GetLeft(this); m_startTop = Canvas.GetTop(this); m_startWidth = Width; m_startHeight = Height; (sender as UIElement)?.CapturePointer(e.Pointer); } }
+        private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e) { if (m_resizing) { Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint, e.GetCurrentPoint(null).Position, new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 480, 320); Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y); Width = bounds.Width; Height = bounds.Height; } }
+        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; (sender as UIElement)?.ReleasePointerCaptures(); }
 
         private async void New_Click(object sender, RoutedEventArgs e)
         {

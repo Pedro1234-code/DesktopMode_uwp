@@ -28,6 +28,11 @@ namespace Bridge
     };
 
     void ResetGuestResourceHandles();
+    // Runs guest FLS destructors while the calling thread still has all bridge
+    // scopes installed. Guest callback addresses must never be registered with
+    // the host FLS implementation, which would invoke them from ntdll after
+    // those scopes have already gone away.
+    void InvokeGuestFlsCallbacksForCurrentThread();
     HANDLE WINAPI BridgeCreateFileW(
         LPCWSTR fileName,
         DWORD desiredAccess,

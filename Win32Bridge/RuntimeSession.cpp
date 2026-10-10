@@ -344,7 +344,7 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
 
     return create_async([state, executable, moduleSourceFolder]()
     {
-        return create_task(FileIO::ReadBufferAsync(executable)).then(
+        auto preparation = create_task(FileIO::ReadBufferAsync(executable)).then(
             [state, moduleSourceFolder](IBuffer^ buffer) -> task<bool>
         {
             if (!buffer || buffer->Length == 0)
@@ -371,11 +371,15 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
                 return ReadOptionalFileBytesAsync(satellite);
             }).then([state, moduleSourceFolder, bytes](std::vector<BYTE> satelliteBytes)
             {
+                if (satelliteBytes.empty())
+                    RuntimeDiagnostics::Record(
+                        L"MUI: no companion resource file was found beside the executable.");
                 const std::wstring virtualModulePath =
                     L"C:\\Program Files\\Win32Bridge\\" + state->executableName;
                 state->storage = std::make_shared<GuestStorageContext>(
                     ApplicationData::Current->LocalFolder,
-                    virtualModulePath);
+                    virtualModulePath,
+                    moduleSourceFolder);
                 state->runtime = std::unique_ptr<GuestRuntime>(new GuestRuntime());
                 state->runtime->SetStorageContext(state->storage);
                 state->runtime->SetWindowManager(state->windows);
@@ -389,12 +393,6 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
                         L"MUI: ignoring an invalid companion resource image: " + error);
                     error.clear();
                 }
-                else if (satelliteBytes.empty())
-                {
-                    RuntimeDiagnostics::Record(
-                        L"MUI: no companion resource file was found beside the executable.");
-                }
-
                 const bool prepared = state->runtime->Prepare(
                     bytes->data(), bytes->size(), ResolveRuntimeImport, &error);
                 state->prepared.store(prepared);
@@ -410,6 +408,46 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
                 PersistReport(RuntimeDiagnostics::Snapshot());
                 return prepared;
             });
+        });
+        return preparation.then([state](task<bool> completed)
+        {
+            try
+            {
+                return completed.get();
+            }
+            catch (Exception^ exception)
+            {
+                const unsigned long hresult = static_cast<unsigned long>(
+                    exception ? exception->HResult : E_FAIL);
+                const std::wstring message = exception && exception->Message
+                    ? ToWide(exception->Message) : std::wstring(L"Unspecified error");
+                state->lastError = L"Runtime preparation failed (HRESULT " +
+                    std::to_wstring(hresult) + L"): " + message;
+                state->prepared.store(false);
+                RuntimeDiagnostics::Record(L"PREPARE EXCEPTION: " + state->lastError);
+                PersistReport(RuntimeDiagnostics::Snapshot());
+                return false;
+            }
+            catch (const std::exception& exception)
+            {
+                std::wstring message;
+                const char* source = exception.what();
+                while (source && *source)
+                    message.push_back(static_cast<unsigned char>(*source++));
+                state->lastError = L"Runtime preparation failed: " + message;
+                state->prepared.store(false);
+                RuntimeDiagnostics::Record(L"PREPARE EXCEPTION: " + state->lastError);
+                PersistReport(RuntimeDiagnostics::Snapshot());
+                return false;
+            }
+            catch (...)
+            {
+                state->lastError = L"Runtime preparation failed with an unknown exception.";
+                state->prepared.store(false);
+                RuntimeDiagnostics::Record(L"PREPARE EXCEPTION: unknown exception.");
+                PersistReport(RuntimeDiagnostics::Snapshot());
+                return false;
+            }
         });
     });
 }

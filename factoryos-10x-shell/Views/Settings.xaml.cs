@@ -33,34 +33,6 @@ namespace factoryos_10x_shell
         {
             Frame.Navigate(typeof(StartMenu), null);
         }
-        private void CopilotSwitch_Toggled(object sender, RoutedEventArgs e)
-        {
-            ToggleSwitch toggleSwitch = sender as ToggleSwitch;
-            if (toggleSwitch != null)
-            {
-                if (toggleSwitch.Name == "VisibilityToggleSwitch")
-                {
-                    AppState.Instance.IsSearchButtonVisible = toggleSwitch.IsOn;
-                    Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsSearchButtonVisible"] = toggleSwitch.IsOn;
-                }
-                else if (toggleSwitch.Name == "CopilotToggleSwitch")
-                {
-                    AppState.Instance.IsCopilotButtonVisible = toggleSwitch.IsOn;
-                    Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsCopilotButtonVisible"] = toggleSwitch.IsOn;
-                }
-            }
-        }
-
-        private void Search_Toggled(object sender, RoutedEventArgs e)
-        {
-            ToggleSwitch toggleSwitch = sender as ToggleSwitch;
-            if (toggleSwitch != null)
-            {
-                AppState.Instance.IsSearchButtonVisible = toggleSwitch.IsOn;
-                Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsSearchButtonVisible"] = toggleSwitch.IsOn;
-            }
-        }
-
         private void BG_Toggled(object sender, RoutedEventArgs e)
         {
             {

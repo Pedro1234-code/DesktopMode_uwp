@@ -45,6 +45,7 @@ namespace factoryos_10x_shell
         private bool m_isWindowActive = true;
         private bool m_hasMouseInput;
         private bool m_altTabHeld;
+        private bool m_desktopInitialized;
 
         public MainPage()
         {
@@ -70,9 +71,11 @@ namespace factoryos_10x_shell
             ApplicationViewTitleBar titleBar = ApplicationView.GetForCurrentView().TitleBar;
             titleBar.ButtonBackgroundColor = Colors.Transparent;
 
-            // Init frame
+            // Bind the frame now, but defer constructing the full desktop tree
+            // until after the first activation. Constructing MainDesktop,
+            // StartMenu and all internal windows inside the launch call can
+            // exceed Xbox's activation watchdog (0x8027025A).
             m_desktopNavigator.FrameContext = DesktopFrame;
-            m_desktopNavigator.DesktopNavigate(DesktopPageType.RootContentDesktop);
 
             Window.Current.CoreWindow.KeyDown += CoreWindow_KeyDown;
             Window.Current.CoreWindow.Dispatcher.AcceleratorKeyActivated += Dispatcher_AcceleratorKeyActivated;
@@ -89,6 +92,13 @@ namespace factoryos_10x_shell
         private void MainPage_Loaded(object sender, RoutedEventArgs e)
         {
             ApplyDesktopScale();
+            if (!m_desktopInitialized)
+            {
+                m_desktopInitialized = true;
+                _ = Dispatcher.RunAsync(
+                    Windows.UI.Core.CoreDispatcherPriority.Low,
+                    () => m_desktopNavigator.DesktopNavigate(DesktopPageType.RootContentDesktop));
+            }
         }
 
         private void Window_SizeChanged(object sender, WindowSizeChangedEventArgs e)

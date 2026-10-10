@@ -14,6 +14,7 @@ namespace factoryos_10x_shell.Controls
         private bool m_dragging;
         private bool m_resizing;
         private bool m_maximized;
+        private WindowResizeCorner m_resizeCorner;
         private Point m_startPoint;
         private double m_startLeft;
         private double m_startTop;
@@ -24,6 +25,7 @@ namespace factoryos_10x_shell.Controls
         private double m_restoreWidth;
         private double m_restoreHeight;
         private bool m_calculatorLoaded;
+        private ResourceDictionary m_calculatorResources;
 
         public CalculatorWindow()
         {
@@ -41,6 +43,14 @@ namespace factoryos_10x_shell.Controls
 
             if (!m_calculatorLoaded)
             {
+                if (m_calculatorResources == null)
+                {
+                    m_calculatorResources = new ResourceDictionary
+                    {
+                        Source = new Uri("ms-appx:///CalculatorApp/App.xaml")
+                    };
+                    Application.Current.Resources.MergedDictionaries.Add(m_calculatorResources);
+                }
                 CalculatorApp.MainPage.SetDiagnosticStage("navigating the Calculator frame");
                 m_calculatorLoaded = CalculatorFrame.Navigate(typeof(CalculatorApp.MainPage));
             }
@@ -64,6 +74,11 @@ namespace factoryos_10x_shell.Controls
             CalculatorFrame.BackStack.Clear();
             CalculatorFrame.ForwardStack.Clear();
             m_calculatorLoaded = false;
+            if (m_calculatorResources != null)
+            {
+                Application.Current.Resources.MergedDictionaries.Remove(m_calculatorResources);
+                m_calculatorResources = null;
+            }
             Visibility = Visibility.Collapsed;
             AppState.Instance.SetCalculatorWindowState(false, false);
         }
@@ -160,24 +175,29 @@ namespace factoryos_10x_shell.Controls
         {
             if (m_maximized) return;
             m_resizing = true;
-            m_startPoint = e.GetCurrentPoint(this).Position;
+            m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
+            m_startPoint = e.GetCurrentPoint(null).Position;
+            m_startLeft = Canvas.GetLeft(this);
+            m_startTop = Canvas.GetTop(this);
             m_startWidth = Width;
             m_startHeight = Height;
-            ResizeGrip.CapturePointer(e.Pointer);
+            (sender as UIElement)?.CapturePointer(e.Pointer);
         }
 
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
-            Point point = e.GetCurrentPoint(this).Position;
-            Width = Math.Max(320, m_startWidth + point.X - m_startPoint.X);
-            Height = Math.Max(450, m_startHeight + point.Y - m_startPoint.Y);
+            Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint,
+                e.GetCurrentPoint(null).Position,
+                new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 320, 450);
+            Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y);
+            Width = bounds.Width; Height = bounds.Height;
         }
 
         private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e)
         {
             m_resizing = false;
-            ResizeGrip.ReleasePointerCaptures();
+            (sender as UIElement)?.ReleasePointerCaptures();
         }
     }
 }
