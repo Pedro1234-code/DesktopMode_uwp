@@ -21,10 +21,12 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 - Taskbar with open-window indicators, context menus, and persistent pinned items.
 - Task View, `Alt` + `Tab` switching, and window focus management.
 - Installable Web Apps powered by WebView2, with favicons, multiple windows, resizing, minimize, maximize, and close controls.
-- Files: a file browser built around UWP permissions and folder pickers, including removable media after user authorization.
+- Files: a file browser built around UWP permissions and folder pickers, with tabs and Files-based UI.
+- Calculator: actual Windows Calculator included as an internal app.
 - Notepad: open, edit, save, and save-as support for `.txt` files.
 - Settings: a built-in app with personalization, taskbar, device information, and a visual Windows Update page.
 - A custom Action Center with volume, network status, and system settings shortcuts.
+- Strawfox: a built-in Firefox port running with its own window, with Download, Upload and Add-on support.
 - Experimental PE loader for Win32 binaries
 
 ## Project structure
