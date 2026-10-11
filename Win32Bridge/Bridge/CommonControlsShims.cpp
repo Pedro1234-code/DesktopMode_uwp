@@ -10,6 +10,7 @@
 #include "Bridge\\MiniGdi.h"
 
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -109,6 +110,31 @@ namespace
         if (!theme || !duration) return E_INVALIDARG;
         *duration = 0;
         return S_OK;
+    }
+
+    BOOL WINAPI BridgeMakeDragList(HWND list)
+    {
+        GuestWindowManager* manager = CurrentGuestWindowManager();
+        return manager && manager->IsGuestWindow(list) ? TRUE : FALSE;
+    }
+
+    void WINAPI BridgeDrawInsert(HWND, HWND list, int)
+    {
+        if (GuestWindowManager* manager = CurrentGuestWindowManager())
+            manager->InvalidateGuestRect(list, nullptr, FALSE, nullptr);
+    }
+
+    int WINAPI BridgeListBoxItemFromPoint(HWND list, POINT point, BOOL)
+    {
+        GuestWindowManager* manager = CurrentGuestWindowManager();
+        if (!manager || !manager->IsGuestWindow(list)) return -1;
+        RECT bounds{};
+        if (!manager->GetGuestWindowRect(list, &bounds, nullptr)) return -1;
+        const int x = point.x - bounds.left;
+        const int y = point.y - bounds.top;
+        const LRESULT hit = manager->SendGuestMessage(list, 0x01a9, 0,
+            MAKELPARAM(static_cast<SHORT>(x), static_cast<SHORT>(y)), nullptr);
+        return HIWORD(hit) ? -1 : static_cast<int>(LOWORD(hit));
     }
 }
 
@@ -240,33 +266,41 @@ namespace
         GuestSubclassProc procedure = nullptr;
         UINT_PTR identifier = 0;
         DWORD_PTR referenceData = 0;
+        bool removed = false;
+        std::shared_ptr<SubclassEntry> next;
     };
     struct SubclassWindow final
     {
         GuestAbi::WndProc original = nullptr;
-        std::vector<SubclassEntry> entries;
+        std::shared_ptr<SubclassEntry> first;
+        unsigned int running = 0;
     };
     std::mutex g_subclassLock;
-    std::unordered_map<ULONG_PTR, SubclassWindow> g_subclasses;
+    std::unordered_map<ULONG_PTR, std::shared_ptr<SubclassWindow>> g_subclasses;
     struct SubclassFrame final
     {
         HWND window = nullptr;
         UINT message = 0;
         WPARAM wParam = 0;
         LPARAM lParam = 0;
-        std::vector<SubclassEntry> entries;
-        GuestAbi::WndProc original = nullptr;
-        size_t next = 0;
+        std::shared_ptr<SubclassWindow> state;
+        std::shared_ptr<SubclassEntry> next;
         SubclassFrame* previous = nullptr;
     };
     thread_local SubclassFrame* g_subclassFrame = nullptr;
+    thread_local unsigned int g_subclassDispatchDepth = 0;
+    constexpr unsigned int MaximumSubclassDispatchDepth = 128;
 
-    LRESULT InvokeSubclassEntry(SubclassFrame* frame, const SubclassEntry& entry)
+    LRESULT InvokeSubclassEntry(
+        SubclassFrame* frame,
+        GuestSubclassProc procedure,
+        UINT_PTR identifier,
+        DWORD_PTR referenceData)
     {
         __try
         {
-            return entry.procedure(frame->window, frame->message, frame->wParam,
-                frame->lParam, entry.identifier, entry.referenceData);
+            return procedure(frame->window, frame->message, frame->wParam,
+                frame->lParam, identifier, referenceData);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -280,6 +314,19 @@ namespace
     LRESULT CALLBACK SubclassDispatcher(
         HWND window, UINT message, WPARAM wParam, LPARAM lParam)
     {
+        // A malformed subclass chain must not be allowed to consume the host
+        // thread's stack.  Windows keeps the subclass chain separately from
+        // GWLP_WNDPROC and ultimately calls the saved original procedure.  A
+        // guest that accidentally installs the dispatcher as that original
+        // procedure would otherwise recurse until ntdll faults while unwinding.
+        if (g_subclassDispatchDepth >= MaximumSubclassDispatchDepth)
+        {
+            RuntimeDiagnostics::Record(
+                L"CONTROL SUBCLASS: recursive dispatch was stopped for handle " +
+                std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) + L".");
+            return BridgeDefWindowProcW(window, message, wParam, lParam);
+        }
+
         SubclassFrame frame;
         frame.window = window;
         frame.message = message;
@@ -290,18 +337,39 @@ namespace
             const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
             if (found == g_subclasses.end())
                 return BridgeDefWindowProcW(window, message, wParam, lParam);
-            frame.entries = found->second.entries;
-            frame.original = found->second.original;
+            frame.state = found->second;
+            frame.next = frame.state->first;
+            ++frame.state->running;
         }
         frame.previous = g_subclassFrame;
         g_subclassFrame = &frame;
+        ++g_subclassDispatchDepth;
         const LRESULT result = BridgeDefSubclassProc(window, message, wParam, lParam);
+        --g_subclassDispatchDepth;
         g_subclassFrame = frame.previous;
-        if (message == 0x0082) // WM_NCDESTROY
+
+        GuestAbi::WndProc restore = nullptr;
+        bool restoreProcedure = false;
         {
             std::lock_guard<std::mutex> guard(g_subclassLock);
-            g_subclasses.erase(reinterpret_cast<ULONG_PTR>(window));
+            if (frame.state->running != 0)
+                --frame.state->running;
+
+            const bool destroying = message == 0x0082; // WM_NCDESTROY
+            if (destroying)
+                frame.state->first.reset();
+
+            if (!frame.state->first && frame.state->running == 0)
+            {
+                const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
+                if (found != g_subclasses.end() && found->second == frame.state)
+                    g_subclasses.erase(found);
+                restore = frame.state->original;
+                restoreProcedure = !destroying;
+            }
         }
+        if (restoreProcedure)
+            BridgeSetWindowLongPtrW(window, -4, reinterpret_cast<LONG_PTR>(restore));
         return result;
     }
 
@@ -310,22 +378,40 @@ namespace
     {
         if (!window || !procedure) return FALSE;
         std::lock_guard<std::mutex> guard(g_subclassLock);
-        auto& state = g_subclasses[reinterpret_cast<ULONG_PTR>(window)];
-        if (state.entries.empty())
+        const ULONG_PTR key = reinterpret_cast<ULONG_PTR>(window);
+        auto found = g_subclasses.find(key);
+        std::shared_ptr<SubclassWindow> state;
+        if (found == g_subclasses.end())
         {
-            state.original = reinterpret_cast<GuestAbi::WndProc>(
+            state = std::make_shared<SubclassWindow>();
+            state->original = reinterpret_cast<GuestAbi::WndProc>(
                 BridgeSetWindowLongPtrW(window, -4,
                     reinterpret_cast<LONG_PTR>(&SubclassDispatcher)));
+            g_subclasses.emplace(key, state);
         }
-        for (auto& entry : state.entries)
+        else
         {
-            if (entry.procedure == procedure && entry.identifier == identifier)
+            state = found->second;
+        }
+
+        for (auto entry = state->first; entry; entry = entry->next)
+        {
+            if (!entry->removed && entry->procedure == procedure &&
+                entry->identifier == identifier)
             {
-                entry.referenceData = referenceData;
+                entry->referenceData = referenceData;
                 return TRUE;
             }
         }
-        state.entries.push_back({ procedure, identifier, referenceData });
+
+        // COMCTL32 inserts new procedures at the head of the chain.  This is
+        // observable when multiple libraries subclass the same control.
+        auto entry = std::make_shared<SubclassEntry>();
+        entry->procedure = procedure;
+        entry->identifier = identifier;
+        entry->referenceData = referenceData;
+        entry->next = state->first;
+        state->first = std::move(entry);
         return TRUE;
     }
 
@@ -336,11 +422,12 @@ namespace
         std::lock_guard<std::mutex> guard(g_subclassLock);
         const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
         if (found == g_subclasses.end()) return FALSE;
-        for (const auto& entry : found->second.entries)
+        for (auto entry = found->second->first; entry; entry = entry->next)
         {
-            if (entry.procedure == procedure && entry.identifier == identifier)
+            if (!entry->removed && entry->procedure == procedure &&
+                entry->identifier == identifier)
             {
-                if (referenceData) *referenceData = entry.referenceData;
+                if (referenceData) *referenceData = entry->referenceData;
                 return TRUE;
             }
         }
@@ -350,21 +437,39 @@ namespace
     BOOL WINAPI BridgeRemoveWindowSubclass(
         HWND window, GuestSubclassProc procedure, UINT_PTR identifier)
     {
-        std::lock_guard<std::mutex> guard(g_subclassLock);
-        const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
-        if (found == g_subclasses.end()) return FALSE;
-        auto& entries = found->second.entries;
-        const auto entry = std::find_if(entries.begin(), entries.end(),
-            [procedure, identifier](const SubclassEntry& item)
-            { return item.procedure == procedure && item.identifier == identifier; });
-        if (entry == entries.end()) return FALSE;
-        entries.erase(entry);
-        if (entries.empty())
+        GuestAbi::WndProc restore = nullptr;
+        bool removed = false;
         {
-            BridgeSetWindowLongPtrW(window, -4,
-                reinterpret_cast<LONG_PTR>(found->second.original));
-            g_subclasses.erase(found);
+            std::lock_guard<std::mutex> guard(g_subclassLock);
+            const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
+            if (found == g_subclasses.end()) return FALSE;
+
+            const auto state = found->second;
+            std::shared_ptr<SubclassEntry>* link = &state->first;
+            while (*link)
+            {
+                const auto entry = *link;
+                if (!entry->removed && entry->procedure == procedure &&
+                    entry->identifier == identifier)
+                {
+                    *link = entry->next;
+                    entry->removed = true;
+                    removed = true;
+                    if (!state->first && state->running == 0)
+                    {
+                        restore = state->original;
+                        g_subclasses.erase(found);
+                    }
+                    break;
+                }
+                link = &entry->next;
+            }
         }
+
+        if (!removed)
+            return FALSE;
+        if (restore)
+            BridgeSetWindowLongPtrW(window, -4, reinterpret_cast<LONG_PTR>(restore));
         return TRUE;
     }
 
@@ -377,10 +482,29 @@ namespace
         frame->message = message;
         frame->wParam = wParam;
         frame->lParam = lParam;
-        if (frame->next < frame->entries.size())
-            return InvokeSubclassEntry(frame, frame->entries[frame->next++]);
-        return frame->original
-            ? BridgeCallWindowProcW(frame->original, window, message, wParam, lParam)
+
+        GuestSubclassProc procedure = nullptr;
+        UINT_PTR identifier = 0;
+        DWORD_PTR referenceData = 0;
+        {
+            std::lock_guard<std::mutex> guard(g_subclassLock);
+            while (frame->next && frame->next->removed)
+                frame->next = frame->next->next;
+            if (frame->next)
+            {
+                const auto entry = frame->next;
+                frame->next = entry->next;
+                procedure = entry->procedure;
+                identifier = entry->identifier;
+                referenceData = entry->referenceData;
+            }
+        }
+        if (procedure)
+            return InvokeSubclassEntry(frame, procedure, identifier, referenceData);
+
+        const GuestAbi::WndProc original = frame->state->original;
+        return original && original != &SubclassDispatcher
+            ? BridgeCallWindowProcW(original, window, message, wParam, lParam)
             : BridgeDefWindowProcW(window, message, wParam, lParam);
     }
 
@@ -905,6 +1029,9 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
         else if (_wcsicmp(symbol.name.c_str(), L"_trackmouseevent") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTrackMouseEvent);
         else if (_wcsicmp(symbol.name.c_str(), L"createtoolbarex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateToolbarEx);
         else if (_wcsicmp(symbol.name.c_str(), L"createstatuswindoww") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateStatusWindowW);
+        else if (_wcsicmp(symbol.name.c_str(), L"makedraglist") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMakeDragList);
+        else if (_wcsicmp(symbol.name.c_str(), L"drawinsert") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawInsert);
+        else if (_wcsicmp(symbol.name.c_str(), L"lbitemfrompt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeListBoxItemFromPoint);
         else if (_wcsicmp(symbol.name.c_str(), L"propertysheetw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePropertySheetW);
         else if (_wcsicmp(symbol.name.c_str(), L"createpropertysheetpagew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePropertySheetPageW);
         else if (_wcsicmp(symbol.name.c_str(), L"dllgetversion") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDllGetVersion);

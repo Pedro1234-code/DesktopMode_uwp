@@ -85,6 +85,21 @@ namespace MiniGdi
     Rect NormalizeRect(const Rect& rect);
     Rect IntersectRect(const Rect& first, const Rect& second);
 
+    struct Region
+    {
+        std::vector<Rect> rectangles;
+
+        bool Empty() const { return rectangles.empty(); }
+        bool Contains(Point point) const;
+        Rect Bounds() const;
+    };
+
+    Region RectRegion(const Rect& rect);
+    Region IntersectRegion(const Region& first, const Region& second);
+    Region UnionRegion(const Region& first, const Region& second);
+    Region XorRegion(const Region& first, const Region& second);
+    Region SubtractRegion(const Region& first, const Region& second);
+
     // Source-over blending for straight-alpha 0xAARRGGBB colors.  Classic GDI
     // brushes and pens are normally opaque, but preserving alpha here makes
     // the core usable by later layered-window and bitmap adapters as well.
@@ -357,8 +372,10 @@ namespace MiniGdi
         bool SelectBitmap(DcHandle dc, BitmapHandle bitmap, BitmapHandle* previous = nullptr);
 
         bool SetClipRect(DcHandle dc, const Rect& clip);
+        bool SetClipRegion(DcHandle dc, const Region& clip);
         bool ResetClip(DcHandle dc);
         bool GetClipRect(DcHandle dc, Rect* clip) const;
+        bool GetClipRegion(DcHandle dc, Region* clip) const;
 
         bool MoveTo(DcHandle dc, Point point, Point* previous = nullptr);
         bool GetCurrentPosition(DcHandle dc, Point* point) const;
@@ -430,7 +447,7 @@ namespace MiniGdi
         struct DeviceContext
         {
             Surface* surface = nullptr;
-            Rect clip;
+            Region clip;
             Point current;
             ObjectHandle pen = InvalidObject;
             ObjectHandle brush = InvalidObject;

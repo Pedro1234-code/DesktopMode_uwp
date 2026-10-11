@@ -564,7 +564,11 @@ namespace
         for (size_t attempts = 0; attempts < state->tabControls.size(); ++attempts)
         {
             const HWND candidate = state->tabControls[index];
-            if (manager->IsGuestWindow(candidate))
+            DWORD visibleError = ERROR_SUCCESS;
+            DWORD enabledError = ERROR_SUCCESS;
+            if (manager->IsGuestWindow(candidate) &&
+                manager->IsGuestWindowVisible(candidate, &visibleError) &&
+                manager->IsGuestWindowEnabled(candidate, &enabledError))
             {
                 manager->SetGuestFocus(candidate, nullptr);
                 return true;
@@ -574,6 +578,49 @@ namespace
                 : (index + 1) % state->tabControls.size();
         }
         return false;
+    }
+
+    bool DialogControlHasMnemonic(
+        GuestWindowManager* manager, HWND control, wchar_t requested)
+    {
+        DWORD error = ERROR_SUCCESS;
+        const int length = manager->GetGuestWindowTextLength(control, &error);
+        if (length <= 0 || error != ERROR_SUCCESS) return false;
+        std::vector<wchar_t> text(static_cast<size_t>(length) + 1, L'\0');
+        if (!manager->GetGuestWindowText(control, text.data(),
+            static_cast<int>(text.size()), &error)) return false;
+        for (int index = 0; index < length; ++index)
+        {
+            if (text[static_cast<size_t>(index)] != L'&') continue;
+            if (index + 1 < length && text[static_cast<size_t>(index + 1)] == L'&')
+            {
+                ++index;
+                continue;
+            }
+            return index + 1 < length && towupper(text[static_cast<size_t>(index + 1)]) ==
+                towupper(requested);
+        }
+        return false;
+    }
+
+    void SetDialogDefaultButton(
+        const std::shared_ptr<DialogWindowState>& state,
+        GuestWindowManager* manager, UINT identifier)
+    {
+        if (!state || !manager) return;
+        const UINT previous = state->defaultButton;
+        state->defaultButton = identifier;
+        if (previous && previous != identifier)
+        {
+            HWND oldButton = manager->GetGuestDlgItem(state->window,
+                static_cast<int>(previous), nullptr);
+            if (oldButton) manager->SendGuestMessage(oldButton, BM_SETSTYLE,
+                BS_PUSHBUTTON, TRUE, nullptr);
+        }
+        HWND newButton = manager->GetGuestDlgItem(state->window,
+            static_cast<int>(identifier), nullptr);
+        if (newButton) manager->SendGuestMessage(newButton, BM_SETSTYLE,
+            BS_DEFPUSHBUTTON, TRUE, nullptr);
     }
 
     int CaptureDialogException(
@@ -666,7 +713,12 @@ namespace
             {
                 if (lParam)
                 {
-                    manager->SetGuestFocus(reinterpret_cast<HWND>(wParam), nullptr);
+                    const HWND requested = reinterpret_cast<HWND>(wParam);
+                    DWORD ignored = ERROR_SUCCESS;
+                    if (requested && manager->IsGuestChild(state->window, requested) &&
+                        manager->IsGuestWindowVisible(requested, &ignored) &&
+                        manager->IsGuestWindowEnabled(requested, &ignored))
+                        manager->SetGuestFocus(requested, &ignored);
                 }
                 else
                 {
@@ -682,7 +734,8 @@ namespace
         case DialogSetDefaultId:
             if (state)
             {
-                state->defaultButton = static_cast<UINT>(wParam & 0xffffu);
+                SetDialogDefaultButton(
+                    state, manager, static_cast<UINT>(wParam & 0xffffu));
                 return TRUE;
             }
             break;
@@ -712,26 +765,139 @@ namespace
         const std::shared_ptr<DialogWindowState>& state,
         const GuestAbi::Message& message)
     {
-        if (!state || message.message != WM_KEYDOWN) return false;
+        if (!state) return false;
         GuestWindowManager* manager = CurrentGuestWindowManager();
         if (!manager) return false;
 
-        if (message.wParam == VK_TAB && !state->tabControls.empty())
+        const bool keyDown = message.message == WM_KEYDOWN ||
+            message.message == WM_SYSKEYDOWN;
+        const bool character = message.message == WM_CHAR ||
+            message.message == WM_SYSCHAR;
+        if (!keyDown && !character) return false;
+
+        constexpr LRESULT WantArrows = 0x0001;
+        constexpr LRESULT WantTab = 0x0002;
+        constexpr LRESULT WantAllKeys = 0x0004;
+        constexpr LRESULT WantChars = 0x0080;
+        constexpr LRESULT DefPushButton = 0x0010;
+        constexpr LRESULT UndefPushButton = 0x0020;
+        constexpr LRESULT RadioButton = 0x0040;
+        constexpr LRESULT Button = 0x2000;
+        constexpr UINT GetDialogCode = 0x0087;
+
+        DWORD ignored = ERROR_SUCCESS;
+        HWND focused = manager->GetGuestFocus(&ignored);
+        if (!focused || (focused != state->window &&
+            !manager->IsGuestChild(state->window, focused)))
+            focused = message.hwnd;
+
+        LRESULT dialogCode = 0;
+        if (focused && focused != state->window)
+        {
+            dialogCode = manager->SendGuestMessage(focused, GetDialogCode,
+                message.wParam,
+                reinterpret_cast<LPARAM>(const_cast<GuestAbi::Message*>(&message)),
+                nullptr);
+        }
+
+        if ((keyDown && (dialogCode & WantAllKeys)) ||
+            (character && (dialogCode & (WantAllKeys | WantChars))))
+            return false;
+
+        if (keyDown && message.wParam == VK_TAB &&
+            !(dialogCode & WantTab) && !state->tabControls.empty())
         {
             return FocusNextDialogControl(
-                state, manager, message.hwnd, BridgeGetKeyState(VK_SHIFT) < 0);
+                state, manager, focused, BridgeGetKeyState(VK_SHIFT) < 0);
         }
-        if (message.wParam == VK_ESCAPE)
+        if (keyDown && message.wParam == VK_ESCAPE)
         {
             manager->SendGuestMessage(state->window, WM_COMMAND,
                 MAKEWPARAM(IDCANCEL, BN_CLICKED), 0, nullptr);
             return true;
         }
-        if (message.wParam == VK_RETURN)
+        if (keyDown && message.wParam == VK_RETURN)
         {
-            manager->SendGuestMessage(state->window, WM_COMMAND,
-                MAKEWPARAM(state->defaultButton, BN_CLICKED), 0, nullptr);
+            if (focused && (dialogCode & (Button | DefPushButton | UndefPushButton)))
+            {
+                manager->SendGuestMessage(focused, BM_CLICK, 0, 0, nullptr);
+                return true;
+            }
+            const HWND button = manager->GetGuestDlgItem(
+                state->window, static_cast<int>(state->defaultButton), nullptr);
+            if (button && manager->IsGuestWindowEnabled(button, &ignored))
+                manager->SendGuestMessage(button, BM_CLICK, 0, 0, nullptr);
+            else
+                manager->SendGuestMessage(state->window, WM_COMMAND,
+                    MAKEWPARAM(state->defaultButton, BN_CLICKED), 0, nullptr);
             return true;
+        }
+
+        if (keyDown && (message.wParam == VK_LEFT || message.wParam == VK_UP ||
+            message.wParam == VK_RIGHT || message.wParam == VK_DOWN) &&
+            (dialogCode & RadioButton))
+        {
+            const auto current = std::find(
+                state->controls.begin(), state->controls.end(), focused);
+            if (current != state->controls.end())
+            {
+                size_t index = static_cast<size_t>(current - state->controls.begin());
+                size_t begin = index;
+                while (begin > 0)
+                {
+                    DWORD styleError = ERROR_SUCCESS;
+                    if (manager->GetGuestWindowLongPtr(
+                        state->controls[begin], GWL_STYLE, &styleError) & WS_GROUP)
+                        break;
+                    --begin;
+                }
+                size_t end = index + 1;
+                while (end < state->controls.size())
+                {
+                    DWORD styleError = ERROR_SUCCESS;
+                    if (manager->GetGuestWindowLongPtr(
+                        state->controls[end], GWL_STYLE, &styleError) & WS_GROUP)
+                        break;
+                    ++end;
+                }
+                const bool backwards = message.wParam == VK_LEFT || message.wParam == VK_UP;
+                for (size_t attempt = 0; attempt < end - begin; ++attempt)
+                {
+                    index = backwards
+                        ? (index == begin ? end - 1 : index - 1)
+                        : (index + 1 == end ? begin : index + 1);
+                    const HWND candidate = state->controls[index];
+                    const LRESULT code = manager->SendGuestMessage(
+                        candidate, GetDialogCode, 0, 0, nullptr);
+                    if ((code & RadioButton) && manager->IsGuestWindowVisible(candidate, &ignored) &&
+                        manager->IsGuestWindowEnabled(candidate, &ignored))
+                    {
+                        manager->SetGuestFocus(candidate, &ignored);
+                        manager->SendGuestMessage(candidate, BM_CLICK, 0, 0, nullptr);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        if (character && message.wParam && message.wParam != L' ')
+        {
+            const wchar_t mnemonic = static_cast<wchar_t>(message.wParam);
+            for (const HWND control : state->controls)
+            {
+                if (!manager->IsGuestWindowVisible(control, &ignored) ||
+                    !manager->IsGuestWindowEnabled(control, &ignored) ||
+                    !DialogControlHasMnemonic(manager, control, mnemonic))
+                    continue;
+                manager->SetGuestFocus(control, &ignored);
+                const LRESULT code = manager->SendGuestMessage(
+                    control, GetDialogCode, 0, 0, nullptr);
+                if (code & Button)
+                    manager->SendGuestMessage(control, BM_CLICK, 0, 0, nullptr);
+                else if (code & 0x0100) // DLGC_STATIC: mnemonic targets the next tab stop.
+                    FocusNextDialogControl(state, manager, control, false);
+                return true;
+            }
         }
         return false;
     }
@@ -773,9 +939,10 @@ namespace
         const int clientHeight = (std::max)(1, PixelsY(dialog.height, baseUnits));
         const DWORD rootStyle = (runModal ? dialog.style | DialogPopupStyle : dialog.style) &
             ~DialogVisibleStyle;
+        const bool childDialog = (rootStyle & DialogChildStyle) != 0;
         const GuestMetrics::NonClientMetrics nonClient =
             GuestMetrics::NonClientForEmbeddedWindow(
-                rootStyle, dialog.extendedStyle, parent != nullptr);
+                rootStyle, dialog.extendedStyle, childDialog);
         // Dialog-template dimensions describe the client area. CreateWindowEx
         // dimensions describe the complete window, including its frame.
         const int dialogWidth = clientWidth + nonClient.left + nonClient.right;
@@ -784,13 +951,24 @@ namespace
         int dialogY = PixelsY(dialog.y, baseUnits);
         if ((dialog.style & DialogCenterStyle) != 0 && parent)
         {
-            RECT parentClient{};
-            if (manager->GetGuestClientRect(parent, &parentClient, nullptr))
+            RECT parentRect{};
+            if (!childDialog && manager->GetGuestWindowRect(parent, &parentRect, nullptr))
             {
-                dialogX = (std::max)(0,
-                    (static_cast<int>(parentClient.right - parentClient.left) - dialogWidth) / 2);
-                dialogY = (std::max)(0,
-                    (static_cast<int>(parentClient.bottom - parentClient.top) - dialogHeight) / 2);
+                dialogX = parentRect.left + (std::max)(0,
+                    (static_cast<int>(parentRect.right - parentRect.left) - dialogWidth) / 2);
+                dialogY = parentRect.top + (std::max)(0,
+                    (static_cast<int>(parentRect.bottom - parentRect.top) - dialogHeight) / 2);
+            }
+            else
+            {
+                RECT parentClient{};
+                if (manager->GetGuestClientRect(parent, &parentClient, nullptr))
+                {
+                    dialogX = (std::max)(0,
+                        (static_cast<int>(parentClient.right - parentClient.left) - dialogWidth) / 2);
+                    dialogY = (std::max)(0,
+                        (static_cast<int>(parentClient.bottom - parentClient.top) - dialogHeight) / 2);
+                }
             }
         }
 
@@ -942,6 +1120,7 @@ namespace
         // accidentally re-enabling an owner disabled by an outer loop.
         const bool ownerWasEnabled = parent && manager->IsGuestWindow(parent) &&
             manager->IsGuestWindowEnabled(parent, nullptr) != FALSE;
+        const HWND previousFocus = manager->GetGuestFocus(nullptr);
         if (ownerWasEnabled) manager->EnableGuestWindow(parent, FALSE, nullptr);
 
         const LRESULT initializeFocus = manager->SendGuestMessage(root, WM_INITDIALOG,
@@ -1003,7 +1182,12 @@ namespace
             manager->EnableGuestWindow(parent, TRUE, nullptr);
         if (parent && manager->IsGuestWindow(parent) &&
             manager->IsGuestWindowEnabled(parent, nullptr))
-            manager->SetGuestFocus(parent, nullptr);
+        {
+            manager->SetGuestForegroundWindow(parent, false, nullptr);
+            if (previousFocus && manager->IsGuestWindow(previousFocus) &&
+                manager->IsGuestChild(parent, previousFocus))
+                manager->SetGuestFocus(previousFocus, nullptr);
+        }
         g_activeModalDialog = modal.previous;
         BridgeSetLastError(ERROR_SUCCESS);
         return modal.result;
@@ -1861,7 +2045,7 @@ namespace
 INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResourceWithStyles(
     HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC procedure,
     LPARAM initParameter, DWORD stylesToAdd, DWORD stylesToRemove,
-    LPCWSTR titleOverride)
+    LPCWSTR titleOverride, bool modal, HWND* createdWindow)
 {
     if (!CurrentGuestWindowManager() || !templateName)
     {
@@ -1904,7 +2088,8 @@ INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResourceWithStyles(
     dialog.style = (dialog.style | stylesToAdd) & ~stylesToRemove;
     if (titleOverride) dialog.title.text = titleOverride;
 
-    return RunGuestDialog(instance, dialog, parent, procedure, initParameter);
+    return RunGuestDialog(instance, dialog, parent, procedure, initParameter,
+        modal, createdWindow);
 }
 
 INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResource(

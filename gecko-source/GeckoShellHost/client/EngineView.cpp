@@ -1221,8 +1221,30 @@ void EngineView::Tick() {
   // from the Shell UI thread on every XAML frame. Pages that invalidate many
   // chrome items, such as about:downloads, can then stall the entire Shell
   // while Gecko rebuilds and paints them.
+  // Popup/menu widgets are separate headless windows and are composited into
+  // the software frame exposed by frame_copy. Keep that path alive while an
+  // overlay is visible and for one final frame after it closes. That last
+  // transparent frame is what erases the old menu from the Image above the
+  // SwapChainPanel.
+  const bool hasChromeOverlay = overlay_ && overlay_() == 1;
   if (g_panelPresenting.load()) {
-    return;
+    const bool overlayWasVisible = chromeOverlayVisible_;
+    if (!hasChromeOverlay && !overlayWasVisible) {
+      return;
+    }
+
+    // A full-size BGRA frame is several megabytes. Copying it on every XAML
+    // render callback monopolizes the Shell UI thread while animated menus are
+    // open. Twenty updates a second is sufficient for chrome popups and leaves
+    // time for their pointer events to be delivered. Opening and closing are
+    // never throttled.
+    const unsigned long long now = ::GetTickCount64();
+    if (hasChromeOverlay && overlayWasVisible && lastChromeOverlayCopy_ &&
+        now - lastChromeOverlayCopy_ < 50) {
+      return;
+    }
+    chromeOverlayVisible_ = hasChromeOverlay;
+    lastChromeOverlayCopy_ = now;
   }
 
   // Ask with the serial we last drew. An unchanged engine answers zero without

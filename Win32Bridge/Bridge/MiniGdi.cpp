@@ -467,6 +467,188 @@ Rect IntersectRect(const Rect& first, const Rect& second)
     return Rect{ left, top, right, bottom };
 }
 
+namespace
+{
+    bool RegionContainsCell(const Region& region, int x, int y)
+    {
+        for (const Rect& rect : region.rectangles)
+            if (x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom)
+                return true;
+        return false;
+    }
+
+    enum class RegionBoolean { Intersect, Union, Xor, Subtract };
+
+    Region CombineRegions(const Region& first, const Region& second, RegionBoolean operation)
+    {
+        std::vector<int> ys;
+        const auto collect = [&](const Region& region)
+        {
+            for (const Rect& source : region.rectangles)
+            {
+                const Rect rect = NormalizeRect(source);
+                if (rect.Empty()) continue;
+                ys.push_back(rect.top);
+                ys.push_back(rect.bottom);
+            }
+        };
+        collect(first);
+        collect(second);
+        if (ys.size() < 2) return {};
+        std::sort(ys.begin(), ys.end());
+        ys.erase(std::unique(ys.begin(), ys.end()), ys.end());
+
+        const auto activeIntervals = [](const Region& region, int y)
+        {
+            std::vector<std::pair<int, int>> intervals;
+            for (const Rect& rect : region.rectangles)
+                if (rect.top <= y && y < rect.bottom && !rect.Empty())
+                    intervals.emplace_back(rect.left, rect.right);
+            std::sort(intervals.begin(), intervals.end());
+            std::vector<std::pair<int, int>> merged;
+            for (const auto& interval : intervals)
+            {
+                if (merged.empty() || interval.first > merged.back().second)
+                    merged.push_back(interval);
+                else
+                    merged.back().second = (std::max)(merged.back().second, interval.second);
+            }
+            return merged;
+        };
+        const auto contains = [](const std::vector<std::pair<int, int>>& intervals, int x)
+        {
+            for (const auto& interval : intervals)
+            {
+                if (x < interval.first) return false;
+                if (x < interval.second) return true;
+            }
+            return false;
+        };
+
+        Region result;
+        std::vector<std::size_t> previousRuns;
+        for (std::size_t y = 0; y + 1 < ys.size(); ++y)
+        {
+            const auto firstIntervals = activeIntervals(first, ys[y]);
+            const auto secondIntervals = activeIntervals(second, ys[y]);
+            std::vector<int> xs;
+            for (const auto& interval : firstIntervals)
+            {
+                xs.push_back(interval.first);
+                xs.push_back(interval.second);
+            }
+            for (const auto& interval : secondIntervals)
+            {
+                xs.push_back(interval.first);
+                xs.push_back(interval.second);
+            }
+            std::sort(xs.begin(), xs.end());
+            xs.erase(std::unique(xs.begin(), xs.end()), xs.end());
+            std::vector<std::pair<int, int>> runs;
+            bool open = false;
+            int runLeft = 0;
+            for (std::size_t x = 0; x + 1 < xs.size(); ++x)
+            {
+                const bool inFirst = contains(firstIntervals, xs[x]);
+                const bool inSecond = contains(secondIntervals, xs[x]);
+                bool include = false;
+                switch (operation)
+                {
+                case RegionBoolean::Intersect: include = inFirst && inSecond; break;
+                case RegionBoolean::Union: include = inFirst || inSecond; break;
+                case RegionBoolean::Xor: include = inFirst != inSecond; break;
+                case RegionBoolean::Subtract: include = inFirst && !inSecond; break;
+                }
+                if (include && !open)
+                {
+                    open = true;
+                    runLeft = xs[x];
+                }
+                if (open && (!include || x + 2 == xs.size()))
+                {
+                    const int runRight = include && x + 2 == xs.size() ? xs[x + 1] : xs[x];
+                    runs.emplace_back(runLeft, runRight);
+                    open = false;
+                }
+            }
+
+            std::vector<std::size_t> currentRuns;
+            for (const auto& run : runs)
+            {
+                std::size_t match = static_cast<std::size_t>(-1);
+                for (std::size_t candidate : previousRuns)
+                {
+                    const Rect& prior = result.rectangles[candidate];
+                    if (prior.left == run.first && prior.right == run.second && prior.bottom == ys[y])
+                    {
+                        match = candidate;
+                        break;
+                    }
+                }
+                if (match != static_cast<std::size_t>(-1))
+                {
+                    result.rectangles[match].bottom = ys[y + 1];
+                    currentRuns.push_back(match);
+                }
+                else
+                {
+                    result.rectangles.push_back({ run.first, ys[y], run.second, ys[y + 1] });
+                    currentRuns.push_back(result.rectangles.size() - 1);
+                }
+            }
+            previousRuns = std::move(currentRuns);
+        }
+        return result;
+    }
+}
+
+bool Region::Contains(Point point) const
+{
+    return RegionContainsCell(*this, point.x, point.y);
+}
+
+Rect Region::Bounds() const
+{
+    if (rectangles.empty()) return {};
+    Rect bounds = rectangles.front();
+    for (std::size_t index = 1; index < rectangles.size(); ++index)
+    {
+        bounds.left = (std::min)(bounds.left, rectangles[index].left);
+        bounds.top = (std::min)(bounds.top, rectangles[index].top);
+        bounds.right = (std::max)(bounds.right, rectangles[index].right);
+        bounds.bottom = (std::max)(bounds.bottom, rectangles[index].bottom);
+    }
+    return bounds;
+}
+
+Region RectRegion(const Rect& source)
+{
+    const Rect rect = NormalizeRect(source);
+    Region result;
+    if (!rect.Empty()) result.rectangles.push_back(rect);
+    return result;
+}
+
+Region IntersectRegion(const Region& first, const Region& second)
+{
+    return CombineRegions(first, second, RegionBoolean::Intersect);
+}
+
+Region UnionRegion(const Region& first, const Region& second)
+{
+    return CombineRegions(first, second, RegionBoolean::Union);
+}
+
+Region XorRegion(const Region& first, const Region& second)
+{
+    return CombineRegions(first, second, RegionBoolean::Xor);
+}
+
+Region SubtractRegion(const Region& first, const Region& second)
+{
+    return CombineRegions(first, second, RegionBoolean::Subtract);
+}
+
 Color BlendSourceOver(Color source, Color destination)
 {
     const std::uint32_t sourceAlpha = Alpha(source);
@@ -950,7 +1132,7 @@ DcHandle GdiContext::CreateDc(Surface* surface)
 
     DeviceContext dc;
     dc.surface = surface;
-    dc.clip = surface->Bounds();
+    dc.clip = RectRegion(surface->Bounds());
     dc.isMemoryDc = false;
     dc.clipIsDefault = true;
     return AllocateDc(dc);
@@ -960,7 +1142,7 @@ DcHandle GdiContext::CreateMemoryDc()
 {
     DeviceContext dc;
     dc.surface = nullptr;
-    dc.clip = Rect{};
+    dc.clip = Region{};
     dc.bitmap = InvalidObject;
     dc.isMemoryDc = true;
     dc.clipIsDefault = true;
@@ -1256,15 +1438,16 @@ bool GdiContext::SelectBitmap(DcHandle dc, BitmapHandle bitmap, BitmapHandle* pr
     context->surface = ResolveBitmap(bitmap);
     if (context->surface == nullptr)
     {
-        context->clip = Rect{};
+        context->clip = Region{};
     }
     else if (context->clipIsDefault)
     {
-        context->clip = context->surface->Bounds();
+        context->clip = RectRegion(context->surface->Bounds());
     }
     else
     {
-        context->clip = IntersectRect(context->surface->Bounds(), context->clip);
+        context->clip = IntersectRegion(
+            RectRegion(context->surface->Bounds()), context->clip);
     }
 
     return true;
@@ -1272,13 +1455,18 @@ bool GdiContext::SelectBitmap(DcHandle dc, BitmapHandle bitmap, BitmapHandle* pr
 
 bool GdiContext::SetClipRect(DcHandle dc, const Rect& clip)
 {
+    return SetClipRegion(dc, RectRegion(clip));
+}
+
+bool GdiContext::SetClipRegion(DcHandle dc, const Region& clip)
+{
     DeviceContext* context = FindDc(dc);
     if (context == nullptr || context->surface == nullptr)
     {
         return false;
     }
 
-    context->clip = IntersectRect(context->surface->Bounds(), clip);
+    context->clip = IntersectRegion(RectRegion(context->surface->Bounds()), clip);
     context->clipIsDefault = false;
     return true;
 }
@@ -1291,7 +1479,7 @@ bool GdiContext::ResetClip(DcHandle dc)
         return false;
     }
 
-    context->clip = context->surface->Bounds();
+    context->clip = RectRegion(context->surface->Bounds());
     context->clipIsDefault = true;
     return true;
 }
@@ -1304,6 +1492,14 @@ bool GdiContext::GetClipRect(DcHandle dc, Rect* clip) const
         return false;
     }
 
+    *clip = context->clip.Bounds();
+    return true;
+}
+
+bool GdiContext::GetClipRegion(DcHandle dc, Region* clip) const
+{
+    const DeviceContext* context = FindDc(dc);
+    if (context == nullptr || clip == nullptr) return false;
     *clip = context->clip;
     return true;
 }
@@ -1352,7 +1548,10 @@ bool GdiContext::LineTo(DcHandle dc, Point point)
         return false;
     }
 
-    return DrawLine(*context->surface, start, point, pen.color, pen.width, &context->clip);
+    bool drawn = false;
+    for (const Rect& clip : context->clip.rectangles)
+        drawn = DrawLine(*context->surface, start, point, pen.color, pen.width, &clip) || drawn;
+    return drawn;
 }
 
 bool GdiContext::FillRect(DcHandle dc, const Rect& rect)
@@ -1369,7 +1568,10 @@ bool GdiContext::FillRect(DcHandle dc, const Rect& rect)
         return false;
     }
 
-    return MiniGdi::FillRect(*context->surface, rect, brush.color, &context->clip);
+    bool drawn = false;
+    for (const Rect& clip : context->clip.rectangles)
+        drawn = MiniGdi::FillRect(*context->surface, rect, brush.color, &clip) || drawn;
+    return drawn;
 }
 
 bool GdiContext::Rectangle(DcHandle dc, const Rect& rect)
@@ -1384,7 +1586,10 @@ bool GdiContext::Rectangle(DcHandle dc, const Rect& rect)
     const Pen& pen = ResolvePen(context->pen);
     const Color fill = brush.isNull ? Transparent : brush.color;
     const Color stroke = pen.isNull ? Transparent : pen.color;
-    return DrawRectangle(*context->surface, rect, fill, stroke, pen.width, &context->clip);
+    bool drawn = false;
+    for (const Rect& clip : context->clip.rectangles)
+        drawn = DrawRectangle(*context->surface, rect, fill, stroke, pen.width, &clip) || drawn;
+    return drawn;
 }
 
 bool GdiContext::Ellipse(DcHandle dc, const Rect& rect)
@@ -1399,7 +1604,10 @@ bool GdiContext::Ellipse(DcHandle dc, const Rect& rect)
     const Pen& pen = ResolvePen(context->pen);
     const Color fill = brush.isNull ? Transparent : brush.color;
     const Color stroke = pen.isNull ? Transparent : pen.color;
-    return DrawEllipse(*context->surface, rect, fill, stroke, pen.width, &context->clip);
+    bool drawn = false;
+    for (const Rect& clip : context->clip.rectangles)
+        drawn = DrawEllipse(*context->surface, rect, fill, stroke, pen.width, &clip) || drawn;
+    return drawn;
 }
 
 bool GdiContext::SetPixelV(DcHandle dc, Point point, Color color)
@@ -1410,9 +1618,7 @@ bool GdiContext::SetPixelV(DcHandle dc, Point point, Color color)
         return false;
     }
 
-    const Rect outputClip = SurfaceClip(*context->surface, &context->clip);
-    if (outputClip.Empty() || point.x < outputClip.left || point.x >= outputClip.right ||
-        point.y < outputClip.top || point.y >= outputClip.bottom)
+    if (!context->clip.Contains(point))
     {
         // GDI drawing outside the current clip is valid and simply produces
         // no raster output.  Preserve that distinction from an invalid HDC.
@@ -1439,9 +1645,7 @@ bool GdiContext::GetPixel(DcHandle dc, Point point, Color* color) const
         return false;
     }
 
-    const Rect outputClip = SurfaceClip(*context->surface, &context->clip);
-    if (outputClip.Empty() || point.x < outputClip.left || point.x >= outputClip.right ||
-        point.y < outputClip.top || point.y >= outputClip.bottom)
+    if (!context->clip.Contains(point))
     {
         return false;
     }
@@ -1464,7 +1668,8 @@ bool GdiContext::Clear(DcHandle dc, Color color)
         return false;
     }
 
-    context->surface->Clear(color);
+    for (const Rect& clip : context->clip.rectangles)
+        MiniGdi::FillRect(*context->surface, clip, color, &clip);
     return true;
 }
 
@@ -1491,13 +1696,21 @@ bool GdiContext::BitBlt(
         SaturateToInt(static_cast<std::int64_t>(sourceOrigin.x) + extent.width),
         SaturateToInt(static_cast<std::int64_t>(sourceOrigin.y) + extent.height)
     };
-    return CopyRect(
-        *destination->surface,
-        destinationOrigin,
-        *source->surface,
-        sourceRect,
-        &source->clip,
-        &destination->clip);
+    bool copied = false;
+    for (const Rect& sourceClip : source->clip.rectangles)
+    {
+        for (const Rect& destinationClip : destination->clip.rectangles)
+        {
+            copied = CopyRect(
+                *destination->surface,
+                destinationOrigin,
+                *source->surface,
+                sourceRect,
+                &sourceClip,
+                &destinationClip) || copied;
+        }
+    }
+    return copied || destination->clip.Empty() || source->clip.Empty();
 }
 
 bool GdiContext::SetTextColor(DcHandle dc, Color color, Color* previous)
@@ -1608,131 +1821,86 @@ bool GdiContext::TextOutW(
 
     const Font selectedFont = ResolveFont(context->font);
     const Size cell = FontCellSize(selectedFont);
-    Size directWriteExtent{};
-    if (DirectWriteText::Measure(selectedFont, text, characterCount,
-        &directWriteExtent, nullptr))
+    Size measured{};
+    const bool haveDirectWriteMetrics = DirectWriteText::Measure(
+        selectedFont, text, characterCount, &measured, nullptr);
+    if (!haveDirectWriteMetrics) measured = TextExtentForCount(characterCount, cell);
+    if (extent) *extent = measured;
+    if (characterCount == 0 || context->clip.Empty()) return true;
+
+    if (haveDirectWriteMetrics)
     {
-        if (extent) *extent = directWriteExtent;
-        if (characterCount == 0) return true;
-        const Rect outputClip = SurfaceClip(*context->surface, &context->clip);
-        if (outputClip.Empty()) return true;
-        if (context->backgroundMode == BackgroundMode::Opaque)
+        bool allDrawn = true;
+        for (const Rect& regionClip : context->clip.rectangles)
         {
-            MiniGdi::FillRect(*context->surface,
-                Rect{ origin.x, origin.y,
-                    SaturateToInt(static_cast<std::int64_t>(origin.x) +
-                        directWriteExtent.width),
-                    SaturateToInt(static_cast<std::int64_t>(origin.y) +
-                        directWriteExtent.height) },
-                context->backgroundColor, &outputClip);
+            const Rect outputClip = SurfaceClip(*context->surface, &regionClip);
+            if (outputClip.Empty()) continue;
+            if (context->backgroundMode == BackgroundMode::Opaque)
+                MiniGdi::FillRect(*context->surface,
+                    Rect{ origin.x, origin.y,
+                        SaturateToInt(static_cast<std::int64_t>(origin.x) + measured.width),
+                        SaturateToInt(static_cast<std::int64_t>(origin.y) + measured.height) },
+                    context->backgroundColor, &outputClip);
+            allDrawn = DirectWriteText::Draw(*context->surface, outputClip, origin,
+                selectedFont, text, characterCount, context->textColor,
+                context->backgroundMode == BackgroundMode::Opaque) && allDrawn;
         }
-        if (DirectWriteText::Draw(*context->surface, outputClip, origin,
-            selectedFont, text, characterCount, context->textColor,
-            context->backgroundMode == BackgroundMode::Opaque))
-            return true;
-        // A transient DirectWrite failure still falls through to the compact
-        // rasterizer, preserving GDI's best-effort drawing behavior.
-    }
-    if (extent != nullptr)
-    {
-        *extent = TextExtentForCount(characterCount, cell);
-    }
-
-    if (characterCount == 0)
-    {
-        return true;
-    }
-
-    const Rect outputClip = SurfaceClip(*context->surface, &context->clip);
-    if (outputClip.Empty())
-    {
-        return true;
+        if (allDrawn) return true;
     }
 
     const std::int64_t glyphTop = origin.y;
     const std::int64_t glyphBottom = glyphTop + cell.height;
-    if (glyphBottom <= outputClip.top || glyphTop >= outputClip.bottom)
-    {
-        return true;
-    }
-
-    std::size_t firstCharacter = 0;
     const std::int64_t originX = origin.x;
-    if (originX < outputClip.left)
+    for (const Rect& regionClip : context->clip.rectangles)
     {
-        const std::int64_t hiddenPixels = static_cast<std::int64_t>(outputClip.left) - originX;
-        const std::int64_t hiddenCharacters =
-            (hiddenPixels + cell.width - 1) / cell.width;
-        if (static_cast<std::size_t>(hiddenCharacters) >= characterCount)
+        const Rect outputClip = SurfaceClip(*context->surface, &regionClip);
+        if (outputClip.Empty() || glyphBottom <= outputClip.top || glyphTop >= outputClip.bottom)
+            continue;
+
+        std::size_t firstCharacter = 0;
+        if (originX < outputClip.left)
         {
-            return true;
+            const std::int64_t hidden =
+                (static_cast<std::int64_t>(outputClip.left) - originX + cell.width - 1) / cell.width;
+            if (hidden >= static_cast<std::int64_t>(characterCount)) continue;
+            firstCharacter = static_cast<std::size_t>(hidden);
         }
-        firstCharacter = static_cast<std::size_t>(hiddenCharacters);
-    }
-
-    std::size_t endCharacter = 0;
-    if (originX < outputClip.right)
-    {
-        const std::int64_t visiblePixels = static_cast<std::int64_t>(outputClip.right) - originX;
-        const std::int64_t visibleCharacters =
-            (visiblePixels + cell.width - 1) / cell.width;
-        if (visibleCharacters > 0)
+        std::size_t endCharacter = 0;
+        if (originX < outputClip.right)
         {
-            endCharacter = std::min(
-                characterCount,
-                static_cast<std::size_t>(visibleCharacters));
+            const std::int64_t visible =
+                (static_cast<std::int64_t>(outputClip.right) - originX + cell.width - 1) / cell.width;
+            if (visible > 0)
+                endCharacter = (std::min)(characterCount, static_cast<std::size_t>(visible));
+        }
+        if (firstCharacter >= endCharacter) continue;
+
+        const int top = SaturateToInt(glyphTop);
+        const int bottom = SaturateToInt(glyphBottom);
+        const int firstLeft = SaturateToInt(originX +
+            static_cast<std::int64_t>(firstCharacter) * cell.width);
+        const int lastRight = SaturateToInt(originX +
+            static_cast<std::int64_t>(endCharacter) * cell.width);
+        if (context->backgroundMode == BackgroundMode::Opaque)
+            MiniGdi::FillRect(*context->surface,
+                Rect{ firstLeft, top, lastRight, bottom },
+                context->backgroundColor, &outputClip);
+        for (std::size_t index = firstCharacter; index < endCharacter; ++index)
+            RasterGlyph(*context->surface,
+                SaturateToInt(originX + static_cast<std::int64_t>(index) * cell.width), top,
+                GlyphForCharacter(text[index]), context->textColor, outputClip, cell);
+        if (selectedFont.underline)
+            MiniGdi::FillRect(*context->surface,
+                Rect{ firstLeft, (std::max)(top, bottom - 2), lastRight, bottom - 1 },
+                context->textColor, &outputClip);
+        if (selectedFont.strikeOut)
+        {
+            const int strikeY = top + cell.height / 2;
+            MiniGdi::FillRect(*context->surface,
+                Rect{ firstLeft, strikeY, lastRight, strikeY + 1 },
+                context->textColor, &outputClip);
         }
     }
-
-    if (firstCharacter >= endCharacter)
-    {
-        return true;
-    }
-
-    const int top = SaturateToInt(glyphTop);
-    const int bottom = SaturateToInt(glyphBottom);
-    const int firstLeft = SaturateToInt(
-        originX + static_cast<std::int64_t>(firstCharacter) * cell.width);
-    const int lastRight = SaturateToInt(
-        originX + static_cast<std::int64_t>(endCharacter) * cell.width);
-
-    if (context->backgroundMode == BackgroundMode::Opaque)
-    {
-        MiniGdi::FillRect(
-            *context->surface,
-            Rect{ firstLeft, top, lastRight, bottom },
-            context->backgroundColor,
-            &outputClip);
-    }
-
-    for (std::size_t index = firstCharacter; index < endCharacter; ++index)
-    {
-        const int cellLeft = SaturateToInt(
-            originX + static_cast<std::int64_t>(index) * cell.width);
-        RasterGlyph(
-            *context->surface,
-            cellLeft,
-            top,
-            GlyphForCharacter(text[index]),
-            context->textColor,
-            outputClip,
-            cell);
-    }
-
-    if (selectedFont.underline)
-    {
-        MiniGdi::FillRect(*context->surface,
-            Rect{ firstLeft, (std::max)(top, bottom - 2), lastRight, bottom - 1 },
-            context->textColor, &outputClip);
-    }
-    if (selectedFont.strikeOut)
-    {
-        const int strikeY = top + cell.height / 2;
-        MiniGdi::FillRect(*context->surface,
-            Rect{ firstLeft, strikeY, lastRight, strikeY + 1 },
-            context->textColor, &outputClip);
-    }
-
     return true;
 }
 
@@ -1761,19 +1929,36 @@ bool GdiContext::DrawTextW(DcHandle dc, const Rect& layoutRect,
     Surface* surface = draw ? context->surface : nullptr;
     if (draw && !surface) return false;
 
-    Rect effectiveClip{};
-    const Rect* clip = nullptr;
-    if (surface)
-    {
-        effectiveClip = SurfaceClip(*surface, &context->clip);
-        if (options.clipToLayout)
-            effectiveClip = IntersectRect(effectiveClip, NormalizeRect(layoutRect));
-        clip = &effectiveClip;
-    }
-    if (DirectWriteText::Layout(surface, clip, layoutRect,
+    Size directWriteExtent{};
+    const bool directWriteMeasured = DirectWriteText::Layout(nullptr, nullptr, layoutRect,
         ResolveFont(context->font), text, characterCount, options,
         context->textColor, context->backgroundColor,
-        context->backgroundMode == BackgroundMode::Opaque, extent)) return true;
+        context->backgroundMode == BackgroundMode::Opaque, &directWriteExtent);
+    if (directWriteMeasured) *extent = directWriteExtent;
+
+    if (!surface)
+    {
+        if (directWriteMeasured) return true;
+    }
+    else
+    {
+        if (context->clip.Empty()) return directWriteMeasured || characterCount == 0;
+        bool allDrawn = directWriteMeasured;
+        for (const Rect& regionClip : context->clip.rectangles)
+        {
+            Rect effectiveClip = SurfaceClip(*surface, &regionClip);
+            if (options.clipToLayout)
+                effectiveClip = IntersectRect(effectiveClip, NormalizeRect(layoutRect));
+            if (effectiveClip.Empty()) continue;
+            Size currentExtent{};
+            const bool drawn = DirectWriteText::Layout(surface, &effectiveClip, layoutRect,
+                ResolveFont(context->font), text, characterCount, options,
+                context->textColor, context->backgroundColor,
+                context->backgroundMode == BackgroundMode::Opaque, &currentExtent);
+            allDrawn = allDrawn && drawn;
+        }
+        if (allDrawn) return true;
+    }
 
     // Keep the deterministic compact rasterizer available on systems where
     // DirectWrite initialization fails. It cannot reproduce wrapping, but it

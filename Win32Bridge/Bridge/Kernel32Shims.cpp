@@ -133,10 +133,10 @@ namespace
         }
     }
 
-    // This is an opaque per-process identity for the primary PE, rather than
-    // a host module address.  It gives normal Win32 startup code an HMODULE
-    // it can carry into RegisterClass/CreateWindow without exposing a UWP
-    // module or relying on a desktop loader.
+    // Resource handles retain a stable internal identity for the primary PE.
+    // Public module APIs, however, must expose the mapped PE base because an
+    // HMODULE is also the image base on Win32 and applications legitimately
+    // inspect its DOS/NT headers.
     constexpr ULONG_PTR GuestMainModuleToken = 0x10000;
     constexpr ULONG_PTR GuestProcessHeapToken = 0x10001;
     constexpr ULONG_PTR BridgeSystemModuleBaseToken = 0x20000;
@@ -170,9 +170,20 @@ namespace
         return reinterpret_cast<HMODULE>(GuestMainModuleToken);
     }
 
+    HMODULE GuestMainModuleHandle()
+    {
+        const BYTE* imageBase = CurrentGuestImageBase();
+        return imageBase
+            ? reinterpret_cast<HMODULE>(const_cast<BYTE*>(imageBase))
+            : GuestMainModule();
+    }
+
     bool IsGuestMainModule(HMODULE module)
     {
-        return module == nullptr || module == GuestMainModule();
+        const BYTE* imageBase = CurrentGuestImageBase();
+        return module == nullptr ||
+            module == GuestMainModule() ||
+            (imageBase && reinterpret_cast<const BYTE*>(module) == imageBase);
     }
 
     DWORD ResourceStatusError(GuestResourceStatus status)
@@ -711,14 +722,6 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeReadFile(
     LPDWORD bytesRead,
     LPOVERLAPPED overlapped)
 {
-    if (overlapped)
-    {
-        RuntimeDiagnostics::Record(
-            L"STORAGE: ReadFile rejected an OVERLAPPED request (" +
-            std::to_wstring(bytesToRead) + L" byte(s)).");
-        SetGuestLastError(ERROR_NOT_SUPPORTED);
-        return FALSE;
-    }
     GuestStorageContext* storage = CurrentStorageOrFail();
     if (!storage)
     {
@@ -726,10 +729,24 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeReadFile(
     }
 
     DWORD error = ERROR_SUCCESS;
-    if (!storage->ReadFile(file, buffer, bytesToRead, bytesRead, &error))
+    DWORD completed = 0;
+    const ULONGLONG offset = overlapped
+        ? (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) | overlapped->Offset
+        : ~0ull;
+    if (!(overlapped
+        ? storage->ReadFileAt(file, buffer, bytesToRead, offset, &completed, &error)
+        : storage->ReadFile(file, buffer, bytesToRead, &completed, &error)))
     {
+        if (overlapped) overlapped->Internal = error;
         SetGuestLastError(error);
         return FALSE;
+    }
+    if (bytesRead) *bytesRead = completed;
+    if (overlapped)
+    {
+        overlapped->Internal = 0;
+        overlapped->InternalHigh = completed;
+        if (overlapped->hEvent) BridgeSetEvent(overlapped->hEvent);
     }
     SetGuestLastError(ERROR_SUCCESS);
     return TRUE;
@@ -742,14 +759,6 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
     LPDWORD bytesWritten,
     LPOVERLAPPED overlapped)
 {
-    if (overlapped)
-    {
-        RuntimeDiagnostics::Record(
-            L"STORAGE: WriteFile rejected an OVERLAPPED request (" +
-            std::to_wstring(bytesToWrite) + L" byte(s)).");
-        SetGuestLastError(ERROR_NOT_SUPPORTED);
-        return FALSE;
-    }
     GuestStorageContext* storage = CurrentStorageOrFail();
     if (!storage)
     {
@@ -757,8 +766,15 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
     }
 
     DWORD error = ERROR_SUCCESS;
-    if (!storage->WriteFile(file, buffer, bytesToWrite, bytesWritten, &error))
+    DWORD completed = 0;
+    const ULONGLONG offset = overlapped
+        ? (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) | overlapped->Offset
+        : ~0ull;
+    if (!(overlapped
+        ? storage->WriteFileAt(file, buffer, bytesToWrite, offset, &completed, &error)
+        : storage->WriteFile(file, buffer, bytesToWrite, &completed, &error)))
     {
+        if (overlapped) overlapped->Internal = error;
         if (error == ERROR_SUCCESS) error = ERROR_WRITE_FAULT;
         SetGuestLastError(error);
         RuntimeDiagnostics::Record(
@@ -768,8 +784,64 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
             std::to_wstring(error) + L".");
         return FALSE;
     }
+    if (bytesWritten) *bytesWritten = completed;
+    if (overlapped)
+    {
+        overlapped->Internal = 0;
+        overlapped->InternalHigh = completed;
+        if (overlapped->hEvent) BridgeSetEvent(overlapped->hEvent);
+    }
     SetGuestLastError(ERROR_SUCCESS);
     return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetOverlappedResult(
+    HANDLE, LPOVERLAPPED overlapped, LPDWORD bytesTransferred, BOOL wait)
+{
+    constexpr ULONG_PTR StatusPending = 0x103u;
+    if (!overlapped || !bytesTransferred)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (overlapped->Internal == StatusPending && wait && overlapped->hEvent)
+        BridgeWaitForSingleObject(overlapped->hEvent, INFINITE);
+    if (overlapped->Internal == StatusPending)
+    {
+        SetGuestLastError(ERROR_IO_INCOMPLETE);
+        return FALSE;
+    }
+    if (overlapped->Internal != 0)
+    {
+        SetGuestLastError(static_cast<DWORD>(overlapped->Internal));
+        return FALSE;
+    }
+    *bytesTransferred = static_cast<DWORD>(overlapped->InternalHigh);
+    SetGuestLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetOverlappedResultEx(
+    HANDLE file, LPOVERLAPPED overlapped, LPDWORD bytesTransferred,
+    DWORD milliseconds, BOOL)
+{
+    constexpr ULONG_PTR StatusPending = 0x103u;
+    if (!overlapped || !bytesTransferred)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (overlapped->Internal == StatusPending && overlapped->hEvent)
+    {
+        const DWORD waitResult = BridgeWaitForSingleObject(
+            overlapped->hEvent, milliseconds);
+        if (waitResult == WAIT_TIMEOUT)
+        {
+            SetGuestLastError(WAIT_TIMEOUT);
+            return FALSE;
+        }
+    }
+    return BridgeGetOverlappedResult(file, overlapped, bytesTransferred, FALSE);
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeCloseHandle(HANDLE object)
@@ -1136,6 +1208,13 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetTempPathW(DWORD bufferLength, LPWSTR 
     return result;
 }
 
+DWORD WINAPI Win32Bridge::Bridge::BridgeGetTempPath2W(DWORD bufferLength, LPWSTR buffer)
+{
+    // The virtual environment has one process-private temporary directory;
+    // GetTempPath2 differs in host policy selection, not in buffer semantics.
+    return BridgeGetTempPathW(bufferLength, buffer);
+}
+
 DWORD WINAPI Win32Bridge::Bridge::BridgeGetLogicalDrives()
 {
     // Bit zero denotes C:.  The bridge deliberately exposes only the one
@@ -1281,7 +1360,7 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleW(LPCWSTR moduleName)
     if (IsGuestModuleName(storage->ModulePath(), moduleName))
     {
         SetGuestLastError(ERROR_SUCCESS);
-        return GuestMainModule();
+        return GuestMainModuleHandle();
     }
 
     GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
@@ -1832,9 +1911,39 @@ void WINAPI Win32Bridge::Bridge::BridgeGetSystemTimeAsFileTime(LPFILETIME system
     SetGuestLastError(ERROR_SUCCESS);
 }
 
+void WINAPI Win32Bridge::Bridge::BridgeGetSystemTimePreciseAsFileTime(
+    LPFILETIME systemTime)
+{
+    if (!systemTime)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return;
+    }
+    // Use the host implementation when available. It is a pure time query and
+    // does not expose filesystem or process state outside the sandbox.
+    ::GetSystemTimeAsFileTime(systemTime);
+    SetGuestLastError(ERROR_SUCCESS);
+}
+
 HANDLE WINAPI Win32Bridge::Bridge::BridgeGetCurrentProcess()
 {
     return reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-1));
+}
+
+LONG WINAPI Win32Bridge::Bridge::BridgeAppPolicyGetProcessTerminationMethod(
+    HANDLE,
+    int* policy)
+{
+    if (!policy)
+    {
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    // AppPolicyProcessTerminationMethod_ExitProcess.  The desktop CRT probes
+    // this dynamically while initializing worker threads; the bridge process
+    // has normal ExitProcess semantics and does not expose the host's policy.
+    *policy = 0;
+    return ERROR_SUCCESS;
 }
 
 LPVOID WINAPI Win32Bridge::Bridge::BridgeVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protection)
@@ -3665,11 +3774,16 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateThread(
     SetGuestLastError(error);
     return handle;
 }
-void WINAPI Win32Bridge::Bridge::BridgeRaiseException(DWORD, DWORD, DWORD, const ULONG_PTR*)
+void WINAPI Win32Bridge::Bridge::BridgeRaiseException(
+    DWORD code, DWORD flags, DWORD argumentCount, const ULONG_PTR* arguments)
 {
-    // Guest exceptions require PE unwind metadata registration. Until that
-    // runtime slice is present, avoid unwinding through host frames.
-    SetGuestLastError(ERROR_NOT_SUPPORTED);
+    // RuntimeImage registers every mapped x64 exception directory through
+    // RtlAddFunctionTable before execution. Raising through the host primitive
+    // therefore preserves normal SEH/C++ dispatch while keeping the mapped
+    // image's unwind RVAs relative to its actual allocation base.
+    constexpr DWORD MaximumArguments = EXCEPTION_MAXIMUM_PARAMETERS;
+    const DWORD safeCount = (std::min)(argumentCount, MaximumArguments);
+    ::RaiseException(code, flags, safeCount, safeCount ? arguments : nullptr);
 }
 
 ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol& symbol)
@@ -3686,6 +3800,10 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReadFile);
     else if (_wcsicmp(symbol.name.c_str(), L"writefile") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWriteFile);
+    else if (_wcsicmp(symbol.name.c_str(), L"getoverlappedresult") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetOverlappedResult);
+    else if (_wcsicmp(symbol.name.c_str(), L"getoverlappedresultex") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetOverlappedResultEx);
     else if (_wcsicmp(symbol.name.c_str(), L"closehandle") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCloseHandle);
     else if (_wcsicmp(symbol.name.c_str(), L"getfilesizeex") == 0)
@@ -3818,6 +3936,8 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCurrentDirectoryW);
     else if (_wcsicmp(symbol.name.c_str(), L"gettemppathw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTempPathW);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettemppath2w") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTempPath2W);
     if (_wcsicmp(symbol.name.c_str(), L"getlogicaldrives") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLogicalDrives);
     else if (_wcsicmp(symbol.name.c_str(), L"getlogicaldrivestringsw") == 0)
@@ -3912,8 +4032,12 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCurrentProcessId);
     else if (_wcsicmp(symbol.name.c_str(), L"getcurrentprocess") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCurrentProcess);
+    else if (_wcsicmp(symbol.name.c_str(), L"apppolicygetprocessterminationmethod") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAppPolicyGetProcessTerminationMethod);
     else if (_wcsicmp(symbol.name.c_str(), L"getsystemtimeasfiletime") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetSystemTimeAsFileTime);
+    else if (_wcsicmp(symbol.name.c_str(), L"getsystemtimepreciseasfiletime") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetSystemTimePreciseAsFileTime);
     else if (_wcsicmp(symbol.name.c_str(), L"virtualalloc") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeVirtualAlloc);
     if (_wcsicmp(symbol.name.c_str(), L"virtualfree") == 0)

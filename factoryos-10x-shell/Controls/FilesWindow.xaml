@@ -85,7 +85,7 @@
                     </Button>
                 </StackPanel>
             </Grid>
-            <NavigationView x:Name="LocationsNavigation" Grid.Row="1" Background="Transparent" AlwaysShowHeader="False" CompactModeThresholdWidth="680" CompactPaneLength="48" IsBackButtonVisible="Collapsed" IsPaneOpen="True" IsPaneToggleButtonVisible="True" IsSettingsVisible="False" OpenPaneLength="210" PaneDisplayMode="LeftCompact" ItemInvoked="LocationsNavigation_ItemInvoked">
+            <NavigationView x:Name="LocationsNavigation" Grid.Row="1" Background="Transparent" AlwaysShowHeader="False" CompactModeThresholdWidth="680" CompactPaneLength="48" IsBackButtonVisible="Collapsed" IsPaneOpen="True" IsPaneToggleButtonVisible="True" IsSettingsVisible="True" OpenPaneLength="210" PaneDisplayMode="LeftCompact" ItemInvoked="LocationsNavigation_ItemInvoked">
                 <NavigationView.PaneHeader>
                     <TextBlock Margin="10,8,0,8" FontSize="12" FontWeight="SemiBold" Opacity="0.65" Text="PLACES" />
                 </NavigationView.PaneHeader>
@@ -283,6 +283,26 @@
                     <Grid Grid.Row="4" Padding="14,0" Background="{ThemeResource FilesToolbarBrush}" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="0,1,0,0">
                         <TextBlock x:Name="StatusText" VerticalAlignment="Center" FontSize="12" Opacity="0.72" Text="0 items" />
                     </Grid>
+                    <ScrollViewer x:Name="SettingsPage" Grid.RowSpan="5" Background="{ThemeResource ApplicationPageBackgroundThemeBrush}" Visibility="Collapsed">
+                        <StackPanel MaxWidth="720" Margin="40,32" HorizontalAlignment="Left">
+                            <TextBlock FontSize="28" FontWeight="SemiBold" Text="Settings" />
+                            <TextBlock Margin="0,30,0,10" FontSize="18" FontWeight="SemiBold" Text="Privacy" />
+                            <Border Padding="20" Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" BorderThickness="1" CornerRadius="6">
+                                <Grid ColumnSpacing="24">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <StackPanel VerticalAlignment="Center">
+                                        <TextBlock FontSize="16" Text="Authorized folders" />
+                                        <TextBlock MaxWidth="500" Margin="0,5,0,0" Opacity="0.72" Text="Forget every folder previously authorized for Files. You will be asked to choose these folders again when you open them." TextWrapping="Wrap" />
+                                    </StackPanel>
+                                    <Button Grid.Column="1" MinWidth="96" VerticalAlignment="Center" Click="ResetAuthorizedFolders_Click" Content="Reset" />
+                                </Grid>
+                            </Border>
+                            <TextBlock x:Name="ResetAuthorizedFoldersStatus" Margin="2,12,0,0" Foreground="{ThemeResource SystemControlForegroundAccentBrush}" TextWrapping="Wrap" Visibility="Collapsed" />
+                        </StackPanel>
+                    </ScrollViewer>
                 </Grid>
             </NavigationView>
             <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" />

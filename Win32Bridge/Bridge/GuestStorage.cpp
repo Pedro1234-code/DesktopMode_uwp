@@ -857,12 +857,6 @@ bool GuestStorageContext::CreateFile(
     }
     *guestHandle = INVALID_HANDLE_VALUE;
 
-    if ((flagsAndAttributes & FILE_FLAG_OVERLAPPED) != 0)
-    {
-        SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
-        return false;
-    }
-
     const bool readable = HasReadAccess(desiredAccess);
     const bool writable = HasWriteAccess(desiredAccess);
     if ((creationDisposition == CREATE_NEW || creationDisposition == CREATE_ALWAYS ||
@@ -989,6 +983,12 @@ bool GuestStorageContext::CreateFile(
 
 bool GuestStorageContext::ReadFile(HANDLE guestHandle, void* buffer, DWORD bytesToRead, DWORD* bytesRead, DWORD* win32Error)
 {
+    return ReadFileAt(guestHandle, buffer, bytesToRead, ~0ull, bytesRead, win32Error);
+}
+
+bool GuestStorageContext::ReadFileAt(HANDLE guestHandle, void* buffer,
+    DWORD bytesToRead, ULONGLONG offset, DWORD* bytesRead, DWORD* win32Error)
+{
     if (bytesRead)
     {
         *bytesRead = 0;
@@ -1024,6 +1024,9 @@ bool GuestStorageContext::ReadFile(HANDLE guestHandle, void* buffer, DWORD bytes
             SetWin32Error(win32Error, ERROR_SUCCESS);
             return true;
         }
+        const bool positioned = offset != ~0ull;
+        const ULONGLONG previousPosition = positioned ? stream->Position : 0;
+        if (positioned) stream->Seek(offset);
         auto requested = ref new Buffer(bytesToRead);
         IBuffer^ data = create_task(stream->ReadAsync(requested, bytesToRead, InputStreamOptions::None)).get();
         auto copy = ref new Array<byte>(data->Length);
@@ -1033,6 +1036,7 @@ bool GuestStorageContext::ReadFile(HANDLE guestHandle, void* buffer, DWORD bytes
         {
             *bytesRead = copy->Length;
         }
+        if (positioned) stream->Seek(previousPosition);
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return true;
     }
@@ -1044,6 +1048,12 @@ bool GuestStorageContext::ReadFile(HANDLE guestHandle, void* buffer, DWORD bytes
 }
 
 bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWORD bytesToWrite, DWORD* bytesWritten, DWORD* win32Error)
+{
+    return WriteFileAt(guestHandle, buffer, bytesToWrite, ~0ull, bytesWritten, win32Error);
+}
+
+bool GuestStorageContext::WriteFileAt(HANDLE guestHandle, const void* buffer,
+    DWORD bytesToWrite, ULONGLONG offset, DWORD* bytesWritten, DWORD* win32Error)
 {
     if (bytesWritten)
     {
@@ -1087,6 +1097,9 @@ bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWOR
             SetWin32Error(win32Error, ERROR_SUCCESS);
             return true;
         }
+        const bool positioned = offset != ~0ull;
+        const ULONGLONG previousPosition = positioned ? stream->Position : 0;
+        if (positioned) stream->Seek(offset);
         // Bind the writer directly to the random-access stream.  This is the
         // UWP storage contract equivalent of synchronous Win32 WriteFile and
         // avoids relying on a detached in-memory IBuffer being accepted by
@@ -1098,6 +1111,7 @@ bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWOR
         const unsigned int written = create_task(writer->StoreAsync()).get();
         writer->DetachStream();
         delete writer;
+        if (positioned) stream->Seek(previousPosition);
         if (bytesWritten)
         {
             *bytesWritten = written;

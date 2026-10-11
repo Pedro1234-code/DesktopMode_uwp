@@ -8,6 +8,7 @@
 #include "Bridge\\RuntimeDiagnostics.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
@@ -360,6 +361,25 @@ namespace
     }
 }
 
+#include "Bridge/Gdi32CompatibilityShims.inl"
+
+bool Win32Bridge::Bridge::BridgeCopyRegion(
+    HRGN region, MiniGdi::Region* geometry)
+{
+    return CopyRegionHandle(region, geometry);
+}
+
+bool Win32Bridge::Bridge::BridgeAssignRegion(
+    HRGN region, const MiniGdi::Region& geometry)
+{
+    return AssignRegionHandle(region, geometry);
+}
+
+bool Win32Bridge::Bridge::BridgeDeleteRegion(HRGN region)
+{
+    return DeleteRegionHandle(region);
+}
+
 HBRUSH WINAPI Win32Bridge::Bridge::BridgeCreateSolidBrush(COLORREF color)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
@@ -675,6 +695,11 @@ HGDIOBJ WINAPI Win32Bridge::Bridge::BridgeGetStockObject(int object)
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeDeleteObject(HGDIOBJ object)
 {
+    if (BridgeDeleteRegion(reinterpret_cast<HRGN>(object)))
+    {
+        BridgeSetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
     GuestWindowManager* manager = CurrentManagerOrFail();
     const MiniGdi::ObjectHandle resolved = FromGuestObject(object);
     if (!manager || resolved == MiniGdi::InvalidObject)
@@ -834,7 +859,12 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeRectangle(HDC dc, int left, int top, int 
         return FALSE;
     }
 
-    manager->Gdi().Rectangle(resolvedDc, MiniGdi::Rect{ left, top, right, bottom });
+    const auto state = DcState(dc);
+    const POINT first = LogicalToDevicePoint(state, left, top);
+    const POINT second = LogicalToDevicePoint(state, right, bottom);
+    manager->Gdi().Rectangle(resolvedDc, MiniGdi::Rect{
+        (std::min)(first.x, second.x), (std::min)(first.y, second.y),
+        (std::max)(first.x, second.x), (std::max)(first.y, second.y) });
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -856,7 +886,12 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeEllipse(HDC dc, int left, int top, int ri
     // A NULL_PEN/NULL_BRUSH, a reversed rectangle, or a fully clipped ellipse
     // is a valid GDI no-op.  The only bridge-level failure here is an invalid
     // or targetless guest DC.
-    manager->Gdi().Ellipse(resolvedDc, MiniGdi::Rect{ left, top, right, bottom });
+    const auto state = DcState(dc);
+    const POINT first = LogicalToDevicePoint(state, left, top);
+    const POINT second = LogicalToDevicePoint(state, right, bottom);
+    manager->Gdi().Ellipse(resolvedDc, MiniGdi::Rect{
+        (std::min)(first.x, second.x), (std::min)(first.y, second.y),
+        (std::max)(first.x, second.x), (std::max)(first.y, second.y) });
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -870,16 +905,17 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeMoveToEx(HDC dc, int x, int y, LPPOINT pr
         return FALSE;
     }
 
+    const auto state = DcState(dc);
+    const POINT target = LogicalToDevicePoint(state, x, y);
     MiniGdi::Point oldPosition;
-    if (!manager->Gdi().MoveTo(resolvedDc, MiniGdi::Point{ x, y }, previous ? &oldPosition : nullptr))
+    if (!manager->Gdi().MoveTo(resolvedDc, MiniGdi::Point{ target.x, target.y }, previous ? &oldPosition : nullptr))
     {
         BridgeSetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
     if (previous)
     {
-        previous->x = oldPosition.x;
-        previous->y = oldPosition.y;
+        *previous = DeviceToLogicalPoint(state, oldPosition.x, oldPosition.y);
     }
 
     BridgeSetLastError(ERROR_SUCCESS);
@@ -897,7 +933,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeLineTo(HDC dc, int x, int y)
 
     // A NULL_PEN or a completely clipped line performs no raster write, but
     // it is still a successful GDI state transition (the current point moves).
-    manager->Gdi().LineTo(resolvedDc, MiniGdi::Point{ x, y });
+    const POINT target = LogicalToDevicePoint(DcState(dc), x, y);
+    manager->Gdi().LineTo(resolvedDc, MiniGdi::Point{ target.x, target.y });
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -910,7 +947,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeSetPixelV(HDC dc, int x, int y, COLORREF 
     {
         return FALSE;
     }
-    if (!manager->Gdi().SetPixelV(resolvedDc, MiniGdi::Point{ x, y }, ColorFromColorRef(color)))
+    const POINT target = LogicalToDevicePoint(DcState(dc), x, y);
+    if (!manager->Gdi().SetPixelV(resolvedDc,
+        MiniGdi::Point{ target.x, target.y }, ColorFromColorRef(color)))
     {
         BridgeSetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
@@ -929,8 +968,9 @@ COLORREF WINAPI Win32Bridge::Bridge::BridgeGetPixel(HDC dc, int x, int y)
         return GuestAbi::ColorInvalid;
     }
 
+    const POINT target = LogicalToDevicePoint(DcState(dc), x, y);
     MiniGdi::Color color;
-    if (!manager->Gdi().GetPixel(resolvedDc, MiniGdi::Point{ x, y }, &color))
+    if (!manager->Gdi().GetPixel(resolvedDc, MiniGdi::Point{ target.x, target.y }, &color))
     {
         // GetPixel's only supported readback is a visible point in a guest
         // surface.  CLR_INVALID makes clip/bounds failure unambiguous to the
@@ -1008,25 +1048,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeTextOutW(HDC dc, int x, int y, LPCWSTR te
         return FALSE;
     }
 
-    GuestWindowManager* manager = CurrentManagerOrFail();
-    MiniGdi::DcHandle resolvedDc = MiniGdi::InvalidDc;
-    if (!manager || !HasValidDc(manager, dc, &resolvedDc))
-    {
-        return FALSE;
-    }
-
-    if (!manager->Gdi().TextOutW(
-        resolvedDc,
-        MiniGdi::Point{ x, y },
-        text,
-        static_cast<std::size_t>(characterCount)))
-    {
-        BridgeSetLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-
-    BridgeSetLastError(ERROR_SUCCESS);
-    return TRUE;
+    return BridgeExtTextOutW(
+        dc, x, y, 0, nullptr, text, static_cast<UINT>(characterCount), nullptr);
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetTextExtentPoint32W(
@@ -1056,8 +1079,11 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetTextExtentPoint32W(
         return FALSE;
     }
 
-    extent->cx = measured.width;
-    extent->cy = measured.height;
+    const auto state = DcState(dc);
+    extent->cx = (std::abs)(ScaleCoordinate(
+        measured.width, state.windowExtent.cx, state.viewportExtent.cx));
+    extent->cy = (std::abs)(ScaleCoordinate(
+        measured.height, state.windowExtent.cy, state.viewportExtent.cy));
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -1106,6 +1132,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeDeleteDC(HDC dc)
         return FALSE;
     }
 
+    EraseDcCompatibilityState(dc);
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -1156,11 +1183,6 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeBitBlt(
     {
         return FALSE;
     }
-    if (rasterOperation != GuestAbi::RasterOpSrcCopy)
-    {
-        BridgeSetLastError(ERROR_NOT_SUPPORTED);
-        return FALSE;
-    }
     if (width < 0 || height < 0)
     {
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
@@ -1177,19 +1199,11 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeBitBlt(
         return FALSE;
     }
 
-    // Fully clipped copies are still valid BitBlt calls.  With valid DCs and
-    // SRCCOPY, MiniGdi's false result therefore remains a benign no-op.
-    manager->Gdi().BitBlt(
-        destinationDc,
-        MiniGdi::Point{ x, y },
-        sourceDc,
-        MiniGdi::Point{ sourceX, sourceY },
-        MiniGdi::Size{ width, height });
-    BridgeSetLastError(ERROR_SUCCESS);
-    return TRUE;
+    // StretchBlt owns the shared coordinate, clipping, overlap and ROP path so
+    // BitBlt cannot quietly diverge from it.
+    return BridgeStretchBlt(destination, x, y, width, height, source,
+        sourceX, sourceY, width, height, rasterOperation);
 }
-
-#include "Bridge/Gdi32CompatibilityShims.inl"
 
 ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& symbol)
 {
@@ -1259,24 +1273,43 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"endpage") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndPage);
     else if (_wcsicmp(symbol.name.c_str(), L"lptodp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLPtoDP);
     else if (_wcsicmp(symbol.name.c_str(), L"setwindowextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowExtEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"getwindowextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowExtEx);
     else if (_wcsicmp(symbol.name.c_str(), L"setviewportextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetViewportExtEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"getviewportextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetViewportExtEx);
     else if (_wcsicmp(symbol.name.c_str(), L"setmapmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetMapMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"getmapmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMapMode);
     else if (_wcsicmp(symbol.name.c_str(), L"enumfontsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumFontsW);
     else if (_wcsicmp(symbol.name.c_str(), L"createdcw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDCW);
     else if (_wcsicmp(symbol.name.c_str(), L"setwindoworgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowOrgEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"getwindoworgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowOrgEx);
     else if (_wcsicmp(symbol.name.c_str(), L"offsetwindoworgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOffsetWindowOrgEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"setviewportorgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetViewportOrgEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"getviewportorgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetViewportOrgEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"offsetviewportorgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOffsetViewportOrgEx);
     else if (_wcsicmp(symbol.name.c_str(), L"dptolp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDPtoLP);
     else if (_wcsicmp(symbol.name.c_str(), L"setbrushorgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetBrushOrgEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"getbrushorgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetBrushOrgEx);
     else if (_wcsicmp(symbol.name.c_str(), L"setstretchbltmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetStretchBltMode);
     else if (_wcsicmp(symbol.name.c_str(), L"setrop2") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetROP2);
     else if (_wcsicmp(symbol.name.c_str(), L"getrop2") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetROP2);
     else if (_wcsicmp(symbol.name.c_str(), L"settextalign") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetTextAlign);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettextalign") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextAlign);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcurrentpositionex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCurrentPositionEx);
     else if (_wcsicmp(symbol.name.c_str(), L"createbitmap") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateBitmap);
     else if (_wcsicmp(symbol.name.c_str(), L"createpatternbrush") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePatternBrush);
     else if (_wcsicmp(symbol.name.c_str(), L"patblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePatBlt);
     else if (_wcsicmp(symbol.name.c_str(), L"createrectrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateRectRgn);
     else if (_wcsicmp(symbol.name.c_str(), L"createrectrgnindirect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateRectRgnIndirect);
+    else if (_wcsicmp(symbol.name.c_str(), L"createellipticrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateEllipticRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"setrectrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetRectRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"offsetrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOffsetRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"getrgnbox") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetRgnBox);
+    else if (_wcsicmp(symbol.name.c_str(), L"ptinregion") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePtInRegion);
+    else if (_wcsicmp(symbol.name.c_str(), L"rectinregion") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRectInRegion);
+    else if (_wcsicmp(symbol.name.c_str(), L"equalrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEqualRgn);
     else if (_wcsicmp(symbol.name.c_str(), L"selectcliprgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSelectClipRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"extselectcliprgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtSelectClipRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclipbox") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipBox);
     else if (_wcsicmp(symbol.name.c_str(), L"intersectcliprect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIntersectClipRect);
     else if (_wcsicmp(symbol.name.c_str(), L"excludecliprect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExcludeClipRect);
     else if (_wcsicmp(symbol.name.c_str(), L"getcliprgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipRgn);
@@ -1298,16 +1331,18 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"stretchblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStretchBlt);
     else if (_wcsicmp(symbol.name.c_str(), L"gdialphablend") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGdiAlphaBlend);
     else if (_wcsicmp(symbol.name.c_str(), L"alphablend") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGdiAlphaBlend);
+    else if (_wcsicmp(symbol.name.c_str(), L"transparentblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTransparentBlt);
     else if (_wcsicmp(symbol.name.c_str(), L"enumfontfamiliesexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumFontFamiliesExW);
     else if (_wcsicmp(symbol.name.c_str(), L"createdibsection") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDIBSection);
     else if (_wcsicmp(symbol.name.c_str(), L"setdibits") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetDIBits);
     else if (_wcsicmp(symbol.name.c_str(), L"getdibits") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDIBits);
     else if (_wcsicmp(symbol.name.c_str(), L"stretchdibits") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStretchDIBits);
+    else if (_wcsicmp(symbol.name.c_str(), L"setdibitstodevice") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetDIBitsToDevice);
 
     if (resolution.targetAddress != 0)
     {
         resolution.disposition = ImportDisposition::NeedsBridge;
-        resolution.note = L"MiniGDI adapter: software pens, brushes, retained font handles and queries (GetObjectW for HFONT), primitive raster drawing, text, memory DCs, bitmaps, and SRCCOPY blits.";
+        resolution.note = L"MiniGDI adapter: software drawing, text, memory DCs, DIBs, clipped raster operations, color-key blits, and source-over alpha composition.";
     }
     return resolution;
 }

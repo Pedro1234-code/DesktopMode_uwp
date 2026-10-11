@@ -281,6 +281,11 @@ class EngineView {
   uint64_t seen_ = 0;
   int32_t width_ = 0;
   int32_t height_ = 0;
+  // Chrome popups are software-composited over the GPU-backed browser. Track
+  // their transition so the final transparent frame is copied when one closes,
+  // and cap those large UI-thread copies while it remains open.
+  bool chromeOverlayVisible_ = false;
+  unsigned long long lastChromeOverlayCopy_ = 0;
   bool reported_ = false;
   bool panelGiven_ = false;
   bool sizeSent_ = false;

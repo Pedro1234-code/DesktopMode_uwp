@@ -173,7 +173,9 @@ namespace Bridge
     BOOL WINAPI BridgeTrackPopupMenu(HMENU menu, UINT flags, int x, int y, int reserved, HWND owner, const RECT* rect);
     BOOL WINAPI BridgeEndMenu();
     HANDLE WINAPI BridgeLoadAcceleratorsW(HINSTANCE instance, LPCWSTR resource);
+    HANDLE WINAPI BridgeLoadAcceleratorsA(HINSTANCE instance, LPCSTR resource);
     int WINAPI BridgeTranslateAcceleratorW(HWND window, HANDLE accelerators, const GuestAbi::Message* message);
+    int WINAPI BridgeTranslateAcceleratorA(HWND window, HANDLE accelerators, const GuestAbi::Message* message);
     UINT WINAPI BridgeGetDialogBaseUnits();
     HWND WINAPI BridgeChildWindowFromPointEx(HWND parent, POINT point, UINT flags);
     HWND WINAPI BridgeWindowFromPoint(POINT point);

@@ -43,6 +43,10 @@ namespace Bridge
         HANDLE templateFile);
     BOOL WINAPI BridgeReadFile(HANDLE file, LPVOID buffer, DWORD bytesToRead, LPDWORD bytesRead, LPOVERLAPPED overlapped);
     BOOL WINAPI BridgeWriteFile(HANDLE file, LPCVOID buffer, DWORD bytesToWrite, LPDWORD bytesWritten, LPOVERLAPPED overlapped);
+    BOOL WINAPI BridgeGetOverlappedResult(HANDLE file, LPOVERLAPPED overlapped,
+        LPDWORD bytesTransferred, BOOL wait);
+    BOOL WINAPI BridgeGetOverlappedResultEx(HANDLE file, LPOVERLAPPED overlapped,
+        LPDWORD bytesTransferred, DWORD milliseconds, BOOL alertable);
     BOOL WINAPI BridgeCloseHandle(HANDLE object);
     BOOL WINAPI BridgeGetFileSizeEx(HANDLE file, PLARGE_INTEGER fileSize);
     DWORD WINAPI BridgeGetFileSize(HANDLE file, LPDWORD fileSizeHigh);
@@ -109,6 +113,7 @@ namespace Bridge
     BOOL WINAPI BridgeSetCurrentDirectoryW(LPCWSTR path);
     DWORD WINAPI BridgeGetCurrentDirectoryW(DWORD bufferLength, LPWSTR buffer);
     DWORD WINAPI BridgeGetTempPathW(DWORD bufferLength, LPWSTR buffer);
+    DWORD WINAPI BridgeGetTempPath2W(DWORD bufferLength, LPWSTR buffer);
     DWORD WINAPI BridgeGetLogicalDrives();
     DWORD WINAPI BridgeGetLogicalDriveStringsW(DWORD bufferLength, LPWSTR buffer);
     UINT WINAPI BridgeGetDriveTypeW(LPCWSTR rootPath);
@@ -147,7 +152,9 @@ namespace Bridge
     DWORD WINAPI BridgeGetCurrentThreadId();
     DWORD WINAPI BridgeGetCurrentProcessId();
     HANDLE WINAPI BridgeGetCurrentProcess();
+    LONG WINAPI BridgeAppPolicyGetProcessTerminationMethod(HANDLE token, int* policy);
     void WINAPI BridgeGetSystemTimeAsFileTime(LPFILETIME systemTime);
+    void WINAPI BridgeGetSystemTimePreciseAsFileTime(LPFILETIME systemTime);
     LPVOID WINAPI BridgeVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocationType, DWORD protection);
     BOOL WINAPI BridgeVirtualFree(LPVOID address, SIZE_T size, DWORD freeType);
     BOOL WINAPI BridgeVirtualProtect(LPVOID address, SIZE_T size, DWORD protection, PDWORD oldProtection);

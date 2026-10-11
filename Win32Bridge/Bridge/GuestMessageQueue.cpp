@@ -249,6 +249,16 @@ bool GuestMessageQueue::Matches(
     UINT firstMessage,
     UINT lastMessage)
 {
+    // The bridge's synchronous-send wakeup is consumed by GuestWindowManager,
+    // never returned to guest code. Like kernel sent-message wakeups, it must
+    // bypass GetMessage's HWND and range filters or a cross-thread SendMessage
+    // could deadlock behind an unrelated filter.
+    if (message.hwnd == nullptr &&
+        (message.message == 0xffffffffu || message.message == 0xfffffffeu))
+    {
+        return true;
+    }
+
     // Win32 treats WM_QUIT as a thread-level termination request regardless
     // of the requested HWND or message range.
     if (message.message == GuestAbi::WmQuit)

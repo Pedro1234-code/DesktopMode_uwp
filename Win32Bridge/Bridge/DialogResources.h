@@ -55,7 +55,8 @@ namespace Bridge
         HWND parent, DLGPROC procedure, LPARAM initParameter, bool modal, HWND* createdWindow);
     INT_PTR ShowGuestDialogFromResourceWithStyles(HINSTANCE instance, LPCWSTR templateName,
         HWND parent, DLGPROC procedure, LPARAM initParameter,
-        DWORD stylesToAdd, DWORD stylesToRemove, LPCWSTR titleOverride);
+        DWORD stylesToAdd, DWORD stylesToRemove, LPCWSTR titleOverride,
+        bool modal = true, HWND* createdWindow = nullptr);
     INT_PTR ShowGuestPropertySheet(const GuestPropertySheetDescriptor& descriptor);
     bool ShowGuestFileDialog(const GuestFileDialogDescriptor& descriptor,
         std::wstring* selectedPath, DWORD* selectedFilterIndex);

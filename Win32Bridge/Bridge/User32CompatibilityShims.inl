@@ -12,10 +12,10 @@ namespace
     using GuestWndEnumProc = BOOL (CALLBACK*)(HWND, LPARAM);
     using GuestMonitorEnumProc = BOOL (CALLBACK*)(HMONITOR, HDC, LPRECT, LPARAM);
     using GuestHookProc = LRESULT (CALLBACK*)(int, WPARAM, LPARAM);
+    using GuestSendAsyncProc = void (CALLBACK*)(HWND, UINT, ULONG_PTR, LRESULT);
     struct GuestTrackMouseEvent { DWORD cbSize; DWORD dwFlags; HWND hwndTrack; DWORD dwHoverTime; };
     struct GuestScrollInfo { UINT cbSize; UINT fMask; int nMin; int nMax; UINT nPage; int nPos; int nTrackPos; };
     struct GuestFlashWindowInfo { UINT cbSize; HWND hwnd; DWORD dwFlags; UINT uCount; DWORD dwTimeout; };
-    struct GuestAccel { BYTE fVirt; WORD key; WORD cmd; };
     struct GuestComboBoxInfo { DWORD cbSize; RECT rcItem; RECT rcButton; DWORD stateButton; HWND hwndCombo; HWND hwndItem; HWND hwndList; };
     struct GuestMenuBarInfo { DWORD cbSize; RECT rcBar; HMENU hMenu; HWND hwndMenu; BOOL fBarFocused : 1; BOOL fFocused : 1; };
     struct GuestIconInfo { BOOL fIcon; DWORD xHotspot; DWORD yHotspot; HBITMAP hbmMask; HBITMAP hbmColor; };
@@ -301,7 +301,11 @@ HWND WINAPI BridgeGetActiveWindow()
 
 HWND WINAPI BridgeGetLastActivePopup(HWND window)
 {
-    return BridgeIsWindow(window) ? window : nullptr;
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const HWND result = manager ? manager->GetGuestLastActivePopup(window, &error) : nullptr;
+    BridgeSetLastError(error);
+    return result;
 }
 
 BOOL WINAPI BridgeBringWindowToTop(HWND window)
@@ -312,15 +316,96 @@ BOOL WINAPI BridgeBringWindowToTop(HWND window)
 
 DWORD WINAPI BridgeGetWindowThreadProcessId(HWND window, LPDWORD processId)
 {
-    if (!BridgeIsWindow(window))
-    {
-        if (processId) *processId = 0;
-        BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE);
-        return 0;
-    }
-    if (processId) *processId = BridgeGetCurrentProcessId();
-    BridgeSetLastError(ERROR_SUCCESS);
-    return BridgeGetCurrentThreadId();
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const DWORD threadId = manager
+        ? manager->GetGuestWindowThreadId(window, &error) : 0;
+    if (processId) *processId = threadId ? BridgeGetCurrentProcessId() : 0;
+    BridgeSetLastError(error);
+    return threadId;
+}
+
+BOOL WINAPI BridgePostThreadMessageW(
+    DWORD threadId, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const BOOL result = manager
+        ? manager->PostGuestThreadMessage(threadId, message, wParam, lParam, &error)
+        : FALSE;
+    BridgeSetLastError(error);
+    return result;
+}
+
+BOOL WINAPI BridgePostThreadMessageA(
+    DWORD threadId, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    return BridgePostThreadMessageW(threadId, message, wParam, lParam);
+}
+
+LRESULT WINAPI BridgeSendMessageTimeoutW(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam, UINT flags, UINT timeout, PDWORD_PTR result)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const BOOL sent = manager ? manager->SendGuestMessageTimeout(window, message,
+        wParam, lParam, flags, timeout, result, &error) : FALSE;
+    BridgeSetLastError(error);
+    return sent;
+}
+
+LRESULT WINAPI BridgeSendMessageTimeoutA(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam, UINT flags, UINT timeout, PDWORD_PTR result)
+{
+    return BridgeSendMessageTimeoutW(window, message, wParam, lParam,
+        flags, timeout, result);
+}
+
+BOOL WINAPI BridgeSendNotifyMessageW(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const BOOL sent = manager ? manager->SendGuestNotifyMessage(
+        window, message, wParam, lParam, &error) : FALSE;
+    BridgeSetLastError(error);
+    return sent;
+}
+
+BOOL WINAPI BridgeSendNotifyMessageA(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam)
+{
+    return BridgeSendNotifyMessageW(window, message, wParam, lParam);
+}
+
+BOOL WINAPI BridgeSendMessageCallbackW(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam, GuestSendAsyncProc callback, ULONG_PTR data)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const BOOL sent = manager ? manager->SendGuestMessageCallback(window,
+        message, wParam, lParam, callback, data, &error) : FALSE;
+    BridgeSetLastError(error);
+    return sent;
+}
+
+BOOL WINAPI BridgeSendMessageCallbackA(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam, GuestSendAsyncProc callback, ULONG_PTR data)
+{
+    return BridgeSendMessageCallbackW(window, message, wParam, lParam,
+        callback, data);
+}
+
+BOOL WINAPI BridgeInSendMessage()
+{
+    GuestWindowManager* manager = CurrentGuestWindowManager();
+    return manager && manager->GuestInSendMessageState() != 0;
+}
+
+DWORD WINAPI BridgeInSendMessageEx(LPVOID)
+{
+    GuestWindowManager* manager = CurrentGuestWindowManager();
+    return manager ? manager->GuestInSendMessageState() : 0;
 }
 
 BOOL WINAPI BridgeSetPropW(HWND window, LPCWSTR name, HANDLE data)
@@ -428,6 +513,43 @@ HANDLE WINAPI BridgeGetClipboardData(UINT format)
     return found->second;
 }
 
+UINT WINAPI BridgeRegisterClipboardFormatA(LPCSTR name)
+{
+    if (!name) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    const std::wstring wide = AnsiToWide(name);
+    if (wide.empty() && *name) { BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION); return 0; }
+    return BridgeRegisterClipboardFormatW(wide.c_str());
+}
+
+BOOL WINAPI BridgeIsClipboardFormatAvailable(UINT format)
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    return g_clipboardData.find(format) != g_clipboardData.end();
+}
+
+int WINAPI BridgeCountClipboardFormats()
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    return static_cast<int>((std::min)(g_clipboardData.size(),
+        static_cast<size_t>((std::numeric_limits<int>::max)())));
+}
+
+UINT WINAPI BridgeEnumClipboardFormats(UINT previous)
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    UINT next = 0;
+    for (const auto& entry : g_clipboardData)
+        if (entry.first > previous && (!next || entry.first < next)) next = entry.first;
+    BridgeSetLastError(ERROR_SUCCESS);
+    return next;
+}
+
+DWORD WINAPI BridgeGetClipboardSequenceNumber()
+{
+    std::lock_guard<std::mutex> guard(g_menuLock);
+    return g_clipboardSequence;
+}
+
 BOOL WINAPI BridgeAddClipboardFormatListener(HWND window) { return BridgeIsWindow(window); }
 BOOL WINAPI BridgeRemoveClipboardFormatListener(HWND window) { return BridgeIsWindow(window); }
 HWND WINAPI BridgeSetClipboardViewer(HWND window) { return BridgeIsWindow(window) ? nullptr : nullptr; }
@@ -471,19 +593,180 @@ BOOL WINAPI BridgeSystemParametersInfoA(UINT action, UINT parameter, PVOID value
 HDC WINAPI BridgeGetWindowDC(HWND window) { return BridgeGetDC(window); }
 HDC WINAPI BridgeGetDCEx(HWND window, HRGN, DWORD) { return BridgeGetDC(window); }
 
-BOOL WINAPI BridgeValidateRect(HWND window, const RECT*)
+BOOL WINAPI BridgeValidateRect(HWND window, const RECT* rect)
 {
-    // The retained compositor has no exposed update-region object. Painting
-    // consumes invalidation atomically, so validation is equivalent to an
-    // immediate update of the current virtual surface.
-    return BridgeUpdateWindow(window);
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return FALSE;
+    DWORD error = ERROR_SUCCESS;
+    const BOOL result = manager->ValidateGuestRect(window, rect, &error);
+    BridgeSetLastError(error);
+    return result;
 }
 
-BOOL WINAPI BridgeRedrawWindow(HWND window, const RECT* update, HRGN, UINT flags)
+BOOL WINAPI BridgeGetUpdateRect(HWND window, RECT* update, BOOL erase)
 {
-    const BOOL erase = (flags & RDW_ERASE) != 0;
-    if ((flags & RDW_INVALIDATE) != 0 && !BridgeInvalidateRect(window, update, erase)) return FALSE;
-    return (flags & (RDW_UPDATENOW | RDW_ERASENOW)) != 0 ? BridgeUpdateWindow(window) : TRUE;
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return FALSE;
+    DWORD error = ERROR_SUCCESS;
+    const BOOL result = manager->GetGuestUpdateRect(window, update, erase, &error);
+    BridgeSetLastError(error);
+    return result;
+}
+
+BOOL WINAPI BridgeInvalidateRgn(HWND window, HRGN region, BOOL erase)
+{
+    if (!region) return BridgeInvalidateRect(window, nullptr, erase);
+    MiniGdi::Region geometry;
+    if (!BridgeCopyRegion(region, &geometry))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return FALSE;
+    DWORD error = ERROR_SUCCESS;
+    const BOOL result = manager->InvalidateGuestRegion(window, geometry, erase, &error);
+    BridgeSetLastError(error);
+    return result;
+}
+
+BOOL WINAPI BridgeValidateRgn(HWND window, HRGN region)
+{
+    if (!region) return BridgeValidateRect(window, nullptr);
+    MiniGdi::Region geometry;
+    if (!BridgeCopyRegion(region, &geometry))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return FALSE;
+    DWORD error = ERROR_SUCCESS;
+    const BOOL result = manager->ValidateGuestRegion(window, geometry, &error);
+    BridgeSetLastError(error);
+    return result;
+}
+
+BOOL WINAPI BridgeRedrawWindow(HWND window, const RECT* update, HRGN region, UINT flags)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return FALSE;
+    if (!window)
+    {
+        // The bridge has no guest desktop HWND. Match the useful Win32 effect:
+        // apply a whole-client redraw to every virtual window.
+        if ((flags & RDW_INVALIDATE) != 0)
+            return manager->InvalidateGuestRect(nullptr, update,
+                (flags & RDW_ERASE) != 0, nullptr);
+        BridgeSetLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    bool regionEmpty = false;
+    const RECT* damage = update;
+    MiniGdi::Region regionGeometry;
+    if (region)
+    {
+        if (!BridgeCopyRegion(region, &regionGeometry))
+        {
+            BridgeSetLastError(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        regionEmpty = regionGeometry.Empty();
+        damage = nullptr;
+    }
+
+    DWORD error = ERROR_SUCCESS;
+    if ((flags & RDW_INVALIDATE) != 0 && !regionEmpty)
+    {
+        const BOOL result = region
+            ? manager->InvalidateGuestRegion(window, regionGeometry, (flags & RDW_ERASE) != 0, &error)
+            : manager->InvalidateGuestRect(window, damage, (flags & RDW_ERASE) != 0, &error);
+        if (!result) goto Failure;
+    }
+    if ((flags & RDW_VALIDATE) != 0 && !regionEmpty)
+    {
+        const BOOL result = region
+            ? manager->ValidateGuestRegion(window, regionGeometry, &error)
+            : manager->ValidateGuestRect(window, damage, &error);
+        if (!result) goto Failure;
+    }
+    if ((flags & RDW_NOERASE) != 0 &&
+        !manager->SetGuestErasePending(window, FALSE, &error))
+        goto Failure;
+    else if ((flags & RDW_ERASE) != 0 &&
+        !manager->SetGuestErasePending(window, TRUE, &error))
+        goto Failure;
+    if ((flags & RDW_INTERNALPAINT) != 0 &&
+        !manager->SetGuestInternalPaint(window, TRUE, &error))
+        goto Failure;
+    if ((flags & RDW_NOINTERNALPAINT) != 0 &&
+        !manager->SetGuestInternalPaint(window, FALSE, &error))
+        goto Failure;
+
+    if ((flags & RDW_ALLCHILDREN) != 0)
+    {
+        POINT parentOrigin{};
+        manager->GetGuestClientOrigin(window, &parentOrigin, nullptr);
+        for (HWND child : manager->SnapshotGuestWindows(window, true))
+        {
+            MiniGdi::Region childDamage;
+            bool hasSpecificDamage = false;
+            if (region || update)
+            {
+                childDamage = region ? regionGeometry : MiniGdi::RectRegion(
+                    { update->left, update->top, update->right, update->bottom });
+                POINT childOrigin{};
+                manager->GetGuestClientOrigin(child, &childOrigin, nullptr);
+                const int offsetX = parentOrigin.x - childOrigin.x;
+                const int offsetY = parentOrigin.y - childOrigin.y;
+                for (MiniGdi::Rect& rect : childDamage.rectangles)
+                {
+                    rect.left += offsetX;
+                    rect.right += offsetX;
+                    rect.top += offsetY;
+                    rect.bottom += offsetY;
+                }
+                hasSpecificDamage = true;
+            }
+            if ((flags & RDW_INVALIDATE) != 0)
+            {
+                if (hasSpecificDamage)
+                    manager->InvalidateGuestRegion(child, childDamage,
+                        (flags & RDW_ERASE) != 0, nullptr);
+                else
+                    manager->InvalidateGuestRect(child, nullptr,
+                        (flags & RDW_ERASE) != 0, nullptr);
+            }
+            if ((flags & RDW_VALIDATE) != 0)
+            {
+                if (hasSpecificDamage) manager->ValidateGuestRegion(child, childDamage, nullptr);
+                else manager->ValidateGuestRect(child, nullptr, nullptr);
+            }
+            if ((flags & RDW_NOERASE) != 0)
+                manager->SetGuestErasePending(child, FALSE, nullptr);
+            else if ((flags & RDW_ERASE) != 0)
+                manager->SetGuestErasePending(child, TRUE, nullptr);
+            if ((flags & RDW_INTERNALPAINT) != 0)
+                manager->SetGuestInternalPaint(child, TRUE, nullptr);
+            if ((flags & RDW_NOINTERNALPAINT) != 0)
+                manager->SetGuestInternalPaint(child, FALSE, nullptr);
+        }
+    }
+
+    if ((flags & (RDW_UPDATENOW | RDW_ERASENOW)) != 0)
+    {
+        if (!manager->UpdateGuestWindow(window, &error)) goto Failure;
+        if ((flags & RDW_ALLCHILDREN) != 0)
+            for (HWND child : manager->SnapshotGuestWindows(window, true))
+                manager->UpdateGuestWindow(child, nullptr);
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return TRUE;
+
+Failure:
+    BridgeSetLastError(error);
+    return FALSE;
 }
 
 BOOL WINAPI BridgeTrackMouseEvent(GuestTrackMouseEvent* event)
@@ -526,9 +809,39 @@ BOOL WINAPI BridgeEndDeferWindowPos(HANDLE handle)
 {
     std::unique_ptr<DeferredWindowPosition> positions(reinterpret_cast<DeferredWindowPosition*>(handle));
     if (!positions) { BridgeSetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    // HDWP is committed as one visual transaction. Individual HWNDs still get
+    // their synchronous WINDOWPOS/NCCALCSIZE messages in request order, but no
+    // intermediate frame is exposed while sibling geometry is half updated.
+    constexpr UINT SwpNoRedraw = 0x0008;
+    for (const auto& entry : positions->entries)
+    {
+        const ULONG_PTR after = reinterpret_cast<ULONG_PTR>(entry.after);
+        const bool specialAfter = after == 0 || after == 1 ||
+            after == static_cast<ULONG_PTR>(-1) ||
+            after == static_cast<ULONG_PTR>(-2);
+        if (!BridgeIsWindow(entry.window) || (!specialAfter && !BridgeIsWindow(entry.after)))
+        {
+            BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE);
+            return FALSE;
+        }
+        if ((entry.flags & SWP_NOSIZE) == 0 &&
+            (entry.width < 0 || entry.height < 0))
+        {
+            BridgeSetLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+    }
     for (const auto& entry : positions->entries)
         if (!BridgeSetWindowPos(entry.window, entry.after, entry.x, entry.y,
-            entry.width, entry.height, entry.flags)) return FALSE;
+            entry.width, entry.height, entry.flags | SwpNoRedraw)) return FALSE;
+    for (const auto& entry : positions->entries)
+    {
+        if ((entry.flags & SwpNoRedraw) == 0)
+            BridgeInvalidateRect(entry.window, nullptr, TRUE);
+    }
+    if (!positions->entries.empty())
+        BridgeUpdateWindow(positions->entries.back().window);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
@@ -692,6 +1005,18 @@ HWND WINAPI BridgeCreateDialogIndirectParamW(HINSTANCE instance, const void* dat
     return result < 0 ? nullptr : created;
 }
 
+INT_PTR WINAPI BridgeDialogBoxIndirectParamA(HINSTANCE instance, const void* data,
+    HWND parent, DLGPROC procedure, LPARAM parameter)
+{
+    return BridgeDialogBoxIndirectParamW(instance, data, parent, procedure, parameter);
+}
+
+HWND WINAPI BridgeCreateDialogIndirectParamA(HINSTANCE instance, const void* data,
+    HWND parent, DLGPROC procedure, LPARAM parameter)
+{
+    return BridgeCreateDialogIndirectParamW(instance, data, parent, procedure, parameter);
+}
+
 BOOL WINAPI BridgeInsertMenuW(HMENU menu, UINT item, UINT flags, UINT_PTR identifier, LPCWSTR text)
 {
     GuestMenuItemInfoW info{};
@@ -783,23 +1108,52 @@ int WINAPI BridgeToAscii(UINT virtualKey, UINT, const BYTE* state, LPWORD charac
     return 1;
 }
 
-struct GuestAcceleratorTable final { std::vector<GuestAccel> entries; };
-
 HANDLE WINAPI BridgeCreateAcceleratorTableW(GuestAccel* entries, int count)
 {
     if (!entries || count <= 0) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return nullptr; }
-    auto table = new (std::nothrow) GuestAcceleratorTable();
-    if (!table) { BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
-    try { table->entries.assign(entries, entries + count); }
-    catch (...) { delete table; BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
-    return reinterpret_cast<HANDLE>(table);
+    try
+    {
+        HANDLE table = StoreAcceleratorTable(std::vector<GuestAccel>(entries, entries + count));
+        BridgeSetLastError(table ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+        return table;
+    }
+    catch (...) { BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY); return nullptr; }
+}
+
+HANDLE WINAPI BridgeCreateAcceleratorTableA(GuestAccel* entries, int count)
+{
+    return BridgeCreateAcceleratorTableW(entries, count);
 }
 
 BOOL WINAPI BridgeDestroyAcceleratorTable(HANDLE table)
 {
-    if (!table) return FALSE;
-    delete reinterpret_cast<GuestAcceleratorTable*>(table);
+    std::lock_guard<std::mutex> guard(g_acceleratorLock);
+    if (!table || g_accelerators.erase(reinterpret_cast<ULONG_PTR>(table)) == 0)
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
+}
+
+int WINAPI BridgeCopyAcceleratorTableW(HANDLE table, GuestAccel* destination, int count)
+{
+    const auto source = FindAcceleratorTable(table);
+    if (!source) { BridgeSetLastError(1403u); return 0; }
+    if (!destination || count == 0)
+        return static_cast<int>((std::min)(source->entries.size(),
+            static_cast<size_t>((std::numeric_limits<int>::max)())));
+    if (count < 0) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    const size_t copied = (std::min)(source->entries.size(), static_cast<size_t>(count));
+    memcpy(destination, source->entries.data(), copied * sizeof(GuestAccel));
+    BridgeSetLastError(ERROR_SUCCESS);
+    return static_cast<int>(copied);
+}
+
+int WINAPI BridgeCopyAcceleratorTableA(HANDLE table, GuestAccel* destination, int count)
+{
+    return BridgeCopyAcceleratorTableW(table, destination, count);
 }
 
 BOOL WINAPI BridgeGetComboBoxInfo(HWND window, GuestComboBoxInfo* info)
@@ -834,11 +1188,70 @@ BOOL WINAPI BridgeGetMenuBarInfo(HWND window, LONG objectId, LONG itemId, GuestM
     return info->hMenu != nullptr;
 }
 
-int WINAPI BridgeGetUpdateRgn(HWND window, HRGN, BOOL erase)
+int WINAPI BridgeGetUpdateRgn(HWND window, HRGN region, BOOL erase)
 {
-    if (!BridgeIsWindow(window)) return ERROR;
-    if (erase) BridgeUpdateWindow(window);
-    return NULLREGION;
+    if (!region)
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return ERROR;
+    }
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return ERROR;
+    MiniGdi::Region update;
+    DWORD error = ERROR_SUCCESS;
+    const BOOL dirty = manager->GetGuestUpdateRegion(window, &update, erase, &error);
+    if (!dirty && error != ERROR_SUCCESS)
+    {
+        BridgeSetLastError(error);
+        return ERROR;
+    }
+    if (!BridgeAssignRegion(region, update))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return ERROR;
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return !dirty ? NULLREGION :
+        (update.rectangles.size() == 1 ? SIMPLEREGION : COMPLEXREGION);
+}
+
+int WINAPI BridgeExcludeUpdateRgn(HDC dc, HWND window)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager || !manager->IsGuestDc(dc))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return ERROR;
+    }
+    MiniGdi::Region update;
+    DWORD error = ERROR_SUCCESS;
+    if (!manager->GetGuestUpdateRegion(window, &update, FALSE, &error))
+    {
+        if (error != ERROR_SUCCESS)
+        {
+            BridgeSetLastError(error);
+            return ERROR;
+        }
+        BridgeSetLastError(ERROR_SUCCESS);
+        return NULLREGION;
+    }
+
+    MiniGdi::Region clip;
+    const MiniGdi::DcHandle guestDc = manager->GuestDcHandle(dc);
+    if (!manager->Gdi().GetClipRegion(guestDc, &clip))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return ERROR;
+    }
+    const MiniGdi::Region remaining = MiniGdi::SubtractRegion(clip, update);
+    if (!manager->Gdi().SetClipRegion(guestDc, remaining))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return ERROR;
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return remaining.Empty() ? NULLREGION :
+        (remaining.rectangles.size() == 1 ? SIMPLEREGION : COMPLEXREGION);
 }
 
 void WINAPI BridgeMouseEvent(DWORD, DWORD, DWORD, DWORD, ULONG_PTR)
@@ -900,10 +1313,76 @@ HWND WINAPI BridgeChildWindowFromPoint(HWND parent, POINT point)
     return BridgeChildWindowFromPointEx(parent, point, 0);
 }
 
-HMENU WINAPI BridgeGetSystemMenu(HWND, BOOL)
+HMENU WINAPI BridgeGetSystemMenu(HWND window, BOOL revert)
 {
+    constexpr UINT ScSize = 0xf000u;
+    constexpr UINT ScMove = 0xf010u;
+    constexpr UINT ScMinimize = 0xf020u;
+    constexpr UINT ScMaximize = 0xf030u;
+    constexpr UINT ScClose = 0xf060u;
+    constexpr UINT ScRestore = 0xf120u;
+    if (!BridgeIsWindow(window))
+    {
+        BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return nullptr;
+    }
+    HMENU removed = nullptr;
+    HMENU duplicate = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(g_menuLock);
+        const ULONG_PTR key = reinterpret_cast<ULONG_PTR>(window);
+        const auto found = g_systemMenus.find(key);
+        if (revert)
+        {
+            if (found != g_systemMenus.end())
+            {
+                removed = found->second;
+                g_systemMenus.erase(found);
+            }
+        }
+        else if (found != g_systemMenus.end())
+        {
+            BridgeSetLastError(ERROR_SUCCESS);
+            return found->second;
+        }
+    }
+    if (removed) BridgeDestroyMenu(removed);
+    if (revert)
+    {
+        BridgeSetLastError(ERROR_SUCCESS);
+        return nullptr;
+    }
+
+    HMENU menu = BridgeCreatePopupMenu();
+    if (!menu) return nullptr;
+    const bool built =
+        BridgeAppendMenuW(menu, MF_STRING, ScRestore, L"&Restore") &&
+        BridgeAppendMenuW(menu, MF_STRING, ScMove, L"&Move") &&
+        BridgeAppendMenuW(menu, MF_STRING, ScSize, L"&Size") &&
+        BridgeAppendMenuW(menu, MF_STRING, ScMinimize, L"Mi&nimize") &&
+        BridgeAppendMenuW(menu, MF_STRING, ScMaximize, L"Ma&ximize") &&
+        BridgeAppendMenuW(menu, MF_SEPARATOR, 0, nullptr) &&
+        BridgeAppendMenuW(menu, MF_STRING, ScClose, L"&Close\tAlt+F4");
+    if (!built)
+    {
+        BridgeDestroyMenu(menu);
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_menuLock);
+        const ULONG_PTR key = reinterpret_cast<ULONG_PTR>(window);
+        const auto inserted = g_systemMenus.emplace(key, menu);
+        if (!inserted.second)
+        {
+            HMENU existing = inserted.first->second;
+            // Another guest thread won the lazy creation race.
+            duplicate = menu;
+            menu = existing;
+        }
+    }
+    if (duplicate) BridgeDestroyMenu(duplicate);
     BridgeSetLastError(ERROR_SUCCESS);
-    return nullptr;
+    return menu;
 }
 
 UINT WINAPI BridgeRegisterWindowMessageW(LPCWSTR text)
@@ -933,10 +1412,40 @@ int WINAPI BridgeSetScrollPos(HWND window, int bar, int position, BOOL redraw)
 }
 
 HWND WINAPI BridgeCreateDialogParamW(
-    HINSTANCE, LPCWSTR, HWND, DLGPROC, LPARAM)
+    HINSTANCE instance, LPCWSTR templateName, HWND parent,
+    DLGPROC procedure, LPARAM parameter)
 {
-    BridgeSetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-    return nullptr;
+    HWND created = nullptr;
+    const INT_PTR result = ShowGuestDialogFromResourceWithStyles(instance,
+        templateName, parent, procedure, parameter, 0, 0, nullptr,
+        false, &created);
+    return result < 0 ? nullptr : created;
+}
+
+INT_PTR WINAPI BridgeDialogBoxParamA(HINSTANCE instance, LPCSTR templateName,
+    HWND parent, DLGPROC procedure, LPARAM parameter)
+{
+    std::wstring storage;
+    LPCWSTR converted = nullptr;
+    if (!ConvertAnsiResourceName(templateName, &storage, &converted))
+    {
+        BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return -1;
+    }
+    return BridgeDialogBoxParamW(instance, converted, parent, procedure, parameter);
+}
+
+HWND WINAPI BridgeCreateDialogParamA(HINSTANCE instance, LPCSTR templateName,
+    HWND parent, DLGPROC procedure, LPARAM parameter)
+{
+    std::wstring storage;
+    LPCWSTR converted = nullptr;
+    if (!ConvertAnsiResourceName(templateName, &storage, &converted))
+    {
+        BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return nullptr;
+    }
+    return BridgeCreateDialogParamW(instance, converted, parent, procedure, parameter);
 }
 
 int WINAPI BridgeDrawTextExW(
@@ -966,10 +1475,12 @@ HWND WINAPI BridgeFindWindowW(LPCWSTR, LPCWSTR)
 
 BOOL WINAPI BridgeSetForegroundWindow(HWND window)
 {
-    if (!BridgeIsWindow(window)) { BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE); return FALSE; }
-    BridgeSetFocus(window);
-    BridgeSetLastError(ERROR_SUCCESS);
-    return TRUE;
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const BOOL result = manager
+        ? manager->SetGuestForegroundWindow(window, false, &error) : FALSE;
+    BridgeSetLastError(error);
+    return result;
 }
 
 HWINEVENTHOOK WINAPI BridgeSetWinEventHook(
@@ -1002,7 +1513,6 @@ HWND WINAPI BridgeGetForegroundWindow()
 
 BOOL WINAPI BridgeMessageBeep(UINT) { return TRUE; }
 BOOL WINAPI BridgeIsIconic(HWND) { return FALSE; }
-BOOL WINAPI BridgeIsClipboardFormatAvailable(UINT) { return FALSE; }
 
 HWND WINAPI BridgeSetActiveWindow(HWND window)
 {

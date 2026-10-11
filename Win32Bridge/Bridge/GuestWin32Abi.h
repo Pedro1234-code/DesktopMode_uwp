@@ -149,12 +149,34 @@ namespace GuestAbi
     constexpr int SwHide = 0;
     constexpr int SwShow = 5;
     constexpr UINT SizeRestored = 0;
+    constexpr LRESULT HtError = -2;
+    constexpr LRESULT HtTransparent = -1;
+    constexpr LRESULT HtNowhere = 0;
     constexpr LRESULT HtClient = 1;
+    constexpr LRESULT HtCaption = 2;
+    constexpr LRESULT HtSysMenu = 3;
+    constexpr LRESULT HtGrowBox = 4;
+    constexpr LRESULT HtMenu = 5;
+    constexpr LRESULT HtHScroll = 6;
+    constexpr LRESULT HtVScroll = 7;
+    constexpr LRESULT HtMinButton = 8;
+    constexpr LRESULT HtMaxButton = 9;
+    constexpr LRESULT HtLeft = 10;
+    constexpr LRESULT HtRight = 11;
+    constexpr LRESULT HtTop = 12;
+    constexpr LRESULT HtTopLeft = 13;
+    constexpr LRESULT HtTopRight = 14;
+    constexpr LRESULT HtBottom = 15;
+    constexpr LRESULT HtBottomLeft = 16;
+    constexpr LRESULT HtBottomRight = 17;
+    constexpr LRESULT HtBorder = 18;
+    constexpr LRESULT HtClose = 20;
 
     constexpr UINT WmCreate = 0x0001;
     constexpr UINT WmDestroy = 0x0002;
     constexpr UINT WmMove = 0x0003;
     constexpr UINT WmSize = 0x0005;
+    constexpr UINT WmActivate = 0x0006;
     constexpr UINT WmSetFocus = 0x0007;
     constexpr UINT WmKillFocus = 0x0008;
     constexpr UINT WmEnable = 0x000A;
@@ -166,6 +188,7 @@ namespace GuestAbi
     constexpr UINT WmQuit = 0x0012;
     constexpr UINT WmEraseBkgnd = 0x0014;
     constexpr UINT WmShowWindow = 0x0018;
+    constexpr UINT WmActivateApp = 0x001C;
     constexpr UINT WmSetFont = 0x0030;
     constexpr UINT WmGetFont = 0x0031;
     constexpr UINT WmWindowPosChanging = 0x0046;
@@ -174,7 +197,10 @@ namespace GuestAbi
     constexpr UINT WmContextMenu = 0x007b;
     constexpr UINT WmNcCreate = 0x0081;
     constexpr UINT WmNcDestroy = 0x0082;
+    constexpr UINT WmNcCalcSize = 0x0083;
     constexpr UINT WmNcHitTest = 0x0084;
+    constexpr UINT WmNcPaint = 0x0085;
+    constexpr UINT WmNcActivate = 0x0086;
     constexpr UINT WmKeyDown = 0x0100;
     constexpr UINT WmKeyUp = 0x0101;
     constexpr UINT WmChar = 0x0102;
@@ -198,6 +224,17 @@ namespace GuestAbi
     constexpr UINT WmXButtonDown = 0x020B;
     constexpr UINT WmXButtonUp = 0x020C;
     constexpr UINT WmCaptureChanged = 0x0215;
+    constexpr UINT WmNcMouseMove = 0x00A0;
+    constexpr UINT WmNcLButtonDown = 0x00A1;
+    constexpr UINT WmNcLButtonUp = 0x00A2;
+    constexpr UINT WmNcRButtonDown = 0x00A4;
+    constexpr UINT WmNcRButtonUp = 0x00A5;
+    constexpr UINT WmNcMButtonDown = 0x00A7;
+    constexpr UINT WmNcMButtonUp = 0x00A8;
+
+    constexpr WORD WaInactive = 0;
+    constexpr WORD WaActive = 1;
+    constexpr WORD WaClickActive = 2;
 
     constexpr UINT PeekNoRemove = 0x0000;
     constexpr UINT PeekRemove = 0x0001;

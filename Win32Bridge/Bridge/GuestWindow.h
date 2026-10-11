@@ -64,6 +64,8 @@ namespace Bridge
             DWORD* win32Error);
         BOOL DestroyGuestWindow(HWND window, DWORD* win32Error);
         HWND GetGuestForegroundWindow() const;
+        BOOL SetGuestForegroundWindow(HWND window, bool mouseActivation, DWORD* win32Error);
+        HWND GetGuestLastActivePopup(HWND window, DWORD* win32Error) const;
         void DestroyGuestWindowsForProcess(
             DWORD processId,
             HWND restoreForeground,
@@ -126,7 +128,18 @@ namespace Bridge
 
         LRESULT DefaultGuestWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
         BOOL PostGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam, DWORD* win32Error);
+        BOOL PostGuestThreadMessage(DWORD threadId, UINT message, WPARAM wParam,
+            LPARAM lParam, DWORD* win32Error);
         LRESULT SendGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam, DWORD* win32Error);
+        BOOL SendGuestMessageTimeout(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
+            UINT flags, UINT timeoutMilliseconds, DWORD_PTR* result, DWORD* win32Error);
+        BOOL SendGuestNotifyMessage(HWND window, UINT message, WPARAM wParam,
+            LPARAM lParam, DWORD* win32Error);
+        BOOL SendGuestMessageCallback(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
+            void (CALLBACK* callback)(HWND, UINT, ULONG_PTR, LRESULT),
+            ULONG_PTR callbackData, DWORD* win32Error);
+        DWORD GuestInSendMessageState() const;
+        DWORD GetGuestWindowThreadId(HWND window, DWORD* win32Error) const;
         void PostGuestQuitMessage(int exitCode);
         GuestGetMessageResult GetGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum);
         BOOL PeekGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum, UINT removeFlags);
@@ -134,6 +147,13 @@ namespace Bridge
         LRESULT DispatchGuestMessage(const GuestAbi::Message* message, DWORD* win32Error);
 
         BOOL InvalidateGuestRect(HWND window, const RECT* rect, BOOL erase, DWORD* win32Error);
+        BOOL InvalidateGuestRegion(HWND window, const MiniGdi::Region& region, BOOL erase, DWORD* win32Error);
+        BOOL ValidateGuestRect(HWND window, const RECT* rect, DWORD* win32Error);
+        BOOL ValidateGuestRegion(HWND window, const MiniGdi::Region& region, DWORD* win32Error);
+        BOOL GetGuestUpdateRect(HWND window, RECT* rect, BOOL erase, DWORD* win32Error);
+        BOOL GetGuestUpdateRegion(HWND window, MiniGdi::Region* region, BOOL erase, DWORD* win32Error);
+        BOOL SetGuestErasePending(HWND window, BOOL pending, DWORD* win32Error);
+        BOOL SetGuestInternalPaint(HWND window, BOOL pending, DWORD* win32Error);
         BOOL UpdateGuestWindow(HWND window, DWORD* win32Error);
         HDC BeginGuestPaint(HWND window, GuestAbi::PaintStruct* paint, DWORD* win32Error);
         BOOL EndGuestPaint(HWND window, const GuestAbi::PaintStruct* paint, DWORD* win32Error);
@@ -153,6 +173,7 @@ namespace Bridge
 
         struct WindowClass;
         struct WindowRecord;
+        struct SentMessageRecord;
         struct PopupMenuLevel final
         {
             HMENU menu = nullptr;
@@ -203,11 +224,16 @@ namespace Bridge
             int* targetLeft,
             int* targetTop) const;
         HWND HitTestGuestWindow(HWND rootWindow, int rootX, int rootY) const;
+        MiniGdi::Region VisibleRegionForWindow(HWND window, bool clipChildren) const;
+        void ReorderGuestWindow(HWND window, HWND insertAfter);
         bool HandleGuestMenuPointer(HWND rootWindow, int rootX, int rootY, UINT message);
         LRESULT CallWindowProcedure(const std::shared_ptr<WindowRecord>& window, UINT message, WPARAM wParam, LPARAM lParam);
         LRESULT BuiltinControlProcedure(const std::shared_ptr<WindowRecord>& window, UINT message, WPARAM wParam, LPARAM lParam);
+        LRESULT DefaultNonClientProcedure(const std::shared_ptr<WindowRecord>& window, UINT message, WPARAM wParam, LPARAM lParam);
         bool EraseGuestBackground(const std::shared_ptr<WindowRecord>& window, HDC dc, const RECT& rect);
         void PostPaint(const std::shared_ptr<WindowRecord>& window, const RECT* rect = nullptr, BOOL erase = TRUE);
+        void PostPaintRegion(const std::shared_ptr<WindowRecord>& window, const MiniGdi::Region& region, BOOL erase);
+        void PostInternalPaint(const std::shared_ptr<WindowRecord>& window);
         void Present(const std::shared_ptr<WindowRecord>& window);
         // Leaf SEH gateways for CoreWindow delegates. The UI dispatcher must
         // never receive a guest/bridge structured exception directly.
@@ -253,6 +279,7 @@ namespace Bridge
         mutable std::mutex m_windowsLock;
         std::unordered_map<ULONG_PTR, std::shared_ptr<WindowRecord>> m_windows;
         ULONG_PTR m_nextWindow = 0x20000;
+        std::uint64_t m_nextZOrder = 1;
         std::atomic<ULONG_PTR> m_foregroundWindow{ 0 };
         std::atomic<ULONG_PTR> m_focusWindow{ 0 };
         std::atomic<ULONG_PTR> m_captureWindow{ 0 };
@@ -263,7 +290,21 @@ namespace Bridge
         std::atomic<bool> m_inputEnabled{ true };
         std::atomic<bool> m_eventsAttached{ false };
 
-        GuestMessageQueue m_messages;
+        std::shared_ptr<GuestMessageQueue> MessageQueueForThread(
+            DWORD threadId, bool create);
+        mutable std::mutex m_messageQueuesLock;
+        std::unordered_map<DWORD, std::shared_ptr<GuestMessageQueue>> m_messageQueues;
+        bool DispatchOneSentMessage(DWORD threadId);
+        void DispatchSentMessageToken(ULONG_PTR token);
+        void DispatchSentCallbackToken(ULONG_PTR token);
+        BOOL QueueAsynchronousSentMessage(HWND window, UINT message, WPARAM wParam,
+            LPARAM lParam, void (CALLBACK* callback)(HWND, UINT, ULONG_PTR, LRESULT),
+            ULONG_PTR callbackData, DWORD sendState, DWORD* win32Error);
+        mutable std::mutex m_sentMessagesLock;
+        std::unordered_map<ULONG_PTR, std::shared_ptr<SentMessageRecord>> m_sentMessages;
+        ULONG_PTR m_nextSentMessage = 1;
+        mutable std::mutex m_inSendStateLock;
+        std::unordered_map<DWORD, std::vector<DWORD>> m_inSendState;
         MiniGdi::GdiContext m_gdi;
         // GetDC(NULL) is a real screen DC in Win32 and is commonly requested
         // before the first HWND exists for font and device-capability probes.

@@ -2,6 +2,7 @@
 
 #include "Bridge\\CompatibilityCatalog.h"
 #include "Bridge\\GuestWin32Abi.h"
+#include "Bridge\\MiniGdi.h"
 
 #include <windows.h>
 
@@ -32,6 +33,12 @@ namespace Bridge
     int WINAPI BridgeGetObjectW(HGDIOBJ object, int bufferBytes, LPVOID buffer);
     HGDIOBJ WINAPI BridgeGetStockObject(int object);
     BOOL WINAPI BridgeDeleteObject(HGDIOBJ object);
+    // Shared rectangular-region access used by USER32 update-region APIs.
+    // MiniGDI currently models regions as bounds, but keeps them as real
+    // mutable GDI handles instead of fabricating success in USER32.
+    bool BridgeCopyRegion(HRGN region, MiniGdi::Region* geometry);
+    bool BridgeAssignRegion(HRGN region, const MiniGdi::Region& geometry);
+    bool BridgeDeleteRegion(HRGN region);
     HGDIOBJ WINAPI BridgeSelectObject(HDC dc, HGDIOBJ object);
     COLORREF WINAPI BridgeSetTextColor(HDC dc, COLORREF color);
     COLORREF WINAPI BridgeSetBkColor(HDC dc, COLORREF color);

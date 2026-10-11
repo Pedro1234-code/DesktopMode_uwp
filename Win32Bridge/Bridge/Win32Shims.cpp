@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "Bridge/DialogResources.h"
 #include "Bridge/ApiSet.h"
+#include "Bridge/GuestResources.h"
 #include "Bridge\\Win32Shims.h"
 #include "Bridge\\Gdi32Shims.h"
 #include "Bridge/Advapi32Shims.h"
@@ -425,6 +426,12 @@ BOOL WINAPI BridgeIsDestinationReachableW(LPCWSTR, PVOID)
 
 PIMAGE_NT_HEADERS WINAPI BridgeImageNtHeader(PVOID base)
 {
+    if (!base) return nullptr;
+    // Older bridge code used 0x10000 as an opaque main-module token. Accept it
+    // at this boundary so callers holding that identity never dereference the
+    // token as memory. New GetModuleHandle calls return the real mapped base.
+    if (reinterpret_cast<ULONG_PTR>(base) == 0x10000)
+        base = const_cast<BYTE*>(CurrentGuestImageBase());
     if (!base) return nullptr;
     __try
     {

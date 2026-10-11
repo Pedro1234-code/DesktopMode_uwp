@@ -32,6 +32,7 @@ using namespace Win32Bridge::Bridge;
 
 namespace
 {
+    SHORT WINAPI BridgeGetKeyState(int virtualKey);
     constexpr DWORD BitmapCompressionAlphaBitFields = 6;
     constexpr DWORD GuestBitmapV4HeaderSize = 108;
     constexpr size_t GuestBitmapV4RedMaskOffset = 40;
@@ -842,6 +843,53 @@ namespace
         std::vector<VirtualMenuItem> items;
     };
 
+    struct GuestAccel
+    {
+        BYTE fVirt = 0;
+        WORD key = 0;
+        WORD cmd = 0;
+    };
+
+    struct GuestAcceleratorTable final
+    {
+        std::vector<GuestAccel> entries;
+    };
+
+#pragma pack(push, 1)
+    struct PeAcceleratorEntry
+    {
+        BYTE fVirt;
+        BYTE padding0;
+        WORD key;
+        WORD command;
+        WORD padding1;
+    };
+#pragma pack(pop)
+    static_assert(sizeof(PeAcceleratorEntry) == 8, "RT_ACCELERATOR entry layout");
+
+    std::mutex g_acceleratorLock;
+    std::unordered_map<ULONG_PTR, std::shared_ptr<GuestAcceleratorTable>> g_accelerators;
+    ULONG_PTR g_nextAccelerator = 0x7fff7000;
+
+    HANDLE StoreAcceleratorTable(std::vector<GuestAccel> entries)
+    {
+        if (entries.empty()) return nullptr;
+        auto table = std::make_shared<GuestAcceleratorTable>();
+        table->entries = std::move(entries);
+        std::lock_guard<std::mutex> guard(g_acceleratorLock);
+        ULONG_PTR token = ++g_nextAccelerator;
+        if (!token) token = ++g_nextAccelerator;
+        g_accelerators.emplace(token, std::move(table));
+        return reinterpret_cast<HANDLE>(token);
+    }
+
+    std::shared_ptr<GuestAcceleratorTable> FindAcceleratorTable(HANDLE handle)
+    {
+        std::lock_guard<std::mutex> guard(g_acceleratorLock);
+        const auto found = g_accelerators.find(reinterpret_cast<ULONG_PTR>(handle));
+        return found == g_accelerators.end() ? nullptr : found->second;
+    }
+
     constexpr UINT kMfByPosition = 0x0400;
     constexpr UINT kMfPopup = 0x0010;
     constexpr UINT kMfGrayed = 0x0001;
@@ -954,14 +1002,37 @@ namespace
     std::mutex g_menuLock;
     std::unordered_map<ULONG_PTR, VirtualMenu> g_menus;
     std::unordered_map<ULONG_PTR, HMENU> g_windowMenus;
+    std::unordered_map<ULONG_PTR, HMENU> g_systemMenus;
     ULONG_PTR g_nextMenu = 0x7fff5000;
     UINT g_nextClipboardFormat = 0xc000;
     std::unordered_map<UINT, HANDLE> g_clipboardData;
+    std::unordered_map<std::wstring, UINT> g_clipboardFormats;
+    DWORD g_clipboardSequence = 0;
 
     VirtualMenu* FindMenuLocked(HMENU menu)
     {
         const auto found = g_menus.find(reinterpret_cast<ULONG_PTR>(menu));
         return found == g_menus.end() ? nullptr : &found->second;
+    }
+
+    bool FindMenuCommandStateLocked(HMENU menu, UINT command, UINT* state,
+        unsigned depth = 0)
+    {
+        if (depth > 64) return false;
+        const VirtualMenu* source = FindMenuLocked(menu);
+        if (!source) return false;
+        for (const auto& item : source->items)
+        {
+            if (!item.subMenu && item.identifier == command)
+            {
+                if (state) *state = item.state;
+                return true;
+            }
+            if (item.subMenu && FindMenuCommandStateLocked(
+                item.subMenu, command, state, depth + 1))
+                return true;
+        }
+        return false;
     }
 
     VirtualMenuItem* FindMenuItemLocked(VirtualMenu& menu, UINT item, BOOL byPosition)
@@ -1971,6 +2042,20 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeDestroyWindow(HWND window)
 
     DWORD error = ERROR_SUCCESS;
     const BOOL result = manager->DestroyGuestWindow(window, &error);
+    HMENU systemMenu = nullptr;
+    if (result)
+    {
+        std::lock_guard<std::mutex> guard(g_menuLock);
+        const ULONG_PTR key = reinterpret_cast<ULONG_PTR>(window);
+        const auto found = g_systemMenus.find(key);
+        if (found != g_systemMenus.end())
+        {
+            systemMenu = found->second;
+            g_systemMenus.erase(found);
+        }
+        g_windowMenus.erase(key);
+    }
+    if (systemMenu) BridgeDestroyMenu(systemMenu);
     BridgeSetLastError(error);
     return result;
 }
@@ -3081,16 +3166,46 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeEndDialog(HWND dialog, INT_PTR result)
     return EndGuestResourceDialog(dialog, result);
 }
 
-BOOL WINAPI Win32Bridge::Bridge::BridgeSystemParametersInfoW(UINT action, UINT, PVOID value, UINT)
+BOOL WINAPI Win32Bridge::Bridge::BridgeSystemParametersInfoW(
+    UINT action, UINT parameter, PVOID value, UINT)
 {
     if (action == SPI_GETWORKAREA && value)
     {
-        *static_cast<RECT*>(value) = { 0, 0, 1280, 720 };
+        *static_cast<RECT*>(value) = { 0, 0,
+            BridgeGetSystemMetrics(SM_CXSCREEN),
+            BridgeGetSystemMetrics(SM_CYSCREEN) };
         BridgeSetLastError(ERROR_SUCCESS);
         return TRUE;
     }
-    BridgeSetLastError(ERROR_CALL_NOT_IMPLEMENTED);
-    return FALSE;
+    // These scalar queries are frequently used by controls to choose input
+    // and animation behavior. They are process-independent policy values in
+    // the virtual desktop and must not expose host settings.
+    if (value && action == SPI_GETWHEELSCROLLLINES)
+        *static_cast<UINT*>(value) = 3;
+    else if (value && action == SPI_GETWHEELSCROLLCHARS)
+        *static_cast<UINT*>(value) = 3;
+    else if (value && action == SPI_GETKEYBOARDSPEED)
+        *static_cast<UINT*>(value) = 31;
+    else if (value && action == SPI_GETKEYBOARDDELAY)
+        *static_cast<UINT*>(value) = 1;
+    else if (value && action == SPI_GETCARETWIDTH)
+        *static_cast<UINT*>(value) = 1;
+    else if (value && action == SPI_GETFONTSMOOTHING)
+        *static_cast<BOOL*>(value) = TRUE;
+    else if (action == SPI_GETBEEP || action == SPI_GETMENUANIMATION ||
+        action == SPI_GETCOMBOBOXANIMATION || action == SPI_GETLISTBOXSMOOTHSCROLLING)
+    {
+        if (!value) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+        *static_cast<BOOL*>(value) = TRUE;
+    }
+    else
+    {
+        (void)parameter;
+        BridgeSetLastError(ERROR_CALL_NOT_IMPLEMENTED);
+        return FALSE;
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return TRUE;
 }
 
 HMONITOR WINAPI Win32Bridge::Bridge::BridgeMonitorFromWindow(HWND, DWORD)
@@ -3119,7 +3234,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetMonitorInfoA(HMONITOR monitor, PVOID m
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    info->rcMonitor = { 0, 0, 1280, 720 };
+    info->rcMonitor = { 0, 0,
+        GuestMetrics::CurrentScreenWidth(), GuestMetrics::CurrentScreenHeight() };
     info->rcWork = info->rcMonitor;
     info->dwFlags = 1; // MONITORINFOF_PRIMARY
     BridgeSetLastError(ERROR_SUCCESS);
@@ -3142,6 +3258,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeEmptyClipboard()
 {
     std::lock_guard<std::mutex> guard(g_menuLock);
     g_clipboardData.clear();
+    ++g_clipboardSequence;
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -3150,14 +3267,31 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeSetClipboardData(UINT format, HANDLE me
 {
     std::lock_guard<std::mutex> guard(g_menuLock);
     g_clipboardData[format] = memory;
+    ++g_clipboardSequence;
     BridgeSetLastError(ERROR_SUCCESS);
     return memory;
 }
 
-UINT WINAPI Win32Bridge::Bridge::BridgeRegisterClipboardFormatW(LPCWSTR)
+UINT WINAPI Win32Bridge::Bridge::BridgeRegisterClipboardFormatW(LPCWSTR name)
 {
+    if (!name || !*name) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    std::wstring key(name);
+    std::transform(key.begin(), key.end(), key.begin(), [](wchar_t value)
+    {
+        return static_cast<wchar_t>(towlower(value));
+    });
     std::lock_guard<std::mutex> guard(g_menuLock);
-    return g_nextClipboardFormat++;
+    const auto found = g_clipboardFormats.find(key);
+    if (found != g_clipboardFormats.end()) return found->second;
+    if (g_nextClipboardFormat > 0xffffu)
+    {
+        BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
+    const UINT format = g_nextClipboardFormat++;
+    g_clipboardFormats.emplace(std::move(key), format);
+    BridgeSetLastError(ERROR_SUCCESS);
+    return format;
 }
 
 HMENU WINAPI Win32Bridge::Bridge::BridgeCreateMenu()
@@ -3197,6 +3331,12 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeDestroyMenu(HMENU menu)
     {
         if (std::find(pending.begin(), pending.end(), iterator->second) != pending.end())
             iterator = g_windowMenus.erase(iterator);
+        else ++iterator;
+    }
+    for (auto iterator = g_systemMenus.begin(); iterator != g_systemMenus.end();)
+    {
+        if (std::find(pending.begin(), pending.end(), iterator->second) != pending.end())
+            iterator = g_systemMenus.erase(iterator);
         else ++iterator;
     }
     BridgeSetLastError(ERROR_SUCCESS);
@@ -3671,8 +3811,145 @@ UINT WINAPI Win32Bridge::Bridge::BridgeTrackPopupMenuEx(HMENU menu, UINT flags, 
     BridgeSetLastError(error);
     return result;
 }
-HANDLE WINAPI Win32Bridge::Bridge::BridgeLoadAcceleratorsW(HINSTANCE, LPCWSTR) { return reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(1)); }
-int WINAPI Win32Bridge::Bridge::BridgeTranslateAcceleratorW(HWND, HANDLE, const GuestAbi::Message*) { return 0; }
+HANDLE WINAPI Win32Bridge::Bridge::BridgeLoadAcceleratorsW(
+    HINSTANCE instance, LPCWSTR resource)
+{
+    const BYTE* bytes = nullptr;
+    size_t size = 0;
+    if (!resource || !FindModuleResource(instance, 9 /* RT_ACCELERATOR */,
+        resource, &bytes, &size) || !bytes || size == 0 ||
+        size % sizeof(PeAcceleratorEntry) != 0)
+    {
+        BridgeSetLastError(ERROR_RESOURCE_NAME_NOT_FOUND);
+        return nullptr;
+    }
+    const size_t count = size / sizeof(PeAcceleratorEntry);
+    if (count > 0xffffu)
+    {
+        BridgeSetLastError(ERROR_INVALID_DATA);
+        return nullptr;
+    }
+    std::vector<GuestAccel> entries;
+    try
+    {
+        entries.reserve(count);
+        for (size_t index = 0; index < count; ++index)
+        {
+            PeAcceleratorEntry source{};
+            memcpy(&source, bytes + index * sizeof(source), sizeof(source));
+            GuestAccel converted{};
+            converted.fVirt = static_cast<BYTE>(source.fVirt & 0x7fu);
+            converted.key = source.key;
+            converted.cmd = source.command;
+            entries.push_back(converted);
+        }
+    }
+    catch (...)
+    {
+        BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    HANDLE table = nullptr;
+    try { table = StoreAcceleratorTable(std::move(entries)); }
+    catch (...) { table = nullptr; }
+    BridgeSetLastError(table ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    return table;
+}
+
+HANDLE WINAPI Win32Bridge::Bridge::BridgeLoadAcceleratorsA(
+    HINSTANCE instance, LPCSTR resource)
+{
+    std::wstring storage;
+    LPCWSTR converted = nullptr;
+    if (!ConvertAnsiResourceName(resource, &storage, &converted))
+    {
+        BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return nullptr;
+    }
+    return BridgeLoadAcceleratorsW(instance, converted);
+}
+
+int WINAPI Win32Bridge::Bridge::BridgeTranslateAcceleratorW(
+    HWND window, HANDLE accelerators, const GuestAbi::Message* message)
+{
+    constexpr BYTE FVirtKey = 0x01u;
+    constexpr BYTE FShift = 0x04u;
+    constexpr BYTE FControl = 0x08u;
+    constexpr BYTE FAlt = 0x10u;
+    constexpr UINT MenuDisabled = 0x0001u | 0x0002u;
+    const auto table = FindAcceleratorTable(accelerators);
+    if (!BridgeIsWindow(window) || !message || !table)
+    {
+        BridgeSetLastError(table ? ERROR_INVALID_PARAMETER : 1403u);
+        return 0;
+    }
+    BYTE modifiers = 0;
+    if (BridgeGetKeyState(VK_SHIFT) & 0x8000) modifiers |= FShift;
+    if (BridgeGetKeyState(VK_CONTROL) & 0x8000) modifiers |= FControl;
+    if (BridgeGetKeyState(VK_MENU) & 0x8000) modifiers |= FAlt;
+
+    for (const GuestAccel& entry : table->entries)
+    {
+        bool matched = false;
+        if (entry.fVirt & FVirtKey)
+        {
+            matched = (message->message == WM_KEYDOWN ||
+                message->message == WM_SYSKEYDOWN) &&
+                message->wParam == entry.key &&
+                modifiers == (entry.fVirt & (FShift | FControl | FAlt));
+        }
+        else
+        {
+            matched = (message->message == WM_CHAR ||
+                message->message == WM_SYSCHAR) &&
+                message->wParam == entry.key &&
+                (modifiers & FAlt) == (entry.fVirt & FAlt);
+        }
+        if (!matched) continue;
+
+        bool systemCommand = false;
+        bool menuCommand = false;
+        UINT menuState = 0;
+        HMENU menu = BridgeGetMenu(window);
+        HMENU systemMenu = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(g_menuLock);
+            const auto system = g_systemMenus.find(reinterpret_cast<ULONG_PTR>(window));
+            if (system != g_systemMenus.end()) systemMenu = system->second;
+        }
+        if (menu) BridgeSendMessageW(window, WM_INITMENU,
+            reinterpret_cast<WPARAM>(menu), 0);
+        else if (systemMenu) BridgeSendMessageW(window, WM_INITMENU,
+            reinterpret_cast<WPARAM>(systemMenu), 0);
+        {
+            std::lock_guard<std::mutex> guard(g_menuLock);
+            menuCommand = FindMenuCommandStateLocked(menu, entry.cmd, &menuState);
+            if (!menuCommand && systemMenu)
+                systemCommand = FindMenuCommandStateLocked(
+                    systemMenu, entry.cmd, &menuState);
+        }
+        if (!menuCommand && !systemCommand && (entry.cmd & 0xf000u) == 0xf000u)
+            systemCommand = true;
+        if (BridgeIsWindowEnabled(window) && (menuState & MenuDisabled) == 0)
+        {
+            if (systemCommand)
+                BridgeSendMessageW(window, WM_SYSCOMMAND, entry.cmd, 0x00010000L);
+            else
+                BridgeSendMessageW(window, WM_COMMAND,
+                    MAKEWPARAM(entry.cmd, 1), 0);
+        }
+        BridgeSetLastError(ERROR_SUCCESS);
+        return 1;
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return 0;
+}
+
+int WINAPI Win32Bridge::Bridge::BridgeTranslateAcceleratorA(
+    HWND window, HANDLE accelerators, const GuestAbi::Message* message)
+{
+    return BridgeTranslateAcceleratorW(window, accelerators, message);
+}
 UINT WINAPI Win32Bridge::Bridge::BridgeGetDialogBaseUnits()
 {
     return static_cast<UINT>(GuestMetrics::TextWidth) |
@@ -4038,8 +4315,28 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDefWindowProcW);
     else if (_wcsicmp(symbol.name.c_str(), L"postmessagew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePostMessageW);
+    else if (_wcsicmp(symbol.name.c_str(), L"postthreadmessagew") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePostThreadMessageW);
+    else if (_wcsicmp(symbol.name.c_str(), L"postthreadmessagea") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePostThreadMessageA);
     else if (_wcsicmp(symbol.name.c_str(), L"sendmessagew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendMessageW);
+    else if (_wcsicmp(symbol.name.c_str(), L"sendmessagetimeoutw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendMessageTimeoutW);
+    else if (_wcsicmp(symbol.name.c_str(), L"sendmessagetimeouta") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendMessageTimeoutA);
+    else if (_wcsicmp(symbol.name.c_str(), L"sendnotifymessagew") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendNotifyMessageW);
+    else if (_wcsicmp(symbol.name.c_str(), L"sendnotifymessagea") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendNotifyMessageA);
+    else if (_wcsicmp(symbol.name.c_str(), L"sendmessagecallbackw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendMessageCallbackW);
+    else if (_wcsicmp(symbol.name.c_str(), L"sendmessagecallbacka") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendMessageCallbackA);
+    else if (_wcsicmp(symbol.name.c_str(), L"insendmessage") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInSendMessage);
+    else if (_wcsicmp(symbol.name.c_str(), L"insendmessageex") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInSendMessageEx);
     else if (_wcsicmp(symbol.name.c_str(), L"postquitmessage") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePostQuitMessage);
     else if (_wcsicmp(symbol.name.c_str(), L"getmessagew") == 0)
@@ -4172,8 +4469,12 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndMenu);
     if (_wcsicmp(symbol.name.c_str(), L"loadacceleratorsw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadAcceleratorsW);
+    else if (_wcsicmp(symbol.name.c_str(), L"loadacceleratorsa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadAcceleratorsA);
     else if (_wcsicmp(symbol.name.c_str(), L"translateacceleratorw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTranslateAcceleratorW);
+    else if (_wcsicmp(symbol.name.c_str(), L"translateacceleratora") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTranslateAcceleratorA);
     else if (_wcsicmp(symbol.name.c_str(), L"getdialogbaseunits") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDialogBaseUnits);
     else if (_wcsicmp(symbol.name.c_str(), L"childwindowfrompointex") == 0)
@@ -4198,6 +4499,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCallWindowProcW);
     else if (_wcsicmp(symbol.name.c_str(), L"dialogboxparamw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDialogBoxParamW);
+    else if (_wcsicmp(symbol.name.c_str(), L"dialogboxparama") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDialogBoxParamA);
     else if (_wcsicmp(symbol.name.c_str(), L"isdialogmessagew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsDialogMessageW);
 
@@ -4207,6 +4510,7 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"registerwindowmessagew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterWindowMessageW);
     else if (_wcsicmp(symbol.name.c_str(), L"setscrollpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetScrollPos);
     else if (_wcsicmp(symbol.name.c_str(), L"createdialogparamw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDialogParamW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createdialogparama") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDialogParamA);
     else if (_wcsicmp(symbol.name.c_str(), L"drawtextexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawTextExW);
     else if (_wcsicmp(symbol.name.c_str(), L"getancestor") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetAncestor);
     else if (_wcsicmp(symbol.name.c_str(), L"findwindoww") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFindWindowW);
@@ -4218,7 +4522,6 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"getforegroundwindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetForegroundWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"messagebeep") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMessageBeep);
     else if (_wcsicmp(symbol.name.c_str(), L"isiconic") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsIconic);
-    else if (_wcsicmp(symbol.name.c_str(), L"isclipboardformatavailable") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsClipboardFormatAvailable);
     else if (_wcsicmp(symbol.name.c_str(), L"setactivewindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetActiveWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"equalrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEqualRect);
     else if (_wcsicmp(symbol.name.c_str(), L"setrectempty") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetRectEmpty);
@@ -4264,6 +4567,11 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"getkeyboardstate") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetKeyboardState);
     else if (_wcsicmp(symbol.name.c_str(), L"getmessagetime") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMessageTime);
     else if (_wcsicmp(symbol.name.c_str(), L"getclipboarddata") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipboardData);
+    else if (_wcsicmp(symbol.name.c_str(), L"registerclipboardformata") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterClipboardFormatA);
+    else if (_wcsicmp(symbol.name.c_str(), L"isclipboardformatavailable") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsClipboardFormatAvailable);
+    else if (_wcsicmp(symbol.name.c_str(), L"countclipboardformats") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCountClipboardFormats);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumclipboardformats") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumClipboardFormats);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclipboardsequencenumber") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipboardSequenceNumber);
     else if (_wcsicmp(symbol.name.c_str(), L"addclipboardformatlistener") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAddClipboardFormatListener);
     else if (_wcsicmp(symbol.name.c_str(), L"removeclipboardformatlistener") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRemoveClipboardFormatListener);
     else if (_wcsicmp(symbol.name.c_str(), L"setclipboardviewer") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetClipboardViewer);
@@ -4275,6 +4583,9 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"getwindowdc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowDC);
     else if (_wcsicmp(symbol.name.c_str(), L"getdcex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDCEx);
     else if (_wcsicmp(symbol.name.c_str(), L"validaterect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeValidateRect);
+    else if (_wcsicmp(symbol.name.c_str(), L"invalidatergn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInvalidateRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"validatergn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeValidateRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"getupdaterect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetUpdateRect);
     else if (_wcsicmp(symbol.name.c_str(), L"redrawwindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRedrawWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"trackmouseevent") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTrackMouseEvent);
     else if (_wcsicmp(symbol.name.c_str(), L"notifywinevent") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeNotifyWinEvent);
@@ -4303,12 +4614,18 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"drawframecontrol") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawFrameControl);
     else if (_wcsicmp(symbol.name.c_str(), L"toascii") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeToAscii);
     else if (_wcsicmp(symbol.name.c_str(), L"dialogboxindirectparamw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDialogBoxIndirectParamW);
+    else if (_wcsicmp(symbol.name.c_str(), L"dialogboxindirectparama") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDialogBoxIndirectParamA);
     else if (_wcsicmp(symbol.name.c_str(), L"createdialogindirectparamw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDialogIndirectParamW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createdialogindirectparama") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDialogIndirectParamA);
     else if (_wcsicmp(symbol.name.c_str(), L"createacceleratortablew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateAcceleratorTableW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createacceleratortablea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateAcceleratorTableA);
     else if (_wcsicmp(symbol.name.c_str(), L"destroyacceleratortable") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDestroyAcceleratorTable);
+    else if (_wcsicmp(symbol.name.c_str(), L"copyacceleratortablew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCopyAcceleratorTableW);
+    else if (_wcsicmp(symbol.name.c_str(), L"copyacceleratortablea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCopyAcceleratorTableA);
     else if (_wcsicmp(symbol.name.c_str(), L"getcomboboxinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetComboBoxInfo);
     else if (_wcsicmp(symbol.name.c_str(), L"getmenubarinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMenuBarInfo);
     else if (_wcsicmp(symbol.name.c_str(), L"getupdatergn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetUpdateRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"excludeupdatergn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExcludeUpdateRgn);
     else if (_wcsicmp(symbol.name.c_str(), L"mouse_event") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMouseEvent);
     else if (_wcsicmp(symbol.name.c_str(), L"createiconindirect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateIconIndirect);
     else if (_wcsicmp(symbol.name.c_str(), L"geticoninfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetIconInfo);

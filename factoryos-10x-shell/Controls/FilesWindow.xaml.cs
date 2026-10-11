@@ -121,11 +121,14 @@ namespace factoryos_10x_shell.Controls
         private async void FilesTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             if (m_switchingTabs) return;
+            bool wasShowingSettings = SettingsPage.Visibility == Visibility.Visible;
+            SettingsPage.Visibility = Visibility.Collapsed;
             Muxc.TabViewItem tab = FilesTabs.SelectedItem as Muxc.TabViewItem;
             FileTabState state = tab?.Tag as FileTabState;
             if (state == null || ReferenceEquals(state, m_activeTab)) return;
 
-            SaveActiveTabState();
+            if (!wasShowingSettings)
+                SaveActiveTabState();
             ActivateTabState(state);
             int revision = ++m_tabSelectionRevision;
             string searchText = state.SearchText ?? string.Empty;
@@ -173,6 +176,7 @@ namespace factoryos_10x_shell.Controls
         public async void OpenHome()
         {
             Visibility = Visibility.Visible;
+            SettingsPage.Visibility = Visibility.Collapsed;
             AppState.Instance.SetFilesWindowState(true, false);
             AppState.Instance.ActivateFiles();
             m_history.Clear();
@@ -274,6 +278,7 @@ namespace factoryos_10x_shell.Controls
         private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; (sender as UIElement)?.ReleasePointerCaptures(); }
         private async void Home_Click(object sender, RoutedEventArgs e)
         {
+            SettingsPage.Visibility = Visibility.Collapsed;
             m_history.Clear();
             m_forwardHistory.Clear();
             LocationsNavigation.SelectedItem = HomeNavigationItem;
@@ -290,6 +295,13 @@ namespace factoryos_10x_shell.Controls
 
         private async void LocationsNavigation_ItemInvoked(NavigationView sender, NavigationViewItemInvokedEventArgs e)
         {
+            if (e.IsSettingsInvoked)
+            {
+                SettingsPage.Visibility = Visibility.Visible;
+                return;
+            }
+
+            SettingsPage.Visibility = Visibility.Collapsed;
             NavigationViewItem selectedItem = e.InvokedItemContainer as NavigationViewItem;
             string location = selectedItem?.Tag as string;
             if (m_activeTab != null)
@@ -302,6 +314,51 @@ namespace factoryos_10x_shell.Controls
                 return;
             }
             await OpenLibraryAsync(location);
+        }
+
+        private async void ResetAuthorizedFolders_Click(object sender, RoutedEventArgs e)
+        {
+            var accessList = StorageApplicationPermissions.FutureAccessList;
+            List<string> filesTokens = accessList.Entries
+                .Where(entry => entry.Token.StartsWith(MountPrefix, StringComparison.Ordinal))
+                .Select(entry => entry.Token)
+                .ToList();
+
+            foreach (string token in filesTokens)
+                accessList.Remove(token);
+
+            ApplicationData.Current.LocalSettings.Values.Remove(RemovableMediaNameKey);
+            RemovableMediaItem.Content = "Removable media";
+            m_clipboardFolder = null;
+            m_clipboardFile = null;
+            m_cutOperation = false;
+
+            foreach (Muxc.TabViewItem tab in FilesTabs.TabItems.OfType<Muxc.TabViewItem>())
+            {
+                FileTabState state = tab.Tag as FileTabState;
+                if (state == null) continue;
+
+                state.CurrentFolder = ApplicationData.Current.LocalFolder;
+                state.DisplayName = "Home";
+                state.SearchText = string.Empty;
+                state.SelectedNavigationItem = HomeNavigationItem;
+                state.History.Clear();
+                state.ForwardHistory.Clear();
+                tab.Header = "Home";
+            }
+
+            m_currentFolder = ApplicationData.Current.LocalFolder;
+            m_currentDisplayName = "Home";
+            m_history.Clear();
+            m_forwardHistory.Clear();
+            await OpenFolderAsync(ApplicationData.Current.LocalFolder, "Home", false);
+
+            ResetAuthorizedFoldersStatus.Text = filesTokens.Count == 0
+                ? "There were no authorized folders to reset."
+                : filesTokens.Count == 1
+                    ? "1 authorized folder was reset."
+                    : filesTokens.Count + " authorized folders were reset.";
+            ResetAuthorizedFoldersStatus.Visibility = Visibility.Visible;
         }
 
         private async Task OpenLibraryAsync(string location)

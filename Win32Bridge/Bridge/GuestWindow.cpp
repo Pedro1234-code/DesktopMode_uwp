@@ -45,6 +45,13 @@ using namespace Windows::UI::Xaml::Media::Imaging;
 
 namespace
 {
+    // Reserved strictly inside the bridge queues. It is consumed before a
+    // message can become visible to guest GetMessage/PeekMessage callers.
+    constexpr UINT InternalSentMessage = 0xffffffffu;
+    constexpr UINT InternalSentCallbackMessage = 0xfffffffeu;
+    constexpr DWORD GuestIsmexSend = 0x00000001u;
+    constexpr DWORD GuestIsmexNotify = 0x00000002u;
+    constexpr DWORD GuestIsmexCallback = 0x00000004u;
     // WriteableBitmap exposes its storage through this documented internal
     // interface. The surface data never leaves the UWP app container.
     // IBufferByteAccess is the SDK COM interface behind WriteableBitmap's
@@ -169,6 +176,23 @@ namespace
         }
     }
 
+    void InvokeGuestSendAsyncProcedure(
+        void (CALLBACK* procedure)(HWND, UINT, ULONG_PTR, LRESULT),
+        HWND window, UINT message, ULONG_PTR data, LRESULT result)
+    {
+        if (!procedure) return;
+        __try
+        {
+            procedure(window, message, data, result);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            // The callback belongs to the mapped guest. Match the guarded
+            // WNDPROC boundary and do not let a stale guest address terminate
+            // the UWP host process.
+        }
+    }
+
     std::wstring Lowercase(std::wstring value)
     {
         for (auto& character : value)
@@ -205,7 +229,15 @@ namespace
         Progress,
         TreeView,
         UpDown,
-        ToolTip
+        ToolTip,
+        SysLink,
+        DateTime,
+        MonthCalendar,
+        IpAddress,
+        HotKey,
+        Pager,
+        Animate,
+        NativeFont
     };
 
     BuiltinControlKind BuiltinControlKindForClassName(LPCWSTR className)
@@ -287,6 +319,22 @@ namespace
         {
             return BuiltinControlKind::ToolTip;
         }
+        if (_wcsicmp(className, L"syslink") == 0)
+            return BuiltinControlKind::SysLink;
+        if (_wcsicmp(className, L"sysdatetimepick32") == 0)
+            return BuiltinControlKind::DateTime;
+        if (_wcsicmp(className, L"sysmonthcal32") == 0)
+            return BuiltinControlKind::MonthCalendar;
+        if (_wcsicmp(className, L"sysipaddress32") == 0)
+            return BuiltinControlKind::IpAddress;
+        if (_wcsicmp(className, L"msctls_hotkey32") == 0)
+            return BuiltinControlKind::HotKey;
+        if (_wcsicmp(className, L"syspager") == 0)
+            return BuiltinControlKind::Pager;
+        if (_wcsicmp(className, L"sysanimate32") == 0)
+            return BuiltinControlKind::Animate;
+        if (_wcsicmp(className, L"nativefontctl") == 0)
+            return BuiltinControlKind::NativeFont;
         return BuiltinControlKind::None;
     }
 
@@ -298,6 +346,8 @@ namespace
             kind == BuiltinControlKind::Toolbar ||
             kind == BuiltinControlKind::StatusBar ||
             kind == BuiltinControlKind::Rebar ||
+            kind == BuiltinControlKind::Pager ||
+            kind == BuiltinControlKind::Animate ||
             kind == BuiltinControlKind::Tab ||
             kind == BuiltinControlKind::Progress
             ? 16 // COLOR_BTNFACE + 1
@@ -705,7 +755,11 @@ namespace
     constexpr UINT GuestSwpFrameChanged = 0x0020;
     constexpr UINT GuestSwpShowWindow = 0x0040;
     constexpr UINT GuestSwpHideWindow = 0x0080;
+    constexpr UINT GuestSwpNoCopyBits = 0x0100;
     constexpr UINT GuestSwpNoSendChanging = 0x0400;
+    constexpr DWORD GuestWsChild = 0x40000000u;
+    constexpr DWORD GuestWsClipSiblings = 0x04000000u;
+    constexpr DWORD GuestWsClipChildren = 0x02000000u;
     constexpr int MaximumWindowExtraBytes = 64 * 1024;
     constexpr DWORD GuestWsVisible = 0x10000000u;
     constexpr DWORD GuestWsDisabled = 0x08000000u;
@@ -1009,6 +1063,8 @@ namespace
     // ListView style; applying it to a retained-item view invents blank rows.
     constexpr DWORD ListViewStyleOwnerData = 0x00001000u;
     constexpr UINT ListViewExtendedGridLines = 0x00000001;
+    constexpr UINT ListViewExtendedCheckBoxes = 0x00000004;
+    constexpr UINT ListViewStateImageMask = 0x0000f000;
     constexpr UINT ListViewNextItemSelected = 0x0002;
     constexpr UINT ListViewNotifyGetDisplayInfoW = static_cast<UINT>(-177); // LVN_GETDISPINFOW
     constexpr UINT ListViewNotifyItemChanged = static_cast<UINT>(-101); // LVN_ITEMCHANGED
@@ -1079,6 +1135,53 @@ namespace
         UINT_PTR identifier;
         UINT code;
     };
+
+    struct GuestDrawItem final
+    {
+        UINT controlType;
+        UINT controlId;
+        UINT itemId;
+        UINT itemAction;
+        UINT itemState;
+        HWND itemWindow;
+        HDC dc;
+        RECT itemRect;
+        ULONG_PTR itemData;
+    };
+
+    // NM_CUSTOMDRAW is the common prefix of the control-specific custom-draw
+    // notifications. Keep writable trailing storage because applications cast
+    // this pointer to NMLVCUSTOMDRAW/NMTVCUSTOMDRAW and related structures.
+    struct GuestCustomDrawNotification final
+    {
+        GuestNotifyHeader header;
+        DWORD drawStage;
+        DWORD drawStagePadding;
+        HDC dc;
+        RECT bounds;
+        DWORD_PTR itemSpec;
+        UINT itemState;
+        UINT itemStatePadding;
+        LPARAM itemData;
+        BYTE controlSpecific[128];
+    };
+    static_assert(offsetof(GuestCustomDrawNotification, dc) == 32,
+        "Guest NMCUSTOMDRAW HDC offset must remain x64-compatible.");
+    static_assert(offsetof(GuestCustomDrawNotification, itemData) == 72,
+        "Guest NMCUSTOMDRAW LPARAM offset must remain x64-compatible.");
+
+    constexpr UINT NotifyCustomDraw = static_cast<UINT>(-12);
+    constexpr DWORD CustomDrawDoDefault = 0x00000000u;
+    constexpr DWORD CustomDrawSkipDefault = 0x00000004u;
+    constexpr DWORD CustomDrawNotifyPostPaint = 0x00000010u;
+    constexpr DWORD CustomDrawNotifyItemDraw = 0x00000020u;
+    constexpr DWORD CustomDrawNotifySubItemDraw = 0x00000020u;
+    constexpr DWORD CustomDrawPrePaint = 0x00000001u;
+    constexpr DWORD CustomDrawPostPaint = 0x00000002u;
+    constexpr DWORD CustomDrawItem = 0x00010000u;
+    constexpr DWORD CustomDrawSubItem = 0x00020000u;
+    constexpr DWORD CustomDrawItemPrePaint = CustomDrawItem | CustomDrawPrePaint;
+    constexpr DWORD CustomDrawItemPostPaint = CustomDrawItem | CustomDrawPostPaint;
 
     struct GuestListViewDisplayInfoW final
     {
@@ -1322,6 +1425,12 @@ namespace
     };
     static_assert(sizeof(GuestWindowPosition) == 40,
         "Guest WINDOWPOS layout must remain x64-compatible.");
+
+    struct GuestNcCalcSizeParams final
+    {
+        RECT rectangles[3];
+        GuestWindowPosition* windowPosition;
+    };
 
     struct GuestHeaderLayout final
     {
@@ -1598,23 +1707,6 @@ namespace
         clipped.right = (std::max)(0L, (std::min)(clipped.right, width));
         clipped.bottom = (std::max)(0L, (std::min)(clipped.bottom, height));
         return clipped;
-    }
-
-    void UnionDamage(RECT* target, const RECT& addition)
-    {
-        if (!target || !HasArea(addition))
-        {
-            return;
-        }
-        if (!HasArea(*target))
-        {
-            *target = addition;
-            return;
-        }
-        target->left = (std::min)(target->left, addition.left);
-        target->top = (std::min)(target->top, addition.top);
-        target->right = (std::max)(target->right, addition.right);
-        target->bottom = (std::max)(target->bottom, addition.bottom);
     }
 
     MiniGdi::Color SystemColorBrush(ULONG_PTR encodedBrush)
@@ -2261,15 +2353,20 @@ struct GuestWindowManager::WindowRecord final
 {
     HWND handle = nullptr;
     DWORD processId = 0;
+    DWORD threadId = 0;
     std::shared_ptr<WindowClass> windowClass;
     GuestAbi::WndProc procedure = nullptr;
     std::wstring title;
     RECT bounds = {};
+    RECT clientArea = {};
     DWORD style = 0;
     DWORD extendedStyle = 0;
     LONG_PTR userData = 0;
     HINSTANCE instance = nullptr;
     HWND parent = nullptr;
+    HWND owner = nullptr;
+    std::uint64_t zOrder = 0;
+    bool zTopMost = false;
     UINT_PTR controlId = 0;
     std::vector<BYTE> extraBytes;
     MiniGdi::ObjectHandle controlFont = MiniGdi::InvalidObject;
@@ -2291,6 +2388,7 @@ struct GuestWindowManager::WindowRecord final
     HLOCAL editTextHandle = nullptr;
     bool buttonPressed = false;
     bool buttonKeyboardPressed = false;
+    UINT buttonCheck = 0;
     std::vector<std::wstring> choiceItems;
     HANDLE comboBoxExImageList = nullptr;
     int selectedChoice = -1;
@@ -2398,12 +2496,38 @@ struct GuestWindowManager::WindowRecord final
     bool invalidated = false;
     bool paintPosted = false;
     bool erasePending = false;
+    bool internalPaintPending = false;
     bool paintActive = false;
-    RECT updateRect = {};
+    bool paintClipSaved = false;
+    MiniGdi::Region updateRegion;
+    MiniGdi::Region paintPreviousClip;
+    std::vector<MiniGdi::Region> commonDcClipStack;
     bool destroyed = false;
+    bool nonClientCreated = false;
+    bool nonClientActive = false;
+    HWND lastActivePopup = nullptr;
     MiniGdi::Surface surface;
     MiniGdi::DcHandle dc = MiniGdi::InvalidDc;
     mutable std::mutex lock;
+};
+
+struct GuestWindowManager::SentMessageRecord final
+{
+    HWND window = nullptr;
+    UINT message = 0;
+    WPARAM wParam = 0;
+    LPARAM lParam = 0;
+    DWORD targetThread = 0;
+    DWORD senderThread = 0;
+    DWORD sendState = GuestIsmexSend;
+    void (CALLBACK* callback)(HWND, UINT, ULONG_PTR, LRESULT) = nullptr;
+    ULONG_PTR callbackData = 0;
+    bool autoRelease = false;
+    std::mutex lock;
+    std::condition_variable completedChanged;
+    LRESULT result = 0;
+    bool completed = false;
+    bool cancelled = false;
 };
 
 GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHost)
@@ -2621,7 +2745,11 @@ void GuestWindowManager::Activate()
         return;
     }
 
-    m_messages.Reset();
+    {
+        std::lock_guard<std::mutex> guard(m_messageQueuesLock);
+        m_messageQueues.clear();
+    }
+    MessageQueueForThread(BridgeGetCurrentThreadId(), true);
     m_focusWindow.store(0);
     const auto timers = m_timers;
     if (timers)
@@ -2657,8 +2785,32 @@ void GuestWindowManager::Deactivate()
     m_focusWindow.store(0);
     m_captureWindow.store(0);
     StopGuestTimers();
-    m_messages.Close();
-    m_messages.Clear();
+    std::vector<std::shared_ptr<SentMessageRecord>> pendingSends;
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        for (const auto& entry : m_sentMessages) pendingSends.push_back(entry.second);
+        m_sentMessages.clear();
+    }
+    for (const auto& sent : pendingSends)
+    {
+        {
+            std::lock_guard<std::mutex> guard(sent->lock);
+            sent->cancelled = true;
+            sent->completed = true;
+        }
+        sent->completedChanged.notify_all();
+    }
+    std::vector<std::shared_ptr<GuestMessageQueue>> messageQueues;
+    {
+        std::lock_guard<std::mutex> guard(m_messageQueuesLock);
+        for (const auto& entry : m_messageQueues) messageQueues.push_back(entry.second);
+        m_messageQueues.clear();
+    }
+    for (const auto& queue : messageQueues)
+    {
+        queue->Close();
+        queue->Clear();
+    }
 
     // A guest may return without explicitly destroying every window.  Those
     // HWNDs and HDCs are guest-lifetime resources, so tear them down before a
@@ -2916,8 +3068,19 @@ HWND GuestWindowManager::CreateGuestWindow(
         return nullptr;
     }
 
+    // CreateWindowEx's hWndParent is an actual parent only for WS_CHILD.
+    // For top-level and popup windows the same parameter is the owner. Keeping
+    // that distinction is essential: an owned dialog participates in desktop
+    // z-order and activation, but is not clipped or laid out as a child.
+    const HWND suppliedParent = parent;
+    const bool childWindow = (style & GuestWsChild) != 0;
+    const HWND owner = childWindow ? nullptr : suppliedParent;
+    parent = childWindow ? suppliedParent : nullptr;
+
     auto window = std::make_shared<WindowRecord>();
     window->processId = BridgeGetCurrentProcessId();
+    window->threadId = BridgeGetCurrentThreadId();
+    MessageQueueForThread(window->threadId, true);
     window->windowClass = registered;
     window->procedure = registered->procedure;
     window->title = windowName ? windowName : L"";
@@ -2930,6 +3093,7 @@ HWND GuestWindowManager::CreateGuestWindow(
     window->extendedStyle = extendedStyle;
     window->instance = instance;
     window->parent = parent;
+    window->owner = owner;
     window->controlId = parent ? reinterpret_cast<UINT_PTR>(menu) : 0;
     // Comctl32 binds a control to the activation context in effect when the
     // window is created. Preserve that choice even if a nested context is
@@ -3008,6 +3172,7 @@ HWND GuestWindowManager::CreateGuestWindow(
         std::lock_guard<std::mutex> guard(m_windowsLock);
         const ULONG_PTR token = m_nextWindow++;
         window->handle = reinterpret_cast<HWND>(token);
+        window->zOrder = m_nextZOrder++;
         m_windows.emplace(token, window);
     }
 
@@ -3045,7 +3210,7 @@ HWND GuestWindowManager::CreateGuestWindow(
     create.lpCreateParams = parameter;
     create.hInstance = instance;
     create.hMenu = menu;
-    create.hwndParent = parent;
+    create.hwndParent = suppliedParent;
     create.cy = window->bounds.bottom - window->bounds.top;
     create.cx = window->bounds.right - window->bounds.left;
     create.y = window->bounds.top;
@@ -3055,7 +3220,27 @@ HWND GuestWindowManager::CreateGuestWindow(
     create.lpszClass = className;
     create.dwExStyle = extendedStyle;
 
-    if (CallWindowProcedure(window, GuestAbi::WmNcCreate, 0, reinterpret_cast<LPARAM>(&create)) == FALSE ||
+    RECT initialClient = window->bounds;
+    const bool ncCreated = CallWindowProcedure(window, GuestAbi::WmNcCreate, 0,
+        reinterpret_cast<LPARAM>(&create)) != FALSE;
+    if (ncCreated)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        window->nonClientCreated = true;
+    }
+    if (ncCreated)
+        CallWindowProcedure(window, GuestAbi::WmNcCalcSize, FALSE,
+            reinterpret_cast<LPARAM>(&initialClient));
+    if (ncCreated)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        window->clientArea = RECT{
+            initialClient.left - window->bounds.left,
+            initialClient.top - window->bounds.top,
+            initialClient.right - window->bounds.left,
+            initialClient.bottom - window->bounds.top };
+    }
+    if (!ncCreated ||
         CallWindowProcedure(window, GuestAbi::WmCreate, 0, reinterpret_cast<LPARAM>(&create)) == -1)
     {
         DWORD ignored = ERROR_SUCCESS;
@@ -3399,7 +3584,18 @@ void GuestWindowManager::ClearGuestForegroundForSubtree(HWND window)
     }
 
     ULONG_PTR expected = reinterpret_cast<ULONG_PTR>(foreground);
-    m_foregroundWindow.compare_exchange_strong(expected, 0);
+    if (m_foregroundWindow.compare_exchange_strong(expected, 0))
+    {
+        const auto record = FindWindow(foreground);
+        if (record)
+        {
+            CallWindowProcedure(record, GuestAbi::WmNcActivate, FALSE, 0);
+            CallWindowProcedure(record, GuestAbi::WmActivate,
+                GuestAbi::WaInactive, 0);
+            CallWindowProcedure(record, GuestAbi::WmActivateApp, FALSE,
+                BridgeGetCurrentThreadId());
+        }
+    }
 }
 
 void GuestWindowManager::ClearGuestFocusForSubtree(HWND window)
@@ -3613,6 +3809,7 @@ BOOL GuestWindowManager::DestroyGuestWindow(HWND window, DWORD* win32Error)
     }
 
     HWND parent = nullptr;
+    HWND owner = nullptr;
     {
         std::lock_guard<std::mutex> guard(record->lock);
         if (record->destroyed)
@@ -3621,6 +3818,7 @@ BOOL GuestWindowManager::DestroyGuestWindow(HWND window, DWORD* win32Error)
             return FALSE;
         }
         parent = record->parent;
+        owner = record->owner;
         record->destroyed = true;
     }
 
@@ -3644,7 +3842,8 @@ BOOL GuestWindowManager::DestroyGuestWindow(HWND window, DWORD* win32Error)
         HWND child = nullptr;
         {
             std::lock_guard<std::mutex> guard(candidate->lock);
-            if (!candidate->destroyed && candidate->parent == window)
+            if (!candidate->destroyed &&
+                (candidate->parent == window || candidate->owner == window))
             {
                 child = candidate->handle;
             }
@@ -3666,15 +3865,23 @@ BOOL GuestWindowManager::DestroyGuestWindow(HWND window, DWORD* win32Error)
 
     CallWindowProcedure(record, GuestAbi::WmDestroy, 0, 0);
     CallWindowProcedure(record, GuestAbi::WmNcDestroy, 0, 0);
-    m_messages.ClearForWindow(window);
+    if (const auto queue = MessageQueueForThread(record->threadId, false))
+        queue->ClearForWindow(window);
     m_gdi.DestroyDc(record->dc);
     {
         std::lock_guard<std::mutex> guard(m_windowsLock);
         m_windows.erase(reinterpret_cast<ULONG_PTR>(window));
     }
-    if (parent)
+    if (owner && IsGuestWindowVisibleInternal(owner) &&
+        IsGuestWindowEnabledInternal(owner))
     {
-        const auto parentRecord = FindWindow(parent);
+        DWORD ignored = ERROR_SUCCESS;
+        SetGuestForegroundWindow(owner, false, &ignored);
+    }
+    const HWND repaintTarget = parent ? parent : owner;
+    if (repaintTarget)
+    {
+        const auto parentRecord = FindWindow(repaintTarget);
         if (parentRecord)
         {
             // Once a child leaves the map, rebuilding its parent is the only
@@ -3736,15 +3943,12 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
         // Showing a child must not make it a new top-level foreground window.
         // Its parent is composed into the same guest desktop and hit-testing
         // selects the child under the pointer.
-        if (!parent)
-        {
-            m_foregroundWindow.store(reinterpret_cast<ULONG_PTR>(window));
-        }
         CallWindowProcedure(record, GuestAbi::WmShowWindow, TRUE, 0);
         if (enabled && effectivelyVisible)
         {
             DWORD ignored = ERROR_SUCCESS;
-            SetGuestFocus(window, &ignored);
+            if (!parent) SetGuestForegroundWindow(window, false, &ignored);
+            else SetGuestFocus(window, &ignored);
         }
         PostGuestMessage(window, GuestAbi::WmSize, GuestAbi::SizeRestored,
             GuestAbi::MakeMouseLParam(static_cast<WORD>(width), static_cast<WORD>(height)), nullptr);
@@ -3768,6 +3972,17 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
         ClearGuestFocusForSubtree(window);
         ClearGuestForegroundForSubtree(window);
         CallWindowProcedure(record, GuestAbi::WmShowWindow, FALSE, 0);
+        if (parent)
+        {
+            RECT childBounds{};
+            {
+                std::lock_guard<std::mutex> guard(record->lock);
+                childBounds = record->bounds;
+            }
+            InvalidateGuestRegion(parent, MiniGdi::RectRegion(MiniGdi::Rect{
+                childBounds.left, childBounds.top,
+                childBounds.right, childBounds.bottom }), TRUE, nullptr);
+        }
         // The record is still mapped, so Present can rebuild its visible
         // top-level ancestor without this newly-hidden child layer.
         Present(record);
@@ -3786,16 +4001,10 @@ BOOL GuestWindowManager::GetGuestClientRect(HWND window, LPRECT rect, DWORD* win
     }
 
     std::lock_guard<std::mutex> guard(record->lock);
-    const GuestMetrics::NonClientMetrics nonClient =
-        GuestMetrics::NonClientForEmbeddedWindow(
-            record->style, record->extendedStyle, record->parent != nullptr);
     rect->left = 0;
     rect->top = 0;
-    rect->right = (std::max)(0, record->surface.Width() -
-        nonClient.left - nonClient.right);
-    rect->bottom = (std::max)(0, record->surface.Height() -
-        nonClient.top - nonClient.bottom -
-        ((!record->parent && record->menuBar) ? GuestMetrics::MenuHeight : 0));
+    rect->right = (std::max)(0L, record->clientArea.right - record->clientArea.left);
+    rect->bottom = (std::max)(0L, record->clientArea.bottom - record->clientArea.top);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
@@ -3830,6 +4039,30 @@ BOOL GuestWindowManager::SetGuestWindowMenuBar(HWND window, BOOL visible, DWORD*
     }
     if (changed)
     {
+        RECT clientBounds{};
+        bool canNotify = false;
+        {
+            std::lock_guard<std::mutex> guard(record->lock);
+            clientBounds = record->bounds;
+            canNotify = record->nonClientCreated;
+        }
+        if (canNotify)
+        {
+            CallWindowProcedure(record, GuestAbi::WmNcCalcSize, FALSE,
+                reinterpret_cast<LPARAM>(&clientBounds));
+            {
+                std::lock_guard<std::mutex> guard(record->lock);
+                record->clientArea = RECT{
+                    clientBounds.left - record->bounds.left,
+                    clientBounds.top - record->bounds.top,
+                    clientBounds.right - record->bounds.left,
+                    clientBounds.bottom - record->bounds.top };
+                width = (std::max)(0L,
+                    record->clientArea.right - record->clientArea.left);
+                height = (std::max)(0L,
+                    record->clientArea.bottom - record->clientArea.top);
+            }
+        }
         // A menu is non-client chrome. The guest therefore continues to use
         // client coordinates beginning at zero, while composition applies the
         // visual offset below the bar.
@@ -3966,6 +4199,102 @@ HWND GuestWindowManager::GetGuestForegroundWindow() const
     return foreground && IsGuestWindow(foreground) ? foreground : nullptr;
 }
 
+BOOL GuestWindowManager::SetGuestForegroundWindow(
+    HWND window, bool mouseActivation, DWORD* win32Error)
+{
+    const auto requested = FindWindow(window);
+    if (!requested)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+
+    HWND active = window;
+    HWND owner = nullptr;
+    for (;;)
+    {
+        const auto current = FindWindow(active);
+        if (!current) break;
+        HWND parent = nullptr;
+        {
+            std::lock_guard<std::mutex> guard(current->lock);
+            if (current->destroyed || !current->visible || !current->enabled)
+            {
+                SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+                return FALSE;
+            }
+            parent = current->parent;
+            if (!parent) owner = current->owner;
+        }
+        if (!parent) break;
+        active = parent;
+    }
+
+    const HWND previous = reinterpret_cast<HWND>(
+        m_foregroundWindow.exchange(reinterpret_cast<ULONG_PTR>(active)));
+    if (previous != active)
+    {
+        const auto oldRecord = FindWindow(previous);
+        if (oldRecord)
+        {
+            CallWindowProcedure(oldRecord, GuestAbi::WmNcActivate, FALSE,
+                reinterpret_cast<LPARAM>(active));
+            CallWindowProcedure(oldRecord, GuestAbi::WmActivate,
+                GuestAbi::WaInactive, reinterpret_cast<LPARAM>(active));
+            if (!active)
+                CallWindowProcedure(oldRecord, GuestAbi::WmActivateApp, FALSE,
+                    BridgeGetCurrentThreadId());
+        }
+        const auto activeRecord = FindWindow(active);
+        if (activeRecord)
+        {
+            if (!previous)
+                CallWindowProcedure(activeRecord, GuestAbi::WmActivateApp, TRUE,
+                    BridgeGetCurrentThreadId());
+            CallWindowProcedure(activeRecord, GuestAbi::WmNcActivate, TRUE,
+                reinterpret_cast<LPARAM>(previous));
+            CallWindowProcedure(activeRecord, GuestAbi::WmActivate,
+                mouseActivation ? GuestAbi::WaClickActive : GuestAbi::WaActive,
+                reinterpret_cast<LPARAM>(previous));
+        }
+    }
+    if (owner)
+    {
+        const auto ownerRecord = FindWindow(owner);
+        if (ownerRecord)
+        {
+            std::lock_guard<std::mutex> guard(ownerRecord->lock);
+            if (!ownerRecord->destroyed) ownerRecord->lastActivePopup = active;
+        }
+    }
+    ReorderGuestWindow(active, nullptr);
+    SetGuestFocus(window, nullptr);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
+HWND GuestWindowManager::GetGuestLastActivePopup(HWND window, DWORD* win32Error) const
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return nullptr;
+    }
+    HWND popup = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        popup = record->lastActivePopup;
+    }
+    if (popup && IsGuestWindow(popup) && IsGuestWindowVisibleInternal(popup))
+    {
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return popup;
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return window;
+}
+
 void GuestWindowManager::DestroyGuestWindowsForProcess(
     DWORD processId,
     HWND restoreForeground,
@@ -4003,7 +4332,8 @@ void GuestWindowManager::DestroyGuestWindowsForProcess(
     for (const auto& victim : victims)
     {
         CancelGuestTimersForWindow(victim->handle);
-        m_messages.ClearForWindow(victim->handle);
+        if (const auto queue = MessageQueueForThread(victim->threadId, false))
+            queue->ClearForWindow(victim->handle);
         m_gdi.DestroyDc(victim->dc);
     }
 
@@ -4238,8 +4568,8 @@ BOOL GuestWindowManager::GetGuestClientOrigin(HWND window, LPPOINT point, DWORD*
     }
 
     point->x = windowRect.left;
-    point->y = SaturatingAdd(windowRect.top,
-        rootMenuBar ? GuestMetrics::MenuHeight : 0);
+    point->y = SaturatingAdd(
+        windowRect.top, rootMenuBar ? GuestMetrics::MenuHeight : 0);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
@@ -4317,27 +4647,32 @@ std::vector<HWND> GuestWindowManager::SnapshotGuestWindows(HWND parent, bool des
         records.reserve(m_windows.size());
         for (const auto& item : m_windows) records.push_back(item.second);
     }
-    std::vector<HWND> result;
+    std::vector<std::pair<std::uint64_t, HWND>> ordered;
     for (const auto& record : records)
     {
         HWND candidateParent = nullptr;
         bool alive = false;
+        std::uint64_t zOrder = 0;
         {
             std::lock_guard<std::mutex> guard(record->lock);
             alive = !record->destroyed;
             candidateParent = record->parent;
+            zOrder = record->zOrder;
         }
         if (!alive) continue;
         const bool matches = parent
             ? (descendants ? IsGuestWindowDescendantOrSelf(candidateParent, parent)
                            : candidateParent == parent)
             : candidateParent == nullptr;
-        if (matches) result.push_back(record->handle);
+        if (matches) ordered.emplace_back(zOrder, record->handle);
     }
-    std::sort(result.begin(), result.end(), [](HWND left, HWND right)
+    std::sort(ordered.begin(), ordered.end(), [](const auto& left, const auto& right)
     {
-        return reinterpret_cast<ULONG_PTR>(left) < reinterpret_cast<ULONG_PTR>(right);
+        return left.first > right.first;
     });
+    std::vector<HWND> result;
+    result.reserve(ordered.size());
+    for (const auto& item : ordered) result.push_back(item.second);
     return result;
 }
 
@@ -4422,14 +4757,16 @@ HWND GuestWindowManager::GetGuestWindowRelationship(HWND window, UINT command, D
         return nullptr;
     }
     HWND parent = nullptr;
+    HWND owner = nullptr;
     {
         std::lock_guard<std::mutex> guard(record->lock);
         parent = record->parent;
+        owner = record->owner;
     }
     if (command == GuestGwOwner)
     {
         SetWin32Error(win32Error, ERROR_SUCCESS);
-        return parent;
+        return owner;
     }
     if (command == GuestGwChild)
     {
@@ -4843,10 +5180,6 @@ bool GuestWindowManager::GetGuestSurfaceGeometry(
             width = record->surface.Width();
             height = record->surface.Height();
             bounds = record->bounds;
-            if (!parent)
-            {
-                rootMenuBar = record->menuBar;
-            }
         }
 
         if (first)
@@ -4861,8 +5194,7 @@ bool GuestWindowManager::GetGuestSurfaceGeometry(
             *rootWidth = width;
             *rootHeight = height;
             *targetLeft = SaturatingAdd(bounds.left, accumulatedLeft);
-            *targetTop = SaturatingAdd(SaturatingAdd(bounds.top, accumulatedTop),
-                rootMenuBar && window != current ? GuestMetrics::MenuHeight : 0);
+            *targetTop = SaturatingAdd(bounds.top, accumulatedTop);
             return width > 0 && height > 0 && *targetWidth > 0 && *targetHeight > 0;
         }
 
@@ -4873,16 +5205,108 @@ bool GuestWindowManager::GetGuestSurfaceGeometry(
         {
             std::lock_guard<std::mutex> guard(parentRecord->lock);
             if (parentRecord->destroyed) return false;
-            const GuestMetrics::NonClientMetrics parentNonClient =
-                GuestMetrics::NonClientForEmbeddedWindow(
-                    parentRecord->style, parentRecord->extendedStyle,
-                    parentRecord->parent != nullptr);
-            accumulatedLeft = SaturatingAdd(accumulatedLeft, parentNonClient.left);
-            accumulatedTop = SaturatingAdd(accumulatedTop, parentNonClient.top);
+            accumulatedLeft = SaturatingAdd(accumulatedLeft,
+                parentRecord->clientArea.left);
+            accumulatedTop = SaturatingAdd(accumulatedTop,
+                parentRecord->clientArea.top);
         }
         current = parent;
     }
     return false;
+}
+
+MiniGdi::Region GuestWindowManager::VisibleRegionForWindow(HWND window, bool clipChildren) const
+{
+    HWND root = nullptr;
+    int rootWidth = 0, rootHeight = 0, width = 0, height = 0, left = 0, top = 0;
+    if (!GetGuestSurfaceGeometry(window, &root, &rootWidth, &rootHeight,
+        &width, &height, &left, &top))
+        return MiniGdi::Region{};
+
+    MiniGdi::Region visible = MiniGdi::RectRegion(MiniGdi::Rect{ 0, 0, width, height });
+    const auto target = FindWindow(window);
+    if (!target) return MiniGdi::Region{};
+
+    HWND parent = nullptr;
+    DWORD style = 0;
+    std::uint64_t zOrder = 0;
+    bool targetTopMost = false;
+    {
+        std::lock_guard<std::mutex> guard(target->lock);
+        if (target->destroyed || !target->visible) return MiniGdi::Region{};
+        parent = target->parent;
+        style = target->style;
+        zOrder = target->zOrder;
+        targetTopMost = target->zTopMost;
+    }
+
+    // Every ancestor client clips descendants. Coordinates are converted from
+    // the common virtual-screen space back into this window's surface space.
+    for (HWND ancestor = parent; ancestor;)
+    {
+        HWND ancestorRoot = nullptr;
+        int arw = 0, arh = 0, aw = 0, ah = 0, al = 0, at = 0;
+        if (!GetGuestSurfaceGeometry(ancestor, &ancestorRoot, &arw, &arh, &aw, &ah, &al, &at))
+            return MiniGdi::Region{};
+        RECT client{};
+        if (!GetGuestClientRect(ancestor, &client, nullptr)) return MiniGdi::Region{};
+        const auto record = FindWindow(ancestor);
+        if (!record) return MiniGdi::Region{};
+        HWND nextAncestor = nullptr;
+        int clientOffsetX = 0;
+        int clientOffsetY = 0;
+        {
+            std::lock_guard<std::mutex> guard(record->lock);
+            clientOffsetX = record->clientArea.left;
+            clientOffsetY = record->clientArea.top;
+            nextAncestor = record->parent;
+        }
+        visible = MiniGdi::IntersectRegion(visible, MiniGdi::RectRegion(MiniGdi::Rect{
+            SaturatingAdd(al - left, clientOffsetX + client.left),
+            SaturatingAdd(at - top, clientOffsetY + client.top),
+            SaturatingAdd(al - left, clientOffsetX + client.right),
+            SaturatingAdd(at - top, clientOffsetY + client.bottom) }));
+        ancestor = nextAncestor;
+    }
+
+    std::vector<std::shared_ptr<WindowRecord>> records;
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        for (const auto& item : m_windows) records.push_back(item.second);
+    }
+    for (const auto& candidate : records)
+    {
+        HWND candidateParent = nullptr;
+        HWND candidateHandle = nullptr;
+        bool candidateVisible = false;
+        std::uint64_t candidateZ = 0;
+        bool candidateTopMost = false;
+        {
+            std::lock_guard<std::mutex> guard(candidate->lock);
+            candidateHandle = candidate->handle;
+            candidateParent = candidate->parent;
+            candidateVisible = candidate->visible && !candidate->destroyed;
+            candidateZ = candidate->zOrder;
+            candidateTopMost = candidate->zTopMost;
+        }
+        const bool aboveTarget = candidateTopMost != targetTopMost
+            ? candidateTopMost : candidateZ > zOrder;
+        const bool obscuringSibling = (style & GuestWsClipSiblings) != 0 &&
+            candidateParent == parent && candidateHandle != window && aboveTarget;
+        const bool obscuringChild = clipChildren && (style & GuestWsClipChildren) != 0 &&
+            candidateParent == window;
+        if (!candidateVisible || (!obscuringSibling && !obscuringChild)) continue;
+
+        HWND candidateRoot = nullptr;
+        int crw = 0, crh = 0, cw = 0, ch = 0, cl = 0, ct = 0;
+        if (GetGuestSurfaceGeometry(candidateHandle, &candidateRoot, &crw, &crh,
+            &cw, &ch, &cl, &ct))
+        {
+            visible = MiniGdi::SubtractRegion(visible, MiniGdi::RectRegion(MiniGdi::Rect{
+                cl - left, ct - top, SaturatingAdd(cl - left, cw), SaturatingAdd(ct - top, ch) }));
+        }
+    }
+    return visible;
 }
 
 HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int rootY) const
@@ -4900,6 +5324,8 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
         bool visible = false;
         bool menuBar = false;
         bool topMost = false;
+        std::uint64_t zOrder = 0;
+        bool zTopMost = false;
         int clientLeft = 0;
         int clientTop = 0;
     };
@@ -4948,6 +5374,8 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
             snapshot.topMost = record->windowClass &&
                 record->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
                 record->comboDropped;
+            snapshot.zOrder = record->zOrder;
+            snapshot.zTopMost = record->zTopMost;
         }
         windows.push_back(snapshot);
     }
@@ -4958,8 +5386,8 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
         [](const HitTestSnapshot& left, const HitTestSnapshot& right)
         {
             if (left.topMost != right.topMost) return !left.topMost;
-            return reinterpret_cast<ULONG_PTR>(left.handle) <
-                reinterpret_cast<ULONG_PTR>(right.handle);
+            if (left.zTopMost != right.zTopMost) return !left.zTopMost;
+            return left.zOrder < right.zOrder;
         });
 
     std::unordered_set<ULONG_PTR> path;
@@ -5425,7 +5853,72 @@ HWND GuestWindowManager::GetGuestParent(HWND window, DWORD* win32Error) const
         return nullptr;
     }
     SetWin32Error(win32Error, ERROR_SUCCESS);
-    return record->parent;
+    return record->parent ? record->parent : record->owner;
+}
+
+void GuestWindowManager::ReorderGuestWindow(HWND window, HWND insertAfter)
+{
+    const auto moving = FindWindow(window);
+    if (!moving) return;
+
+    HWND parent = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(moving->lock);
+        if (moving->destroyed) return;
+        parent = moving->parent;
+    }
+    const ULONG_PTR requested = reinterpret_cast<ULONG_PTR>(insertAfter);
+    {
+        std::lock_guard<std::mutex> guard(moving->lock);
+        if (requested == static_cast<ULONG_PTR>(-1)) moving->zTopMost = true;
+        else if (requested == static_cast<ULONG_PTR>(-2)) moving->zTopMost = false;
+    }
+
+    std::vector<std::shared_ptr<WindowRecord>> siblings;
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        siblings.reserve(m_windows.size());
+        for (const auto& item : m_windows)
+        {
+            const auto& candidate = item.second;
+            std::lock_guard<std::mutex> candidateGuard(candidate->lock);
+            if (!candidate->destroyed && candidate->parent == parent)
+                siblings.push_back(candidate);
+        }
+    }
+    std::sort(siblings.begin(), siblings.end(), [](const auto& left, const auto& right)
+    {
+        if (left->zTopMost != right->zTopMost) return !left->zTopMost;
+        return left->zOrder < right->zOrder;
+    });
+    siblings.erase(std::remove(siblings.begin(), siblings.end(), moving), siblings.end());
+
+    bool movingTopMost = false;
+    {
+        std::lock_guard<std::mutex> guard(moving->lock);
+        movingTopMost = moving->zTopMost;
+    }
+    const auto firstTopMost = std::find_if(siblings.begin(), siblings.end(), [](const auto& item)
+    {
+        return item->zTopMost;
+    });
+    auto position = movingTopMost ? siblings.end() : firstTopMost;
+    if (requested == 1) // HWND_BOTTOM
+        position = movingTopMost ? firstTopMost : siblings.begin();
+    else if (requested > 1 && requested < static_cast<ULONG_PTR>(-2))
+    {
+        const auto after = std::find_if(siblings.begin(), siblings.end(), [insertAfter](const auto& item)
+        {
+            return item->handle == insertAfter;
+        });
+        if (after != siblings.end()) position = std::next(after);
+    }
+    siblings.insert(position, moving);
+    for (const auto& sibling : siblings)
+    {
+        std::lock_guard<std::mutex> guard(sibling->lock);
+        sibling->zOrder = m_nextZOrder++;
+    }
 }
 
 HWND GuestWindowManager::ChildGuestWindowFromPoint(
@@ -5453,6 +5946,8 @@ HWND GuestWindowManager::ChildGuestWindowFromPoint(
         bool visible = false;
         bool enabled = false;
         bool transparent = false;
+        std::uint64_t zOrder = 0;
+        bool zTopMost = false;
     };
     std::vector<Candidate> candidates;
     {
@@ -5478,14 +5973,16 @@ HWND GuestWindowManager::ChildGuestWindowFromPoint(
                 bounds,
                 record->visible,
                 record->enabled,
-                (record->extendedStyle & ExTransparent) != 0 });
+                (record->extendedStyle & ExTransparent) != 0,
+                record->zOrder,
+                record->zTopMost });
         }
     }
     std::sort(candidates.begin(), candidates.end(),
         [](const Candidate& left, const Candidate& right)
         {
-            return reinterpret_cast<ULONG_PTR>(left.handle) >
-                reinterpret_cast<ULONG_PTR>(right.handle);
+            if (left.zTopMost != right.zTopMost) return left.zTopMost;
+            return left.zOrder > right.zOrder;
         });
 
     for (const auto& candidate : candidates)
@@ -5513,6 +6010,8 @@ HWND GuestWindowManager::GuestWindowFromPoint(POINT point, DWORD* win32Error) co
         RECT bounds{};
         bool visible = false;
         bool enabled = false;
+        std::uint64_t zOrder = 0;
+        bool zTopMost = false;
     };
     std::vector<RootCandidate> roots;
     {
@@ -5524,14 +6023,15 @@ HWND GuestWindowManager::GuestWindowFromPoint(POINT point, DWORD* win32Error) co
             std::lock_guard<std::mutex> recordGuard(record->lock);
             if (record->destroyed || record->parent) continue;
             roots.push_back(RootCandidate{
-                record->handle, record->bounds, record->visible, record->enabled });
+                record->handle, record->bounds, record->visible, record->enabled,
+                record->zOrder, record->zTopMost });
         }
     }
     std::sort(roots.begin(), roots.end(),
         [](const RootCandidate& left, const RootCandidate& right)
         {
-            return reinterpret_cast<ULONG_PTR>(left.handle) >
-                reinterpret_cast<ULONG_PTR>(right.handle);
+            if (left.zTopMost != right.zTopMost) return left.zTopMost;
+            return left.zOrder > right.zOrder;
         });
 
     for (const auto& root : roots)
@@ -5910,11 +6410,8 @@ BOOL GuestWindowManager::SetGuestWindowPos(
         return FALSE;
     }
 
-    // The composed guest desktop has deterministic creation-order layering.
-    // insertAfter needs a dedicated sibling z-order table before it can alter
-    // that layer order; position and size are retained now for layout and
-    // child-surface composition.
-    (void)insertAfter;
+    if ((flags & GuestSwpNoZOrder) == 0)
+        ReorderGuestWindow(window, insertAfter);
     const bool show = (flags & GuestSwpShowWindow) != 0;
     const bool hide = !show && (flags & GuestSwpHideWindow) != 0;
     bool changedSize = false;
@@ -5922,6 +6419,7 @@ BOOL GuestWindowManager::SetGuestWindowPos(
     bool becameHidden = false;
     bool enabled = false;
     HWND parent = nullptr;
+    HWND owner = nullptr;
     int currentWidth = 0;
     int currentHeight = 0;
     int currentLeft = 0;
@@ -5971,10 +6469,20 @@ BOOL GuestWindowManager::SetGuestWindowPos(
 
         if (resize && (newWidth != oldWidth || newHeight != oldHeight))
         {
+            MiniGdi::Surface preserved;
+            if ((flags & GuestSwpNoCopyBits) == 0)
+                preserved = record->surface;
             if (!record->surface.Resize(newWidth, newHeight, MiniGdi::OpaqueWhite))
             {
                 SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY);
                 return FALSE;
+            }
+            if (!preserved.Empty() && (flags & GuestSwpNoCopyBits) == 0)
+            {
+                MiniGdi::CopyRect(record->surface, MiniGdi::Point{ 0, 0 }, preserved,
+                    MiniGdi::Rect{ 0, 0,
+                        (std::min)(oldWidth, newWidth),
+                        (std::min)(oldHeight, newHeight) });
             }
             m_gdi.ResetClip(record->dc);
             // A damage rectangle expressed against the old surface cannot be
@@ -5983,7 +6491,7 @@ BOOL GuestWindowManager::SetGuestWindowPos(
             // WM_PAINT harmlessly coalesced.
             record->invalidated = false;
             record->erasePending = false;
-            record->updateRect = RECT{};
+            record->updateRegion = MiniGdi::Region{};
             changedSize = true;
         }
 
@@ -6010,6 +6518,7 @@ BOOL GuestWindowManager::SetGuestWindowPos(
         becameHidden = wasVisible && !record->visible;
         enabled = record->enabled;
         parent = record->parent;
+        owner = record->owner;
         currentWidth = record->surface.Width();
         currentHeight = record->surface.Height();
         currentLeft = record->bounds.left;
@@ -6025,15 +6534,12 @@ BOOL GuestWindowManager::SetGuestWindowPos(
 
     if (becameVisible)
     {
-        if (!parent && (flags & GuestSwpNoActivate) == 0)
-        {
-            m_foregroundWindow.store(reinterpret_cast<ULONG_PTR>(window));
-        }
         CallWindowProcedure(record, GuestAbi::WmShowWindow, TRUE, 0);
         if ((flags & GuestSwpNoActivate) == 0 && enabled)
         {
             DWORD ignored = ERROR_SUCCESS;
-            SetGuestFocus(window, &ignored);
+            if (!parent) SetGuestForegroundWindow(window, false, &ignored);
+            else SetGuestFocus(window, &ignored);
         }
     }
     else if (becameHidden)
@@ -6064,9 +6570,54 @@ BOOL GuestWindowManager::SetGuestWindowPos(
 
     const bool changedPosition = move &&
         (currentLeft != previousLeft || currentTop != previousTop);
+    if (parent && (flags & GuestSwpNoRedraw) == 0 &&
+        (changedPosition || changedSize || becameHidden))
+    {
+        const MiniGdi::Region oldArea = MiniGdi::RectRegion(MiniGdi::Rect{
+            previousLeft, previousTop,
+            SaturatingAdd(previousLeft, previousWidth),
+            SaturatingAdd(previousTop, previousHeight) });
+        MiniGdi::Region exposed = oldArea;
+        if (!becameHidden)
+        {
+            const MiniGdi::Region newArea = MiniGdi::RectRegion(MiniGdi::Rect{
+                currentLeft, currentTop,
+                SaturatingAdd(currentLeft, currentWidth),
+                SaturatingAdd(currentTop, currentHeight) });
+            exposed = MiniGdi::SubtractRegion(oldArea, newArea);
+        }
+        if (!exposed.Empty())
+            InvalidateGuestRegion(parent, exposed, TRUE, nullptr);
+    }
+    if (!parent && owner && (flags & GuestSwpNoRedraw) == 0 &&
+        (changedPosition || changedSize || becameHidden))
+    {
+        const auto ownerRecord = FindWindow(owner);
+        if (ownerRecord) Present(ownerRecord);
+    }
     if (changedSize || changedPosition || becameVisible || becameHidden ||
         (flags & GuestSwpFrameChanged) != 0)
     {
+        if (changedSize || (flags & GuestSwpFrameChanged) != 0)
+        {
+            GuestNcCalcSizeParams nc{};
+            nc.rectangles[0] = RECT{ currentLeft, currentTop,
+                SaturatingAdd(currentLeft, currentWidth),
+                SaturatingAdd(currentTop, currentHeight) };
+            GuestWindowPosition ncPosition{ window, insertAfter, currentLeft, currentTop,
+                currentWidth, currentHeight, flags };
+            nc.windowPosition = &ncPosition;
+            CallWindowProcedure(record, GuestAbi::WmNcCalcSize, TRUE,
+                reinterpret_cast<LPARAM>(&nc));
+            {
+                std::lock_guard<std::mutex> guard(record->lock);
+                record->clientArea = RECT{
+                    nc.rectangles[0].left - currentLeft,
+                    nc.rectangles[0].top - currentTop,
+                    nc.rectangles[0].right - currentLeft,
+                    nc.rectangles[0].bottom - currentTop };
+            }
+        }
         GuestWindowPosition completed{
             window,
             insertAfter,
@@ -6077,6 +6628,9 @@ BOOL GuestWindowManager::SetGuestWindowPos(
             flags };
         CallWindowProcedure(record, GuestAbi::WmWindowPosChanged, 0,
             reinterpret_cast<LPARAM>(&completed));
+        if ((changedSize || (flags & GuestSwpFrameChanged) != 0) &&
+            (flags & GuestSwpNoRedraw) == 0)
+            CallWindowProcedure(record, GuestAbi::WmNcPaint, 1, 0);
     }
 
     if (becameVisible && !parent)
@@ -6111,6 +6665,13 @@ BOOL GuestWindowManager::SetGuestWindowPos(
     {
         // A hidden child has no paint of its own, but removing its composed
         // layer still changes the visible root desktop.
+        Present(record);
+    }
+    else if ((changedPosition || (flags & GuestSwpNoZOrder) == 0) &&
+        (flags & GuestSwpNoRedraw) == 0)
+    {
+        // Moving/reordering does not damage the retained window bitmap, but it
+        // exposes a different part of its parent/desktop and must recompose it.
         Present(record);
     }
 
@@ -6307,6 +6868,109 @@ BOOL GuestWindowManager::KillGuestTimer(HWND window, UINT_PTR timerId, DWORD* wi
     return TRUE;
 }
 
+LRESULT GuestWindowManager::DefaultNonClientProcedure(
+    const std::shared_ptr<WindowRecord>& window,
+    UINT message,
+    WPARAM wParam,
+    LPARAM lParam)
+{
+    if (!window) return 0;
+    DWORD style = 0, extendedStyle = 0;
+    bool child = false, menuBar = false;
+    RECT bounds{};
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        if (window->destroyed) return 0;
+        style = window->style;
+        extendedStyle = window->extendedStyle;
+        child = window->parent != nullptr;
+        menuBar = !child && window->menuBar;
+        bounds = window->bounds;
+    }
+    const GuestMetrics::NonClientMetrics metrics =
+        GuestMetrics::NonClientForEmbeddedWindow(style, extendedStyle, child);
+
+    if (message == GuestAbi::WmNcActivate)
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        window->nonClientActive = wParam != FALSE;
+        return TRUE;
+    }
+
+    if (message == GuestAbi::WmNcCalcSize)
+    {
+        RECT requested{};
+        RECT* destination = nullptr;
+        GuestNcCalcSizeParams parameters{};
+        if (wParam)
+        {
+            auto guest = reinterpret_cast<GuestNcCalcSizeParams*>(lParam);
+            if (!TryReadGuestValue(guest, &parameters)) return 0;
+            requested = parameters.rectangles[0];
+            destination = &guest->rectangles[0];
+        }
+        else
+        {
+            destination = reinterpret_cast<RECT*>(lParam);
+            if (!TryReadGuestValue(destination, &requested)) return 0;
+        }
+        requested.left = SaturatingAdd(requested.left, metrics.left);
+        requested.top = SaturatingAdd(requested.top, metrics.top +
+            (menuBar ? GuestMetrics::MenuHeight : 0));
+        requested.right = (std::max)(requested.left, requested.right - metrics.right);
+        requested.bottom = (std::max)(requested.top, requested.bottom - metrics.bottom);
+        return TryWriteGuestValue(destination, requested) ? 0 : 0;
+    }
+    if (message == GuestAbi::WmNcPaint)
+    {
+        // Chrome is rendered by the software compositor after the client
+        // bitmap. Acknowledge the message so custom procedures can override it.
+        return 0;
+    }
+    if (message == GuestAbi::WmNcLButtonUp && wParam == GuestAbi::HtClose)
+    {
+        PostGuestMessage(window->handle, GuestAbi::WmSysCommand,
+            GuestAbi::ScClose, lParam, nullptr);
+        return 0;
+    }
+    if (message == GuestAbi::WmNcLButtonDown ||
+        message == GuestAbi::WmNcLButtonUp ||
+        message == GuestAbi::WmNcMouseMove ||
+        message == GuestAbi::WmNcRButtonDown ||
+        message == GuestAbi::WmNcRButtonUp ||
+        message == GuestAbi::WmNcMButtonDown ||
+        message == GuestAbi::WmNcMButtonUp)
+        return 0;
+    if (message != GuestAbi::WmNcHitTest) return 0;
+
+    const int x = static_cast<int>(static_cast<SHORT>(lParam & 0xffff));
+    const int y = static_cast<int>(static_cast<SHORT>(
+        (static_cast<ULONG_PTR>(lParam) >> 16) & 0xffff));
+    if (x < bounds.left || y < bounds.top || x >= bounds.right || y >= bounds.bottom)
+        return GuestAbi::HtNowhere;
+    const int localX = x - bounds.left;
+    const int localY = y - bounds.top;
+    const int width = bounds.right - bounds.left;
+    const int height = bounds.bottom - bounds.top;
+    if (metrics.left > 0 && localX < metrics.left)
+        return localY < metrics.top ? GuestAbi::HtTopLeft :
+            localY >= height - metrics.bottom ? GuestAbi::HtBottomLeft : GuestAbi::HtLeft;
+    if (metrics.right > 0 && localX >= width - metrics.right)
+        return localY < metrics.top ? GuestAbi::HtTopRight :
+            localY >= height - metrics.bottom ? GuestAbi::HtBottomRight : GuestAbi::HtRight;
+    if (metrics.top > 0 && localY < metrics.top)
+    {
+        if (metrics.closeButton && localX >= width - metrics.right - GuestMetrics::CaptionHeight)
+            return GuestAbi::HtClose;
+        return metrics.caption ? GuestAbi::HtCaption : GuestAbi::HtTop;
+    }
+    if (metrics.bottom > 0 && localY >= height - metrics.bottom)
+        return GuestAbi::HtBottom;
+    if (menuBar && localY < metrics.top + GuestMetrics::MenuHeight)
+        return GuestAbi::HtMenu;
+    return GuestAbi::HtClient;
+}
+
 LRESULT GuestWindowManager::BuiltinControlProcedure(
     const std::shared_ptr<WindowRecord>& window,
     UINT message,
@@ -6330,6 +6994,50 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     if (controlKind == BuiltinControlKind::None)
     {
         return 0;
+    }
+
+    // WM_GETDLGCODE is the contract used by IsDialogMessage to decide which
+    // keys remain with a control and which participate in dialog navigation.
+    if (message == 0x0087)
+    {
+        constexpr LRESULT WantArrows = 0x0001;
+        constexpr LRESULT WantChars = 0x0080;
+        constexpr LRESULT DefPushButton = 0x0010;
+        constexpr LRESULT UndefPushButton = 0x0020;
+        constexpr LRESULT RadioButton = 0x0040;
+        constexpr LRESULT Static = 0x0100;
+        constexpr LRESULT Button = 0x2000;
+        DWORD style = 0;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            style = window->style;
+        }
+        switch (controlKind)
+        {
+        case BuiltinControlKind::Button:
+            switch (style & GuestAbi::BsTypeMask)
+            {
+            case 1: return Button | DefPushButton; // BS_DEFPUSHBUTTON
+            case 4: case 9: return Button | RadioButton | WantArrows;
+            default: return Button | UndefPushButton;
+            }
+        case BuiltinControlKind::Edit:
+        case BuiltinControlKind::ComboBox:
+        case BuiltinControlKind::IpAddress:
+        case BuiltinControlKind::HotKey:
+            return WantChars;
+        case BuiltinControlKind::ListBox:
+        case BuiltinControlKind::ListView:
+        case BuiltinControlKind::TreeView:
+        case BuiltinControlKind::Tab:
+            return WantArrows | WantChars;
+        case BuiltinControlKind::Static:
+        case BuiltinControlKind::SysLink:
+        case BuiltinControlKind::NativeFont:
+            return Static;
+        default:
+            return 0;
+        }
     }
 
     // Snapshot parent-notification data before calling guest code because a
@@ -6363,6 +7071,74 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             handle = window->handle;
         }
         InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
+    };
+
+    const auto activateButton = [this, window, invalidate]()
+    {
+        constexpr DWORD AutoCheckBox = 0x00000003u;
+        constexpr DWORD AutoThreeState = 0x00000006u;
+        constexpr DWORD AutoRadio = 0x00000009u;
+        constexpr DWORD WindowGroup = 0x00020000u;
+        HWND handle = nullptr;
+        HWND parent = nullptr;
+        DWORD type = 0;
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (window->destroyed) return;
+            handle = window->handle;
+            parent = window->parent;
+            type = window->style & GuestAbi::BsTypeMask;
+            if (type == AutoCheckBox) window->buttonCheck = window->buttonCheck ? 0u : 1u;
+            else if (type == AutoThreeState) window->buttonCheck = (window->buttonCheck + 1u) % 3u;
+            else if (type == AutoRadio) window->buttonCheck = 1u;
+        }
+        if (type == AutoRadio && parent)
+        {
+            const auto siblings = SnapshotGuestWindows(parent, false);
+            const auto current = std::find(siblings.begin(), siblings.end(), handle);
+            if (current != siblings.end())
+            {
+                size_t begin = static_cast<size_t>(current - siblings.begin());
+                while (begin > 0)
+                {
+                    const auto candidate = FindWindow(siblings[begin]);
+                    if (!candidate) break;
+                    std::lock_guard<std::mutex> guard(candidate->lock);
+                    if ((candidate->style & WindowGroup) != 0) break;
+                    --begin;
+                }
+                size_t end = static_cast<size_t>(current - siblings.begin()) + 1;
+                while (end < siblings.size())
+                {
+                    const auto candidate = FindWindow(siblings[end]);
+                    if (!candidate) break;
+                    std::lock_guard<std::mutex> guard(candidate->lock);
+                    if ((candidate->style & WindowGroup) != 0) break;
+                    ++end;
+                }
+                for (size_t index = begin; index < end; ++index)
+                {
+                    if (siblings[index] == handle) continue;
+                    const auto candidate = FindWindow(siblings[index]);
+                    if (!candidate) continue;
+                    bool changed = false;
+                    HWND candidateHandle = nullptr;
+                    {
+                        std::lock_guard<std::mutex> guard(candidate->lock);
+                        if (candidate->windowClass &&
+                            candidate->windowClass->builtinKind == BuiltinControlKind::Button &&
+                            (candidate->style & GuestAbi::BsTypeMask) == AutoRadio)
+                        {
+                            changed = candidate->buttonCheck != 0;
+                            candidate->buttonCheck = 0;
+                            candidateHandle = candidate->handle;
+                        }
+                    }
+                    if (changed) InvalidateGuestRect(candidateHandle, nullptr, TRUE, nullptr);
+                }
+            }
+        }
+        invalidate();
     };
 
     // Multiline EDIT controls expose their backing local-memory buffer through
@@ -7367,6 +8143,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 window->listViewExtendedStyle = mask == 0
                     ? requested
                     : ((window->listViewExtendedStyle & ~mask) | (requested & mask));
+                if ((window->listViewExtendedStyle & ListViewExtendedCheckBoxes) != 0 &&
+                    (previous & ListViewExtendedCheckBoxes) == 0)
+                {
+                    for (UINT& state : window->listViewItemStates)
+                        if ((state & ListViewStateImageMask) == 0) state |= 0x1000;
+                }
             }
             InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             return previous;
@@ -8079,6 +8861,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         (source.mask & ListViewItemState) != 0
                             ? source.state & source.stateMask
                             : 0);
+                    if ((window->listViewExtendedStyle & ListViewExtendedCheckBoxes) != 0 &&
+                        (window->listViewItemStates[position] & ListViewStateImageMask) == 0)
+                        window->listViewItemStates[position] |= 0x1000;
                     window->listViewItemImages.insert(window->listViewItemImages.begin() + position,
                         (source.mask & ListViewItemImage) != 0 ? source.image : -1);
                     if ((window->listViewItemStates[position] &
@@ -10214,8 +10999,18 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     {
     case GuestAbi::WmNcCreate:
         return TRUE;
+    case GuestAbi::WmNcCalcSize:
+    case GuestAbi::WmNcPaint:
+    case GuestAbi::WmNcActivate:
     case GuestAbi::WmNcHitTest:
-        return GuestAbi::HtClient;
+    case GuestAbi::WmNcMouseMove:
+    case GuestAbi::WmNcLButtonDown:
+    case GuestAbi::WmNcLButtonUp:
+    case GuestAbi::WmNcRButtonDown:
+    case GuestAbi::WmNcRButtonUp:
+    case GuestAbi::WmNcMButtonDown:
+    case GuestAbi::WmNcMButtonUp:
+        return DefaultNonClientProcedure(window, message, wParam, lParam);
     case GuestAbi::WmWindowPosChanged:
     {
         GuestWindowPosition position{};
@@ -10593,7 +11388,135 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
 
         const MiniGdi::DcHandle guestDc = FromGuestDc(dc);
         MiniGdi::Surface* surface = m_gdi.GetSurface(guestDc);
-        if (surface)
+        if (surface && parent && controlKind == BuiltinControlKind::Button &&
+            (style & GuestAbi::BsTypeMask) == 0x0000000bu) // BS_OWNERDRAW
+        {
+            GuestDrawItem item{};
+            item.controlType = 4; // ODT_BUTTON
+            item.controlId = static_cast<UINT>(controlId);
+            item.itemId = static_cast<UINT>(-1);
+            item.itemAction = 0x0001; // ODA_DRAWENTIRE
+            item.itemState = (pressed ? 0x0001u : 0u) |
+                (m_focusWindow.load() == reinterpret_cast<ULONG_PTR>(handle) ? 0x0010u : 0u) |
+                (!enabled ? 0x0004u : 0u);
+            item.itemWindow = handle;
+            item.dc = dc;
+            item.itemRect = { 0, 0, surface->Width(), surface->Height() };
+            SendGuestMessage(parent, 0x002b, static_cast<WPARAM>(controlId),
+                reinterpret_cast<LPARAM>(&item), nullptr); // WM_DRAWITEM
+            EndGuestPaint(handle, &paint, nullptr);
+            return 0;
+        }
+        const bool supportsCustomDraw =
+            controlKind == BuiltinControlKind::ListView ||
+            controlKind == BuiltinControlKind::TreeView ||
+            controlKind == BuiltinControlKind::Tab ||
+            controlKind == BuiltinControlKind::Toolbar ||
+            controlKind == BuiltinControlKind::Header;
+        const auto sendCustomDraw = [this, parent, handle, controlId, dc,
+            controlKind, listViewTextColor, listViewTextBackgroundColor,
+            treeTextColor, treeBackgroundColor](
+            DWORD stage, const RECT& bounds, DWORD_PTR itemSpec = 0,
+            UINT itemState = 0, LPARAM itemData = 0, int subItem = 0,
+            COLORREF* customText = nullptr, COLORREF* customBackground = nullptr) -> DWORD
+        {
+            if (!parent) return CustomDrawDoDefault;
+            GuestCustomDrawNotification notification{};
+            notification.header = GuestNotifyHeader{ handle, controlId, NotifyCustomDraw };
+            notification.drawStage = stage;
+            notification.dc = dc;
+            notification.bounds = bounds;
+            notification.itemSpec = itemSpec;
+            notification.itemState = itemState;
+            notification.itemData = itemData;
+            if (controlKind == BuiltinControlKind::ListView)
+            {
+                // NMLVCUSTOMDRAW appends clrText, clrTextBk and iSubItem to
+                // NMCUSTOMDRAW. These fields are writable by the owner.
+                const COLORREF initialText = customText ? *customText : listViewTextColor;
+                const COLORREF initialBackground = customBackground
+                    ? *customBackground : listViewTextBackgroundColor;
+                memcpy(notification.controlSpecific, &initialText,
+                    sizeof(initialText));
+                memcpy(notification.controlSpecific + sizeof(COLORREF),
+                    &initialBackground, sizeof(initialBackground));
+                memcpy(notification.controlSpecific + 2 * sizeof(COLORREF),
+                    &subItem, sizeof(subItem));
+            }
+            else if (controlKind == BuiltinControlKind::TreeView)
+            {
+                const COLORREF initialText = customText ? *customText : treeTextColor;
+                const COLORREF initialBackground = customBackground
+                    ? *customBackground : treeBackgroundColor;
+                memcpy(notification.controlSpecific, &initialText,
+                    sizeof(initialText));
+                memcpy(notification.controlSpecific + sizeof(COLORREF),
+                    &initialBackground, sizeof(initialBackground));
+                memcpy(notification.controlSpecific + 2 * sizeof(COLORREF),
+                    &subItem, sizeof(subItem)); // NMTVCUSTOMDRAW::iLevel
+            }
+            else if (controlKind == BuiltinControlKind::Toolbar)
+            {
+                // NMTBCUSTOMDRAW: three pointer-sized GDI handles precede the
+                // color fields. clrText and clrBtnFace are the values consumed
+                // by this software renderer.
+                const COLORREF initialText = customText ? *customText : RGB(0, 0, 0);
+                const COLORREF initialFace = customBackground
+                    ? *customBackground : RGB(240, 240, 240);
+                memcpy(notification.controlSpecific + 3 * sizeof(void*),
+                    &initialText, sizeof(initialText));
+                memcpy(notification.controlSpecific + 3 * sizeof(void*) +
+                    3 * sizeof(COLORREF), &initialFace, sizeof(initialFace));
+            }
+            const DWORD result = static_cast<DWORD>(SendGuestMessage(parent, GuestAbi::WmNotify,
+                static_cast<WPARAM>(controlId),
+                reinterpret_cast<LPARAM>(&notification), nullptr));
+            if ((controlKind == BuiltinControlKind::ListView ||
+                controlKind == BuiltinControlKind::TreeView) && customText)
+            {
+                memcpy(customText, notification.controlSpecific, sizeof(*customText));
+            }
+            if ((controlKind == BuiltinControlKind::ListView ||
+                controlKind == BuiltinControlKind::TreeView) && customBackground)
+            {
+                memcpy(customBackground,
+                    notification.controlSpecific + sizeof(COLORREF),
+                    sizeof(*customBackground));
+            }
+            if (controlKind == BuiltinControlKind::Toolbar && customText)
+            {
+                memcpy(customText,
+                    notification.controlSpecific + 3 * sizeof(void*),
+                    sizeof(*customText));
+            }
+            if (controlKind == BuiltinControlKind::Toolbar && customBackground)
+            {
+                memcpy(customBackground,
+                    notification.controlSpecific + 3 * sizeof(void*) +
+                        3 * sizeof(COLORREF),
+                    sizeof(*customBackground));
+            }
+            return result;
+        };
+        DWORD customDrawMode = CustomDrawDoDefault;
+        RECT customDrawBounds{};
+        COLORREF customDrawTextColor = controlKind == BuiltinControlKind::TreeView
+            ? treeTextColor : (controlKind == BuiltinControlKind::Toolbar
+                ? RGB(0, 0, 0) : listViewTextColor);
+        COLORREF customDrawBackgroundColor = controlKind == BuiltinControlKind::TreeView
+            ? treeBackgroundColor : (controlKind == BuiltinControlKind::Toolbar
+                ? RGB(240, 240, 240) : listViewTextBackgroundColor);
+        if (surface && supportsCustomDraw)
+        {
+            customDrawBounds = { 0, 0, surface->Width(), surface->Height() };
+            customDrawMode = sendCustomDraw(CustomDrawPrePaint, customDrawBounds,
+                0, 0, 0, 0, &customDrawTextColor,
+                &customDrawBackgroundColor);
+            // WM_NOTIFY is guest code and may destroy or resize the control.
+            // Re-resolve the surface instead of retaining a stale pointer.
+            surface = m_gdi.GetSurface(guestDc);
+        }
+        if (surface && (customDrawMode & CustomDrawSkipDefault) == 0)
         {
             const int width = surface->Width();
             const int height = surface->Height();
@@ -10617,7 +11540,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     fill,
                     focused && visualStyles ? MiniGdi::MakeColor(0, 120, 215) : MiniGdi::MakeColor(96, 96, 96));
             }
-            else if (controlKind == BuiltinControlKind::Edit)
+            else if (controlKind == BuiltinControlKind::Edit ||
+                controlKind == BuiltinControlKind::IpAddress ||
+                controlKind == BuiltinControlKind::HotKey ||
+                controlKind == BuiltinControlKind::DateTime)
             {
                 MiniGdi::DrawRectangle(
                     *surface,
@@ -10649,7 +11575,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             else if (controlKind == BuiltinControlKind::Toolbar ||
                 controlKind == BuiltinControlKind::Rebar ||
                 controlKind == BuiltinControlKind::StatusBar ||
-                controlKind == BuiltinControlKind::Tab)
+                controlKind == BuiltinControlKind::Tab ||
+                controlKind == BuiltinControlKind::Pager ||
+                controlKind == BuiltinControlKind::Animate ||
+                controlKind == BuiltinControlKind::MonthCalendar)
             {
                 MiniGdi::DrawRectangle(
                     *surface,
@@ -11023,7 +11952,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             int textX = 2;
             int textY = (std::max)(0,
                 (height - controlTextHeight) / 2);
-            if (controlKind == BuiltinControlKind::Static)
+            if (controlKind == BuiltinControlKind::Static ||
+                controlKind == BuiltinControlKind::SysLink ||
+                controlKind == BuiltinControlKind::NativeFont)
             {
                 if (!staticImage.Empty())
                 {
@@ -11213,8 +12144,27 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     const int right = (std::min)(width - 1, left + itemWidth);
                     if (right <= left) break;
                     const bool selected = static_cast<int>(index) == tabSelectedItem;
+                    const RECT itemBounds{ left, selected ? 1 : 3, right, itemHeight + 1 };
+                    const UINT itemState = selected ? (0x0001u | 0x0010u) : 0u;
+                    DWORD itemDrawMode = CustomDrawDoDefault;
+                    if ((customDrawMode & CustomDrawNotifyItemDraw) != 0)
+                    {
+                        itemDrawMode = sendCustomDraw(CustomDrawItemPrePaint,
+                            itemBounds, index, itemState);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
+                        if ((itemDrawMode & CustomDrawSkipDefault) != 0)
+                        {
+                            if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
+                                sendCustomDraw(CustomDrawItemPostPaint,
+                                    itemBounds, index, itemState);
+                            left = right;
+                            continue;
+                        }
+                    }
                     MiniGdi::DrawRectangle(*surface,
-                        MiniGdi::Rect{ left, selected ? 1 : 3, right, itemHeight + 1 },
+                        MiniGdi::Rect{ itemBounds.left, itemBounds.top,
+                            itemBounds.right, itemBounds.bottom },
                         selected ? MiniGdi::OpaqueWhite : MiniGdi::MakeColor(232, 232, 232),
                         MiniGdi::MakeColor(144, 144, 144));
                     int textLeft = left + 6;
@@ -11236,6 +12186,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         MiniGdi::Point{ textLeft, (std::max)(2,
                             (itemHeight - controlTextHeight) / 2) },
                         tabItems[index].data(), visible, nullptr);
+                    if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
+                    {
+                        sendCustomDraw(CustomDrawItemPostPaint,
+                            itemBounds, index, itemState);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
+                    }
                     left = right;
                     if (left >= width - 1) break;
                 }
@@ -11255,6 +12212,25 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         ? (std::max)(0, headerItemWidths[item]) : 120;
                     const int right = (std::min)(width, left + itemWidth);
                     if (right <= left) continue;
+                    const RECT itemBounds{ left, 0, right, height };
+                    const UINT itemState = static_cast<int>(item) == headerPressedItem
+                        ? 0x0001u : 0u;
+                    DWORD itemDrawMode = CustomDrawDoDefault;
+                    if ((customDrawMode & CustomDrawNotifyItemDraw) != 0)
+                    {
+                        itemDrawMode = sendCustomDraw(CustomDrawItemPrePaint,
+                            itemBounds, item, itemState);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
+                        if ((itemDrawMode & CustomDrawSkipDefault) != 0)
+                        {
+                            if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
+                                sendCustomDraw(CustomDrawItemPostPaint,
+                                    itemBounds, item, itemState);
+                            left = right;
+                            continue;
+                        }
+                    }
                     MiniGdi::DrawRectangle(*surface, MiniGdi::Rect{ left, 0, right, height },
                         static_cast<int>(item) == headerPressedItem
                             ? MiniGdi::MakeColor(216, 216, 216)
@@ -11278,6 +12254,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     m_gdi.TextOutW(guestDc, MiniGdi::Point{ textLeft,
                         (std::max)(0, (height - controlTextHeight) / 2) },
                         headerItems[item].data(), visible, nullptr);
+                    if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
+                    {
+                        sendCustomDraw(CustomDrawItemPostPaint,
+                            itemBounds, item, itemState);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
+                    }
                     left = right;
                     if (left >= width) break;
                 }
@@ -11307,12 +12290,36 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     if (!node) continue;
                     const bool selected = node->token == treeSelectedItem ||
                         (node->state & TreeStateSelected) != 0;
-                    if (selected)
+                    const RECT itemBounds{ 0, top, width,
+                        (std::min)(height, top + rowHeight) };
+                    const UINT itemState = (selected ? 0x0001u : 0u) |
+                        (node->token == treeSelectedItem ? 0x0010u : 0u);
+                    DWORD itemDrawMode = CustomDrawDoDefault;
+                    COLORREF customItemText = selected
+                        ? RGB(255, 255, 255) : customDrawTextColor;
+                    COLORREF customItemBackground = selected
+                        ? RGB(0, 120, 215) : customDrawBackgroundColor;
+                    if ((customDrawMode & CustomDrawNotifyItemDraw) != 0)
                     {
-                        MiniGdi::DrawRectangle(*surface,
-                            MiniGdi::Rect{ 0, top, width, (std::min)(height, top + rowHeight) },
-                            MiniGdi::MakeColor(0, 120, 215), MiniGdi::MakeColor(0, 120, 215));
+                        itemDrawMode = sendCustomDraw(CustomDrawItemPrePaint,
+                            itemBounds, node->token, itemState, node->itemData,
+                            visible[position].depth, &customItemText,
+                            &customItemBackground);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
+                        if ((itemDrawMode & CustomDrawSkipDefault) != 0)
+                        {
+                            if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
+                                sendCustomDraw(CustomDrawItemPostPaint, itemBounds,
+                                    node->token, itemState, node->itemData,
+                                    visible[position].depth);
+                            continue;
+                        }
                     }
+                    MiniGdi::DrawRectangle(*surface,
+                        MiniGdi::Rect{ 0, top, width, (std::min)(height, top + rowHeight) },
+                        ColorFromGuestColorRef(customItemBackground),
+                        ColorFromGuestColorRef(customItemBackground));
                     const int branchLeft = visible[position].depth * treeIndent + 2;
                     const bool hasChildren = node->declaredChildren != 0 ||
                         std::any_of(treeNodes.begin(), treeNodes.end(), [node](const TreeNode& candidate)
@@ -11354,12 +12361,20 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     const size_t characters = (std::min)(node->text.size(),
                         static_cast<size_t>((std::max)(0, width - textLeft - 2) /
                             controlTextWidth));
-                    const MiniGdi::Color ink = selected
-                        ? MiniGdi::OpaqueWhite : ColorFromGuestColorRef(treeTextColor);
+                    const MiniGdi::Color ink = ColorFromGuestColorRef(customItemText);
                     m_gdi.SetTextColor(guestDc, ink, nullptr);
                     m_gdi.TextOutW(guestDc, MiniGdi::Point{ textLeft,
                         top + (std::max)(0, (rowHeight - controlTextHeight) / 2) },
                         node->text.data(), characters, nullptr);
+                    if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
+                    {
+                        sendCustomDraw(CustomDrawItemPostPaint, itemBounds,
+                            node->token, itemState, node->itemData,
+                            visible[position].depth, &customItemText,
+                            &customItemBackground);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
+                    }
                 }
             }
 
@@ -11399,12 +12414,40 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     const bool buttonEnabled = (buttonState & ToolbarStateEnabled) != 0;
                     const bool buttonPressed = static_cast<int>(index) == toolbarPressedIndex ||
                         (buttonState & (ToolbarStatePressed | ToolbarStateChecked)) != 0;
+                    const RECT itemBounds{ left, 1,
+                        (std::min)(width - 2, left + itemWidth), 1 + buttonHeight };
+                    const UINT itemState = (!buttonEnabled ? 0x0004u : 0u) |
+                        (buttonPressed ? 0x0001u : 0u) |
+                        ((buttonState & ToolbarStateChecked) != 0 ? 0x0008u : 0u) |
+                        ((buttonState & ToolbarStateIndeterminate) != 0 ? 0x0100u : 0u);
+                    DWORD itemDrawMode = CustomDrawDoDefault;
+                    COLORREF customItemText = buttonEnabled
+                        ? customDrawTextColor : RGB(144, 144, 144);
+                    COLORREF customItemBackground = buttonPressed
+                        ? RGB(214, 214, 214)
+                        : (buttonEnabled ? customDrawBackgroundColor : RGB(232, 232, 232));
+                    if ((customDrawMode & CustomDrawNotifyItemDraw) != 0)
+                    {
+                        // comctl32 identifies toolbar items by command id, not
+                        // by their current visual index.
+                        itemDrawMode = sendCustomDraw(CustomDrawItemPrePaint,
+                            itemBounds, static_cast<DWORD_PTR>(toolbarCommands[index]), itemState,
+                            0, 0, &customItemText, &customItemBackground);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
+                        if ((itemDrawMode & CustomDrawSkipDefault) != 0)
+                        {
+                            if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
+                                sendCustomDraw(CustomDrawItemPostPaint, itemBounds,
+                                    static_cast<DWORD_PTR>(toolbarCommands[index]), itemState);
+                            continue;
+                        }
+                    }
                     MiniGdi::DrawRectangle(
                         *surface,
-                        MiniGdi::Rect{ left, 1, (std::min)(width - 2, left + itemWidth), 1 + buttonHeight },
-                        buttonPressed
-                            ? MiniGdi::MakeColor(214, 214, 214)
-                            : (buttonEnabled ? MiniGdi::MakeColor(248, 248, 248) : MiniGdi::MakeColor(232, 232, 232)),
+                        MiniGdi::Rect{ itemBounds.left, itemBounds.top,
+                            itemBounds.right, itemBounds.bottom },
+                        ColorFromGuestColorRef(customItemBackground),
                         buttonEnabled ? MiniGdi::MakeColor(128, 128, 128) : MiniGdi::MakeColor(184, 184, 184));
                     MiniGdi::Surface image;
                     const int bitmapIndex = index < toolbarBitmaps.size()
@@ -11434,8 +12477,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             static_cast<size_t>((std::max)(0, itemWidth - 4) /
                                 GuestMetrics::TextWidth));
                         const int labelWidth = static_cast<int>(visible) * GuestMetrics::TextWidth;
-                        m_gdi.SetTextColor(guestDc, buttonEnabled
-                            ? MiniGdi::OpaqueBlack : MiniGdi::MakeColor(144, 144, 144), nullptr);
+                        m_gdi.SetTextColor(guestDc,
+                            ColorFromGuestColorRef(customItemText), nullptr);
                         m_gdi.TextOutW(guestDc,
                             MiniGdi::Point{ left + (itemWidth - labelWidth) / 2,
                                 (std::max)(iconTop + iconHeight + 1,
@@ -11453,6 +12496,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             MiniGdi::Point{ arrowX, arrowY + 1 }, arrow);
                         MiniGdi::DrawLine(*surface, MiniGdi::Point{ arrowX, arrowY + 1 },
                             MiniGdi::Point{ arrowX + 2, arrowY - 1 }, arrow);
+                    }
+                    if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
+                    {
+                        sendCustomDraw(CustomDrawItemPostPaint, itemBounds,
+                            static_cast<DWORD_PTR>(toolbarCommands[index]), itemState);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
                     }
                 }
             }
@@ -11494,13 +12544,39 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     const bool selected = index < listViewItemStates.size() &&
                         (listViewItemStates[index] & ListViewStateSelected) != 0;
                     const bool editingLabel = static_cast<int>(index) == listViewEditItem;
+                    const RECT itemBounds{ 1, rowTop, (std::max)(1, width - 1),
+                        rowTop + listViewRowHeight };
+                    const UINT customItemState = (selected ? 0x0001u : 0u) |
+                        (static_cast<int>(index) == listViewSelectedItem ? 0x0010u : 0u);
+                    DWORD customItemMode = CustomDrawDoDefault;
+                    COLORREF customItemText = selected ? RGB(255, 255, 255) : customDrawTextColor;
+                    COLORREF customItemBackground = selected
+                        ? RGB(0, 120, 215) : customDrawBackgroundColor;
+                    if ((customDrawMode & CustomDrawNotifyItemDraw) != 0)
+                    {
+                        customItemMode = sendCustomDraw(CustomDrawItemPrePaint,
+                            itemBounds, index, customItemState,
+                            index < listViewItemData.size() ? listViewItemData[index] : 0,
+                            0, &customItemText, &customItemBackground);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
+                        if ((customItemMode & CustomDrawSkipDefault) != 0)
+                        {
+                            if ((customItemMode & CustomDrawNotifyPostPaint) != 0)
+                                sendCustomDraw(CustomDrawItemPostPaint, itemBounds,
+                                    index, customItemState,
+                                    index < listViewItemData.size() ? listViewItemData[index] : 0);
+                            continue;
+                        }
+                    }
                     if (selected)
                     {
                         MiniGdi::FillRect(
                             *surface,
                             MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + listViewRowHeight },
-                            MiniGdi::MakeColor(0, 120, 215));
-                        m_gdi.SetTextColor(guestDc, MiniGdi::OpaqueWhite, nullptr);
+                            ColorFromGuestColorRef(customItemBackground));
+                        m_gdi.SetTextColor(guestDc,
+                            ColorFromGuestColorRef(customItemText), nullptr);
                     }
                     else
                     {
@@ -11510,7 +12586,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         MiniGdi::FillRect(
                             *surface,
                             MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + listViewRowHeight },
-                            ColorFromGuestColorRef(listViewTextBackgroundColor));
+                            ColorFromGuestColorRef(customItemBackground));
+                        m_gdi.SetTextColor(guestDc,
+                            ColorFromGuestColorRef(customItemText), nullptr);
                     }
                     if (editingLabel)
                     {
@@ -11639,8 +12717,63 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         const int cellWidth = subItem < listColumnWidths.size()
                             ? (std::max)(24, listColumnWidths[subItem])
                             : 120;
+                        const RECT subItemBounds{ cellLeft, rowTop,
+                            (std::min)(width, cellLeft + cellWidth),
+                            rowTop + listViewRowHeight };
+                        DWORD customSubItemMode = CustomDrawDoDefault;
+                        COLORREF customSubItemText = customItemText;
+                        COLORREF customSubItemBackground = customItemBackground;
+                        const bool customSubItemNotified =
+                            (customItemMode & CustomDrawNotifySubItemDraw) != 0;
+                        if (customSubItemNotified)
+                        {
+                            customSubItemMode = sendCustomDraw(
+                                CustomDrawItemPrePaint | CustomDrawSubItem,
+                                subItemBounds, index, customItemState,
+                                index < listViewItemData.size() ? listViewItemData[index] : 0,
+                                static_cast<int>(subItem), &customSubItemText,
+                                &customSubItemBackground);
+                            surface = m_gdi.GetSurface(guestDc);
+                            if (!surface) break;
+                        }
+                        if (customSubItemNotified &&
+                            (customSubItemMode & CustomDrawSkipDefault) == 0)
+                        {
+                            MiniGdi::FillRect(*surface,
+                                MiniGdi::Rect{ subItemBounds.left, subItemBounds.top,
+                                    subItemBounds.right, subItemBounds.bottom },
+                                ColorFromGuestColorRef(customSubItemBackground));
+                            m_gdi.SetTextColor(guestDc,
+                                ColorFromGuestColorRef(customSubItemText), nullptr);
+                        }
                         int textInset = 2;
-                        if (subItem == 0 && listViewImageList && index < listViewItemImages.size() &&
+                        if ((customSubItemMode & CustomDrawSkipDefault) == 0 &&
+                            subItem == 0 &&
+                            (listViewExtendedStyle & ListViewExtendedCheckBoxes) != 0)
+                        {
+                            const UINT stateImage = index < listViewItemStates.size()
+                                ? (listViewItemStates[index] & ListViewStateImageMask) >> 12 : 1;
+                            const int boxSize = (std::max)(8, (std::min)(13, listViewRowHeight - 4));
+                            const int boxTop = rowTop + (listViewRowHeight - boxSize) / 2;
+                            MiniGdi::DrawRectangle(*surface,
+                                MiniGdi::Rect{ cellLeft + 2, boxTop,
+                                    cellLeft + 2 + boxSize, boxTop + boxSize },
+                                MiniGdi::OpaqueWhite, MiniGdi::MakeColor(96, 96, 96));
+                            if (stateImage == 2)
+                            {
+                                MiniGdi::DrawLine(*surface,
+                                    MiniGdi::Point{ cellLeft + 4, boxTop + boxSize / 2 },
+                                    MiniGdi::Point{ cellLeft + 2 + boxSize / 2, boxTop + boxSize - 3 },
+                                    MiniGdi::MakeColor(0, 96, 0));
+                                MiniGdi::DrawLine(*surface,
+                                    MiniGdi::Point{ cellLeft + 2 + boxSize / 2, boxTop + boxSize - 3 },
+                                    MiniGdi::Point{ cellLeft + boxSize, boxTop + 3 },
+                                    MiniGdi::MakeColor(0, 96, 0));
+                            }
+                            textInset += boxSize + 4;
+                        }
+                        if ((customSubItemMode & CustomDrawSkipDefault) == 0 &&
+                            subItem == 0 && listViewImageList && index < listViewItemImages.size() &&
                             listViewItemImages[index] >= 0)
                         {
                             MiniGdi::Surface image;
@@ -11654,15 +12787,27 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                                 textInset += iconSize + 2;
                             }
                         }
-                        const size_t visibleCellCharacters = static_cast<size_t>((std::max)(0,
-                            (cellWidth - textInset - 2) / controlTextWidth));
-                        const size_t cellCharacters = (std::min)(cellText->size(), visibleCellCharacters);
-                        m_gdi.TextOutW(
-                            guestDc,
-                            MiniGdi::Point{ cellLeft + textInset, rowTop },
-                            cellText->data(),
-                            cellCharacters,
-                            nullptr);
+                        if ((customSubItemMode & CustomDrawSkipDefault) == 0)
+                        {
+                            const size_t visibleCellCharacters = static_cast<size_t>((std::max)(0,
+                                (cellWidth - textInset - 2) / controlTextWidth));
+                            const size_t cellCharacters = (std::min)(cellText->size(), visibleCellCharacters);
+                            m_gdi.TextOutW(
+                                guestDc,
+                                MiniGdi::Point{ cellLeft + textInset, rowTop },
+                                cellText->data(),
+                                cellCharacters,
+                                nullptr);
+                        }
+                        if ((customSubItemMode & CustomDrawNotifyPostPaint) != 0)
+                        {
+                            sendCustomDraw(CustomDrawItemPostPaint | CustomDrawSubItem,
+                                subItemBounds, index, customItemState,
+                                index < listViewItemData.size() ? listViewItemData[index] : 0,
+                                static_cast<int>(subItem));
+                            surface = m_gdi.GetSurface(guestDc);
+                            if (!surface) break;
+                        }
                         cellLeft += cellWidth;
                     }
                     if (selected)
@@ -11685,6 +12830,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             MiniGdi::Point{ 1, rowTop + listViewRowHeight - 1 },
                             MiniGdi::Point{ (std::max)(1, width - 2), rowTop + listViewRowHeight - 1 },
                             MiniGdi::MakeColor(208, 208, 208));
+                    }
+                    if ((customItemMode & CustomDrawNotifyPostPaint) != 0)
+                    {
+                        sendCustomDraw(CustomDrawItemPostPaint, itemBounds,
+                            index, customItemState,
+                            index < listViewItemData.size() ? listViewItemData[index] : 0);
+                        surface = m_gdi.GetSurface(guestDc);
+                        if (!surface) break;
                     }
                 }
             }
@@ -11717,6 +12870,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 m_gdi.SetTextColor(guestDc, previousText, nullptr);
             }
         }
+        if (surface && supportsCustomDraw &&
+            (customDrawMode & CustomDrawNotifyPostPaint) != 0)
+        {
+            sendCustomDraw(CustomDrawPostPaint, customDrawBounds);
+        }
         EndGuestPaint(handle, &paint, nullptr);
         return 0;
     }
@@ -11729,6 +12887,51 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     case BuiltinControlKind::Button:
         switch (message)
         {
+        case 0x00f0: // BM_GETCHECK
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            return window->buttonCheck;
+        }
+        case 0x00f1: // BM_SETCHECK
+        {
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                window->buttonCheck = static_cast<UINT>((std::min)(wParam, static_cast<WPARAM>(2)));
+            }
+            invalidate();
+            return 0;
+        }
+        case 0x00f2: // BM_GETSTATE
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            UINT state = window->buttonCheck;
+            if (window->buttonPressed || window->buttonKeyboardPressed) state |= 0x0004u;
+            if (m_focusWindow.load() == reinterpret_cast<ULONG_PTR>(window->handle)) state |= 0x0008u;
+            return state;
+        }
+        case 0x00f3: // BM_SETSTATE
+        {
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                window->buttonPressed = wParam != FALSE;
+            }
+            invalidate();
+            return 0;
+        }
+        case 0x00f4: // BM_SETSTYLE
+        {
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                window->style = (window->style & ~GuestAbi::BsTypeMask) |
+                    (static_cast<DWORD>(wParam) & GuestAbi::BsTypeMask);
+            }
+            if (lParam) invalidate();
+            return 0;
+        }
+        case 0x00f5: // BM_CLICK
+            activateButton();
+            notifyParent(GuestAbi::BnClicked);
+            return 0;
         case GuestAbi::WmLButtonDown:
         {
             HWND handle = nullptr;
@@ -11785,6 +12988,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             invalidate();
             if (clicked)
             {
+                activateButton();
                 notifyParent(GuestAbi::BnClicked);
             }
             return 0;
@@ -11822,6 +13026,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 invalidate();
                 if (clicked)
                 {
+                    activateButton();
                     notifyParent(GuestAbi::BnClicked);
                 }
             }
@@ -12745,6 +13950,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             HWND handle = nullptr;
             bool changed = false;
             bool activate = false;
+            bool checkChanged = false;
+            UINT oldCheckState = 0;
+            UINT newCheckState = 0;
             int item = -1;
             int previousItem = -1;
             {
@@ -12771,6 +13979,19 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     window->listViewSelectedItem = item;
                     window->listViewSelectionMark = item;
                     window->listViewPressedItem = item;
+                    if ((window->listViewExtendedStyle & ListViewExtendedCheckBoxes) != 0 &&
+                        x >= 0 && x < 20)
+                    {
+                        oldCheckState = window->listViewItemStates[static_cast<size_t>(item)] &
+                            ListViewStateImageMask;
+                        if (oldCheckState == 0) oldCheckState = 0x1000;
+                        newCheckState = oldCheckState == 0x2000 ? 0x1000 : 0x2000;
+                        window->listViewItemStates[static_cast<size_t>(item)] =
+                            (window->listViewItemStates[static_cast<size_t>(item)] &
+                                ~ListViewStateImageMask) | newCheckState;
+                        checkChanged = true;
+                        changed = true;
+                    }
                     const auto now = std::chrono::steady_clock::now();
                     activate = window->listViewLastClickItem == item &&
                         now - window->listViewLastClick <= std::chrono::milliseconds(500);
@@ -12802,6 +14023,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     ListViewStateSelected,
                     POINT{ x, y });
             }
+            if (checkChanged)
+                notifyOwner(ListViewNotifyItemChanged, item, oldCheckState,
+                    newCheckState, ListViewStateImageMask, POINT{ x, y });
             if (activate)
             {
                 notifyOwner(NotifyDoubleClick, item, 0, 0, 0, POINT{ x, y });
@@ -13500,8 +14724,18 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
     {
     case GuestAbi::WmNcCreate:
         return TRUE;
+    case GuestAbi::WmNcCalcSize:
+    case GuestAbi::WmNcPaint:
+    case GuestAbi::WmNcActivate:
     case GuestAbi::WmNcHitTest:
-        return GuestAbi::HtClient;
+    case GuestAbi::WmNcMouseMove:
+    case GuestAbi::WmNcLButtonDown:
+    case GuestAbi::WmNcLButtonUp:
+    case GuestAbi::WmNcRButtonDown:
+    case GuestAbi::WmNcRButtonUp:
+    case GuestAbi::WmNcMButtonDown:
+    case GuestAbi::WmNcMButtonUp:
+        return DefaultNonClientProcedure(record, message, wParam, lParam);
     case GuestAbi::WmWindowPosChanged:
     {
         GuestWindowPosition position{};
@@ -13559,14 +14793,140 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
     }
 }
 
+std::shared_ptr<GuestMessageQueue> GuestWindowManager::MessageQueueForThread(
+    DWORD threadId, bool create)
+{
+    if (!threadId) return nullptr;
+    std::lock_guard<std::mutex> guard(m_messageQueuesLock);
+    const auto found = m_messageQueues.find(threadId);
+    if (found != m_messageQueues.end()) return found->second;
+    if (!create || !m_active.load()) return nullptr;
+    auto queue = std::make_shared<GuestMessageQueue>();
+    m_messageQueues.emplace(threadId, queue);
+    return queue;
+}
+
+void GuestWindowManager::DispatchSentMessageToken(ULONG_PTR token)
+{
+    std::shared_ptr<SentMessageRecord> sent;
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        const auto found = m_sentMessages.find(token);
+        if (found == m_sentMessages.end()) return;
+        sent = found->second;
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_inSendStateLock);
+        m_inSendState[BridgeGetCurrentThreadId()].push_back(sent->sendState);
+    }
+    LRESULT result = 0;
+    const auto target = FindWindow(sent->window);
+    if (target)
+    {
+        result = CallWindowProcedure(target, sent->message, sent->wParam, sent->lParam);
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_inSendStateLock);
+        auto found = m_inSendState.find(BridgeGetCurrentThreadId());
+        if (found != m_inSendState.end())
+        {
+            if (!found->second.empty()) found->second.pop_back();
+            if (found->second.empty()) m_inSendState.erase(found);
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(sent->lock);
+        if (!sent->cancelled) sent->result = result;
+        sent->completed = true;
+    }
+    sent->completedChanged.notify_all();
+    if (sent->callback)
+    {
+        const auto callbackQueue = MessageQueueForThread(sent->senderThread, false);
+        if (callbackQueue && callbackQueue->Post(nullptr, InternalSentCallbackMessage,
+            static_cast<WPARAM>(token), 0)) return;
+    }
+    if (sent->autoRelease)
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        m_sentMessages.erase(token);
+    }
+}
+
+void GuestWindowManager::DispatchSentCallbackToken(ULONG_PTR token)
+{
+    std::shared_ptr<SentMessageRecord> sent;
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        const auto found = m_sentMessages.find(token);
+        if (found == m_sentMessages.end()) return;
+        sent = found->second;
+    }
+    InvokeGuestSendAsyncProcedure(sent->callback, sent->window, sent->message,
+        sent->callbackData, sent->result);
+    std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+    m_sentMessages.erase(token);
+}
+
+bool GuestWindowManager::DispatchOneSentMessage(DWORD threadId)
+{
+    const auto queue = MessageQueueForThread(threadId, false);
+    if (!queue) return false;
+    GuestAbi::Message internal{};
+    const HWND threadOnly = reinterpret_cast<HWND>(static_cast<LONG_PTR>(-1));
+    if (queue->Peek(&internal, threadOnly, InternalSentMessage,
+        InternalSentMessage, GuestAbi::PeekRemove))
+        DispatchSentMessageToken(static_cast<ULONG_PTR>(internal.wParam));
+    else if (queue->Peek(&internal, threadOnly, InternalSentCallbackMessage,
+        InternalSentCallbackMessage, GuestAbi::PeekRemove))
+        DispatchSentCallbackToken(static_cast<ULONG_PTR>(internal.wParam));
+    else return false;
+    return true;
+}
+
 BOOL GuestWindowManager::PostGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam, DWORD* win32Error)
 {
-    if (window && !IsGuestWindow(window))
+    DWORD targetThread = BridgeGetCurrentThreadId();
+    if (window)
     {
-        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        const auto record = FindWindow(window);
+        if (!record)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return FALSE;
+        }
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return FALSE;
+        }
+        targetThread = record->threadId;
+    }
+    const auto queue = MessageQueueForThread(targetThread, true);
+    if (!queue || !queue->Post(window, message, wParam, lParam))
+    {
+        SetWin32Error(win32Error, ERROR_NOT_ENOUGH_QUOTA);
         return FALSE;
     }
-    if (!m_messages.Post(window, message, wParam, lParam))
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL GuestWindowManager::PostGuestThreadMessage(
+    DWORD threadId, UINT message, WPARAM wParam, LPARAM lParam, DWORD* win32Error)
+{
+    // As in USER32/ReactOS, posting does not create the destination queue. The
+    // target thread must already have called a USER function which creates it.
+    const auto queue = MessageQueueForThread(threadId, false);
+    if (!queue)
+    {
+        // ERROR_INVALID_THREAD_ID is omitted by some UWP SDK partitions.
+        constexpr DWORD InvalidThreadIdError = 1444;
+        SetWin32Error(win32Error, InvalidThreadIdError);
+        return FALSE;
+    }
+    if (!queue->Post(nullptr, message, wParam, lParam))
     {
         SetWin32Error(win32Error, ERROR_NOT_ENOUGH_QUOTA);
         return FALSE;
@@ -13582,21 +14942,17 @@ bool GuestWindowManager::PostGuestTimerMessage(HWND window, UINT_PTR timerId)
         return false;
     }
 
+    DWORD targetThread = BridgeGetCurrentThreadId();
     if (window)
     {
         const auto record = FindWindow(window);
-        if (!record)
-        {
-            return false;
-        }
+        if (!record) return false;
         std::lock_guard<std::mutex> guard(record->lock);
-        if (record->destroyed)
-        {
-            return false;
-        }
+        if (record->destroyed) return false;
+        targetThread = record->threadId;
     }
-
-    return m_messages.PostTimer(window, timerId);
+    const auto queue = MessageQueueForThread(targetThread, true);
+    return queue && queue->PostTimer(window, timerId);
 }
 
 LRESULT GuestWindowManager::SendGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam, DWORD* win32Error)
@@ -13607,23 +14963,330 @@ LRESULT GuestWindowManager::SendGuestMessage(HWND window, UINT message, WPARAM w
         SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
         return 0;
     }
+    DWORD targetThread = 0;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return 0;
+        }
+        targetThread = record->threadId;
+    }
+    const DWORD currentThread = BridgeGetCurrentThreadId();
+    if (targetThread == currentThread)
+    {
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return CallWindowProcedure(record, message, wParam, lParam);
+    }
+
+    const auto targetQueue = MessageQueueForThread(targetThread, false);
+    if (!targetQueue)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return 0;
+    }
+    auto sent = std::make_shared<SentMessageRecord>();
+    sent->window = window;
+    sent->message = message;
+    sent->wParam = wParam;
+    sent->lParam = lParam;
+    sent->targetThread = targetThread;
+    ULONG_PTR token = 0;
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        token = ++m_nextSentMessage;
+        if (!token) token = ++m_nextSentMessage;
+        m_sentMessages[token] = sent;
+    }
+    if (!targetQueue->Post(nullptr, InternalSentMessage,
+        static_cast<WPARAM>(token), 0))
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        m_sentMessages.erase(token);
+        SetWin32Error(win32Error, ERROR_NOT_ENOUGH_QUOTA);
+        return 0;
+    }
+
+    // Sent messages are reentrant. While A waits for B, A must remain able to
+    // dispatch a synchronous callback sent back by B, otherwise ordinary UI
+    // ownership and notification chains deadlock.
+    std::unique_lock<std::mutex> sentLock(sent->lock);
+    while (!sent->completed)
+    {
+        sent->completedChanged.wait_for(sentLock, std::chrono::milliseconds(5));
+        if (sent->completed) break;
+        sentLock.unlock();
+        while (DispatchOneSentMessage(currentThread)) {}
+        sentLock.lock();
+    }
+    const LRESULT result = sent->result;
+    const bool cancelled = sent->cancelled;
+    sentLock.unlock();
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        m_sentMessages.erase(token);
+    }
+    SetWin32Error(win32Error, cancelled ? ERROR_INVALID_WINDOW_HANDLE : ERROR_SUCCESS);
+    return result;
+}
+
+BOOL GuestWindowManager::SendGuestMessageTimeout(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam, UINT flags, UINT timeoutMilliseconds,
+    DWORD_PTR* result, DWORD* win32Error)
+{
+    constexpr UINT SupportedFlags = 0x0001u | 0x0002u | 0x0008u;
+    constexpr UINT BlockFlag = 0x0001u;
+    constexpr DWORD TimeoutError = 1460;
+    if (result) *result = 0;
+    if ((flags & ~SupportedFlags) != 0)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    DWORD targetThread = 0;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return FALSE;
+        }
+        targetThread = record->threadId;
+    }
+    const DWORD currentThread = BridgeGetCurrentThreadId();
+    if (targetThread == currentThread)
+    {
+        const LRESULT value = CallWindowProcedure(record, message, wParam, lParam);
+        if (result) *result = static_cast<DWORD_PTR>(value);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return TRUE;
+    }
+    const auto targetQueue = MessageQueueForThread(targetThread, false);
+    if (!targetQueue)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    auto sent = std::make_shared<SentMessageRecord>();
+    sent->window = window;
+    sent->message = message;
+    sent->wParam = wParam;
+    sent->lParam = lParam;
+    sent->targetThread = targetThread;
+    sent->senderThread = currentThread;
+    ULONG_PTR token = 0;
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        token = ++m_nextSentMessage;
+        if (!token) token = ++m_nextSentMessage;
+        m_sentMessages[token] = sent;
+    }
+    if (!targetQueue->Post(nullptr, InternalSentMessage, static_cast<WPARAM>(token), 0))
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        m_sentMessages.erase(token);
+        SetWin32Error(win32Error, ERROR_NOT_ENOUGH_QUOTA);
+        return FALSE;
+    }
+
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeoutMilliseconds);
+    std::unique_lock<std::mutex> sentLock(sent->lock);
+    while (!sent->completed)
+    {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+        {
+            sent->cancelled = true;
+            break;
+        }
+        const auto wake = std::min(deadline, now + std::chrono::milliseconds(5));
+        sent->completedChanged.wait_until(sentLock, wake);
+        if (!sent->completed && (flags & BlockFlag) == 0)
+        {
+            sentLock.unlock();
+            while (DispatchOneSentMessage(currentThread)) {}
+            sentLock.lock();
+        }
+    }
+    const bool completed = sent->completed && !sent->cancelled;
+    const LRESULT value = sent->result;
+    sentLock.unlock();
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        m_sentMessages.erase(token);
+    }
+    if (completed && result) *result = static_cast<DWORD_PTR>(value);
+    SetWin32Error(win32Error, completed ? ERROR_SUCCESS : TimeoutError);
+    return completed ? TRUE : FALSE;
+}
+
+BOOL GuestWindowManager::QueueAsynchronousSentMessage(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam,
+    void (CALLBACK* callback)(HWND, UINT, ULONG_PTR, LRESULT),
+    ULONG_PTR callbackData, DWORD sendState, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    DWORD targetThread = 0;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return FALSE;
+        }
+        targetThread = record->threadId;
+    }
+    const DWORD senderThread = BridgeGetCurrentThreadId();
+    if (targetThread == senderThread)
+    {
+        const LRESULT value = CallWindowProcedure(record, message, wParam, lParam);
+        InvokeGuestSendAsyncProcedure(callback, window, message, callbackData, value);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return TRUE;
+    }
+    const auto targetQueue = MessageQueueForThread(targetThread, false);
+    if (!targetQueue)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    MessageQueueForThread(senderThread, true);
+    auto sent = std::make_shared<SentMessageRecord>();
+    sent->window = window;
+    sent->message = message;
+    sent->wParam = wParam;
+    sent->lParam = lParam;
+    sent->targetThread = targetThread;
+    sent->senderThread = senderThread;
+    sent->sendState = sendState;
+    sent->callback = callback;
+    sent->callbackData = callbackData;
+    sent->autoRelease = true;
+    ULONG_PTR token = 0;
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        token = ++m_nextSentMessage;
+        if (!token) token = ++m_nextSentMessage;
+        m_sentMessages[token] = sent;
+    }
+    if (!targetQueue->Post(nullptr, InternalSentMessage, static_cast<WPARAM>(token), 0))
+    {
+        std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+        m_sentMessages.erase(token);
+        SetWin32Error(win32Error, ERROR_NOT_ENOUGH_QUOTA);
+        return FALSE;
+    }
     SetWin32Error(win32Error, ERROR_SUCCESS);
-    return CallWindowProcedure(record, message, wParam, lParam);
+    return TRUE;
+}
+
+BOOL GuestWindowManager::SendGuestNotifyMessage(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam, DWORD* win32Error)
+{
+    return QueueAsynchronousSentMessage(window, message, wParam, lParam,
+        nullptr, 0, GuestIsmexNotify, win32Error);
+}
+
+BOOL GuestWindowManager::SendGuestMessageCallback(HWND window, UINT message,
+    WPARAM wParam, LPARAM lParam,
+    void (CALLBACK* callback)(HWND, UINT, ULONG_PTR, LRESULT),
+    ULONG_PTR callbackData, DWORD* win32Error)
+{
+    if (!callback)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    return QueueAsynchronousSentMessage(window, message, wParam, lParam,
+        callback, callbackData, GuestIsmexCallback, win32Error);
+}
+
+DWORD GuestWindowManager::GuestInSendMessageState() const
+{
+    std::lock_guard<std::mutex> guard(m_inSendStateLock);
+    const auto found = m_inSendState.find(BridgeGetCurrentThreadId());
+    return found == m_inSendState.end() || found->second.empty()
+        ? 0 : found->second.back();
 }
 
 void GuestWindowManager::PostGuestQuitMessage(int exitCode)
 {
-    m_messages.PostQuit(exitCode);
+    if (const auto queue = MessageQueueForThread(BridgeGetCurrentThreadId(), true))
+        queue->PostQuit(exitCode);
 }
 
 GuestGetMessageResult GuestWindowManager::GetGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum)
 {
-    return m_messages.Get(message, filter, minimum, maximum);
+    const auto queue = MessageQueueForThread(BridgeGetCurrentThreadId(), true);
+    if (!queue) return GuestGetMessageResult::Error;
+    for (;;)
+    {
+        const GuestGetMessageResult result = queue->Get(message, filter, minimum, maximum);
+        if (result != GuestGetMessageResult::Message || message->hwnd != nullptr ||
+            (message->message != InternalSentMessage &&
+             message->message != InternalSentCallbackMessage))
+            return result;
+        if (message->message == InternalSentMessage)
+            DispatchSentMessageToken(static_cast<ULONG_PTR>(message->wParam));
+        else
+            DispatchSentCallbackToken(static_cast<ULONG_PTR>(message->wParam));
+    }
 }
 
 BOOL GuestWindowManager::PeekGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum, UINT removeFlags)
 {
-    return m_messages.Peek(message, filter, minimum, maximum, removeFlags) ? TRUE : FALSE;
+    const auto queue = MessageQueueForThread(BridgeGetCurrentThreadId(), true);
+    if (!queue) return FALSE;
+    // USER32 dispatches pending sent messages before returning posted work.
+    // Repeat after the filtered peek as well, closing the race where a sender
+    // enqueues between the first drain and the queue inspection.
+    for (;;)
+    {
+        while (DispatchOneSentMessage(BridgeGetCurrentThreadId())) {}
+        if (!queue->Peek(message, filter, minimum, maximum, removeFlags)) return FALSE;
+        if (message->hwnd != nullptr ||
+            (message->message != InternalSentMessage &&
+             message->message != InternalSentCallbackMessage))
+            return TRUE;
+        GuestAbi::Message removed{};
+        queue->Peek(&removed, reinterpret_cast<HWND>(static_cast<LONG_PTR>(-1)),
+            message->message, message->message, GuestAbi::PeekRemove);
+        if (removed.message == InternalSentMessage)
+            DispatchSentMessageToken(static_cast<ULONG_PTR>(removed.wParam));
+        else
+            DispatchSentCallbackToken(static_cast<ULONG_PTR>(removed.wParam));
+    }
+}
+
+DWORD GuestWindowManager::GetGuestWindowThreadId(HWND window, DWORD* win32Error) const
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return 0;
+    }
+    std::lock_guard<std::mutex> guard(record->lock);
+    if (record->destroyed)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return 0;
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return record->threadId;
 }
 
 BOOL GuestWindowManager::TranslateGuestMessage(const GuestAbi::Message* message)
@@ -13666,7 +15329,7 @@ LRESULT GuestWindowManager::DispatchGuestMessage(const GuestAbi::Message* messag
         }
         std::lock_guard<std::mutex> guard(record->lock);
         record->paintPosted = false;
-        if (!record->invalidated)
+        if (!record->invalidated && !record->internalPaintPending)
         {
             SetWin32Error(win32Error, ERROR_SUCCESS);
             return 0;
@@ -13774,34 +15437,27 @@ bool GuestWindowManager::EraseGuestBackground(
 
 void GuestWindowManager::PostPaint(const std::shared_ptr<WindowRecord>& window, const RECT* rect, BOOL erase)
 {
-    if (!window)
-    {
-        return;
-    }
+    if (!window) return;
+    const RECT clipped = ClipToSurface(rect, window->surface);
+    PostPaintRegion(window, MiniGdi::RectRegion(
+        { clipped.left, clipped.top, clipped.right, clipped.bottom }), erase);
+}
 
+void GuestWindowManager::PostPaintRegion(
+    const std::shared_ptr<WindowRecord>& window,
+    const MiniGdi::Region& region,
+    BOOL erase)
+{
+    if (!window || region.Empty()) return;
     bool post = false;
     {
         std::lock_guard<std::mutex> guard(window->lock);
-        if (window->destroyed)
-        {
-            return;
-        }
-
-        const RECT clipped = ClipToSurface(rect, window->surface);
-        if (!HasArea(clipped))
-        {
-            return;
-        }
-
-        if (!window->invalidated)
-        {
-            window->invalidated = true;
-            window->updateRect = clipped;
-        }
-        else
-        {
-            UnionDamage(&window->updateRect, clipped);
-        }
+        if (window->destroyed) return;
+        const MiniGdi::Region clipped = MiniGdi::IntersectRegion(
+            MiniGdi::RectRegion(window->surface.Bounds()), region);
+        if (clipped.Empty()) return;
+        window->updateRegion = MiniGdi::UnionRegion(window->updateRegion, clipped);
+        window->invalidated = !window->updateRegion.Empty();
         window->erasePending = window->erasePending || erase != FALSE;
         if (!window->paintPosted)
         {
@@ -13814,6 +15470,27 @@ void GuestWindowManager::PostPaint(const std::shared_ptr<WindowRecord>& window, 
         // A bounded queue can reject a paint while the region remains dirty.
         // Do not strand that region behind a phantom "posted" bit: a later
         // invalidation or UpdateWindow gets another chance to schedule it.
+        std::lock_guard<std::mutex> guard(window->lock);
+        window->paintPosted = false;
+    }
+}
+
+void GuestWindowManager::PostInternalPaint(const std::shared_ptr<WindowRecord>& window)
+{
+    if (!window) return;
+    bool post = false;
+    {
+        std::lock_guard<std::mutex> guard(window->lock);
+        if (window->destroyed) return;
+        window->internalPaintPending = true;
+        if (!window->paintPosted)
+        {
+            window->paintPosted = true;
+            post = true;
+        }
+    }
+    if (post && !PostGuestMessage(window->handle, GuestAbi::WmPaint, 0, 0, nullptr))
+    {
         std::lock_guard<std::mutex> guard(window->lock);
         window->paintPosted = false;
     }
@@ -13854,6 +15531,134 @@ BOOL GuestWindowManager::InvalidateGuestRect(HWND window, const RECT* rect, BOOL
     return TRUE;
 }
 
+BOOL GuestWindowManager::InvalidateGuestRegion(
+    HWND window, const MiniGdi::Region& region, BOOL erase, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    PostPaintRegion(record, region, erase);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL GuestWindowManager::ValidateGuestRect(HWND window, const RECT* rect, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+
+    const RECT validation = ClipToSurface(rect, record->surface);
+    const MiniGdi::Region region = rect
+        ? MiniGdi::RectRegion({ validation.left, validation.top, validation.right, validation.bottom })
+        : MiniGdi::RectRegion(record->surface.Bounds());
+    return ValidateGuestRegion(window, region, win32Error);
+}
+
+BOOL GuestWindowManager::ValidateGuestRegion(
+    HWND window, const MiniGdi::Region& region, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    std::lock_guard<std::mutex> guard(record->lock);
+    record->updateRegion = MiniGdi::SubtractRegion(record->updateRegion, region);
+    record->invalidated = !record->updateRegion.Empty();
+    if (!record->invalidated) record->erasePending = false;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL GuestWindowManager::GetGuestUpdateRect(HWND window, RECT* rect, BOOL erase, DWORD* win32Error)
+{
+    MiniGdi::Region region;
+    const BOOL dirty = GetGuestUpdateRegion(window, &region, erase, win32Error);
+    if (rect)
+    {
+        const MiniGdi::Rect bounds = region.Bounds();
+        *rect = { bounds.left, bounds.top, bounds.right, bounds.bottom };
+    }
+    return dirty;
+}
+
+BOOL GuestWindowManager::GetGuestUpdateRegion(
+    HWND window, MiniGdi::Region* region, BOOL erase, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    MiniGdi::Region update;
+    bool dirty = false;
+    bool shouldErase = false;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        dirty = record->invalidated;
+        if (dirty) update = record->updateRegion;
+        shouldErase = erase && dirty && record->erasePending;
+        if (shouldErase) record->erasePending = false;
+    }
+    if (region) *region = update;
+    if (shouldErase)
+    {
+        const HDC dc = ToGuestDc(record->dc);
+        MiniGdi::Region previousClip;
+        const bool clipped = m_gdi.GetClipRegion(record->dc, &previousClip) &&
+            m_gdi.SetClipRegion(record->dc, MiniGdi::IntersectRegion(previousClip, update));
+        const LRESULT handled = CallWindowProcedure(record, GuestAbi::WmEraseBkgnd,
+            reinterpret_cast<WPARAM>(dc), 0);
+        const MiniGdi::Rect bounds = update.Bounds();
+        if (handled == 0) EraseGuestBackground(record, dc,
+            { bounds.left, bounds.top, bounds.right, bounds.bottom });
+        if (clipped) m_gdi.SetClipRegion(record->dc, previousClip);
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return dirty ? TRUE : FALSE;
+}
+
+BOOL GuestWindowManager::SetGuestErasePending(HWND window, BOOL pending, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    std::lock_guard<std::mutex> guard(record->lock);
+    record->erasePending = pending != FALSE && record->invalidated;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL GuestWindowManager::SetGuestInternalPaint(HWND window, BOOL pending, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    if (pending) PostInternalPaint(record);
+    else
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        record->internalPaintPending = false;
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
 BOOL GuestWindowManager::UpdateGuestWindow(HWND window, DWORD* win32Error)
 {
     const auto record = FindWindow(window);
@@ -13866,7 +15671,7 @@ BOOL GuestWindowManager::UpdateGuestWindow(HWND window, DWORD* win32Error)
     bool needsPaint = false;
     {
         std::lock_guard<std::mutex> guard(record->lock);
-        needsPaint = record->invalidated;
+        needsPaint = record->invalidated || record->internalPaintPending;
     }
     if (needsPaint)
     {
@@ -13886,6 +15691,7 @@ HDC GuestWindowManager::BeginGuestPaint(HWND window, GuestAbi::PaintStruct* pain
     }
 
     HDC dc = nullptr;
+    MiniGdi::Region updateRegion;
     RECT update = {};
     bool erase = false;
     {
@@ -13904,13 +15710,39 @@ HDC GuestWindowManager::BeginGuestPaint(HWND window, GuestAbi::PaintStruct* pain
         dc = ToGuestDc(record->dc);
         if (record->invalidated)
         {
-            update = record->updateRect;
+            updateRegion = record->updateRegion;
+            const MiniGdi::Rect bounds = updateRegion.Bounds();
+            update = { bounds.left, bounds.top, bounds.right, bounds.bottom };
             erase = record->erasePending;
         }
         record->invalidated = false;
         record->erasePending = false;
-        record->updateRect = RECT{};
+        record->internalPaintPending = false;
+        record->updateRegion = MiniGdi::Region{};
         record->paintActive = true;
+    }
+
+    const MiniGdi::Region visibleRegion = VisibleRegionForWindow(window, true);
+    MiniGdi::Region previousClip;
+    if (!m_gdi.GetClipRegion(record->dc, &previousClip) ||
+        !m_gdi.SetClipRegion(record->dc, MiniGdi::IntersectRegion(
+            MiniGdi::IntersectRegion(previousClip, updateRegion), visibleRegion)))
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        record->paintActive = false;
+        if (!updateRegion.Empty())
+        {
+            record->updateRegion = MiniGdi::UnionRegion(record->updateRegion, updateRegion);
+            record->invalidated = !record->updateRegion.Empty();
+            record->erasePending = record->erasePending || erase;
+        }
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        record->paintPreviousClip = previousClip;
+        record->paintClipSaved = true;
     }
 
     memset(paint, 0, sizeof(*paint));
@@ -13959,6 +15791,8 @@ BOOL GuestWindowManager::EndGuestPaint(HWND window, const GuestAbi::PaintStruct*
         return FALSE;
     }
 
+    MiniGdi::Region previousClip;
+    bool restoreClip = false;
     {
         std::lock_guard<std::mutex> guard(record->lock);
         if (record->destroyed || FromGuestDc(paint->hdc) != record->dc || !record->paintActive)
@@ -13967,7 +15801,11 @@ BOOL GuestWindowManager::EndGuestPaint(HWND window, const GuestAbi::PaintStruct*
             return FALSE;
         }
         record->paintActive = false;
+        restoreClip = record->paintClipSaved;
+        previousClip = record->paintPreviousClip;
+        record->paintClipSaved = false;
     }
+    if (restoreClip) m_gdi.SetClipRegion(record->dc, previousClip);
     if (IsGuestWindowVisibleInternal(window))
     {
         Present(record);
@@ -14012,6 +15850,24 @@ HDC GuestWindowManager::GetGuestDC(HWND window, DWORD* win32Error)
         SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
         return nullptr;
     }
+    MiniGdi::Region previousClip;
+    if (!m_gdi.GetClipRegion(record->dc, &previousClip) ||
+        !m_gdi.SetClipRegion(record->dc, MiniGdi::IntersectRegion(
+            previousClip, VisibleRegionForWindow(window, true))))
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return nullptr;
+    }
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed)
+        {
+            m_gdi.SetClipRegion(record->dc, previousClip);
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return nullptr;
+        }
+        record->commonDcClipStack.push_back(std::move(previousClip));
+    }
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return ToGuestDc(record->dc);
 }
@@ -14039,6 +15895,18 @@ int GuestWindowManager::ReleaseGuestDC(HWND window, HDC dc, DWORD* win32Error)
         SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
         return 0;
     }
+    MiniGdi::Region previousClip;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->commonDcClipStack.empty())
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+            return 0;
+        }
+        previousClip = std::move(record->commonDcClipStack.back());
+        record->commonDcClipStack.pop_back();
+    }
+    m_gdi.SetClipRegion(record->dc, previousClip);
     if (IsGuestWindowVisibleInternal(window))
     {
         Present(record);
@@ -14104,10 +15972,15 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             bool visible = false;
             int compositionHeight = 0;
             bool topMost = false;
+            std::uint64_t zOrder = 0;
+            bool zTopMost = false;
+            bool nonClientActive = false;
             std::wstring title;
             DWORD style = 0;
             DWORD extendedStyle = 0;
             GuestMetrics::NonClientMetrics nonClient;
+            int clientLeft = 0;
+            int clientTop = 0;
             std::shared_ptr<WindowRecord> record;
         };
 
@@ -14143,9 +16016,14 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                 snapshot.nonClient = GuestMetrics::NonClientForEmbeddedWindow(
                     candidate->style, candidate->extendedStyle,
                     candidate->parent != nullptr);
+                snapshot.clientLeft = candidate->clientArea.left;
+                snapshot.clientTop = candidate->clientArea.top;
                 snapshot.topMost = candidate->windowClass &&
                     candidate->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
                     candidate->comboDropped;
+                snapshot.zOrder = candidate->zOrder;
+                snapshot.zTopMost = candidate->zTopMost;
+                snapshot.nonClientActive = candidate->nonClientActive;
                 if (candidate->windowClass &&
                     candidate->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
                     !candidate->comboDropped &&
@@ -14163,17 +16041,16 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             return;
         }
 
-        // Handles are monotonic. Sorting gives newly-created sibling windows a
-        // deterministic front-to-back order (newer children are drawn later),
-        // until a dedicated SetWindowPos z-order table is introduced.
+        // Paint and hit-test consume the same explicit bottom-to-top z-order.
+        // SetWindowPos updates this order relative to insertAfter.
         std::sort(
             snapshots.begin(),
             snapshots.end(),
             [](const WindowSnapshot& left, const WindowSnapshot& right)
             {
                 if (left.topMost != right.topMost) return !left.topMost;
-                return reinterpret_cast<ULONG_PTR>(left.handle) <
-                    reinterpret_cast<ULONG_PTR>(right.handle);
+                if (left.zTopMost != right.zTopMost) return !left.zTopMost;
+                return left.zOrder < right.zOrder;
             });
 
         std::unordered_map<ULONG_PTR, size_t> indexByHandle;
@@ -14228,9 +16105,15 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             const size_t foregroundRoot = rootFor(foreground);
             if (foregroundRoot != noWindow && foregroundRoot != root)
             {
-                // A paint in a background top-level window updates its own
-                // virtual surface, but must not steal the host presentation.
-                return;
+                HWND foregroundOwner = nullptr;
+                {
+                    std::lock_guard<std::mutex> guard(snapshots[foregroundRoot].record->lock);
+                    foregroundOwner = snapshots[foregroundRoot].record->owner;
+                }
+                // An owned popup is composited over its owner using the same
+                // host surface. Let the owner refresh pixels exposed by popup
+                // movement/destruction before the popup is placed again.
+                if (foregroundOwner != snapshots[root].handle) return;
             }
         }
 
@@ -14329,9 +16212,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             &composite,
             &composed,
             &composeChildren,
-            this,
-            root,
-            menuHeight](size_t parentIndex, int parentX, int parentY)
+            this](size_t parentIndex, int parentX, int parentY)
         {
             const HWND parent = snapshots[parentIndex].handle;
             for (size_t childIndex = 0; childIndex < snapshots.size(); ++childIndex)
@@ -14345,14 +16226,14 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
 
                 const WindowSnapshot& parentSnapshot = snapshots[parentIndex];
                 const int childX = SaturatingAdd(
-                    SaturatingAdd(parentX, parentSnapshot.nonClient.left),
+                    SaturatingAdd(parentX, parentSnapshot.clientLeft),
                     child.bounds.left);
                 const int childY = SaturatingAdd(
-                    SaturatingAdd(
-                        SaturatingAdd(parentY, parentSnapshot.nonClient.top),
-                        child.bounds.top),
-                    parentIndex == root ? menuHeight : 0);
+                    SaturatingAdd(parentY, parentSnapshot.clientTop),
+                    child.bounds.top);
                 bool copied = false;
+                const MiniGdi::Region visibleRegion =
+                    VisibleRegionForWindow(child.handle, true);
                 {
                     std::lock_guard<std::mutex> guard(child.record->lock);
                     // Parentage and visibility can change re-entrantly between
@@ -14361,13 +16242,18 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     if (!child.record->destroyed && child.record->visible &&
                         child.record->parent == parent)
                     {
-                        copied = MiniGdi::CopyRect(
-                            composite,
-                            MiniGdi::Point{ childX, childY },
-                            child.record->surface,
-                            MiniGdi::Rect{ 0, 0, child.record->surface.Width(),
-                                (std::min)(child.compositionHeight,
-                                    child.record->surface.Height()) });
+                        for (const MiniGdi::Rect& visible : visibleRegion.rectangles)
+                        {
+                            const MiniGdi::Rect source = MiniGdi::IntersectRect(visible,
+                                MiniGdi::Rect{ 0, 0, child.record->surface.Width(),
+                                    (std::min)(child.compositionHeight,
+                                        child.record->surface.Height()) });
+                            if (source.Empty()) continue;
+                            copied = MiniGdi::CopyRect(composite,
+                                MiniGdi::Point{ SaturatingAdd(childX, source.left),
+                                    SaturatingAdd(childY, source.top) },
+                                child.record->surface, source) || copied;
+                        }
                     }
                 }
                 if (copied)
@@ -14393,7 +16279,9 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                             MiniGdi::FillRect(composite,
                                 MiniGdi::Rect{ captionLeft, captionTop,
                                     captionRight, captionBottom },
-                                MiniGdi::MakeColor(48, 96, 160));
+                                child.nonClientActive
+                                    ? MiniGdi::MakeColor(48, 96, 160)
+                                    : MiniGdi::MakeColor(112, 112, 112));
                             const MiniGdi::DcHandle captionDc = m_gdi.CreateDc(&composite);
                             if (captionDc != MiniGdi::InvalidDc)
                             {
@@ -14634,7 +16522,9 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                         GuestMetrics::CaptionHeight);
                     MiniGdi::FillRect(desktop,
                         MiniGdi::Rect{ captionLeft, captionTop, captionRight, captionBottom },
-                        MiniGdi::MakeColor(48, 96, 160));
+                        snapshots[root].nonClientActive
+                            ? MiniGdi::MakeColor(48, 96, 160)
+                            : MiniGdi::MakeColor(112, 112, 112));
                     const MiniGdi::DcHandle captionDc = m_gdi.CreateDc(&desktop);
                     if (captionDc != MiniGdi::InvalidDc)
                     {
@@ -14956,32 +16846,38 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         m_surfaceImage.Get());
     const int localX = static_cast<int>(static_cast<short>(position & 0xffff));
     const int localY = static_cast<int>(static_cast<short>((position >> 16) & 0xffff));
-    if (message == GuestAbi::WmLButtonDown || message == GuestAbi::WmLButtonUp)
+    const int screenX = SaturatingAdd(targetLeft, localX);
+    const int screenY = SaturatingAdd(targetTop, localY);
+    const LPARAM screenPosition = GuestAbi::MakeMouseLParam(
+        SignedCoordinateWord(screenX), SignedCoordinateWord(screenY));
+    const LRESULT hit = SendGuestMessage(target, GuestAbi::WmNcHitTest, 0,
+        screenPosition, nullptr);
+    if (hit != GuestAbi::HtClient && hit != GuestAbi::HtNowhere &&
+        hit != GuestAbi::HtTransparent && hit != GuestAbi::HtError)
     {
-        const auto targetRecord = FindWindow(target);
-        bool closeHit = false;
-        if (targetRecord)
+        UINT nonClientMessage = 0;
+        switch (message)
         {
-            std::lock_guard<std::mutex> guard(targetRecord->lock);
-            const GuestMetrics::NonClientMetrics nonClient =
-                GuestMetrics::NonClientForEmbeddedWindow(
-                    targetRecord->style, targetRecord->extendedStyle,
-                    targetRecord->parent != nullptr);
-            const int captionTop = nonClient.top - GuestMetrics::CaptionHeight;
-            const int captionRight = targetWidth - nonClient.right;
-            closeHit = nonClient.closeButton &&
-                localX >= captionRight - GuestMetrics::CaptionHeight &&
-                localX < captionRight && localY >= captionTop &&
-                localY < nonClient.top;
+        case GuestAbi::WmMouseMove: nonClientMessage = GuestAbi::WmNcMouseMove; break;
+        case GuestAbi::WmLButtonDown: nonClientMessage = GuestAbi::WmNcLButtonDown; break;
+        case GuestAbi::WmLButtonUp: nonClientMessage = GuestAbi::WmNcLButtonUp; break;
+        case GuestAbi::WmRButtonDown: nonClientMessage = GuestAbi::WmNcRButtonDown; break;
+        case GuestAbi::WmRButtonUp: nonClientMessage = GuestAbi::WmNcRButtonUp; break;
+        case GuestAbi::WmMButtonDown: nonClientMessage = GuestAbi::WmNcMButtonDown; break;
+        case GuestAbi::WmMButtonUp: nonClientMessage = GuestAbi::WmNcMButtonUp; break;
+        default: break;
         }
-        if (closeHit)
+        if (nonClientMessage)
         {
-            if (message == GuestAbi::WmLButtonUp)
-                PostGuestMessage(target, GuestAbi::WmSysCommand,
-                    GuestAbi::ScClose, 0, nullptr);
+            if (message == GuestAbi::WmLButtonDown)
+                SetGuestForegroundWindow(target, true, nullptr);
+            PostGuestMessage(target, nonClientMessage,
+                static_cast<WPARAM>(hit), screenPosition, nullptr);
             return;
         }
     }
+    if (message == GuestAbi::WmLButtonDown)
+        SetGuestForegroundWindow(target, true, nullptr);
     WPARAM state = MouseKeyState(properties);
     if (message == GuestAbi::WmXButtonDown || message == GuestAbi::WmXButtonUp)
     {
@@ -15498,57 +17394,36 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
     for (const auto& root : roots)
     {
         HWND handle = nullptr;
-        MiniGdi::DcHandle dc = MiniGdi::InvalidDc;
-        bool resized = false;
-        int resizedWidth = 0;
-        int resizedHeight = 0;
-        int resizedClientWidth = 0;
-        int resizedClientHeight = 0;
+        bool bindWidth = false;
+        bool bindHeight = false;
+        int resizedWidth = width;
+        int resizedHeight = height;
         {
             std::lock_guard<std::mutex> guard(root->lock);
             if (root->destroyed || root->parent)
-            {
                 continue;
-            }
             handle = root->handle;
-            dc = root->dc;
             const int oldWidth = root->bounds.right - root->bounds.left;
             const int oldHeight = root->bounds.bottom - root->bounds.top;
-            const int newWidth = root->viewportWidthBound ? width : oldWidth;
-            const int newHeight = root->viewportHeightBound ? height : oldHeight;
-            if (oldWidth == newWidth && oldHeight == newHeight)
-            {
-                continue;
-            }
-            if (!root->surface.Resize(newWidth, newHeight, MiniGdi::OpaqueWhite))
-            {
-                continue;
-            }
-            root->bounds.right = SaturatingAdd(root->bounds.left, newWidth);
-            root->bounds.bottom = SaturatingAdd(root->bounds.top, newHeight);
-            root->invalidated = false;
-            root->erasePending = false;
-            root->updateRect = RECT{};
-            resizedWidth = newWidth;
-            resizedHeight = newHeight;
-            const GuestMetrics::NonClientMetrics nonClient =
-                GuestMetrics::NonClientForEmbeddedWindow(
-                    root->style, root->extendedStyle, false);
-            resizedClientWidth = (std::max)(0, newWidth -
-                nonClient.left - nonClient.right);
-            resizedClientHeight = (std::max)(0, newHeight -
-                nonClient.top - nonClient.bottom -
-                (root->menuBar ? GuestMetrics::MenuHeight : 0));
-            resized = true;
+            bindWidth = root->viewportWidthBound;
+            bindHeight = root->viewportHeightBound;
+            resizedWidth = bindWidth ? width : oldWidth;
+            resizedHeight = bindHeight ? height : oldHeight;
+            if (oldWidth == resizedWidth && oldHeight == resizedHeight) continue;
         }
-        if (resized)
+        DWORD ignored = ERROR_SUCCESS;
+        if (SetGuestWindowPos(handle, nullptr, 0, 0, resizedWidth, resizedHeight,
+            GuestSwpNoMove | GuestSwpNoZOrder | GuestSwpNoActivate, &ignored))
         {
-            m_gdi.ResetClip(dc);
-            PostGuestMessage(handle, GuestAbi::WmSize, GuestAbi::SizeRestored,
-                GuestAbi::MakeMouseLParam(
-                    static_cast<WORD>((std::min)(resizedClientWidth, 0xffff)),
-                    static_cast<WORD>((std::min)(resizedClientHeight, 0xffff))), nullptr);
-            InvalidateGuestRect(handle, nullptr, TRUE, nullptr);
+            // SetWindowPos normally detaches explicitly-sized roots. A host
+            // resize is not a guest request, so preserve each CW_USEDEFAULT
+            // binding for the next UWP size notification.
+            std::lock_guard<std::mutex> guard(root->lock);
+            if (!root->destroyed)
+            {
+                root->viewportWidthBound = bindWidth;
+                root->viewportHeightBound = bindHeight;
+            }
             RuntimeDiagnostics::Record(L"VIEWPORT: resized default-bound root to " +
                 std::to_wstring(resizedWidth) + L"x" +
                 std::to_wstring(resizedHeight) + L".");

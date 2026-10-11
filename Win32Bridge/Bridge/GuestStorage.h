@@ -42,7 +42,11 @@ namespace Bridge
             HANDLE* guestHandle,
             DWORD* win32Error);
         bool ReadFile(HANDLE guestHandle, void* buffer, DWORD bytesToRead, DWORD* bytesRead, DWORD* win32Error);
+        bool ReadFileAt(HANDLE guestHandle, void* buffer, DWORD bytesToRead,
+            ULONGLONG offset, DWORD* bytesRead, DWORD* win32Error);
         bool WriteFile(HANDLE guestHandle, const void* buffer, DWORD bytesToWrite, DWORD* bytesWritten, DWORD* win32Error);
+        bool WriteFileAt(HANDLE guestHandle, const void* buffer, DWORD bytesToWrite,
+            ULONGLONG offset, DWORD* bytesWritten, DWORD* win32Error);
         bool CloseFile(HANDLE guestHandle, DWORD* win32Error);
         bool GetFileSize(HANDLE guestHandle, LARGE_INTEGER* fileSize, DWORD* win32Error);
         bool SetFilePointer(HANDLE guestHandle, LARGE_INTEGER distance, LARGE_INTEGER* newPosition, DWORD moveMethod, DWORD* win32Error);
