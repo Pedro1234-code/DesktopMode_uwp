@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <mutex>
+#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -74,6 +75,7 @@ namespace Bridge
             std::vector<BYTE>* bytes) const;
         bool NotifyModule(const std::shared_ptr<Module>& module, DWORD reason,
             std::wstring* error) const;
+        void ReleaseModuleDependencies(const std::shared_ptr<Module>& module);
 
         std::shared_ptr<GuestStorageContext> m_storage;
         ImportResolver m_resolver;
@@ -81,6 +83,7 @@ namespace Bridge
         mutable std::mutex m_lock;
         std::vector<std::shared_ptr<Module>> m_modules;
         std::unordered_map<std::wstring, HMODULE> m_importModules;
+        std::uint64_t m_nextAttachSequence = 1;
     };
 
     GuestModuleLoader* CurrentGuestModuleLoader();

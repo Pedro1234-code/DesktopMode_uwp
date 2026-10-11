@@ -1,6 +1,7 @@
 #include "Bridge\\RuntimeImage.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <cstring>
 #include <vector>
 
@@ -25,6 +26,9 @@ namespace
 
     DWORD PageProtection(DWORD characteristics)
     {
+        if ((characteristics & (IMAGE_SCN_MEM_READ | IMAGE_SCN_MEM_WRITE |
+            IMAGE_SCN_MEM_EXECUTE)) == 0)
+            return PAGE_NOACCESS;
         if ((characteristics & IMAGE_SCN_MEM_EXECUTE) != 0)
         {
             // UWP prohibits a writable-and-executable page. IAT binding and
@@ -105,8 +109,19 @@ bool RuntimeImage::FinalizeProtections(const MappedPeImage& image, std::wstring*
         SetError(error, L"The runtime image must be page-aligned before protection is finalized.");
         return false;
     }
+    if (!InitializeSecurityCookie(error))
+        return false;
 
-    std::vector<DWORD> pageCharacteristics(m_size / PageSize, IMAGE_SCN_MEM_READ);
+    std::vector<DWORD> pageCharacteristics(m_size / PageSize, 0);
+    if (image.headersSize == 0 || image.headersSize > m_size)
+    {
+        SetError(error, L"The mapped PE header span is invalid.");
+        return false;
+    }
+    const size_t headerPages =
+        (static_cast<size_t>(image.headersSize) + PageSize - 1) / PageSize;
+    for (size_t page = 0; page < headerPages; ++page)
+        pageCharacteristics[page] |= IMAGE_SCN_MEM_READ;
     for (const auto& section : image.sections)
     {
         if (section.size == 0 || !Contains(m_size, section.rva, section.size))
@@ -150,6 +165,69 @@ bool RuntimeImage::FinalizeProtections(const MappedPeImage& image, std::wstring*
     return RegisterUnwindMetadata(error);
 }
 
+bool RuntimeImage::InitializeSecurityCookie(std::wstring* error)
+{
+    if (!m_base || m_size < sizeof(IMAGE_DOS_HEADER))
+    {
+        SetError(error, L"The runtime image is unavailable for load-config initialization.");
+        return false;
+    }
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m_base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+        !Contains(m_size, static_cast<size_t>(dos->e_lfanew), sizeof(IMAGE_NT_HEADERS64)))
+    {
+        SetError(error, L"The mapped PE headers are invalid for load-config initialization.");
+        return false;
+    }
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m_base + dos->e_lfanew);
+    if (headers->Signature != IMAGE_NT_SIGNATURE ||
+        headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+    {
+        SetError(error, L"The mapped image is not PE32+ during load-config initialization.");
+        return false;
+    }
+    if (headers->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG)
+        return true;
+    const IMAGE_DATA_DIRECTORY directory =
+        headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_LOAD_CONFIG];
+    if (directory.VirtualAddress == 0 || directory.Size == 0) return true;
+    constexpr size_t RequiredLoadConfigSize =
+        offsetof(IMAGE_LOAD_CONFIG_DIRECTORY64, SecurityCookie) + sizeof(ULONGLONG);
+    if (!Contains(m_size, directory.VirtualAddress, directory.Size))
+    {
+        SetError(error, L"The PE load-config directory is malformed.");
+        return false;
+    }
+    if (directory.Size < RequiredLoadConfigSize) return true;
+    const auto* config = reinterpret_cast<const IMAGE_LOAD_CONFIG_DIRECTORY64*>(
+        m_base + directory.VirtualAddress);
+    if (config->Size < RequiredLoadConfigSize || config->SecurityCookie == 0)
+        return true;
+
+    const ULONG_PTR base = reinterpret_cast<ULONG_PTR>(m_base);
+    const ULONGLONG cookieAddress = config->SecurityCookie;
+    if (cookieAddress < base || cookieAddress - base > m_size - sizeof(ULONGLONG))
+    {
+        SetError(error, L"The PE security cookie lies outside the mapped image.");
+        return false;
+    }
+    auto* cookie = reinterpret_cast<ULONGLONG*>(static_cast<ULONG_PTR>(cookieAddress));
+    constexpr ULONGLONG DefaultCookie64 = 0x00002B992DDFA232ull;
+    if (*cookie != DefaultCookie64 && *cookie != 0xBB40ull) return true;
+
+    LARGE_INTEGER counter{};
+    QueryPerformanceCounter(&counter);
+    ULONGLONG value = static_cast<ULONGLONG>(counter.QuadPart) ^
+        static_cast<ULONGLONG>(GetTickCount64()) ^
+        static_cast<ULONGLONG>(GetCurrentProcessId()) ^
+        (static_cast<ULONGLONG>(GetCurrentThreadId()) << 32) ^
+        static_cast<ULONGLONG>(base) ^ reinterpret_cast<ULONG_PTR>(cookie);
+    value &= 0x0000FFFFFFFFFFFFull;
+    if (value == 0 || value == DefaultCookie64) value = DefaultCookie64 - 1;
+    *cookie = value;
+    return true;
+}
+
 bool RuntimeImage::RegisterUnwindMetadata(std::wstring* error)
 {
     if (!m_base || m_size < sizeof(IMAGE_DOS_HEADER))
@@ -173,6 +251,8 @@ bool RuntimeImage::RegisterUnwindMetadata(std::wstring* error)
         return false;
     }
 
+    if (headers->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_EXCEPTION)
+        return true;
     const IMAGE_DATA_DIRECTORY directory =
         headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
     if (directory.VirtualAddress == 0 || directory.Size == 0)
@@ -187,7 +267,28 @@ bool RuntimeImage::RegisterUnwindMetadata(std::wstring* error)
     }
 
     auto* table = reinterpret_cast<PRUNTIME_FUNCTION>(m_base + directory.VirtualAddress);
-    const DWORD entryCount = directory.Size / sizeof(RUNTIME_FUNCTION);
+    DWORD entryCount = directory.Size / sizeof(RUNTIME_FUNCTION);
+    while (entryCount != 0)
+    {
+        const RUNTIME_FUNCTION& tail = table[entryCount - 1];
+        if (tail.BeginAddress != 0 || tail.EndAddress != 0 || tail.UnwindData != 0)
+            break;
+        --entryCount;
+    }
+    DWORD previousBegin = 0;
+    for (DWORD index = 0; index < entryCount; ++index)
+    {
+        const RUNTIME_FUNCTION& function = table[index];
+        if (function.BeginAddress >= function.EndAddress ||
+            function.EndAddress > m_size ||
+            function.UnwindData >= m_size ||
+            (index != 0 && function.BeginAddress < previousBegin))
+        {
+            SetError(error, L"The PE exception directory contains an invalid runtime function.");
+            return false;
+        }
+        previousBegin = function.BeginAddress;
+    }
     if (entryCount == 0 || !RtlAddFunctionTable(table, entryCount, reinterpret_cast<DWORD64>(m_base)))
     {
         SetError(error, L"RtlAddFunctionTable failed for the mapped guest image.");
@@ -240,6 +341,7 @@ bool RuntimeImage::NotifyTls(DWORD reason, std::wstring* error) const
         if (offset) *offset = value;
         return true;
     };
+    bool attachedThreadStorage = false;
 
     if (reason == DLL_PROCESS_ATTACH || reason == DLL_THREAD_ATTACH)
     {
@@ -316,7 +418,17 @@ bool RuntimeImage::NotifyTls(DWORD reason, std::wstring* error) const
             SetError(error, L"TlsSetValue failed for the mapped PE image.");
             return false;
         }
+        attachedThreadStorage = true;
     }
+
+    const auto abandonAttachStorage = [this, &attachedThreadStorage]()
+    {
+        if (!attachedThreadStorage || m_tlsIndex == TLS_OUT_OF_INDEXES) return;
+        void* block = TlsGetValue(m_tlsIndex);
+        if (block) HeapFree(GetProcessHeap(), 0, block);
+        TlsSetValue(m_tlsIndex, nullptr);
+        attachedThreadStorage = false;
+    };
 
     const auto releaseThreadStorage = [this, reason]()
     {
@@ -340,6 +452,7 @@ bool RuntimeImage::NotifyTls(DWORD reason, std::wstring* error) const
     const ULONG_PTR callbacksAddress = static_cast<ULONG_PTR>(tls->AddressOfCallBacks);
     if (callbacksAddress < base || callbacksAddress - base >= m_size)
     {
+        abandonAttachStorage();
         SetError(error, L"The PE TLS callback array lies outside the mapped image.");
         return false;
     }
@@ -351,6 +464,7 @@ bool RuntimeImage::NotifyTls(DWORD reason, std::wstring* error) const
         const size_t entryOffset = callbacksOffset + index * sizeof(ULONGLONG);
         if (entryOffset < callbacksOffset || !Contains(m_size, entryOffset, sizeof(ULONGLONG)))
         {
+            abandonAttachStorage();
             SetError(error, L"The PE TLS callback array has no in-image terminator.");
             return false;
         }
@@ -365,19 +479,41 @@ bool RuntimeImage::NotifyTls(DWORD reason, std::wstring* error) const
         const ULONG_PTR callbackAddress = static_cast<ULONG_PTR>(callbackValue);
         if (callbackAddress < base || callbackAddress - base >= m_size)
         {
+            abandonAttachStorage();
             SetError(error, L"A PE TLS callback lies outside the mapped image.");
             return false;
         }
         if (!InvokeTlsCallback(
             reinterpret_cast<PIMAGE_TLS_CALLBACK>(callbackAddress), m_base, reason))
         {
+            abandonAttachStorage();
             SetError(error, L"A PE TLS callback raised a structured exception.");
             return false;
         }
     }
 
+    abandonAttachStorage();
     SetError(error, L"The PE TLS callback array exceeds the safety limit.");
     return false;
+}
+
+bool RuntimeImage::HasStaticTls() const
+{
+    if (!m_base || m_size < sizeof(IMAGE_DOS_HEADER)) return false;
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(m_base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
+        !Contains(m_size, static_cast<size_t>(dos->e_lfanew), sizeof(IMAGE_NT_HEADERS64)))
+        return false;
+    const auto* headers = reinterpret_cast<const IMAGE_NT_HEADERS64*>(m_base + dos->e_lfanew);
+    if (headers->Signature != IMAGE_NT_SIGNATURE ||
+        headers->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        headers->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_TLS)
+        return false;
+    const IMAGE_DATA_DIRECTORY directory =
+        headers->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS];
+    return directory.VirtualAddress != 0 &&
+        directory.Size >= sizeof(IMAGE_TLS_DIRECTORY64) &&
+        Contains(m_size, directory.VirtualAddress, sizeof(IMAGE_TLS_DIRECTORY64));
 }
 
 void RuntimeImage::Release()

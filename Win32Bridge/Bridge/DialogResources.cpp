@@ -942,7 +942,7 @@ namespace
         const bool childDialog = (rootStyle & DialogChildStyle) != 0;
         const GuestMetrics::NonClientMetrics nonClient =
             GuestMetrics::NonClientForEmbeddedWindow(
-                rootStyle, dialog.extendedStyle, childDialog);
+                rootStyle, dialog.extendedStyle, childDialog || parent != nullptr);
         // Dialog-template dimensions describe the client area. CreateWindowEx
         // dimensions describe the complete window, including its frame.
         const int dialogWidth = clientWidth + nonClient.left + nonClient.right;
@@ -1736,7 +1736,8 @@ namespace
                 const std::wstring name(data.cFileName);
                 if (name == L"." || name == L"..") continue;
                 const bool directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                if (!directory && !FileDialogNameMatches(*runtime, name)) continue;
+                if (!directory && (runtime->descriptor.folderDialog ||
+                    !FileDialogNameMatches(*runtime, name))) continue;
                 FileDialogEntry entry;
                 entry.name = name;
                 entry.directory = directory;
@@ -1783,7 +1784,9 @@ namespace
         if (!runtime || index < 0 ||
             static_cast<size_t>(index) >= runtime->entries.size()) return;
         const auto& entry = runtime->entries[static_cast<size_t>(index)];
-        if (!entry.directory)
+        if (runtime->descriptor.folderDialog && entry.directory)
+            BridgeSetDlgItemTextW(runtime->window, FileDialogNameId, entry.name.c_str());
+        else if (!entry.directory)
             BridgeSetDlgItemTextW(runtime->window, FileDialogNameId, entry.name.c_str());
     }
 
@@ -1796,6 +1799,20 @@ namespace
         std::wstring name(buffer.data());
         while (!name.empty() && std::iswspace(name.front())) name.erase(name.begin());
         while (!name.empty() && std::iswspace(name.back())) name.pop_back();
+        if (runtime->descriptor.folderDialog)
+        {
+            std::wstring selected = runtime->currentDirectory;
+            if (!name.empty())
+            {
+                const std::wstring candidate = FileDialogJoinPath(
+                    runtime->currentDirectory, name);
+                if (!FileDialogDirectoryExists(runtime->storage, candidate, &selected))
+                    return false;
+            }
+            runtime->selectedPath = std::move(selected);
+            EndGuestResourceDialog(runtime->window, IDOK);
+            return true;
+        }
         if (name.empty()) return false;
 
         if (runtime->descriptor.saveDialog && runtime->descriptor.defaultExtension &&
@@ -1910,7 +1927,7 @@ namespace
                     if (entry.directory)
                         NavigateFileDialog(runtime,
                             FileDialogJoinPath(runtime->currentDirectory, entry.name));
-                    else
+                    else if (!runtime->descriptor.folderDialog)
                     {
                         SelectFileDialogEntry(runtime, notification->item);
                         AcceptFileDialog(runtime);
@@ -2300,7 +2317,8 @@ bool Win32Bridge::Bridge::ShowGuestFileDialog(
     dialog.height = 210;
     dialog.title.text = descriptor.title && *descriptor.title
         ? descriptor.title
-        : (descriptor.saveDialog ? L"Save As" : L"Open");
+        : (descriptor.folderDialog ? L"Select Folder" :
+            (descriptor.saveDialog ? L"Save As" : L"Open"));
     dialog.font.present = true;
     dialog.font.pointSize = 9;
     dialog.font.weight = FW_NORMAL;
@@ -2325,7 +2343,8 @@ bool Win32Bridge::Bridge::ShowGuestFileDialog(
         DialogTabStopStyle | WindowBorderStyle | ListViewReportStyle |
         ListViewSingleSelectionStyle | ListViewShowSelectionAlwaysStyle));
     dialog.items.push_back(FileDialogItem(
-        static_cast<DWORD>(-1), L"static", L"File name:",
+        static_cast<DWORD>(-1), L"static",
+        descriptor.folderDialog ? L"Folder:" : L"File name:",
         6, 149, 48, 10, labelStyle));
     dialog.items.push_back(FileDialogItem(
         FileDialogNameId, L"edit", L"",
@@ -2338,14 +2357,16 @@ bool Win32Bridge::Bridge::ShowGuestFileDialog(
         55, 166, 147, 38,
         DialogTabStopStyle | WindowBorderStyle | ComboBoxDropDownListStyle));
     dialog.items.push_back(FileDialogItem(
-        IDOK, L"button", descriptor.saveDialog ? L"Save" : L"Open",
+        IDOK, L"button", descriptor.folderDialog ? L"Select" :
+            (descriptor.saveDialog ? L"Save" : L"Open"),
         218, 166, 50, 14, buttonStyle | ButtonDefaultPush));
     dialog.items.push_back(FileDialogItem(
         IDCANCEL, L"button", L"Cancel",
         272, 166, 50, 14, buttonStyle));
 
     RuntimeDiagnostics::Record(std::wstring(L"COMMON DIALOG: opening virtual ") +
-        (descriptor.saveDialog ? L"save" : L"open") +
+        (descriptor.folderDialog ? L"folder" :
+            (descriptor.saveDialog ? L"save" : L"open")) +
         L" picker in '" + runtime.currentDirectory + L"'.");
     const HINSTANCE instance = descriptor.instance
         ? descriptor.instance

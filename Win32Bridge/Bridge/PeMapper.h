@@ -20,6 +20,7 @@ namespace Bridge
     {
         ULONGLONG preferredImageBase = 0;
         DWORD entryPointRva = 0;
+        DWORD headersSize = 0;
         std::vector<BYTE> bytes;
         std::vector<MappedSection> sections;
     };

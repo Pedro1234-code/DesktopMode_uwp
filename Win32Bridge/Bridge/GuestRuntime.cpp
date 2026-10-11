@@ -353,7 +353,9 @@ bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportR
     }
     // Keep a writable materialization until Run establishes guest scopes and
     // the DLL loader. Imports that are not bridge APIs are resolved there from
-    // actual guest DLLs, including ordinal and delay-import entries.
+    // actual guest DLLs, including ordinal imports. Delay-load entries retain
+    // their linker thunks and are resolved on first use by the PE's delay
+    // helper, as on Windows.
     if (!m_runtime.CopyFrom(m_mapped, error))
     {
         RuntimeDiagnostics::Record(L"PREPARE FAILED: initial image copy.");
@@ -364,7 +366,8 @@ bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportR
     RuntimeDiagnostics::Record(
         L"PREPARE OK: main image reserved; " + std::to_wstring(m_bindings.bound) +
         L" bridge imports bound, " + std::to_wstring(m_bindings.unresolved) +
-        L" imports deferred to the guest DLL loader; entry RVA " +
+        L" imports deferred to the guest DLL loader, " +
+        std::to_wstring(m_bindings.deferred) + L" delay imports retained; entry RVA " +
         std::to_wstring(m_mapped.entryPointRva) + L".");
     return true;
 }
@@ -375,6 +378,13 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
     {
         SetError(error, L"The guest has not been fully prepared for execution.");
         RuntimeDiagnostics::Record(L"RUN FAILED: called before a successful prepare.");
+        return false;
+    }
+    if (m_mapped.entryPointRva == 0 ||
+        m_mapped.entryPointRva >= m_runtime.Size())
+    {
+        SetError(error, L"The main PE image has no valid executable entry point.");
+        RuntimeDiagnostics::Record(L"RUN FAILED: invalid main-image entry point.");
         return false;
     }
 
@@ -496,7 +506,8 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
     }
     RuntimeDiagnostics::Record(
         L"RUN: final import binding completed; " +
-        std::to_wstring(m_bindings.bound) + L" regular/delay imports bound.");
+        std::to_wstring(m_bindings.bound) + L" regular imports bound, " +
+        std::to_wstring(m_bindings.deferred) + L" delay imports retained.");
 
     std::wstring tlsError;
     if (!m_runtime.NotifyTls(DLL_PROCESS_ATTACH, &tlsError))

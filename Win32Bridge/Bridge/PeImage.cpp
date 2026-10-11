@@ -81,8 +81,11 @@ namespace
 
         for (const auto& section : sections)
         {
-            const DWORD sectionSize = (std::max)(section.Misc.VirtualSize, section.SizeOfRawData);
-            if (rva < section.VirtualAddress || rva - section.VirtualAddress >= sectionSize)
+            const ULONGLONG sectionSize = (std::max)(
+                static_cast<ULONGLONG>(section.Misc.VirtualSize),
+                static_cast<ULONGLONG>(section.SizeOfRawData));
+            if (rva < section.VirtualAddress ||
+                static_cast<ULONGLONG>(rva - section.VirtualAddress) >= sectionSize)
             {
                 continue;
             }
@@ -117,6 +120,25 @@ namespace
         return directory.VirtualAddress != 0 &&
             rva >= directory.VirtualAddress &&
             static_cast<ULONGLONG>(rva) < static_cast<ULONGLONG>(directory.VirtualAddress) + directory.Size;
+    }
+
+    IMAGE_DATA_DIRECTORY DataDirectory(
+        const IMAGE_OPTIONAL_HEADER64& optionalHeader,
+        size_t index)
+    {
+        if (index >= IMAGE_NUMBEROF_DIRECTORY_ENTRIES ||
+            optionalHeader.NumberOfRvaAndSizes <= index)
+            return IMAGE_DATA_DIRECTORY{};
+        return optionalHeader.DataDirectory[index];
+    }
+
+    bool DirectoryFitsImage(
+        const IMAGE_OPTIONAL_HEADER64& optionalHeader,
+        const IMAGE_DATA_DIRECTORY& directory)
+    {
+        if (directory.VirtualAddress == 0 || directory.Size == 0) return true;
+        return directory.VirtualAddress < optionalHeader.SizeOfImage &&
+            directory.Size <= optionalHeader.SizeOfImage - directory.VirtualAddress;
     }
 
     struct DelayImportDescriptor final
@@ -166,9 +188,9 @@ namespace
         std::vector<ImportedSymbol>* imports,
         PeImageInfo* result)
     {
-        size_t thunkOffset = 0;
         if (!imports || lookupTableRva == 0 || addressTableRva == 0 ||
-            !RvaToOffset(reader, optionalHeader, sections, lookupTableRva, &thunkOffset))
+            lookupTableRva >= optionalHeader.SizeOfImage ||
+            addressTableRva >= optionalHeader.SizeOfImage)
         {
             SetError(result, delayLoaded
                 ? L"A delay-import thunk points outside the image."
@@ -176,11 +198,21 @@ namespace
             return false;
         }
 
-        for (size_t thunkIndex = 0; thunkIndex < 65536; ++thunkIndex)
+        const size_t maximumLookupEntries =
+            (optionalHeader.SizeOfImage - lookupTableRva) / sizeof(IMAGE_THUNK_DATA64);
+        const size_t maximumAddressEntries =
+            (optionalHeader.SizeOfImage - addressTableRva) / sizeof(ULONGLONG);
+        const size_t maximumEntries = (std::min)(maximumLookupEntries, maximumAddressEntries);
+        for (size_t thunkIndex = 0; thunkIndex < maximumEntries; ++thunkIndex)
         {
             IMAGE_THUNK_DATA64 thunk{};
-            const size_t currentThunkOffset = thunkOffset + thunkIndex * sizeof(thunk);
-            if (!reader.Read(currentThunkOffset, &thunk))
+            const ULONGLONG currentLookupRva64 = static_cast<ULONGLONG>(lookupTableRva) +
+                thunkIndex * sizeof(thunk);
+            size_t currentThunkOffset = 0;
+            if (currentLookupRva64 > MAXDWORD ||
+                !RvaToOffset(reader, optionalHeader, sections,
+                    static_cast<DWORD>(currentLookupRva64), &currentThunkOffset) ||
+                !reader.Read(currentThunkOffset, &thunk))
             {
                 SetError(result, delayLoaded
                     ? L"A delay-import thunk table is truncated."
@@ -203,6 +235,11 @@ namespace
             symbol.importedByOrdinal = (thunk.u1.Ordinal & IMAGE_ORDINAL_FLAG64) != 0;
             if (symbol.importedByOrdinal)
             {
+                if ((thunk.u1.Ordinal & ~(IMAGE_ORDINAL_FLAG64 | 0xffffull)) != 0)
+                {
+                    SetError(result, L"An ordinal import thunk contains reserved bits.");
+                    return false;
+                }
                 symbol.ordinal = static_cast<WORD>(thunk.u1.Ordinal & 0xffff);
             }
             else
@@ -283,6 +320,15 @@ bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
         SetError(result, L"Only complete PE32+ (64-bit) images are supported by this bootstrap.");
         return false;
     }
+    if (optionalHeader.SizeOfImage == 0 ||
+        optionalHeader.SizeOfHeaders == 0 ||
+        optionalHeader.SizeOfHeaders > optionalHeader.SizeOfImage ||
+        (optionalHeader.AddressOfEntryPoint >= optionalHeader.SizeOfImage &&
+            optionalHeader.AddressOfEntryPoint != 0))
+    {
+        SetError(result, L"The PE optional header contains invalid image bounds.");
+        return false;
+    }
 
     const size_t sectionsOffset = optionalOffset + fileHeader.SizeOfOptionalHeader;
     std::vector<IMAGE_SECTION_HEADER> sections;
@@ -308,7 +354,13 @@ bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
         return false;
     }
 
-    const IMAGE_DATA_DIRECTORY exportDirectory = optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    const IMAGE_DATA_DIRECTORY exportDirectory =
+        DataDirectory(optionalHeader, IMAGE_DIRECTORY_ENTRY_EXPORT);
+    if (!DirectoryFitsImage(optionalHeader, exportDirectory))
+    {
+        SetError(result, L"The PE export directory exceeds the virtual image.");
+        return false;
+    }
     if (exportDirectory.VirtualAddress != 0 && exportDirectory.Size != 0)
     {
         size_t exportOffset = 0;
@@ -382,7 +434,13 @@ bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
         }
     }
 
-    const IMAGE_DATA_DIRECTORY importDirectory = optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    const IMAGE_DATA_DIRECTORY importDirectory =
+        DataDirectory(optionalHeader, IMAGE_DIRECTORY_ENTRY_IMPORT);
+    if (!DirectoryFitsImage(optionalHeader, importDirectory))
+    {
+        SetError(result, L"The PE import directory exceeds the virtual image.");
+        return false;
+    }
     if (importDirectory.VirtualAddress != 0 && importDirectory.Size != 0)
     {
         size_t importOffset = 0;
@@ -393,12 +451,23 @@ bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
         }
 
         bool terminated = false;
-        const size_t maximumDescriptors = importDirectory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR) + 1;
+        const size_t maximumDescriptors = importDirectory.Size / sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if (maximumDescriptors == 0)
+        {
+            SetError(result, L"The PE import directory is too small for a descriptor.");
+            return false;
+        }
         for (size_t descriptorIndex = 0; descriptorIndex < maximumDescriptors; ++descriptorIndex)
         {
             IMAGE_IMPORT_DESCRIPTOR descriptor{};
-            const size_t descriptorOffset = importOffset + descriptorIndex * sizeof(descriptor);
-            if (!reader.Read(descriptorOffset, &descriptor))
+            const ULONGLONG descriptorRva64 =
+                static_cast<ULONGLONG>(importDirectory.VirtualAddress) +
+                descriptorIndex * sizeof(descriptor);
+            size_t descriptorOffset = 0;
+            if (descriptorRva64 > MAXDWORD ||
+                !RvaToOffset(reader, optionalHeader, sections,
+                    static_cast<DWORD>(descriptorRva64), &descriptorOffset) ||
+                !reader.Read(descriptorOffset, &descriptor))
             {
                 SetError(result, L"The PE import descriptor table is truncated.");
                 return false;
@@ -431,7 +500,12 @@ bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
     }
 
     const IMAGE_DATA_DIRECTORY delayDirectory =
-        optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT];
+        DataDirectory(optionalHeader, IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT);
+    if (!DirectoryFitsImage(optionalHeader, delayDirectory))
+    {
+        SetError(result, L"The PE delay-import directory exceeds the virtual image.");
+        return false;
+    }
     if (delayDirectory.VirtualAddress != 0 && delayDirectory.Size != 0)
     {
         size_t delayOffset = 0;
@@ -443,12 +517,23 @@ bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
         }
 
         bool terminated = false;
-        const size_t maximumDescriptors = delayDirectory.Size / sizeof(DelayImportDescriptor) + 1;
+        const size_t maximumDescriptors = delayDirectory.Size / sizeof(DelayImportDescriptor);
+        if (maximumDescriptors == 0)
+        {
+            SetError(result, L"The PE delay-import directory is too small for a descriptor.");
+            return false;
+        }
         for (size_t descriptorIndex = 0; descriptorIndex < maximumDescriptors; ++descriptorIndex)
         {
             DelayImportDescriptor descriptor{};
-            const size_t descriptorOffset = delayOffset + descriptorIndex * sizeof(descriptor);
-            if (!reader.Read(descriptorOffset, &descriptor))
+            const ULONGLONG descriptorRva64 =
+                static_cast<ULONGLONG>(delayDirectory.VirtualAddress) +
+                descriptorIndex * sizeof(descriptor);
+            size_t descriptorOffset = 0;
+            if (descriptorRva64 > MAXDWORD ||
+                !RvaToOffset(reader, optionalHeader, sections,
+                    static_cast<DWORD>(descriptorRva64), &descriptorOffset) ||
+                !reader.Read(descriptorOffset, &descriptor))
             {
                 SetError(result, L"The PE delay-import descriptor table is truncated.");
                 return false;

@@ -265,6 +265,11 @@ namespace Bridge
         Platform::Agile<Windows::UI::Xaml::Controls::Panel^> m_surfaceHost;
         Platform::Agile<Windows::UI::Xaml::Controls::Image^> m_surfaceImage;
         std::shared_ptr<GuestPresentationState> m_presentation;
+        // Present can be requested concurrently by the guest message thread
+        // and the CoreWindow input thread (notably while opening submenus).
+        // MiniGDI DC creation and the software frame snapshot are one atomic
+        // composition operation.
+        std::mutex m_compositionLock;
         std::shared_ptr<GuestInputCallbackState> m_inputCallbacks;
         std::shared_ptr<GuestTimerState> m_timers;
         Windows::Foundation::EventRegistrationToken m_pointerMovedToken{};

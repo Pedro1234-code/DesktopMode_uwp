@@ -20,6 +20,7 @@ namespace Bridge
         LPCWSTR defaultExtension = nullptr;
         DWORD flags = 0;
         BOOL saveDialog = FALSE;
+        BOOL folderDialog = FALSE;
     };
 
     struct GuestPropertyFieldDescriptor

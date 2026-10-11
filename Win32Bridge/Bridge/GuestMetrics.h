@@ -95,7 +95,7 @@ namespace GuestMetrics
     // ordinary Win32 non-client geometry. Plain WS_CHILD controls do not;
     // framed/captioned child windows (such as MDI children) still do.
     inline NonClientMetrics NonClientForEmbeddedWindow(
-        DWORD style, DWORD extendedStyle, bool hasParent)
+        DWORD style, DWORD extendedStyle, bool embeddedOrChild)
     {
         NonClientMetrics result;
         result.caption = (style & WindowStyleCaption) == WindowStyleCaption;
@@ -103,7 +103,11 @@ namespace GuestMetrics
             (result.caption || (style & (WindowStyleDialogFrame |
                 WindowStyleThickFrame)) != 0 ||
                 (extendedStyle & WindowExtendedStyleModalFrame) != 0);
-        if (!hasParent || ((style & WindowStyleChild) != 0 && !framedChild))
+        // The primary guest window uses the real host chrome. Owned popups and
+        // dialogs are embedded in that host surface and need bridge-rendered
+        // non-client geometry. Ordinary unframed WS_CHILD controls do not.
+        if (!embeddedOrChild ||
+            ((style & WindowStyleChild) != 0 && !framedChild))
         {
             result.caption = false;
             return result;

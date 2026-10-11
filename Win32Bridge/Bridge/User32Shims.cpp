@@ -3,6 +3,7 @@
 #include "Bridge\\Win32Shims.h"
 
 #include "Bridge\\GuestWindow.h"
+#include "Bridge\\Gdi32Shims.h"
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge\\MiniGdi.h"
 #include "Bridge/GuestMetrics.h"
@@ -32,7 +33,6 @@ using namespace Win32Bridge::Bridge;
 
 namespace
 {
-    SHORT WINAPI BridgeGetKeyState(int virtualKey);
     constexpr DWORD BitmapCompressionAlphaBitFields = 6;
     constexpr DWORD GuestBitmapV4HeaderSize = 108;
     constexpr size_t GuestBitmapV4RedMaskOffset = 40;
@@ -4437,7 +4437,9 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowTextW);
     else if (_wcsicmp(symbol.name.c_str(), L"getwindowtextlengthw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowTextLengthW);
-    else if (_wcsicmp(symbol.name.c_str(), L"getdlgitem") == 0)
+    // Break the resolver into independent chains to keep C++/CX below its
+    // nested-block compiler limit. Export names are mutually exclusive.
+    if (_wcsicmp(symbol.name.c_str(), L"getdlgitem") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDlgItem);
     else if (_wcsicmp(symbol.name.c_str(), L"getdlgctrlid") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDlgCtrlID);
@@ -4513,7 +4515,7 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInSendMessageEx);
     else if (_wcsicmp(symbol.name.c_str(), L"postquitmessage") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePostQuitMessage);
-    else if (_wcsicmp(symbol.name.c_str(), L"getmessagew") == 0)
+    if (_wcsicmp(symbol.name.c_str(), L"getmessagew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMessageW);
     else if (_wcsicmp(symbol.name.c_str(), L"peekmessagew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePeekMessageW);
@@ -4667,7 +4669,7 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadBitmapW);
     else if (_wcsicmp(symbol.name.c_str(), L"loadbitmapa") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadBitmapA);
-    else if (_wcsicmp(symbol.name.c_str(), L"getclassinfow") == 0)
+    if (_wcsicmp(symbol.name.c_str(), L"getclassinfow") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassInfoW);
     else if (_wcsicmp(symbol.name.c_str(), L"getclassinfoa") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassInfoA);
@@ -4746,7 +4748,7 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"getactivewindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetActiveWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"getlastactivepopup") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLastActivePopup);
     else if (_wcsicmp(symbol.name.c_str(), L"bringwindowtotop") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBringWindowToTop);
-    else if (_wcsicmp(symbol.name.c_str(), L"getwindowthreadprocessid") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowThreadProcessId);
+    if (_wcsicmp(symbol.name.c_str(), L"getwindowthreadprocessid") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowThreadProcessId);
     else if (_wcsicmp(symbol.name.c_str(), L"setpropw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetPropW);
     else if (_wcsicmp(symbol.name.c_str(), L"getpropw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPropW);
     else if (_wcsicmp(symbol.name.c_str(), L"removepropw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRemovePropW);

@@ -34,6 +34,38 @@ struct GuestNewTextMetricExW final
     GuestFontSignature signature;
 };
 
+// Several desktop-only wingdi declarations are hidden by the UWP SDK
+// partition.  Keep private ABI-identical definitions instead of depending on
+// those declarations being exposed by a particular SDK version.
+struct GuestAbc final
+{
+    int abcA;
+    UINT abcB;
+    int abcC;
+};
+
+struct GuestGlyphMetrics final
+{
+    UINT blackBoxX;
+    UINT blackBoxY;
+    POINT glyphOrigin;
+    short cellIncrementX;
+    short cellIncrementY;
+};
+
+struct GuestCharacterPlacementResultsW final
+{
+    DWORD structureSize;
+    LPWSTR outputString;
+    UINT* order;
+    int* advances;
+    int* caretPositions;
+    LPSTR classes;
+    LPWSTR glyphs;
+    UINT glyphCount;
+    int maximumFit;
+};
+
 int InvokeGuestFontEnumProcWSeh(GuestFontEnumProcW callback,
     const LOGFONTW* font, const TEXTMETRICW* metrics, DWORD type,
     LPARAM parameter, bool* faulted)
@@ -927,7 +959,10 @@ MiniGdi::Region PathRegion(const GuestDcCompatibilityState& state)
         {
             int top = state.pathPoints[begin].y, bottom = top;
             for (size_t index = begin + 1; index < end; ++index)
-            { top = (std::min)(top, state.pathPoints[index].y); bottom = (std::max)(bottom, state.pathPoints[index].y); }
+            {
+                top = state.pathPoints[index].y < top ? state.pathPoints[index].y : top;
+                bottom = state.pathPoints[index].y > bottom ? state.pathPoints[index].y : bottom;
+            }
             for (int y = top; y < bottom; ++y)
             {
                 std::vector<int> crossings;
@@ -1390,10 +1425,22 @@ BOOL WINAPI BridgePlgBlt(HDC destination, const POINT* points, HDC source,
     { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     const int fourthX = p1.x + p2.x - p0.x;
     const int fourthY = p1.y + p2.y - p0.y;
-    const int left = (std::min)({ p0.x, p1.x, p2.x, fourthX });
-    const int right = (std::max)({ p0.x, p1.x, p2.x, fourthX });
-    const int top = (std::min)({ p0.y, p1.y, p2.y, fourthY });
-    const int bottom = (std::max)({ p0.y, p1.y, p2.y, fourthY });
+    int left = p0.x;
+    if (p1.x < left) left = p1.x;
+    if (p2.x < left) left = p2.x;
+    if (fourthX < left) left = fourthX;
+    int right = p0.x;
+    if (p1.x > right) right = p1.x;
+    if (p2.x > right) right = p2.x;
+    if (fourthX > right) right = fourthX;
+    int top = p0.y;
+    if (p1.y < top) top = p1.y;
+    if (p2.y < top) top = p2.y;
+    if (fourthY < top) top = fourthY;
+    int bottom = p0.y;
+    if (p1.y > bottom) bottom = p1.y;
+    if (p2.y > bottom) bottom = p2.y;
+    if (fourthY > bottom) bottom = fourthY;
     MiniGdi::Region clip;
     manager->Gdi().GetClipRegion(FromGuestDc(destination), &clip);
     const int sw = (std::abs)(s1.x - s0.x), sh = (std::abs)(s1.y - s0.y);
@@ -2169,7 +2216,7 @@ DWORD WINAPI BridgeGetGlyphIndicesW(HDC dc, LPCWSTR text, int count, LPWORD glyp
     return static_cast<DWORD>(count);
 }
 
-BOOL WINAPI BridgeGetCharABCWidthsW(HDC dc, UINT first, UINT last, LPABC widths)
+BOOL WINAPI BridgeGetCharABCWidthsW(HDC dc, UINT first, UINT last, GuestAbc* widths)
 {
     if (!widths || last < first || static_cast<unsigned long long>(last) - first + 1 > 65536) return FALSE;
     GuestWindowManager* manager = CurrentManagerOrFail(); MiniGdi::Font font{};
@@ -2193,7 +2240,8 @@ BOOL WINAPI BridgeGetCharABCWidthsW(HDC dc, UINT first, UINT last, LPABC widths)
 BOOL WINAPI BridgeGetCharWidth32W(HDC dc, UINT first, UINT last, LPINT widths)
 {
     if (!widths || last < first) return FALSE;
-    const size_t count = static_cast<size_t>(last - first) + 1; std::vector<ABC> abc(count);
+    const size_t count = static_cast<size_t>(last - first) + 1;
+    std::vector<GuestAbc> abc(count);
     if (!BridgeGetCharABCWidthsW(dc, first, last, abc.data())) return FALSE;
     for (size_t index = 0; index < count; ++index)
         widths[index] = abc[index].abcA + static_cast<int>(abc[index].abcB) + abc[index].abcC;
@@ -2201,7 +2249,7 @@ BOOL WINAPI BridgeGetCharWidth32W(HDC dc, UINT first, UINT last, LPINT widths)
 }
 
 DWORD WINAPI BridgeGetGlyphOutlineW(HDC dc, UINT character, UINT format,
-    LPGLYPHMETRICS output, DWORD bufferSize, LPVOID buffer, const MAT2*)
+    GuestGlyphMetrics* output, DWORD bufferSize, LPVOID buffer, const void*)
 {
     constexpr UINT GlyphIndexFlag = 0x0080u;
     if (!output) return GDI_ERROR;
@@ -2215,23 +2263,25 @@ DWORD WINAPI BridgeGetGlyphOutlineW(HDC dc, UINT character, UINT format,
     }
     DirectWriteText::GlyphMetrics metric{};
     if (!DirectWriteText::GetGlyphMetrics(font, &glyph, 1, &metric)) return GDI_ERROR;
-    output->gmBlackBoxX = static_cast<UINT>((std::max)(0, metric.advanceWidth - metric.leftSideBearing - metric.rightSideBearing));
-    output->gmBlackBoxY = static_cast<UINT>((std::max)(0, metric.advanceHeight - metric.topSideBearing - metric.bottomSideBearing));
-    output->gmptGlyphOrigin = { metric.leftSideBearing, metric.verticalOriginY - metric.topSideBearing };
-    output->gmCellIncX = static_cast<short>(metric.advanceWidth); output->gmCellIncY = 0;
+    output->blackBoxX = static_cast<UINT>((std::max)(0, metric.advanceWidth - metric.leftSideBearing - metric.rightSideBearing));
+    output->blackBoxY = static_cast<UINT>((std::max)(0, metric.advanceHeight - metric.topSideBearing - metric.bottomSideBearing));
+    output->glyphOrigin = { metric.leftSideBearing, metric.verticalOriginY - metric.topSideBearing };
+    output->cellIncrementX = static_cast<short>(metric.advanceWidth);
+    output->cellIncrementY = 0;
     if ((format & 0x7fu) == GGO_METRICS) return 0;
     UNREFERENCED_PARAMETER(bufferSize); UNREFERENCED_PARAMETER(buffer);
     BridgeSetLastError(ERROR_NOT_SUPPORTED); return GDI_ERROR;
 }
 
 DWORD WINAPI BridgeGetCharacterPlacementW(HDC dc, LPCWSTR text, int count,
-    int maximumExtent, LPGCP_RESULTSW results, DWORD)
+    int maximumExtent, GuestCharacterPlacementResultsW* results, DWORD)
 {
-    if (!results || results->lStructSize < sizeof(GCP_RESULTSW) || count < 0 || (!text && count))
+    if (!results || results->structureSize < sizeof(GuestCharacterPlacementResultsW) ||
+        count < 0 || (!text && count))
         return 0;
     GuestWindowManager* manager = CurrentManagerOrFail(); MiniGdi::Font font{};
     if (!manager || !manager->Gdi().GetSelectedFont(FromGuestDc(dc), &font)) return 0;
-    const size_t capacity = (std::min)(static_cast<size_t>(count), static_cast<size_t>(results->nGlyphs));
+    const size_t capacity = (std::min)(static_cast<size_t>(count), static_cast<size_t>(results->glyphCount));
     std::vector<WORD> glyphs(static_cast<size_t>(count));
     std::vector<DirectWriteText::GlyphMetrics> metrics(static_cast<size_t>(count));
     if (!DirectWriteText::MapGlyphs(font, text, static_cast<size_t>(count), glyphs.data()) ||
@@ -2239,16 +2289,17 @@ DWORD WINAPI BridgeGetCharacterPlacementW(HDC dc, LPCWSTR text, int count,
     int x = 0; size_t fit = 0;
     for (size_t index = 0; index < capacity; ++index)
     {
-        if (results->lpOutString) results->lpOutString[index] = text[index];
-        if (results->lpOrder) results->lpOrder[index] = static_cast<UINT>(index);
-        if (results->lpDx) results->lpDx[index] = metrics[index].advanceWidth;
-        if (results->lpCaretPos) results->lpCaretPos[index] = x;
-        if (results->lpClass) results->lpClass[index] = 0;
-        if (results->lpGlyphs) results->lpGlyphs[index] = glyphs[index];
+        if (results->outputString) results->outputString[index] = text[index];
+        if (results->order) results->order[index] = static_cast<UINT>(index);
+        if (results->advances) results->advances[index] = metrics[index].advanceWidth;
+        if (results->caretPositions) results->caretPositions[index] = x;
+        if (results->classes) results->classes[index] = 0;
+        if (results->glyphs) results->glyphs[index] = static_cast<wchar_t>(glyphs[index]);
         x += metrics[index].advanceWidth;
         if (maximumExtent <= 0 || x <= maximumExtent) fit = index + 1;
     }
-    results->nGlyphs = static_cast<UINT>(capacity); results->nMaxFit = static_cast<int>(fit);
+    results->glyphCount = static_cast<UINT>(capacity);
+    results->maximumFit = static_cast<int>(fit);
     MiniGdi::FontMetrics fontMetrics{}; manager->Gdi().GetSelectedFontMetrics(FromGuestDc(dc), &fontMetrics);
     return MAKELONG((std::min)(x, 0xffff), (std::min)(fontMetrics.height, 0xffff));
 }
@@ -2405,8 +2456,15 @@ UINT WINAPI BridgeGetEnhMetaFileHeader(HENHMETAFILE metafile, UINT size, LPENHME
 {
     std::lock_guard<std::mutex> guard(g_gdiCompatibilityLock); const auto found = g_metafiles.find(reinterpret_cast<ULONG_PTR>(metafile));
     if (found == g_metafiles.end()) return 0; if (!header || size < sizeof(ENHMETAHEADER)) return sizeof(ENHMETAHEADER);
-    ZeroMemory(header, sizeof(*header)); header->iType = EMR_HEADER; header->nSize = sizeof(*header);
-    header->rclBounds = found->second.bounds; header->dSignature = ENHMETA_SIGNATURE; header->nVersion = 0x10000;
+    ZeroMemory(header, sizeof(*header));
+    header->iType = 1; // EMR_HEADER
+    header->nSize = sizeof(*header);
+    header->rclBounds.left = found->second.bounds.left;
+    header->rclBounds.top = found->second.bounds.top;
+    header->rclBounds.right = found->second.bounds.right;
+    header->rclBounds.bottom = found->second.bounds.bottom;
+    header->dSignature = 0x464D4520u; // ENHMETA_SIGNATURE
+    header->nVersion = 0x10000;
     return sizeof(ENHMETAHEADER);
 }
 

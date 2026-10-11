@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <new>
 
 using namespace Win32Bridge::Bridge;
 
@@ -90,14 +91,32 @@ bool PeMapper::Materialize(const BYTE* fileBytes, size_t fileSize, MappedPeImage
     }
 
     if (optionalHeader.SizeOfImage == 0 || optionalHeader.SizeOfHeaders > optionalHeader.SizeOfImage ||
-        !Contains(fileSize, 0, optionalHeader.SizeOfHeaders))
+        optionalHeader.SizeOfHeaders == 0 ||
+        optionalHeader.SectionAlignment == 0 || optionalHeader.FileAlignment == 0 ||
+        (optionalHeader.SizeOfImage % 4096u) != 0 ||
+        !Contains(fileSize, 0, optionalHeader.SizeOfHeaders) ||
+        !Contains(fileSize, sectionOffset,
+            static_cast<size_t>(fileHeader.NumberOfSections) * sizeof(IMAGE_SECTION_HEADER)))
     {
         SetError(error, L"The image has invalid virtual or header sizes.");
         return false;
     }
 
-    image->bytes.assign(optionalHeader.SizeOfImage, 0);
+    try
+    {
+        image->bytes.assign(optionalHeader.SizeOfImage, 0);
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetError(error, L"The PE virtual image does not fit in available memory.");
+        return false;
+    }
     memcpy(image->bytes.data(), fileBytes, optionalHeader.SizeOfHeaders);
+    image->headersSize = optionalHeader.SizeOfHeaders;
+
+    struct VirtualRange final { DWORD first; DWORD last; };
+    std::vector<VirtualRange> virtualRanges;
+    virtualRanges.reserve(fileHeader.NumberOfSections);
 
     for (WORD index = 0; index < fileHeader.NumberOfSections; ++index)
     {
@@ -109,25 +128,47 @@ bool PeMapper::Materialize(const BYTE* fileBytes, size_t fileSize, MappedPeImage
             return false;
         }
 
-        if (section.SizeOfRawData == 0)
+        const ULONGLONG virtualSpan = (std::max)(
+            static_cast<ULONGLONG>(section.Misc.VirtualSize),
+            static_cast<ULONGLONG>(section.SizeOfRawData));
+        if (virtualSpan != 0)
         {
-            if (section.Misc.VirtualSize != 0)
+            const ULONGLONG virtualEnd =
+                static_cast<ULONGLONG>(section.VirtualAddress) + virtualSpan;
+            if (virtualEnd > optionalHeader.SizeOfImage)
             {
-                image->sections.push_back({ section.VirtualAddress, section.Misc.VirtualSize, section.Characteristics });
+                SetError(error, L"A PE section exceeds the declared virtual image.");
+                return false;
             }
-            continue;
+            virtualRanges.push_back({ section.VirtualAddress,
+                static_cast<DWORD>(virtualEnd) });
+            image->sections.push_back({ section.VirtualAddress,
+                static_cast<DWORD>(virtualSpan), section.Characteristics });
         }
 
-        if (!Contains(fileSize, section.PointerToRawData, section.SizeOfRawData) ||
-            !Contains(image->bytes.size(), section.VirtualAddress, section.SizeOfRawData))
+        if (section.SizeOfRawData != 0 &&
+            (!Contains(fileSize, section.PointerToRawData, section.SizeOfRawData) ||
+             !Contains(image->bytes.size(), section.VirtualAddress, section.SizeOfRawData)))
         {
             SetError(error, L"A PE section exceeds its source or virtual image bounds.");
             return false;
         }
 
-        memcpy(image->bytes.data() + section.VirtualAddress, fileBytes + section.PointerToRawData, section.SizeOfRawData);
-        image->sections.push_back({ section.VirtualAddress,
-            (std::max)(section.Misc.VirtualSize, section.SizeOfRawData), section.Characteristics });
+        if (section.SizeOfRawData != 0)
+            memcpy(image->bytes.data() + section.VirtualAddress,
+                fileBytes + section.PointerToRawData, section.SizeOfRawData);
+    }
+
+    std::sort(virtualRanges.begin(), virtualRanges.end(),
+        [](const VirtualRange& left, const VirtualRange& right)
+        { return left.first < right.first; });
+    for (size_t index = 1; index < virtualRanges.size(); ++index)
+    {
+        if (virtualRanges[index].first < virtualRanges[index - 1].last)
+        {
+            SetError(error, L"The PE contains overlapping virtual sections.");
+            return false;
+        }
     }
 
     image->preferredImageBase = optionalHeader.ImageBase;
@@ -151,10 +192,17 @@ bool PeMapper::ApplyBaseRelocations(MappedPeImage* image, ULONGLONG actualImageB
         return false;
     }
 
-    const IMAGE_DATA_DIRECTORY directory = optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
+    if (actualImageBase == image->preferredImageBase)
+        return true;
+
+    const IMAGE_DATA_DIRECTORY directory =
+        optionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC
+        ? optionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC]
+        : IMAGE_DATA_DIRECTORY{};
     if (directory.VirtualAddress == 0 || directory.Size == 0)
     {
-        return actualImageBase == image->preferredImageBase;
+        SetError(error, L"The image cannot be relocated because it has no base-relocation directory.");
+        return false;
     }
 
     if (!Contains(image->bytes.size(), directory.VirtualAddress, directory.Size))
@@ -168,6 +216,11 @@ bool PeMapper::ApplyBaseRelocations(MappedPeImage* image, ULONGLONG actualImageB
     const size_t end = cursor + directory.Size;
     while (cursor < end)
     {
+        if (end - cursor < sizeof(IMAGE_BASE_RELOCATION))
+        {
+            SetError(error, L"The relocation directory has a truncated block header.");
+            return false;
+        }
         IMAGE_BASE_RELOCATION block{};
         if (!Read(image->bytes.data(), image->bytes.size(), cursor, &block) ||
             block.SizeOfBlock < sizeof(block) || !Contains(end, cursor, block.SizeOfBlock))
@@ -195,7 +248,14 @@ bool PeMapper::ApplyBaseRelocations(MappedPeImage* image, ULONGLONG actualImageB
                 continue;
             }
 
-            const size_t target = static_cast<size_t>(block.VirtualAddress) + offset;
+            const ULONGLONG target64 =
+                static_cast<ULONGLONG>(block.VirtualAddress) + offset;
+            if (target64 > SIZE_MAX)
+            {
+                SetError(error, L"A relocation target overflows the host address space.");
+                return false;
+            }
+            const size_t target = static_cast<size_t>(target64);
             if (type != IMAGE_REL_BASED_DIR64 || !Contains(image->bytes.size(), target, sizeof(ULONGLONG)))
             {
                 SetError(error, L"The image contains an unsupported or out-of-bounds relocation.");

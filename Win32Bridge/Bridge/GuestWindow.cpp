@@ -1126,7 +1126,7 @@ namespace
     struct GuestComboBoxExItemW final
     {
         UINT mask;
-        int item;
+        INT_PTR item;
         LPWSTR text;
         int textCapacity;
         int image;
@@ -1135,6 +1135,10 @@ namespace
         int indent;
         LPARAM itemData;
     };
+    static_assert(offsetof(GuestComboBoxExItemW, text) == 16,
+        "COMBOBOXEXITEMW x64 text offset mismatch");
+    static_assert(sizeof(GuestComboBoxExItemW) == 56,
+        "COMBOBOXEXITEMW x64 guest ABI mismatch");
 
     struct GuestNotifyHeader final
     {
@@ -3837,14 +3841,50 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
         if (message == GuestAbi::WmPaint)
         {
             bool paintActive = false;
+            bool paintStillPending = false;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 paintActive = window->paintActive;
+                paintStillPending = window->invalidated ||
+                    window->internalPaintPending;
             }
             RuntimeDiagnostics::Record(
                 L"PAINT CALLBACK: handle " + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)) +
                 L" used a custom procedure (result=" + std::to_wstring(result) +
                 L", BeginPaint active=" + (paintActive ? L"yes" : L"no") + L").");
+
+            // A number of common controls install a thin/subclass procedure
+            // and rely on the class default procedure to consume WM_PAINT.
+            // If that callback neither BeginPaint/EndPaint nor ValidateRect,
+            // leaving the update region pending would cause an endless stream
+            // of WM_PAINT messages and starve modal/menu loops.  Finish the
+            // class paint here, exactly as CallWindowProc(DefWindowProc) would.
+            // Do not overwrite a custom control that completed BeginPaint:
+            // ListView and other comctl32 controls may have rendered through
+            // their own procedure. ComboBoxEx is the exception in this bridge:
+            // its guest procedure consumes WM_PAINT but has no host drawing
+            // target, so the retained ComboBox renderer must supply its field.
+            const bool needsBuiltinFallback = paintStillPending ||
+                builtinKind == BuiltinControlKind::ComboBox;
+            if (needsBuiltinFallback && !paintActive)
+            {
+                if (builtinKind != BuiltinControlKind::None)
+                {
+                    // A guest ComboBoxEx procedure normally validates its
+                    // update region before returning.  Its drawing is not a
+                    // replacement for the bridge-owned retained surface, so
+                    // the fallback renderer still has to repaint that
+                    // surface.  Give the second BeginPaint a real update
+                    // region; otherwise it receives an empty clip and every
+                    // draw below is silently discarded, leaving the parent
+                    // rebar's white background visible.
+                    if (!paintStillPending)
+                        InvalidateGuestRect(handle, nullptr, FALSE, nullptr);
+                    BuiltinControlProcedure(window, message, wParam, lParam);
+                }
+                else
+                    DefaultGuestWindowProcedure(handle, message, wParam, lParam);
+            }
         }
         return result;
     }
@@ -4055,7 +4095,8 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
         parent = record->parent;
         const GuestMetrics::NonClientMetrics nonClient =
             GuestMetrics::NonClientForEmbeddedWindow(
-                record->style, record->extendedStyle, parent != nullptr);
+                record->style, record->extendedStyle,
+                parent != nullptr || record->owner != nullptr);
         width = (std::max)(0, record->surface.Width() -
             nonClient.left - nonClient.right);
         height = (std::max)(0, record->surface.Height() -
@@ -4298,8 +4339,21 @@ UINT GuestWindowManager::TrackGuestPopupMenu(HMENU menu, UINT flags, int x, int 
     InvalidateGuestRect(root, nullptr, FALSE, nullptr);
     Present(FindWindow(root));
 
+    // TrackPopupMenu is a modal loop, not a passive condition wait. Pointer
+    // input is delivered by the host UI thread, while WM_INITMENUPOPUP and
+    // related synchronous notifications target the guest owner thread. Keep
+    // dispatching sent messages while the popup is open so neither side waits
+    // forever for the other.
+    const DWORD trackingThread = BridgeGetCurrentThreadId();
     std::unique_lock<std::mutex> lock(m_popupMenuLock);
-    m_popupMenuChanged.wait(lock, [this] { return !m_popupMenu.open || !m_active.load(); });
+    while (m_popupMenu.open && m_active.load())
+    {
+        m_popupMenuChanged.wait_for(lock, std::chrono::milliseconds(5));
+        if (!m_popupMenu.open || !m_active.load()) break;
+        lock.unlock();
+        while (DispatchOneSentMessage(trackingThread)) {}
+        lock.lock();
+    }
     const UINT command = m_popupMenu.selectedCommand;
     const bool returnCommand = m_popupMenu.returnCommand;
     const bool notifyOwner = m_popupMenu.notifyOwner;
@@ -5494,7 +5548,7 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
             const GuestMetrics::NonClientMetrics nonClient =
                 GuestMetrics::NonClientForEmbeddedWindow(
                     record->style, record->extendedStyle,
-                    record->parent != nullptr);
+                    record->parent != nullptr || record->owner != nullptr);
             snapshot.clientLeft = nonClient.left;
             snapshot.clientTop = nonClient.top;
             snapshot.topMost = record->windowClass &&
@@ -5610,7 +5664,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
     const auto notifyMenuClosed = [this](HWND owner)
     {
         if (owner)
-            SendGuestMessage(owner, GuestAbi::WmMenuSelect,
+            PostGuestMessage(owner, GuestAbi::WmMenuSelect,
                 GuestAbi::MakeCommandWParam(0, 0xffff), 0, nullptr);
     };
     const auto notifyMenuSelection = [this](HWND owner, HMENU containingMenu,
@@ -5618,7 +5672,7 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
     {
         if (!owner) return;
         const UINT selected = item.subMenu ? static_cast<UINT>(index) : item.identifier;
-        SendGuestMessage(owner, GuestAbi::WmMenuSelect,
+        PostGuestMessage(owner, GuestAbi::WmMenuSelect,
             GuestAbi::MakeCommandWParam(static_cast<WORD>(selected),
                 static_cast<WORD>(MenuSelectFlags(item, true))),
             reinterpret_cast<LPARAM>(containingMenu), nullptr);
@@ -5641,9 +5695,9 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
         if (closing.menuBar && closing.owner)
         {
             for (auto iterator = closing.levels.rbegin(); iterator != closing.levels.rend(); ++iterator)
-                SendGuestMessage(closing.owner, GuestAbi::WmUninitMenuPopup,
+                PostGuestMessage(closing.owner, GuestAbi::WmUninitMenuPopup,
                     reinterpret_cast<WPARAM>(iterator->menu), 0, nullptr);
-            SendGuestMessage(closing.owner, GuestAbi::WmExitMenuLoop, FALSE, 0, nullptr);
+            PostGuestMessage(closing.owner, GuestAbi::WmExitMenuLoop, FALSE, 0, nullptr);
         }
         RuntimeDiagnostics::Record(command
             ? L"MENU: selected command " + std::to_wstring(command) + L"."
@@ -7188,7 +7242,7 @@ LRESULT GuestWindowManager::DefaultNonClientProcedure(
 {
     if (!window) return 0;
     DWORD style = 0, extendedStyle = 0;
-    bool child = false, menuBar = false;
+    bool child = false, embeddedOrChild = false, menuBar = false;
     RECT bounds{};
     {
         std::lock_guard<std::mutex> guard(window->lock);
@@ -7196,11 +7250,13 @@ LRESULT GuestWindowManager::DefaultNonClientProcedure(
         style = window->style;
         extendedStyle = window->extendedStyle;
         child = window->parent != nullptr;
+        embeddedOrChild = child || window->owner != nullptr;
         menuBar = !child && window->menuBar;
         bounds = window->bounds;
     }
     const GuestMetrics::NonClientMetrics metrics =
-        GuestMetrics::NonClientForEmbeddedWindow(style, extendedStyle, child);
+        GuestMetrics::NonClientForEmbeddedWindow(style, extendedStyle,
+            embeddedOrChild);
 
     if (message == GuestAbi::WmNcActivate)
     {
@@ -7865,7 +7921,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
 
             GuestComboBoxExItemW item = {};
-            if (!TryReadGuestValue(reinterpret_cast<const GuestComboBoxExItemW*>(lParam), &item) || item.item < 0)
+            if (!TryReadGuestValue(reinterpret_cast<const GuestComboBoxExItemW*>(lParam), &item) ||
+                (item.item < 0 &&
+                    !(message == ComboBoxExInsertItemW && item.item == -1)))
             {
                 return message == ComboBoxExInsertItemW ? -1 : FALSE;
             }
@@ -7899,7 +7957,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 }
                 if (message == ComboBoxExInsertItemW)
                 {
-                    const size_t insertion = (std::min)(static_cast<size_t>(item.item), window->choiceItems.size());
+                    // CBEM_INSERTITEM documents iItem == -1 as append. This is
+                    // the normal path used by address/history ComboBoxEx
+                    // controls and must not be treated as an invalid index.
+                    const size_t insertion = item.item == -1
+                        ? window->choiceItems.size()
+                        : (std::min)(static_cast<size_t>(item.item),
+                            window->choiceItems.size());
                     window->choiceItems.insert(window->choiceItems.begin() + insertion, std::move(caption));
                     result = static_cast<int>(insertion);
                     if (window->selectedChoice < 0)
@@ -7953,10 +8017,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
         if (reset)
         {
-            std::lock_guard<std::mutex> guard(window->lock);
-            window->choiceItems.clear();
-            window->selectedChoice = -1;
-            window->title.clear();
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                window->choiceItems.clear();
+                window->selectedChoice = -1;
+                window->title.clear();
+            }
+            invalidate();
             return 0;
         }
         if (remove)
@@ -7970,11 +8037,20 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
         if (setSelection)
         {
-            std::lock_guard<std::mutex> guard(window->lock);
             const INT_PTR index = static_cast<INT_PTR>(wParam);
-            if (index < -1 || static_cast<size_t>(index) >= window->choiceItems.size()) return -1;
-            window->selectedChoice = static_cast<int>(index);
-            window->title = index >= 0 ? window->choiceItems[static_cast<size_t>(index)] : std::wstring();
+            {
+                std::lock_guard<std::mutex> guard(window->lock);
+                // Win32 accepts -1 to clear the current selection.  Do not
+                // cast it to size_t before testing it.
+                if (index < -1 || (index >= 0 &&
+                    static_cast<size_t>(index) >= window->choiceItems.size()))
+                    return -1;
+                window->selectedChoice = static_cast<int>(index);
+                window->title = index >= 0
+                    ? window->choiceItems[static_cast<size_t>(index)]
+                    : std::wstring();
+            }
+            invalidate();
             return static_cast<LRESULT>(index);
         }
         if (getSelection)
@@ -11347,7 +11423,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 const GuestMetrics::NonClientMetrics nonClient =
                     GuestMetrics::NonClientForEmbeddedWindow(
                         window->style, window->extendedStyle,
-                        window->parent != nullptr);
+                        window->parent != nullptr || window->owner != nullptr);
                 clientWidth = (std::max)(0, clientWidth -
                     nonClient.left - nonClient.right);
                 clientHeight = (std::max)(0, clientHeight -
@@ -11724,6 +11800,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             (style & 0x0030u) != 0;
         if (ownerDrawChoice)
         {
+            const int width = surface->Width();
+            const int height = surface->Height();
             const UINT controlType = controlKind == BuiltinControlKind::ListBox ? 2u : 3u;
             int rowTop = controlKind == BuiltinControlKind::ComboBox
                 ? (comboDropped ? (std::min)(height, GuestMetrics::ControlHeightForText(controlTextHeight)) : 0) : 0;
@@ -15099,7 +15177,7 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
                 const GuestMetrics::NonClientMetrics nonClient =
                     GuestMetrics::NonClientForEmbeddedWindow(
                         record->style, record->extendedStyle,
-                        record->parent != nullptr);
+                        record->parent != nullptr || record->owner != nullptr);
                 clientWidth = (std::max)(0, clientWidth -
                     nonClient.left - nonClient.right);
                 clientHeight = (std::max)(0, clientHeight -
@@ -15112,6 +15190,15 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
                     static_cast<WORD>((std::min)(clientWidth, 0xffff)),
                     static_cast<WORD>((std::min)(clientHeight, 0xffff))));
         }
+        return 0;
+    }
+    case GuestAbi::WmPaint:
+    {
+        // DefWindowProc validates an otherwise unhandled update region. This
+        // also performs the class-brush erase negotiated by BeginPaint.
+        GuestAbi::PaintStruct paint{};
+        const HDC dc = BeginGuestPaint(window, &paint, nullptr);
+        if (dc) EndGuestPaint(window, &paint, nullptr);
         return 0;
     }
     case GuestAbi::WmEraseBkgnd:
@@ -15446,7 +15533,8 @@ BOOL GuestWindowManager::SendGuestMessageTimeout(HWND window, UINT message,
             sent->cancelled = true;
             break;
         }
-        const auto wake = std::min(deadline, now + std::chrono::milliseconds(5));
+        const auto shortDeadline = now + std::chrono::milliseconds(5);
+        const auto wake = deadline < shortDeadline ? deadline : shortDeadline;
         sent->completedChanged.wait_until(sentLock, wake);
         if (!sent->completed && (flags & BlockFlag) == 0)
         {
@@ -16067,11 +16155,10 @@ HDC GuestWindowManager::BeginGuestPaint(HWND window, GuestAbi::PaintStruct* pain
         record->paintActive = true;
     }
 
-    const MiniGdi::Region visibleRegion = VisibleRegionForWindow(window, true);
     MiniGdi::Region previousClip;
     if (!m_gdi.GetClipRegion(record->dc, &previousClip) ||
-        !m_gdi.SetClipRegion(record->dc, MiniGdi::IntersectRegion(
-            MiniGdi::IntersectRegion(previousClip, updateRegion), visibleRegion)))
+        !m_gdi.SetClipRegion(record->dc,
+            MiniGdi::IntersectRegion(previousClip, updateRegion)))
     {
         std::lock_guard<std::mutex> guard(record->lock);
         record->paintActive = false;
@@ -16195,10 +16282,13 @@ HDC GuestWindowManager::GetGuestDC(HWND window, DWORD* win32Error)
         SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
         return nullptr;
     }
+    // Each HWND owns a retained local surface. Sibling/ancestor occlusion is
+    // applied when those surfaces are composed; applying it to the common DC
+    // as well can permanently leave an occluded portion of the backing store
+    // blank. Preserve only the caller-visible DC state here and restore it in
+    // ReleaseDC.
     MiniGdi::Region previousClip;
-    if (!m_gdi.GetClipRegion(record->dc, &previousClip) ||
-        !m_gdi.SetClipRegion(record->dc, MiniGdi::IntersectRegion(
-            previousClip, VisibleRegionForWindow(window, true))))
+    if (!m_gdi.GetClipRegion(record->dc, &previousClip))
     {
         SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
         return nullptr;
@@ -16280,6 +16370,11 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
         return;
     }
 
+    // Input-driven popup tracking and guest painting can both request a frame
+    // at the same time.  Serializing the complete snapshot/composition keeps
+    // temporary MiniGDI DCs and menu-level snapshots from racing each other.
+    std::lock_guard<std::mutex> compositionGuard(m_compositionLock);
+
     try
     {
         {
@@ -16360,7 +16455,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                 snapshot.extendedStyle = candidate->extendedStyle;
                 snapshot.nonClient = GuestMetrics::NonClientForEmbeddedWindow(
                     candidate->style, candidate->extendedStyle,
-                    candidate->parent != nullptr);
+                    candidate->parent != nullptr || candidate->owner != nullptr);
                 snapshot.clientLeft = candidate->clientArea.left;
                 snapshot.clientTop = candidate->clientArea.top;
                 snapshot.topMost = candidate->windowClass &&

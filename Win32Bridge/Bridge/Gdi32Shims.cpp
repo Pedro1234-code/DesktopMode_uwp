@@ -1356,7 +1356,9 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"widenpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWidenPath);
     else if (_wcsicmp(symbol.name.c_str(), L"getpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPath);
     else if (_wcsicmp(symbol.name.c_str(), L"selectclippath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSelectClipPath);
-    else if (_wcsicmp(symbol.name.c_str(), L"createpalette") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePalette);
+    // Start a new chain periodically: MSVC models a long else-if sequence as
+    // nested blocks and C++/CX otherwise reaches C1061.
+    if (_wcsicmp(symbol.name.c_str(), L"createpalette") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePalette);
     else if (_wcsicmp(symbol.name.c_str(), L"selectpalette") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSelectPalette);
     else if (_wcsicmp(symbol.name.c_str(), L"realizepalette") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRealizePalette);
     else if (_wcsicmp(symbol.name.c_str(), L"getpaletteentries") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPaletteEntries);

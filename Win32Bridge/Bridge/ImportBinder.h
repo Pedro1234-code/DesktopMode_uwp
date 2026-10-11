@@ -12,6 +12,7 @@ namespace Bridge
     struct BindingReport
     {
         unsigned int bound = 0;
+        unsigned int deferred = 0;
         unsigned int unresolved = 0;
         std::vector<ImportResolution> resolutions;
     };

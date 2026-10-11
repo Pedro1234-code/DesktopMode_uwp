@@ -1141,11 +1141,66 @@ namespace
     }
 }
 
-PVOID WINAPI Win32Bridge::Bridge::BridgeSHBrowseForFolderW(PVOID)
+PVOID WINAPI Win32Bridge::Bridge::BridgeSHBrowseForFolderW(PVOID browseInfoValue)
 {
-    // Folder selection is supplied by the UWP picker path, not desktop shell
-    // PIDLs.  Returning cancellation keeps callers on their normal cancel path.
-    return nullptr;
+    struct GuestBrowseInfoW final
+    {
+        HWND owner;
+        PVOID root;
+        LPWSTR displayName;
+        LPCWSTR title;
+        UINT flags;
+        INT_PTR (CALLBACK* callback)(HWND, UINT, LPARAM, LPARAM);
+        LPARAM parameter;
+        int image;
+    };
+    static_assert(sizeof(GuestBrowseInfoW) == 64, "BROWSEINFOW x64 guest ABI mismatch");
+
+    auto* browseInfo = static_cast<GuestBrowseInfoW*>(browseInfoValue);
+    if (!browseInfo)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+
+    std::wstring initialDirectory;
+    VirtualPidlData root{};
+    if (browseInfo->root && ReadVirtualPidl(browseInfo->root, &root) &&
+        (root.node == VirtualShellNode::Drive || root.node == VirtualShellNode::Directory))
+        initialDirectory = root.path;
+    if (initialDirectory.empty())
+    {
+        GuestStorageContext* storage = CurrentGuestStorageContext();
+        initialDirectory = storage ? storage->CurrentDirectory() : L"C:\\";
+    }
+
+    GuestFileDialogDescriptor descriptor;
+    descriptor.owner = browseInfo->owner;
+    descriptor.title = browseInfo->title;
+    descriptor.initialDirectory = initialDirectory.c_str();
+    descriptor.folderDialog = TRUE;
+
+    std::wstring selected;
+    DWORD ignoredFilter = 1;
+    if (!ShowGuestFileDialog(descriptor, &selected, &ignoredFilter))
+        return nullptr;
+    if (selected.size() >= MAX_PATH)
+    {
+        BridgeSetLastError(ERROR_FILENAME_EXCED_RANGE);
+        return nullptr;
+    }
+
+    if (browseInfo->displayName)
+    {
+        const size_t separator = selected.find_last_of(L"\\/");
+        const std::wstring display = separator == std::wstring::npos
+            ? selected : selected.substr(separator + 1);
+        wcsncpy_s(browseInfo->displayName, MAX_PATH, display.c_str(), _TRUNCATE);
+    }
+    RuntimeDiagnostics::Record(L"SHELL: SHBrowseForFolderW selected virtual folder '" +
+        selected + L"'.");
+    BridgeSetLastError(ERROR_SUCCESS);
+    return CreateVirtualPidl(VirtualShellNode::Directory, selected.c_str());
 }
 
 DWORD_PTR WINAPI Win32Bridge::Bridge::BridgeSHGetFileInfoW(LPCWSTR path, DWORD attributes, PVOID info, UINT size, UINT flags)

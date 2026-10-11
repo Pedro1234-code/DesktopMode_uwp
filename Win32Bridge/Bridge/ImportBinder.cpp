@@ -36,6 +36,17 @@ bool ImportBinder::Bind(
     *report = BindingReport{};
     for (const auto& symbol : metadata.imports)
     {
+        // Delay-load IAT entries initially point at linker-generated thunks.
+        // Keep those entries intact so __delayLoadHelper2 performs the load on
+        // first use through the bridge's LoadLibrary/GetProcAddress shims.
+        // Eagerly resolving them here makes optional DLLs mandatory at process
+        // startup and does not match the NT loader contract.
+        if (symbol.delayLoaded)
+        {
+            ++report->deferred;
+            continue;
+        }
+
         const ImportResolution resolution = resolver(symbol);
         report->resolutions.push_back(resolution);
         if (resolution.targetAddress == 0)
