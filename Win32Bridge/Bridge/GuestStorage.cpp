@@ -747,6 +747,49 @@ bool GuestStorageContext::GetFilePath(
     return true;
 }
 
+bool GuestStorageContext::LockFileRange(HANDLE guestHandle, ULONGLONG offset,
+    ULONGLONG length, bool exclusive, bool failImmediately, DWORD* win32Error)
+{
+    UNREFERENCED_PARAMETER(failImmediately);
+    if (!length || offset > (std::numeric_limits<ULONGLONG>::max)() - length)
+    { SetWin32Error(win32Error, ERROR_INVALID_PARAMETER); return false; }
+    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    const auto file = m_files.find(token);
+    if (file == m_files.end() || !file->second)
+    { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
+    const std::wstring key = MetadataKey(file->second->canonicalPath);
+    const ULONGLONG end = offset + length;
+    for (const auto& existing : m_byteRangeLocks[key])
+    {
+        const ULONGLONG existingEnd = existing.offset + existing.length;
+        if (existing.owner != token && offset < existingEnd && existing.offset < end &&
+            (exclusive || existing.exclusive))
+        { SetWin32Error(win32Error, ERROR_LOCK_VIOLATION); return false; }
+    }
+    m_byteRangeLocks[key].push_back({ token, offset, length, exclusive });
+    SetWin32Error(win32Error, ERROR_SUCCESS); return true;
+}
+
+bool GuestStorageContext::UnlockFileRange(HANDLE guestHandle, ULONGLONG offset,
+    ULONGLONG length, DWORD* win32Error)
+{
+    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    const auto file = m_files.find(token);
+    if (file == m_files.end() || !file->second)
+    { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
+    const std::wstring key = MetadataKey(file->second->canonicalPath);
+    auto found = m_byteRangeLocks.find(key);
+    if (found == m_byteRangeLocks.end()) { SetWin32Error(win32Error, ERROR_NOT_LOCKED); return false; }
+    auto& locks = found->second;
+    const auto range = std::find_if(locks.begin(), locks.end(), [=](const ByteRangeLock& value)
+    { return value.owner == token && value.offset == offset && value.length == length; });
+    if (range == locks.end()) { SetWin32Error(win32Error, ERROR_NOT_LOCKED); return false; }
+    locks.erase(range); if (locks.empty()) m_byteRangeLocks.erase(found);
+    SetWin32Error(win32Error, ERROR_SUCCESS); return true;
+}
+
 DWORD GuestStorageContext::ApplyAttributeOverride(
     const std::wstring& canonicalPath,
     DWORD attributes) const
@@ -1152,6 +1195,14 @@ bool GuestStorageContext::CloseFile(HANDLE guestHandle, DWORD* win32Error)
         const std::wstring key = MetadataKey(record->canonicalPath);
         if (record->deleteOnClose) m_deletePending.insert(key);
         m_files.erase(found);
+        auto locked = m_byteRangeLocks.find(key);
+        if (locked != m_byteRangeLocks.end())
+        {
+            auto& ranges = locked->second;
+            ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
+                [token](const ByteRangeLock& range) { return range.owner == token; }), ranges.end());
+            if (ranges.empty()) m_byteRangeLocks.erase(locked);
+        }
         bool stillOpen = false;
         for (const auto& entry : m_files)
         {

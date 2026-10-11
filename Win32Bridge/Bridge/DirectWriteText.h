@@ -8,6 +8,21 @@ namespace Bridge
 {
 namespace DirectWriteText
 {
+    struct GlyphMetrics final
+    {
+        int leftSideBearing = 0;
+        int advanceWidth = 0;
+        int rightSideBearing = 0;
+        int topSideBearing = 0;
+        int advanceHeight = 0;
+        int bottomSideBearing = 0;
+        int verticalOriginY = 0;
+    };
+
+    bool MapGlyphs(const MiniGdi::Font& font, const wchar_t* text,
+        std::size_t characterCount, unsigned short* glyphs);
+    bool GetGlyphMetrics(const MiniGdi::Font& font, const unsigned short* glyphs,
+        std::size_t glyphCount, GlyphMetrics* metrics);
     // Returns false when DirectWrite is unavailable or rejects the requested
     // font. Callers retain MiniGDI's compact raster font as their fallback.
     bool Measure(

@@ -504,6 +504,25 @@ BOOL WINAPI BridgeGetKeyboardState(PBYTE state)
 
 LONG WINAPI BridgeGetMessageTime() { return static_cast<LONG>(BridgeGetTickCount()); }
 
+DWORD WINAPI BridgeGetQueueStatus(UINT flags)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return 0;
+    UINT available = 0; GuestAbi::Message message{};
+    if (manager->PeekGuestMessage(&message, nullptr, WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE)) available |= QS_KEY;
+    if (manager->PeekGuestMessage(&message, nullptr, WM_MOUSEFIRST, WM_MOUSELAST, PM_NOREMOVE)) available |= QS_MOUSE;
+    if (manager->PeekGuestMessage(&message, nullptr, WM_PAINT, WM_PAINT, PM_NOREMOVE)) available |= QS_PAINT;
+    if (manager->PeekGuestMessage(&message, nullptr, WM_TIMER, WM_TIMER, PM_NOREMOVE)) available |= QS_TIMER;
+    if (manager->PeekGuestMessage(&message, nullptr, 0, 0, PM_NOREMOVE)) available |= QS_POSTMESSAGE;
+    available &= flags;
+    return MAKELONG(available, available);
+}
+
+BOOL WINAPI BridgeGetInputState()
+{
+    return (BridgeGetQueueStatus(QS_INPUT) & 0xffffu) != 0;
+}
+
 HANDLE WINAPI BridgeGetClipboardData(UINT format)
 {
     std::lock_guard<std::mutex> guard(g_menuLock);
@@ -1300,6 +1319,18 @@ BOOL WINAPI BridgeUnregisterClassW(LPCWSTR className, HINSTANCE instance)
     const BOOL result = manager ? manager->UnregisterGuestClass(className, instance, &error) : FALSE;
     BridgeSetLastError(error);
     return result;
+}
+
+BOOL WINAPI BridgeUnregisterClassA(LPCSTR className, HINSTANCE instance)
+{
+    std::wstring storage;
+    LPCWSTR converted = nullptr;
+    if (!ConvertAnsiResourceName(className, &storage, &converted))
+    {
+        BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return FALSE;
+    }
+    return BridgeUnregisterClassW(converted, instance);
 }
 
 BOOL WINAPI BridgeWinHelpW(HWND, LPCWSTR, UINT, ULONG_PTR)

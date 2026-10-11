@@ -58,6 +58,7 @@ namespace Bridge
     HANDLE WINAPI BridgeOpenFileMappingW(DWORD desiredAccess, BOOL inheritHandle, LPCWSTR name);
     LPVOID WINAPI BridgeMapViewOfFile(HANDLE mapping, DWORD desiredAccess, DWORD offsetHigh, DWORD offsetLow, SIZE_T bytesToMap);
     BOOL WINAPI BridgeUnmapViewOfFile(LPCVOID baseAddress);
+    BOOL WINAPI BridgeFlushViewOfFile(LPCVOID baseAddress, SIZE_T bytesToFlush);
     BOOL WINAPI BridgeGetFileInformationByHandle(HANDLE file, LPBY_HANDLE_FILE_INFORMATION information);
     BOOL WINAPI BridgeSetFileTime(HANDLE file, const FILETIME* creation, const FILETIME* access, const FILETIME* write);
     BOOL WINAPI BridgeFileTimeToDosDateTime(const FILETIME* fileTime, LPWORD date, LPWORD time);

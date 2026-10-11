@@ -54,6 +54,8 @@ namespace
     };
     std::mutex g_cursorLock;
     std::unordered_map<ULONG_PTR, GuestCursorRecord> g_guestCursors;
+    std::mutex g_ansiClassStringLock;
+    std::unordered_map<std::wstring, std::string> g_ansiClassStrings;
 
     // DPI_AWARENESS_CONTEXT is an opaque pseudo-handle on desktop Windows.
     // The UWP SDK does not consistently expose the typedef/constants, so keep
@@ -102,6 +104,23 @@ namespace
             BridgeSetLastError(ERROR_INVALID_FUNCTION);
         }
         return manager;
+    }
+
+    LPCSTR PersistentAnsiClassString(LPCWSTR text)
+    {
+        if (!text) return nullptr;
+        if (reinterpret_cast<ULONG_PTR>(text) <= 0xffff)
+            return reinterpret_cast<LPCSTR>(text);
+        const int count = ::WideCharToMultiByte(
+            CP_ACP, 0, text, -1, nullptr, 0, nullptr, nullptr);
+        if (count <= 0) return nullptr;
+        std::string converted(static_cast<size_t>(count), '\0');
+        if (::WideCharToMultiByte(CP_ACP, 0, text, -1, &converted[0], count,
+            nullptr, nullptr) != count) return nullptr;
+        converted.resize(static_cast<size_t>(count - 1));
+        std::lock_guard<std::mutex> guard(g_ansiClassStringLock);
+        const auto inserted = g_ansiClassStrings.emplace(text, std::move(converted));
+        return inserted.first->second.c_str();
     }
 
     MiniGdi::ObjectHandle FromGuestObject(HGDIOBJ object)
@@ -1263,6 +1282,50 @@ ATOM WINAPI Win32Bridge::Bridge::BridgeRegisterClassW(const GuestAbi::WndClassW*
     const ATOM result = manager->RegisterGuestClass(windowClass, &error);
     BridgeSetLastError(error);
     return result;
+}
+
+ATOM WINAPI Win32Bridge::Bridge::BridgeRegisterClassExA(const GuestAbi::WndClassExA* source)
+{
+    if (!source || source->cbSize < sizeof(*source))
+    { BridgeSetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    std::wstring classStorage, menuStorage;
+    LPCWSTR className = nullptr, menuName = nullptr;
+    if (!ConvertAnsiResourceName(source->lpszClassName, &classStorage, &className) ||
+        (source->lpszMenuName && !ConvertAnsiResourceName(
+            source->lpszMenuName, &menuStorage, &menuName)))
+    { BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION); return 0; }
+    GuestAbi::WndClassExW converted{};
+    converted.cbSize = sizeof(converted);
+    converted.style = source->style;
+    converted.lpfnWndProc = source->lpfnWndProc;
+    converted.cbClsExtra = source->cbClsExtra;
+    converted.cbWndExtra = source->cbWndExtra;
+    converted.hInstance = source->hInstance;
+    converted.hIcon = source->hIcon;
+    converted.hCursor = source->hCursor;
+    converted.hbrBackground = source->hbrBackground;
+    converted.lpszMenuName = menuName;
+    converted.lpszClassName = className;
+    converted.hIconSm = source->hIconSm;
+    return BridgeRegisterClassExW(&converted);
+}
+
+ATOM WINAPI Win32Bridge::Bridge::BridgeRegisterClassA(const GuestAbi::WndClassA* source)
+{
+    if (!source) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return 0; }
+    GuestAbi::WndClassExA converted{};
+    converted.cbSize = sizeof(converted);
+    converted.style = source->style;
+    converted.lpfnWndProc = source->lpfnWndProc;
+    converted.cbClsExtra = source->cbClsExtra;
+    converted.cbWndExtra = source->cbWndExtra;
+    converted.hInstance = source->hInstance;
+    converted.hIcon = source->hIcon;
+    converted.hCursor = source->hCursor;
+    converted.hbrBackground = source->hbrBackground;
+    converted.lpszMenuName = source->lpszMenuName;
+    converted.lpszClassName = source->lpszClassName;
+    return BridgeRegisterClassExA(&converted);
 }
 
 HWND WINAPI Win32Bridge::Bridge::BridgeCreateWindowExW(
@@ -3579,9 +3642,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWaitMessage()
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager) return FALSE;
-    GuestAbi::Message message{};
-    while (!manager->PeekGuestMessage(&message, nullptr, 0, 0, 0))
-        BridgeSleep(1);
+    if (!manager->WaitForGuestMessage(INFINITE)) return FALSE;
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -4124,7 +4185,116 @@ HBITMAP WINAPI Win32Bridge::Bridge::BridgeLoadBitmapA(HINSTANCE instance, LPCSTR
     return BridgeLoadBitmapW(instance, converted);
 }
 
-BOOL WINAPI Win32Bridge::Bridge::BridgeGetClassInfoW(HINSTANCE, LPCWSTR, GuestAbi::WndClassW*) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetClassInfoExW(
+    HINSTANCE instance, LPCWSTR className, GuestAbi::WndClassExW* result)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager || !result) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    DWORD error = ERROR_SUCCESS;
+    const BOOL found = manager->GetGuestClassInfo(instance, className, result, &error);
+    BridgeSetLastError(error);
+    return found;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetClassInfoW(
+    HINSTANCE instance, LPCWSTR className, GuestAbi::WndClassW* result)
+{
+    if (!result) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    GuestAbi::WndClassExW extended{};
+    if (!BridgeGetClassInfoExW(instance, className, &extended)) return FALSE;
+    result->style = extended.style;
+    result->lpfnWndProc = extended.lpfnWndProc;
+    result->cbClsExtra = extended.cbClsExtra;
+    result->cbWndExtra = extended.cbWndExtra;
+    result->hInstance = extended.hInstance;
+    result->hIcon = extended.hIcon;
+    result->hCursor = extended.hCursor;
+    result->hbrBackground = extended.hbrBackground;
+    result->lpszMenuName = extended.lpszMenuName;
+    result->lpszClassName = extended.lpszClassName;
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetClassInfoExA(
+    HINSTANCE instance, LPCSTR className, GuestAbi::WndClassExA* result)
+{
+    if (!result) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    std::wstring storage;
+    LPCWSTR wideName = nullptr;
+    if (!ConvertAnsiResourceName(className, &storage, &wideName))
+    { BridgeSetLastError(ERROR_NO_UNICODE_TRANSLATION); return FALSE; }
+    GuestAbi::WndClassExW wide{};
+    if (!BridgeGetClassInfoExW(instance, wideName, &wide)) return FALSE;
+    result->cbSize = sizeof(*result);
+    result->style = wide.style;
+    result->lpfnWndProc = wide.lpfnWndProc;
+    result->cbClsExtra = wide.cbClsExtra;
+    result->cbWndExtra = wide.cbWndExtra;
+    result->hInstance = wide.hInstance;
+    result->hIcon = wide.hIcon;
+    result->hCursor = wide.hCursor;
+    result->hbrBackground = wide.hbrBackground;
+    result->lpszMenuName = PersistentAnsiClassString(wide.lpszMenuName);
+    result->lpszClassName = reinterpret_cast<ULONG_PTR>(className) <= 0xffff
+        ? className : PersistentAnsiClassString(wide.lpszClassName);
+    result->hIconSm = wide.hIconSm;
+    return TRUE;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetClassInfoA(
+    HINSTANCE instance, LPCSTR className, GuestAbi::WndClassA* result)
+{
+    if (!result) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    GuestAbi::WndClassExA extended{};
+    if (!BridgeGetClassInfoExA(instance, className, &extended)) return FALSE;
+    result->style = extended.style;
+    result->lpfnWndProc = extended.lpfnWndProc;
+    result->cbClsExtra = extended.cbClsExtra;
+    result->cbWndExtra = extended.cbWndExtra;
+    result->hInstance = extended.hInstance;
+    result->hIcon = extended.hIcon;
+    result->hCursor = extended.hCursor;
+    result->hbrBackground = extended.hbrBackground;
+    result->lpszMenuName = extended.lpszMenuName;
+    result->lpszClassName = extended.lpszClassName;
+    return TRUE;
+}
+
+ULONG_PTR WINAPI Win32Bridge::Bridge::BridgeGetClassLongPtrW(HWND window, int index)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const ULONG_PTR result = manager ? manager->GetGuestClassLongPtr(window, index, &error) : 0;
+    BridgeSetLastError(error);
+    return result;
+}
+
+ULONG_PTR WINAPI Win32Bridge::Bridge::BridgeSetClassLongPtrW(HWND window, int index, LONG_PTR value)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const ULONG_PTR result = manager ? manager->SetGuestClassLongPtr(window, index, value, &error) : 0;
+    BridgeSetLastError(error);
+    return result;
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeGetClassLongW(HWND window, int index)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const DWORD result = manager ? static_cast<DWORD>(manager->GetGuestClassLong(window, index, &error)) : 0;
+    BridgeSetLastError(error);
+    return result;
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeSetClassLongW(HWND window, int index, LONG value)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    DWORD error = ERROR_SUCCESS;
+    const DWORD result = manager ? static_cast<DWORD>(manager->SetGuestClassLong(window, index, value, &error)) : 0;
+    BridgeSetLastError(error);
+    return result;
+}
 LRESULT WINAPI Win32Bridge::Bridge::BridgeCallWindowProcW(GuestAbi::WndProc procedure, HWND window, UINT message, WPARAM wParam, LPARAM lParam)
 {
     if (!procedure)
@@ -4187,8 +4357,12 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
 
     if (_wcsicmp(symbol.name.c_str(), L"registerclassexw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterClassExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"registerclassexa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterClassExA);
     else if (_wcsicmp(symbol.name.c_str(), L"registerclassw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterClassW);
+    else if (_wcsicmp(symbol.name.c_str(), L"registerclassa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterClassA);
     else if (_wcsicmp(symbol.name.c_str(), L"createwindowexw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateWindowExW);
     else if (_wcsicmp(symbol.name.c_str(), L"loadcursorw") == 0)
@@ -4495,6 +4669,24 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadBitmapA);
     else if (_wcsicmp(symbol.name.c_str(), L"getclassinfow") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassInfoW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclassinfoa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassInfoA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclassinfoexw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassInfoExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclassinfoexa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassInfoExA);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclasslongptrw") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"getclasslongptra") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassLongPtrW);
+    else if (_wcsicmp(symbol.name.c_str(), L"setclasslongptrw") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"setclasslongptra") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetClassLongPtrW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getclasslongw") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"getclasslonga") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClassLongW);
+    else if (_wcsicmp(symbol.name.c_str(), L"setclasslongw") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"setclasslonga") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetClassLongW);
     else if (_wcsicmp(symbol.name.c_str(), L"callwindowprocw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCallWindowProcW);
     else if (_wcsicmp(symbol.name.c_str(), L"dialogboxparamw") == 0)
@@ -4566,6 +4758,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"showcursor") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShowCursor);
     else if (_wcsicmp(symbol.name.c_str(), L"getkeyboardstate") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetKeyboardState);
     else if (_wcsicmp(symbol.name.c_str(), L"getmessagetime") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMessageTime);
+    else if (_wcsicmp(symbol.name.c_str(), L"getqueuestatus") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetQueueStatus);
+    else if (_wcsicmp(symbol.name.c_str(), L"getinputstate") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetInputState);
     else if (_wcsicmp(symbol.name.c_str(), L"getclipboarddata") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipboardData);
     else if (_wcsicmp(symbol.name.c_str(), L"registerclipboardformata") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRegisterClipboardFormatA);
     else if (_wcsicmp(symbol.name.c_str(), L"isclipboardformatavailable") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsClipboardFormatAvailable);
@@ -4630,6 +4824,7 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"createiconindirect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateIconIndirect);
     else if (_wcsicmp(symbol.name.c_str(), L"geticoninfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetIconInfo);
     else if (_wcsicmp(symbol.name.c_str(), L"unregisterclassw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnregisterClassW);
+    else if (_wcsicmp(symbol.name.c_str(), L"unregisterclassa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnregisterClassA);
 
     if (resolution.targetAddress != 0)
     {

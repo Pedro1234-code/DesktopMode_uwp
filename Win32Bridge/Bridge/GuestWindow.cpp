@@ -202,6 +202,13 @@ namespace
         return value;
     }
 
+    std::wstring GuestClassKey(DWORD processId, HINSTANCE instance,
+        const std::wstring& lowercaseName)
+    {
+        return std::to_wstring(processId) + L":" +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(instance)) + L":" + lowercaseName;
+    }
+
     bool IsAtomPointer(LPCWSTR value)
     {
         return reinterpret_cast<ULONG_PTR>(value) != 0 && reinterpret_cast<ULONG_PTR>(value) <= 0xffff;
@@ -1148,6 +1155,11 @@ namespace
         RECT itemRect;
         ULONG_PTR itemData;
     };
+    struct GuestMeasureItem final
+    {
+        UINT controlType; UINT controlId; UINT itemId;
+        UINT itemWidth; UINT itemHeight; ULONG_PTR itemData;
+    };
 
     // NM_CUSTOMDRAW is the common prefix of the control-specific custom-draw
     // notifications. Keep writable trailing storage because applications cast
@@ -1671,7 +1683,10 @@ namespace
 
     bool IsValidWindowExtraOffset(int index, size_t available, size_t valueSize)
     {
-        if (index < 0 || valueSize == 0 || (index % static_cast<int>(valueSize)) != 0)
+        // Positive indices are byte offsets, not array indexes. USER32 permits
+        // unaligned offsets as long as the complete LONG/LONG_PTR fits in the
+        // class/window allocation declared at registration time.
+        if (index < 0 || valueSize == 0)
         {
             return false;
         }
@@ -2336,14 +2351,21 @@ struct GuestWindowManager::WindowClass final
 {
     DWORD processId = 0;
     std::wstring name;
+    std::wstring displayName;
     // WNDCLASS owns the menu-resource association for a top-level window.
     // Keep either the resource name or its MAKEINTRESOURCE value so creating
     // the window can materialize the virtual USER32 menu later.
     std::wstring menuResourceName;
     ULONG_PTR menuResourceAtom = 0;
     GuestAbi::WndProc procedure = nullptr;
+    HINSTANCE instance = nullptr;
+    HINSTANCE registrationScope = nullptr;
+    HICON icon = nullptr;
+    HICON smallIcon = nullptr;
+    HCURSOR cursor = nullptr;
     HBRUSH background = nullptr;
     UINT style = 0;
+    std::vector<BYTE> extraBytes;
     int windowExtraBytes = 0;
     ATOM atom = 0;
     BuiltinControlKind builtinKind = BuiltinControlKind::None;
@@ -2881,7 +2903,8 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassExW* windowC
 {
     if (!windowClass || windowClass->cbSize < sizeof(GuestAbi::WndClassExW) || !windowClass->lpszClassName ||
         !windowClass->lpfnWndProc || windowClass->cbClsExtra < 0 || windowClass->cbWndExtra < 0 ||
-        windowClass->cbWndExtra > MaximumWindowExtraBytes)
+        windowClass->cbWndExtra > MaximumWindowExtraBytes ||
+        windowClass->cbClsExtra > MaximumWindowExtraBytes)
     {
         SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
         return 0;
@@ -2896,7 +2919,9 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassExW* windowC
     }
 
     std::lock_guard<std::mutex> guard(m_classesLock);
-    const std::wstring processClassName = std::to_wstring(processId) + L":" + name;
+    const HINSTANCE classScope = (windowClass->style & 0x00004000u) != 0
+        ? nullptr : windowClass->hInstance; // CS_GLOBALCLASS
+    const std::wstring processClassName = GuestClassKey(processId, classScope, name);
     if (m_classes.find(processClassName) != m_classes.end())
     {
         SetWin32Error(win32Error, ERROR_CLASS_ALREADY_EXISTS);
@@ -2906,6 +2931,7 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassExW* windowC
     auto registered = std::make_shared<WindowClass>();
     registered->processId = processId;
     registered->name = name;
+    registered->displayName = windowClass->lpszClassName;
     if (windowClass->lpszMenuName)
     {
         if (IsAtomPointer(windowClass->lpszMenuName))
@@ -2918,13 +2944,29 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassExW* windowC
         }
     }
     registered->procedure = windowClass->lpfnWndProc;
+    registered->instance = windowClass->hInstance;
+    registered->registrationScope = classScope;
+    registered->icon = windowClass->hIcon;
+    registered->smallIcon = windowClass->hIconSm;
+    registered->cursor = windowClass->hCursor;
     registered->background = windowClass->hbrBackground;
     registered->style = windowClass->style;
+    registered->extraBytes.resize(static_cast<size_t>(windowClass->cbClsExtra));
     registered->windowExtraBytes = windowClass->cbWndExtra;
-    registered->atom = m_nextAtom++;
-    if (registered->atom == 0)
+    const ATOM firstCandidate = m_nextAtom;
+    do
     {
         registered->atom = m_nextAtom++;
+        if (m_nextAtom < 0xc000) m_nextAtom = 0xc000;
+        if (registered->atom >= 0xc000 &&
+            m_classesByAtom.find(registered->atom) == m_classesByAtom.end())
+            break;
+        registered->atom = 0;
+    } while (m_nextAtom != firstCandidate);
+    if (!registered->atom)
+    {
+        SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
     }
     m_classes.emplace(processClassName, registered);
     m_classesByAtom.emplace(registered->atom, registered);
@@ -2955,7 +2997,68 @@ ATOM GuestWindowManager::RegisterGuestClass(const GuestAbi::WndClassW* windowCla
     return RegisterGuestClass(&expanded, win32Error);
 }
 
-BOOL GuestWindowManager::UnregisterGuestClass(LPCWSTR className, HINSTANCE, DWORD* win32Error)
+BOOL GuestWindowManager::GetGuestClassInfo(HINSTANCE instance, LPCWSTR className,
+    GuestAbi::WndClassExW* result, DWORD* win32Error) const
+{
+    if (!className || !result)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    std::shared_ptr<WindowClass> target = FindClass(className, instance);
+    bool synthesizedBuiltin = false;
+    if (!target)
+    {
+        if (IsAtomPointer(className))
+        {
+            SetWin32Error(win32Error, ERROR_CLASS_DOES_NOT_EXIST);
+            return FALSE;
+        }
+        const BuiltinControlKind kind = BuiltinControlKindForClassName(className);
+        if (kind == BuiltinControlKind::None)
+        {
+            SetWin32Error(win32Error, ERROR_CLASS_DOES_NOT_EXIST);
+            return FALSE;
+        }
+        target = std::make_shared<WindowClass>();
+        target->processId = BridgeGetCurrentProcessId();
+        target->name = Lowercase(className);
+        target->displayName = className;
+        target->background = BuiltinControlBackground(kind);
+        target->builtinKind = kind;
+        synthesizedBuiltin = true;
+    }
+    if (instance && target->registrationScope && instance != target->instance)
+    {
+        SetWin32Error(win32Error, ERROR_CLASS_DOES_NOT_EXIST);
+        return FALSE;
+    }
+
+    GuestAbi::WndClassExW value{};
+    value.cbSize = sizeof(value);
+    value.style = target->style;
+    value.lpfnWndProc = target->procedure ? target->procedure :
+        (target->builtinKind != BuiltinControlKind::None
+            ? &BridgeBuiltinControlWindowProc : nullptr);
+    value.cbClsExtra = static_cast<int>(target->extraBytes.size());
+    value.cbWndExtra = target->windowExtraBytes;
+    value.hInstance = target->instance;
+    value.hIcon = target->icon;
+    value.hCursor = target->cursor;
+    value.hbrBackground = target->background;
+    value.lpszMenuName = target->menuResourceAtom
+        ? reinterpret_cast<LPCWSTR>(target->menuResourceAtom)
+        : (target->menuResourceName.empty() ? nullptr : target->menuResourceName.c_str());
+    value.lpszClassName = synthesizedBuiltin ? className :
+        (target->displayName.empty() ? target->name.c_str() : target->displayName.c_str());
+    value.hIconSm = target->smallIcon;
+    *result = value;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL GuestWindowManager::UnregisterGuestClass(LPCWSTR className, HINSTANCE instance, DWORD* win32Error)
 {
     if (!className)
     {
@@ -2968,16 +3071,26 @@ BOOL GuestWindowManager::UnregisterGuestClass(LPCWSTR className, HINSTANCE, DWOR
         if (IsAtomPointer(className))
         {
             const auto found = m_classesByAtom.find(static_cast<ATOM>(reinterpret_cast<ULONG_PTR>(className)));
-            if (found != m_classesByAtom.end()) target = found->second;
+            if (found != m_classesByAtom.end() &&
+                found->second->processId == BridgeGetCurrentProcessId())
+                target = found->second;
         }
         else
         {
-            const std::wstring key = std::to_wstring(BridgeGetCurrentProcessId()) + L":" + Lowercase(className);
-            const auto found = m_classes.find(key);
+            const DWORD processId = BridgeGetCurrentProcessId();
+            const std::wstring name = Lowercase(className);
+            auto found = m_classes.find(GuestClassKey(processId, instance, name));
+            if (found == m_classes.end() && instance)
+                found = m_classes.find(GuestClassKey(processId, nullptr, name));
             if (found != m_classes.end()) target = found->second;
         }
     }
     if (!target)
+    {
+        SetWin32Error(win32Error, ERROR_CLASS_DOES_NOT_EXIST);
+        return FALSE;
+    }
+    if (instance && target->instance != instance)
     {
         SetWin32Error(win32Error, ERROR_CLASS_DOES_NOT_EXIST);
         return FALSE;
@@ -2997,13 +3110,15 @@ BOOL GuestWindowManager::UnregisterGuestClass(LPCWSTR className, HINSTANCE, DWOR
     {
         std::lock_guard<std::mutex> guard(m_classesLock);
         m_classesByAtom.erase(target->atom);
-        m_classes.erase(std::to_wstring(target->processId) + L":" + target->name);
+        m_classes.erase(GuestClassKey(
+            target->processId, target->registrationScope, target->name));
     }
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
 
-std::shared_ptr<GuestWindowManager::WindowClass> GuestWindowManager::FindClass(LPCWSTR className) const
+std::shared_ptr<GuestWindowManager::WindowClass> GuestWindowManager::FindClass(
+    LPCWSTR className, HINSTANCE instance) const
 {
     if (!className)
     {
@@ -3015,11 +3130,22 @@ std::shared_ptr<GuestWindowManager::WindowClass> GuestWindowManager::FindClass(L
     if (IsAtomPointer(className))
     {
         const auto found = m_classesByAtom.find(static_cast<ATOM>(reinterpret_cast<ULONG_PTR>(className)));
-        return found == m_classesByAtom.end() ? nullptr : found->second;
+        return found == m_classesByAtom.end() || found->second->processId != processId
+            ? nullptr : found->second;
     }
 
-    const auto found = m_classes.find(
-        std::to_wstring(processId) + L":" + Lowercase(className));
+    const std::wstring name = Lowercase(className);
+    auto found = m_classes.find(GuestClassKey(processId, instance, name));
+    if (found == m_classes.end() && instance)
+        found = m_classes.find(GuestClassKey(processId, nullptr, name));
+    if (found == m_classes.end() && !instance)
+    {
+        // Compatibility fallback for callers that omit hInstance: select the
+        // first local class with this name in the current guest process.
+        for (const auto& entry : m_classes)
+            if (entry.second->processId == processId && entry.second->name == name)
+                return entry.second;
+    }
     return found == m_classes.end() ? nullptr : found->second;
 }
 
@@ -3038,7 +3164,7 @@ HWND GuestWindowManager::CreateGuestWindow(
     LPVOID parameter,
     DWORD* win32Error)
 {
-    auto registered = FindClass(className);
+    auto registered = FindClass(className, instance);
     if (!registered)
     {
         const BuiltinControlKind builtinKind = BuiltinControlKindForClassName(className);
@@ -6137,6 +6263,192 @@ LONG GuestWindowManager::GetGuestWindowLong(HWND window, int index, DWORD* win32
     memcpy(&value, record->extraBytes.data() + index, sizeof(value));
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return value;
+}
+
+ULONG_PTR GuestWindowManager::GetGuestClassLongPtr(
+    HWND window, int index, DWORD* win32Error) const
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return 0;
+    }
+    std::shared_ptr<WindowClass> windowClass;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return 0;
+        }
+        windowClass = record->windowClass;
+    }
+    if (!windowClass)
+    {
+        SetWin32Error(win32Error, ERROR_CLASS_DOES_NOT_EXIST);
+        return 0;
+    }
+    std::lock_guard<std::mutex> guard(m_classesLock);
+    if (index >= 0)
+    {
+        if (!IsValidWindowExtraOffset(index, windowClass->extraBytes.size(), sizeof(LONG_PTR)))
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        ULONG_PTR value = 0;
+        memcpy(&value, windowClass->extraBytes.data() + index, sizeof(value));
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return value;
+    }
+    ULONG_PTR value = 0;
+    switch (index)
+    {
+    case -8: value = windowClass->menuResourceAtom
+        ? windowClass->menuResourceAtom
+        : reinterpret_cast<ULONG_PTR>(windowClass->menuResourceName.empty()
+            ? nullptr : windowClass->menuResourceName.c_str()); break;
+    case -10: value = reinterpret_cast<ULONG_PTR>(windowClass->background); break;
+    case -12: value = reinterpret_cast<ULONG_PTR>(windowClass->cursor); break;
+    case -14: value = reinterpret_cast<ULONG_PTR>(windowClass->icon); break;
+    case -16: value = reinterpret_cast<ULONG_PTR>(windowClass->instance); break;
+    case -18: value = static_cast<ULONG_PTR>(windowClass->windowExtraBytes); break;
+    case -20: value = windowClass->extraBytes.size(); break;
+    case -24: value = reinterpret_cast<ULONG_PTR>(windowClass->procedure
+        ? windowClass->procedure : (windowClass->builtinKind != BuiltinControlKind::None
+            ? &BridgeBuiltinControlWindowProc : nullptr)); break;
+    case -26: value = windowClass->style; break;
+    case -32: value = windowClass->atom; break;
+    case -34: value = reinterpret_cast<ULONG_PTR>(windowClass->smallIcon); break;
+    default:
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return value;
+}
+
+ULONG_PTR GuestWindowManager::SetGuestClassLongPtr(
+    HWND window, int index, LONG_PTR requested, DWORD* win32Error)
+{
+    const auto record = FindWindow(window);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+        return 0;
+    }
+    std::shared_ptr<WindowClass> windowClass;
+    {
+        std::lock_guard<std::mutex> guard(record->lock);
+        if (record->destroyed)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
+            return 0;
+        }
+        windowClass = record->windowClass;
+    }
+    if (!windowClass)
+    {
+        SetWin32Error(win32Error, ERROR_CLASS_DOES_NOT_EXIST);
+        return 0;
+    }
+    std::unique_lock<std::mutex> guard(m_classesLock);
+    GuestAbi::WndProc previousProcedure = nullptr;
+    bool procedureChanged = false;
+    if (index >= 0)
+    {
+        if (!IsValidWindowExtraOffset(index, windowClass->extraBytes.size(), sizeof(LONG_PTR)))
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        ULONG_PTR previous = 0;
+        memcpy(&previous, windowClass->extraBytes.data() + index, sizeof(previous));
+        memcpy(windowClass->extraBytes.data() + index, &requested, sizeof(requested));
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return previous;
+    }
+    ULONG_PTR previous = 0;
+    switch (index)
+    {
+    case -10: previous = reinterpret_cast<ULONG_PTR>(windowClass->background);
+        windowClass->background = reinterpret_cast<HBRUSH>(requested); break;
+    case -12: previous = reinterpret_cast<ULONG_PTR>(windowClass->cursor);
+        windowClass->cursor = reinterpret_cast<HCURSOR>(requested); break;
+    case -14: previous = reinterpret_cast<ULONG_PTR>(windowClass->icon);
+        windowClass->icon = reinterpret_cast<HICON>(requested); break;
+    case -24:
+        if (!requested) { SetWin32Error(win32Error, ERROR_INVALID_PARAMETER); return 0; }
+        previous = reinterpret_cast<ULONG_PTR>(windowClass->procedure
+            ? windowClass->procedure : (windowClass->builtinKind != BuiltinControlKind::None
+                ? &BridgeBuiltinControlWindowProc : nullptr));
+        previousProcedure = windowClass->procedure;
+        windowClass->procedure = reinterpret_cast<GuestAbi::WndProc>(requested); break;
+    case -26: previous = windowClass->style;
+        windowClass->style = static_cast<UINT>(requested); break;
+    case -34: previous = reinterpret_cast<ULONG_PTR>(windowClass->smallIcon);
+        windowClass->smallIcon = reinterpret_cast<HICON>(requested); break;
+    default:
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    procedureChanged = index == -24;
+    if (procedureChanged)
+    {
+        const GuestAbi::WndProc replacement = windowClass->procedure;
+        guard.unlock();
+        std::vector<std::shared_ptr<WindowRecord>> windows;
+        {
+            std::lock_guard<std::mutex> windowsGuard(m_windowsLock);
+            for (const auto& item : m_windows) windows.push_back(item.second);
+        }
+        for (const auto& candidate : windows)
+        {
+            std::lock_guard<std::mutex> candidateGuard(candidate->lock);
+            if (!candidate->destroyed && candidate->windowClass == windowClass &&
+                candidate->procedure == previousProcedure)
+                candidate->procedure = replacement;
+        }
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return previous;
+}
+
+LONG GuestWindowManager::GetGuestClassLong(HWND window, int index, DWORD* win32Error) const
+{
+    if (index < 0)
+        return static_cast<LONG>(GetGuestClassLongPtr(window, index, win32Error));
+    const auto record = FindWindow(window);
+    if (!record) { SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE); return 0; }
+    std::shared_ptr<WindowClass> windowClass;
+    { std::lock_guard<std::mutex> lock(record->lock); windowClass = record->windowClass; }
+    std::lock_guard<std::mutex> guard(m_classesLock);
+    if (!windowClass || !IsValidWindowExtraOffset(index, windowClass->extraBytes.size(), sizeof(LONG)))
+    { SetWin32Error(win32Error, ERROR_INVALID_PARAMETER); return 0; }
+    LONG value = 0;
+    memcpy(&value, windowClass->extraBytes.data() + index, sizeof(value));
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return value;
+}
+
+LONG GuestWindowManager::SetGuestClassLong(
+    HWND window, int index, LONG requested, DWORD* win32Error)
+{
+    if (index < 0)
+        return static_cast<LONG>(SetGuestClassLongPtr(window, index, requested, win32Error));
+    const auto record = FindWindow(window);
+    if (!record) { SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE); return 0; }
+    std::shared_ptr<WindowClass> windowClass;
+    { std::lock_guard<std::mutex> lock(record->lock); windowClass = record->windowClass; }
+    std::lock_guard<std::mutex> guard(m_classesLock);
+    if (!windowClass || !IsValidWindowExtraOffset(index, windowClass->extraBytes.size(), sizeof(LONG)))
+    { SetWin32Error(win32Error, ERROR_INVALID_PARAMETER); return 0; }
+    LONG previous = 0;
+    memcpy(&previous, windowClass->extraBytes.data() + index, sizeof(previous));
+    memcpy(windowClass->extraBytes.data() + index, &requested, sizeof(requested));
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return previous;
 }
 
 LONG GuestWindowManager::SetGuestWindowLong(HWND window, int index, LONG value, DWORD* win32Error)
@@ -11407,6 +11719,33 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             EndGuestPaint(handle, &paint, nullptr);
             return 0;
         }
+        const bool ownerDrawChoice = surface && parent &&
+            (controlKind == BuiltinControlKind::ListBox || controlKind == BuiltinControlKind::ComboBox) &&
+            (style & 0x0030u) != 0;
+        if (ownerDrawChoice)
+        {
+            const UINT controlType = controlKind == BuiltinControlKind::ListBox ? 2u : 3u;
+            int rowTop = controlKind == BuiltinControlKind::ComboBox
+                ? (comboDropped ? (std::min)(height, GuestMetrics::ControlHeightForText(controlTextHeight)) : 0) : 0;
+            const size_t first = controlKind == BuiltinControlKind::ComboBox && !comboDropped && selectedChoice >= 0
+                ? static_cast<size_t>(selectedChoice) : 0;
+            const size_t end = controlKind == BuiltinControlKind::ComboBox && !comboDropped
+                ? (selectedChoice >= 0 ? first + 1 : 0) : choiceItems.size();
+            for (size_t index = first; index < end && rowTop < height; ++index)
+            {
+                GuestMeasureItem measure{ controlType, static_cast<UINT>(controlId), static_cast<UINT>(index),
+                    static_cast<UINT>(width), static_cast<UINT>(GuestMetrics::ControlHeightForText(controlTextHeight)), 0 };
+                SendGuestMessage(parent, 0x002c, static_cast<WPARAM>(controlId), reinterpret_cast<LPARAM>(&measure), nullptr);
+                const int rowHeight = (std::max)(1, static_cast<int>(measure.itemHeight));
+                GuestDrawItem item{}; item.controlType = controlType; item.controlId = static_cast<UINT>(controlId);
+                item.itemId = static_cast<UINT>(index); item.itemAction = 0x0001; item.itemWindow = handle; item.dc = dc;
+                item.itemState = static_cast<int>(index) == selectedChoice ? (0x0001u | 0x0010u) : 0u;
+                item.itemRect = { 0, rowTop, width, (std::min)(height, SaturatingAdd(rowTop, rowHeight)) };
+                SendGuestMessage(parent, 0x002b, static_cast<WPARAM>(controlId), reinterpret_cast<LPARAM>(&item), nullptr);
+                rowTop = item.itemRect.bottom;
+            }
+            EndGuestPaint(handle, &paint, nullptr); return 0;
+        }
         const bool supportsCustomDraw =
             controlKind == BuiltinControlKind::ListView ||
             controlKind == BuiltinControlKind::TreeView ||
@@ -15244,6 +15583,12 @@ GuestGetMessageResult GuestWindowManager::GetGuestMessage(GuestAbi::Message* mes
         else
             DispatchSentCallbackToken(static_cast<ULONG_PTR>(message->wParam));
     }
+}
+
+bool GuestWindowManager::WaitForGuestMessage(DWORD milliseconds)
+{
+    const auto queue = MessageQueueForThread(BridgeGetCurrentThreadId(), true);
+    return queue && queue->WaitForMessage(milliseconds);
 }
 
 BOOL GuestWindowManager::PeekGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum, UINT removeFlags)

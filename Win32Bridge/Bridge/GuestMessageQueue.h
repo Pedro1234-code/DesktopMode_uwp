@@ -83,6 +83,7 @@ namespace Bridge
         void ClearForWindow(HWND hwnd);
 
         size_t Count() const;
+        bool WaitForMessage(DWORD milliseconds = INFINITE);
 
     private:
         using MessageList = std::deque<GuestAbi::Message>;

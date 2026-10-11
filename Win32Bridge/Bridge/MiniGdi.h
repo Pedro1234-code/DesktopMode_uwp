@@ -361,6 +361,8 @@ namespace MiniGdi
         // DC because Win32 permits font queries before a bitmap is selected.
         bool GetSelectedFont(DcHandle dc, Font* font) const;
         bool GetSelectedFontMetrics(DcHandle dc, FontMetrics* metrics) const;
+        bool GetSelectedBrush(DcHandle dc, Brush* brush) const;
+        bool GetSelectedPen(DcHandle dc, Pen* pen) const;
 
         // InvalidObject selects the built-in default (black pen / white brush
         // / fixed fallback font).

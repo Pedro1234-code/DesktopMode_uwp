@@ -47,6 +47,8 @@ namespace Bridge
 
         ATOM RegisterGuestClass(const GuestAbi::WndClassExW* windowClass, DWORD* win32Error);
         ATOM RegisterGuestClass(const GuestAbi::WndClassW* windowClass, DWORD* win32Error);
+        BOOL GetGuestClassInfo(HINSTANCE instance, LPCWSTR className,
+            GuestAbi::WndClassExW* windowClass, DWORD* win32Error) const;
         BOOL UnregisterGuestClass(LPCWSTR className, HINSTANCE instance, DWORD* win32Error);
         HWND CreateGuestWindow(
             DWORD extendedStyle,
@@ -105,6 +107,10 @@ namespace Bridge
         LONG SetGuestWindowLong(HWND window, int index, LONG value, DWORD* win32Error);
         LONG_PTR GetGuestWindowLongPtr(HWND window, int index, DWORD* win32Error) const;
         LONG_PTR SetGuestWindowLongPtr(HWND window, int index, LONG_PTR value, DWORD* win32Error);
+        LONG GetGuestClassLong(HWND window, int index, DWORD* win32Error) const;
+        LONG SetGuestClassLong(HWND window, int index, LONG value, DWORD* win32Error);
+        ULONG_PTR GetGuestClassLongPtr(HWND window, int index, DWORD* win32Error) const;
+        ULONG_PTR SetGuestClassLongPtr(HWND window, int index, LONG_PTR value, DWORD* win32Error);
         BOOL SetGuestWindowPos(
             HWND window,
             HWND insertAfter,
@@ -142,6 +148,7 @@ namespace Bridge
         DWORD GetGuestWindowThreadId(HWND window, DWORD* win32Error) const;
         void PostGuestQuitMessage(int exitCode);
         GuestGetMessageResult GetGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum);
+        bool WaitForGuestMessage(DWORD milliseconds = INFINITE);
         BOOL PeekGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum, UINT removeFlags);
         BOOL TranslateGuestMessage(const GuestAbi::Message* message);
         LRESULT DispatchGuestMessage(const GuestAbi::Message* message, DWORD* win32Error);
@@ -201,7 +208,8 @@ namespace Bridge
         };
 
         std::shared_ptr<WindowRecord> FindWindow(HWND window) const;
-        std::shared_ptr<WindowClass> FindClass(LPCWSTR className) const;
+        std::shared_ptr<WindowClass> FindClass(LPCWSTR className,
+            HINSTANCE instance = nullptr) const;
         void LayoutGuestRebar(HWND rebar);
         bool IsGuestWindowVisibleInternal(HWND window) const;
         bool IsGuestWindowEnabledInternal(HWND window) const;

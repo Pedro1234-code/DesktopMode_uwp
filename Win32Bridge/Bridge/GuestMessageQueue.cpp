@@ -243,6 +243,15 @@ size_t GuestMessageQueue::Count() const
     return m_messages.size();
 }
 
+bool GuestMessageQueue::WaitForMessage(DWORD milliseconds)
+{
+    std::unique_lock<std::mutex> lock(m_mutex);
+    const auto ready = [this]() { return !m_messages.empty() || m_closed; };
+    if (milliseconds == INFINITE) m_messageAvailable.wait(lock, ready);
+    else if (!m_messageAvailable.wait_for(lock, std::chrono::milliseconds(milliseconds), ready)) return false;
+    return !m_messages.empty();
+}
+
 bool GuestMessageQueue::Matches(
     const GuestAbi::Message& message,
     HWND windowFilter,

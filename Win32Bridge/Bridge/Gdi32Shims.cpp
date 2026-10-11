@@ -3,6 +3,7 @@
 
 #include "Bridge\\GuestWindow.h"
 #include "Bridge\\GuestWin32Abi.h"
+#include "Bridge\\DirectWriteText.h"
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge\\MiniGdi.h"
 #include "Bridge\\RuntimeDiagnostics.h"
@@ -700,6 +701,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeDeleteObject(HGDIOBJ object)
         BridgeSetLastError(ERROR_SUCCESS);
         return TRUE;
     }
+    if (BridgeDeletePalette(object)) { BridgeSetLastError(ERROR_SUCCESS); return TRUE; }
     GuestWindowManager* manager = CurrentManagerOrFail();
     const MiniGdi::ObjectHandle resolved = FromGuestObject(object);
     if (!manager || resolved == MiniGdi::InvalidObject)
@@ -907,6 +909,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeMoveToEx(HDC dc, int x, int y, LPPOINT pr
 
     const auto state = DcState(dc);
     const POINT target = LogicalToDevicePoint(state, x, y);
+    RecordPathPoint(dc, target, PT_MOVETO);
     MiniGdi::Point oldPosition;
     if (!manager->Gdi().MoveTo(resolvedDc, MiniGdi::Point{ target.x, target.y }, previous ? &oldPosition : nullptr))
     {
@@ -934,7 +937,11 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeLineTo(HDC dc, int x, int y)
     // A NULL_PEN or a completely clipped line performs no raster write, but
     // it is still a successful GDI state transition (the current point moves).
     const POINT target = LogicalToDevicePoint(DcState(dc), x, y);
-    manager->Gdi().LineTo(resolvedDc, MiniGdi::Point{ target.x, target.y });
+    RecordPathPoint(dc, target, PT_LINETO);
+    if (DcState(dc).pathOpen)
+        manager->Gdi().MoveTo(resolvedDc, MiniGdi::Point{ target.x, target.y }, nullptr);
+    else
+        manager->Gdi().LineTo(resolvedDc, MiniGdi::Point{ target.x, target.y });
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -1223,6 +1230,11 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateFontIndirectW);
     else if (_wcsicmp(symbol.name.c_str(), L"gettextmetricsw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextMetricsW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getglyphindicesw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetGlyphIndicesW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcharabcwidthsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCharABCWidthsW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcharwidth32w") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCharWidth32W);
+    else if (_wcsicmp(symbol.name.c_str(), L"getglyphoutlinew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetGlyphOutlineW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcharacterplacementw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCharacterPlacementW);
     else if (_wcsicmp(symbol.name.c_str(), L"gettextfacew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextFaceW);
     else if (_wcsicmp(symbol.name.c_str(), L"getobjectw") == 0)
@@ -1277,6 +1289,12 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"setviewportextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetViewportExtEx);
     else if (_wcsicmp(symbol.name.c_str(), L"getviewportextex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetViewportExtEx);
     else if (_wcsicmp(symbol.name.c_str(), L"setmapmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetMapMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"setgraphicsmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetGraphicsMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"getgraphicsmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetGraphicsMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"setworldtransform") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWorldTransform);
+    else if (_wcsicmp(symbol.name.c_str(), L"getworldtransform") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWorldTransform);
+    else if (_wcsicmp(symbol.name.c_str(), L"modifyworldtransform") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeModifyWorldTransform);
+    else if (_wcsicmp(symbol.name.c_str(), L"combinetransform") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCombineTransform);
     else if (_wcsicmp(symbol.name.c_str(), L"getmapmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetMapMode);
     else if (_wcsicmp(symbol.name.c_str(), L"enumfontsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumFontsW);
     else if (_wcsicmp(symbol.name.c_str(), L"createdcw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateDCW);
@@ -1319,6 +1337,41 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"rectvisible") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRectVisible);
     else if (_wcsicmp(symbol.name.c_str(), L"polyline") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePolyline);
     else if (_wcsicmp(symbol.name.c_str(), L"polygon") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePolygon);
+    else if (_wcsicmp(symbol.name.c_str(), L"polypolygon") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePolyPolygon);
+    else if (_wcsicmp(symbol.name.c_str(), L"polypolyline") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePolyPolyline);
+    else if (_wcsicmp(symbol.name.c_str(), L"polybezier") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePolyBezier);
+    else if (_wcsicmp(symbol.name.c_str(), L"polybezierto") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePolyBezierTo);
+    else if (_wcsicmp(symbol.name.c_str(), L"arc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeArc);
+    else if (_wcsicmp(symbol.name.c_str(), L"arcto") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeArcTo);
+    else if (_wcsicmp(symbol.name.c_str(), L"pie") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePie);
+    else if (_wcsicmp(symbol.name.c_str(), L"chord") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeChord);
+    else if (_wcsicmp(symbol.name.c_str(), L"beginpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBeginPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"endpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"abortpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAbortPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"closefigure") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCloseFigure);
+    else if (_wcsicmp(symbol.name.c_str(), L"fillpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFillPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"strokepath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStrokePath);
+    else if (_wcsicmp(symbol.name.c_str(), L"strokeandfillpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStrokeAndFillPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"flattenpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlattenPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"widenpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWidenPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"getpath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"selectclippath") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSelectClipPath);
+    else if (_wcsicmp(symbol.name.c_str(), L"createpalette") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePalette);
+    else if (_wcsicmp(symbol.name.c_str(), L"selectpalette") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSelectPalette);
+    else if (_wcsicmp(symbol.name.c_str(), L"realizepalette") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRealizePalette);
+    else if (_wcsicmp(symbol.name.c_str(), L"getpaletteentries") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPaletteEntries);
+    else if (_wcsicmp(symbol.name.c_str(), L"setpaletteentries") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetPaletteEntries);
+    else if (_wcsicmp(symbol.name.c_str(), L"resizepalette") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeResizePalette);
+    else if (_wcsicmp(symbol.name.c_str(), L"getnearestpaletteindex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetNearestPaletteIndex);
+    else if (_wcsicmp(symbol.name.c_str(), L"updatecolors") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUpdateColors);
+    else if (_wcsicmp(symbol.name.c_str(), L"seticmmode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetICMMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"seticmprofilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetICMProfileW);
+    else if (_wcsicmp(symbol.name.c_str(), L"geticmprofilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetICMProfileW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createenhmetafilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateEnhMetaFileW);
+    else if (_wcsicmp(symbol.name.c_str(), L"closeenhmetafile") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCloseEnhMetaFile);
+    else if (_wcsicmp(symbol.name.c_str(), L"deleteenhmetafile") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDeleteEnhMetaFile);
+    else if (_wcsicmp(symbol.name.c_str(), L"playenhmetafile") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePlayEnhMetaFile);
+    else if (_wcsicmp(symbol.name.c_str(), L"getenhmetafileheader") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetEnhMetaFileHeader);
     else if (_wcsicmp(symbol.name.c_str(), L"roundrect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRoundRect);
     else if (_wcsicmp(symbol.name.c_str(), L"createhatchbrush") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateHatchBrush);
     else if (_wcsicmp(symbol.name.c_str(), L"extcreatepen") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtCreatePen);
@@ -1329,6 +1382,8 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"gettextextentexpointw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextExtentExPointW);
     else if (_wcsicmp(symbol.name.c_str(), L"gettextextentexpointa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTextExtentExPointA);
     else if (_wcsicmp(symbol.name.c_str(), L"stretchblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeStretchBlt);
+    else if (_wcsicmp(symbol.name.c_str(), L"maskblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMaskBlt);
+    else if (_wcsicmp(symbol.name.c_str(), L"plgblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePlgBlt);
     else if (_wcsicmp(symbol.name.c_str(), L"gdialphablend") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGdiAlphaBlend);
     else if (_wcsicmp(symbol.name.c_str(), L"alphablend") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGdiAlphaBlend);
     else if (_wcsicmp(symbol.name.c_str(), L"transparentblt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTransparentBlt);

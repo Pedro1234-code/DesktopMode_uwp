@@ -53,6 +53,10 @@ namespace Bridge
         bool SetEndOfFile(HANDLE guestHandle, DWORD* win32Error);
         bool FlushFile(HANDLE guestHandle, DWORD* win32Error);
         bool GetFilePath(HANDLE guestHandle, std::wstring* path, DWORD* win32Error) const;
+        bool LockFileRange(HANDLE guestHandle, ULONGLONG offset, ULONGLONG length,
+            bool exclusive, bool failImmediately, DWORD* win32Error);
+        bool UnlockFileRange(HANDLE guestHandle, ULONGLONG offset, ULONGLONG length,
+            DWORD* win32Error);
 
         // Internal module loading uses the same virtual filesystem as guest
         // CreateFile calls. It never exposes a host path to a PE.
@@ -153,6 +157,8 @@ namespace Bridge
         std::wstring m_initialCurrentDirectory;
         mutable std::mutex m_handlesLock;
         std::unordered_map<ULONG_PTR, std::shared_ptr<FileRecord>> m_files;
+        struct ByteRangeLock { ULONG_PTR owner; ULONGLONG offset; ULONGLONG length; bool exclusive; };
+        std::unordered_map<std::wstring, std::vector<ByteRangeLock>> m_byteRangeLocks;
         std::unordered_set<std::wstring> m_deletePending;
         std::unordered_map<ULONG_PTR, std::shared_ptr<FindRecord>> m_finds;
         ULONG_PTR m_nextHandle = FirstHandleToken;

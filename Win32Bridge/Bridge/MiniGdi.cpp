@@ -1365,6 +1365,24 @@ bool GdiContext::GetSelectedFont(DcHandle dc, Font* font) const
     return true;
 }
 
+bool GdiContext::GetSelectedBrush(DcHandle dc, Brush* brush) const
+{
+    if (!brush) return false;
+    const DeviceContext* selectedDc = FindDc(dc);
+    if (!selectedDc) return false;
+    *brush = ResolveBrush(selectedDc->brush);
+    return true;
+}
+
+bool GdiContext::GetSelectedPen(DcHandle dc, Pen* pen) const
+{
+    if (!pen) return false;
+    const DeviceContext* selectedDc = FindDc(dc);
+    if (!selectedDc) return false;
+    *pen = ResolvePen(selectedDc->pen);
+    return true;
+}
+
 bool GdiContext::GetSelectedFontMetrics(DcHandle dc, FontMetrics* metrics) const
 {
     const DeviceContext* context = FindDc(dc);

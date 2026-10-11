@@ -50,6 +50,36 @@ namespace GuestAbi
         HICON hIconSm;
     };
 
+    struct WndClassA
+    {
+        UINT style;
+        WndProc lpfnWndProc;
+        int cbClsExtra;
+        int cbWndExtra;
+        HINSTANCE hInstance;
+        HICON hIcon;
+        HCURSOR hCursor;
+        HBRUSH hbrBackground;
+        LPCSTR lpszMenuName;
+        LPCSTR lpszClassName;
+    };
+
+    struct WndClassExA
+    {
+        UINT cbSize;
+        UINT style;
+        WndProc lpfnWndProc;
+        int cbClsExtra;
+        int cbWndExtra;
+        HINSTANCE hInstance;
+        HICON hIcon;
+        HCURSOR hCursor;
+        HBRUSH hbrBackground;
+        LPCSTR lpszMenuName;
+        LPCSTR lpszClassName;
+        HICON hIconSm;
+    };
+
     struct CreateStructW
     {
         LPVOID lpCreateParams;

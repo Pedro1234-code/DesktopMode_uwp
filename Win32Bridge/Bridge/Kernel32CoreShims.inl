@@ -717,6 +717,46 @@ BOOL WINAPI BridgeCancelIo(HANDLE)
     return FALSE;
 }
 
+BOOL WINAPI BridgeLockFileEx(HANDLE file, DWORD flags, DWORD, DWORD lengthLow,
+    DWORD lengthHigh, LPOVERLAPPED overlapped)
+{
+    if (!overlapped || (flags & ~3u) != 0) { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    GuestStorageContext* storage = CurrentGuestStorageContext();
+    if (!storage) { SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    const ULONGLONG offset = (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) | overlapped->Offset;
+    const ULONGLONG length = (static_cast<ULONGLONG>(lengthHigh) << 32) | lengthLow;
+    DWORD error = ERROR_SUCCESS;
+    const bool locked = storage->LockFileRange(file, offset, length,
+        (flags & 2u) != 0, (flags & 1u) != 0, &error);
+    SetGuestLastError(error); return locked ? TRUE : FALSE;
+}
+
+BOOL WINAPI BridgeUnlockFileEx(HANDLE file, DWORD, DWORD lengthLow,
+    DWORD lengthHigh, LPOVERLAPPED overlapped)
+{
+    if (!overlapped) { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    GuestStorageContext* storage = CurrentGuestStorageContext();
+    if (!storage) { SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    const ULONGLONG offset = (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) | overlapped->Offset;
+    const ULONGLONG length = (static_cast<ULONGLONG>(lengthHigh) << 32) | lengthLow;
+    DWORD error = ERROR_SUCCESS; const bool unlocked = storage->UnlockFileRange(file, offset, length, &error);
+    SetGuestLastError(error); return unlocked ? TRUE : FALSE;
+}
+
+BOOL WINAPI BridgeLockFile(HANDLE file, DWORD offsetLow, DWORD offsetHigh,
+    DWORD lengthLow, DWORD lengthHigh)
+{
+    OVERLAPPED value{}; value.Offset = offsetLow; value.OffsetHigh = offsetHigh;
+    return BridgeLockFileEx(file, 2u, 0, lengthLow, lengthHigh, &value);
+}
+
+BOOL WINAPI BridgeUnlockFile(HANDLE file, DWORD offsetLow, DWORD offsetHigh,
+    DWORD lengthLow, DWORD lengthHigh)
+{
+    OVERLAPPED value{}; value.Offset = offsetLow; value.OffsetHigh = offsetHigh;
+    return BridgeUnlockFileEx(file, 0, lengthLow, lengthHigh, &value);
+}
+
 BOOL WINAPI BridgeReadDirectoryChangesW(
     HANDLE, LPVOID, DWORD, BOOL, DWORD, LPDWORD bytesReturned,
     LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE)

@@ -36,6 +36,8 @@ namespace Bridge
     HICON CreateGuestShellIcon(bool directory, int size);
     ATOM WINAPI BridgeRegisterClassExW(const GuestAbi::WndClassExW* windowClass);
     ATOM WINAPI BridgeRegisterClassW(const GuestAbi::WndClassW* windowClass);
+    ATOM WINAPI BridgeRegisterClassExA(const GuestAbi::WndClassExA* windowClass);
+    ATOM WINAPI BridgeRegisterClassA(const GuestAbi::WndClassA* windowClass);
     HWND WINAPI BridgeCreateWindowExW(
         DWORD extendedStyle,
         LPCWSTR className,
@@ -186,6 +188,13 @@ namespace Bridge
     HBITMAP WINAPI BridgeLoadBitmapW(HINSTANCE instance, LPCWSTR bitmapName);
     HBITMAP WINAPI BridgeLoadBitmapA(HINSTANCE instance, LPCSTR bitmapName);
     BOOL WINAPI BridgeGetClassInfoW(HINSTANCE instance, LPCWSTR className, GuestAbi::WndClassW* windowClass);
+    BOOL WINAPI BridgeGetClassInfoA(HINSTANCE instance, LPCSTR className, GuestAbi::WndClassA* windowClass);
+    BOOL WINAPI BridgeGetClassInfoExW(HINSTANCE instance, LPCWSTR className, GuestAbi::WndClassExW* windowClass);
+    BOOL WINAPI BridgeGetClassInfoExA(HINSTANCE instance, LPCSTR className, GuestAbi::WndClassExA* windowClass);
+    ULONG_PTR WINAPI BridgeGetClassLongPtrW(HWND window, int index);
+    ULONG_PTR WINAPI BridgeSetClassLongPtrW(HWND window, int index, LONG_PTR value);
+    DWORD WINAPI BridgeGetClassLongW(HWND window, int index);
+    DWORD WINAPI BridgeSetClassLongW(HWND window, int index, LONG value);
     LRESULT WINAPI BridgeCallWindowProcW(GuestAbi::WndProc procedure, HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
     ImportResolution ResolveUser32Import(const ImportedSymbol& symbol);

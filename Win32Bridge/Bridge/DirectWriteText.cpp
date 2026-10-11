@@ -565,6 +565,46 @@ namespace
     };
 }
 
+bool MapGlyphs(const MiniGdi::Font& font, const wchar_t* text,
+    std::size_t characterCount, unsigned short* glyphs)
+{
+    if ((!text && characterCount) || (!glyphs && characterCount) || characterCount > UINT32_MAX)
+        return false;
+    TextObjects objects;
+    if (!CreateObjects(font, text, characterCount, &objects) || !objects.face) return false;
+    std::vector<UINT32> codePoints(characterCount);
+    for (std::size_t index = 0; index < characterCount; ++index)
+        codePoints[index] = static_cast<UINT32>(text[index]);
+    return SUCCEEDED(objects.face->GetGlyphIndices(codePoints.data(),
+        static_cast<UINT32>(characterCount), glyphs));
+}
+
+bool GetGlyphMetrics(const MiniGdi::Font& font, const unsigned short* glyphs,
+    std::size_t glyphCount, GlyphMetrics* metrics)
+{
+    if ((!glyphs && glyphCount) || (!metrics && glyphCount) || glyphCount > UINT32_MAX) return false;
+    TextObjects objects;
+    if (!CreateObjects(font, nullptr, 0, &objects) || !objects.face) return false;
+    std::vector<DWRITE_GLYPH_METRICS> native(glyphCount);
+    if (FAILED(objects.face->GetGdiCompatibleGlyphMetrics(objects.emSize, 1.0f, nullptr,
+        FALSE, glyphs, static_cast<UINT32>(glyphCount), native.data(), FALSE))) return false;
+    DWRITE_FONT_METRICS fontMetrics{}; objects.face->GetMetrics(&fontMetrics);
+    const double scale = fontMetrics.designUnitsPerEm
+        ? objects.emSize / fontMetrics.designUnitsPerEm : 1.0;
+    const auto pixels = [scale](INT32 value) { return static_cast<int>(std::lround(value * scale)); };
+    for (std::size_t index = 0; index < glyphCount; ++index)
+    {
+        metrics[index].leftSideBearing = pixels(native[index].leftSideBearing);
+        metrics[index].advanceWidth = pixels(native[index].advanceWidth);
+        metrics[index].rightSideBearing = pixels(native[index].rightSideBearing);
+        metrics[index].topSideBearing = pixels(native[index].topSideBearing);
+        metrics[index].advanceHeight = pixels(native[index].advanceHeight);
+        metrics[index].bottomSideBearing = pixels(native[index].bottomSideBearing);
+        metrics[index].verticalOriginY = pixels(native[index].verticalOriginY);
+    }
+    return true;
+}
+
 bool Measure(const MiniGdi::Font& font, const wchar_t* text,
     std::size_t characterCount, MiniGdi::Size* extent,
     MiniGdi::FontMetrics* fontMetrics)

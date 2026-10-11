@@ -49,6 +49,7 @@ namespace
         SIZE_T size = 0;
         DWORD protection = PAGE_READONLY;
         std::wstring name;
+        std::wstring sourcePath;
 
         ~GuestFileMapping()
         {
@@ -2919,6 +2920,28 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeUnmapViewOfFile(LPCVOID baseAddress)
     return TRUE;
 }
 
+BOOL WINAPI Win32Bridge::Bridge::BridgeFlushViewOfFile(LPCVOID baseAddress, SIZE_T bytes)
+{
+    std::shared_ptr<GuestFileMapping> mapping; SIZE_T viewSize = 0; bool privateView = false;
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        const auto found = g_fileMappingViews.find(baseAddress);
+        if (found == g_fileMappingViews.end()) { SetGuestLastError(ERROR_INVALID_ADDRESS); return FALSE; }
+        mapping = found->second.mapping; viewSize = found->second.size; privateView = !!found->second.privateAllocation;
+    }
+    if (privateView || !mapping || mapping->sourcePath.empty()) { SetGuestLastError(ERROR_SUCCESS); return TRUE; }
+    const SIZE_T count = bytes ? (std::min)(bytes, viewSize) : viewSize;
+    HANDLE file = BridgeCreateFileW(mapping->sourcePath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) return FALSE;
+    DWORD written = 0; const SIZE_T offset = static_cast<const BYTE*>(baseAddress) - mapping->memory;
+    GuestStorageContext* storage = CurrentGuestStorageContext(); DWORD error = ERROR_SUCCESS;
+    const BOOL result = storage && count <= MAXDWORD && storage->WriteFileAt(file, baseAddress,
+        static_cast<DWORD>(count), offset, &written, &error);
+    if (result) BridgeFlushFileBuffers(file); BridgeCloseHandle(file);
+    return result && written == count;
+}
+
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetFileInformationByHandle(HANDLE file, LPBY_HANDLE_FILE_INFORMATION information)
 {
     if (!information)
@@ -3470,6 +3493,7 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
         mapping->size = static_cast<SIZE_T>(mappingSize);
         mapping->protection = protection;
         mapping->name = name ? name : L"";
+        if (storage) storage->GetFilePath(file, &mapping->sourcePath, nullptr);
     }
     catch (const std::bad_alloc&)
     {
@@ -3826,6 +3850,8 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeMapViewOfFile);
     else if (_wcsicmp(symbol.name.c_str(), L"unmapviewoffile") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnmapViewOfFile);
+    else if (_wcsicmp(symbol.name.c_str(), L"flushviewoffile") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlushViewOfFile);
     else if (_wcsicmp(symbol.name.c_str(), L"getfileinformationbyhandle") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFileInformationByHandle);
     else if (_wcsicmp(symbol.name.c_str(), L"setfiletime") == 0)
@@ -4234,6 +4260,10 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"terminatethread") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTerminateThread);
     else if (_wcsicmp(symbol.name.c_str(), L"setstdhandle") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetStdHandle);
     else if (_wcsicmp(symbol.name.c_str(), L"cancelio") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCancelIo);
+    else if (_wcsicmp(symbol.name.c_str(), L"lockfile") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLockFile);
+    else if (_wcsicmp(symbol.name.c_str(), L"lockfileex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLockFileEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"unlockfile") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnlockFile);
+    else if (_wcsicmp(symbol.name.c_str(), L"unlockfileex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnlockFileEx);
     else if (_wcsicmp(symbol.name.c_str(), L"readdirectorychangesw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReadDirectoryChangesW);
     else if (_wcsicmp(symbol.name.c_str(), L"readconsolew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReadConsoleW);
     else if (_wcsicmp(symbol.name.c_str(), L"writeconsolew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWriteConsoleW);
