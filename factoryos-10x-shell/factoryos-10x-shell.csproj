@@ -171,6 +171,7 @@
     <Compile Include="Services\Hardware\BluetoothService.cs" />
     <Compile Include="Services\Helpers\AppState.cs" />
     <Compile Include="Services\Helpers\UpdateCheckService.cs" />
+    <Compile Include="Services\Files\ArchiveService.cs" />
     <Compile Include="Services\Input\MouseInputService.cs" />
     <Compile Include="Services\WebApps\WebAppService.cs" />
     <Compile Include="Services\WebApps\WindowManagerService.cs" />
@@ -431,6 +432,9 @@
     </PackageReference>
     <PackageReference Include="Newtonsoft.Json">
       <Version>13.0.3</Version>
+    </PackageReference>
+    <PackageReference Include="SharpCompress">
+      <Version>0.50.5</Version>
     </PackageReference>
   </ItemGroup>
   <ItemGroup>

@@ -1,19 +1,31 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 #include <string_view>
 
 namespace gecko_w10m::client {
 
-// Bridges Gecko's ordinary file downloads out of the app container. Gecko
-// writes to LocalState, then the broker transfers completed files through the
-// StorageFolder restored from the FutureAccessList token. The token authorizes
-// WinRT operations on that folder; it does not grant Gecko's raw pathname I/O
-// access to the folder on Xbox.
+// Bridges Gecko's ordinary file downloads to a FolderPicker-authorized folder.
+// The token is restored before its persisted path is handed to Gecko; staging
+// is used only until the user has granted that authorization.
 class DownloadBroker {
  public:
-  // Starts the export monitor and returns Gecko's private staging directory.
+  using DirectoryChangedFn = void (*)(const wchar_t* path);
+
+  // Restores the FolderPicker-authorized directory and returns it directly to
+  // Gecko. Staging is retained only as a fallback until a folder is chosen.
   static std::wstring Initialize(std::wstring_view localStatePath);
+
+  // Lets the host update Gecko's download preferences immediately after the
+  // first FolderPicker authorization, without restarting the browser.
+  static void SetDirectoryChangedSink(DirectoryChangedFn sink);
+  static intptr_t OpenAuthorizedFile(const wchar_t* path, int32_t flags);
+  static int32_t AuthorizedFileExists(const wchar_t* path);
+  static int32_t StatAuthorizedFile(const wchar_t* path, int64_t* size);
+  static int32_t MoveAuthorizedFile(const wchar_t* source,
+                                    const wchar_t* destination);
+  static int32_t RemoveAuthorizedFile(const wchar_t* path);
 
   // Called synchronously from Gecko's thread. The actual picker runs on the
   // XAML UI thread; this call waits like a desktop modal file dialog. Modes

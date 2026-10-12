@@ -76,5 +76,10 @@ namespace Bridge
     };
 
     GuestRuntime* CurrentGuestRuntime();
+
+    // Implements ExitProcess/ExitThread as bridge control flow without exposing
+    // a private exception code to the guest's VEH/SEH chain.  Returns false when
+    // the calling thread is not currently executing a guest entry point.
+    bool RequestGuestExit(DWORD exitCode, bool threadExit);
 }
 }

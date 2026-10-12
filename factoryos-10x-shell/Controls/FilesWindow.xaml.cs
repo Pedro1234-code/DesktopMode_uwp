@@ -3,7 +3,9 @@ using System.Collections.ObjectModel;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
+using factoryos_10x_shell.Services.Files;
 using factoryos_10x_shell.Services.Win32;
 using Windows.Storage;
 using Windows.Storage.AccessCache;
@@ -35,9 +37,9 @@ namespace factoryos_10x_shell.Controls
         private bool m_switchingTabs;
         private int m_tabSelectionRevision;
         private int m_folderLoadRevision;
-        private StorageFolder m_clipboardFolder;
-        private StorageFile m_clipboardFile;
+        private readonly List<FileEntry> m_clipboardEntries = new List<FileEntry>();
         private bool m_cutOperation;
+        private FileEntry m_contextEntry;
         private readonly ObservableCollection<FileEntry> m_items = new ObservableCollection<FileEntry>();
         private readonly List<FileEntry> m_allItems = new List<FileEntry>();
         private bool m_dragging;
@@ -226,7 +228,53 @@ namespace factoryos_10x_shell.Controls
 
         private void Root_PointerPressed(object sender, PointerRoutedEventArgs e) => AppState.Instance.ActivateFiles();
         private void ContextFlyout_Opened(object sender, object e) => MainPage.SetPopupCursorVisibility(true);
-        private void ContextFlyout_Closed(object sender, object e) => MainPage.SetPopupCursorVisibility(false);
+        private void ContextFlyout_Closed(object sender, object e)
+        {
+            m_contextEntry = null;
+            MainPage.SetPopupCursorVisibility(false);
+        }
+
+        private void FileItem_RightTapped(object sender, RightTappedRoutedEventArgs e)
+        {
+            FrameworkElement element = sender as FrameworkElement;
+            FileEntry entry = element?.DataContext as FileEntry;
+            if (entry == null)
+                return;
+
+            // Bind this invocation to the item under the pointer instead of relying
+            // on a possibly stale ListView selection.
+            m_contextEntry = entry;
+            if (!ItemsList.SelectedItems.Contains(entry))
+            {
+                ItemsList.SelectedItems.Clear();
+                ItemsList.SelectedItem = entry;
+            }
+
+            MenuFlyout flyout = element.Resources["ItemContextMenu"] as MenuFlyout;
+            MenuFlyoutSubItem archiveMenu = flyout?.Items
+                .OfType<MenuFlyoutSubItem>()
+                .FirstOrDefault(item => item.Text == "Archive");
+            if (archiveMenu != null)
+                archiveMenu.Visibility = ArchiveService.IsArchive(entry.File)
+                    ? Visibility.Visible
+                    : Visibility.Collapsed;
+            flyout?.ShowAt(element, e.GetPosition(element));
+            e.Handled = true;
+        }
+
+        private void ItemsList_RightTapped(object sender, RightTappedRoutedEventArgs e)
+        {
+            // Item right-clicks are handled above. Reaching here means that the
+            // pointer is on the list background, so never reuse an old item.
+            m_contextEntry = null;
+            ItemsList.SelectedItems.Clear();
+
+            ListView list = sender as ListView;
+            MenuFlyout flyout = list?.Resources["BackgroundContextMenu"] as MenuFlyout;
+            flyout?.ShowAt(list, e.GetPosition(list));
+            e.Handled = true;
+        }
+
         private void TitleBar_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
             if (m_maximized) return;
@@ -329,8 +377,7 @@ namespace factoryos_10x_shell.Controls
 
             ApplicationData.Current.LocalSettings.Values.Remove(RemovableMediaNameKey);
             RemovableMediaItem.Content = "Removable media";
-            m_clipboardFolder = null;
-            m_clipboardFile = null;
+            m_clipboardEntries.Clear();
             m_cutOperation = false;
 
             foreach (Muxc.TabViewItem tab in FilesTabs.TabItems.OfType<Muxc.TabViewItem>())
@@ -488,6 +535,8 @@ namespace factoryos_10x_shell.Controls
             }
             else if (entry.File != null && string.Equals(entry.File.FileType, ".txt", StringComparison.OrdinalIgnoreCase))
                 AppState.Instance.RequestNotepadOpen(entry.File);
+            else if (entry.File != null && ArchiveService.IsArchive(entry.File))
+                await OpenArchivePreviewAsync(entry.File);
             else if (entry.File != null) await Launcher.LaunchFileAsync(entry.File);
         }
 
@@ -639,75 +688,108 @@ namespace factoryos_10x_shell.Controls
             catch (Exception) { await ShowOperationErrorAsync("CoreShell could not create that folder."); }
         }
 
-        private void Copy_Click(object sender, RoutedEventArgs e) => SetClipboard(GetEntry(sender), false);
-        private void Cut_Click(object sender, RoutedEventArgs e) => SetClipboard(GetEntry(sender), true);
+        private void Copy_Click(object sender, RoutedEventArgs e) => SetClipboard(sender, false);
+        private void Cut_Click(object sender, RoutedEventArgs e) => SetClipboard(sender, true);
 
-        private void SetClipboard(FileEntry entry, bool cut)
+        private void SetClipboard(object sender, bool cut)
         {
-            if (entry == null) return;
-            m_clipboardFolder = entry.Folder;
-            m_clipboardFile = entry.File;
+            IReadOnlyList<FileEntry> entries = GetOperationEntries(sender);
+            if (entries.Count == 0) return;
+            m_clipboardEntries.Clear();
+            m_clipboardEntries.AddRange(entries);
             m_cutOperation = cut;
         }
 
         private async void Paste_Click(object sender, RoutedEventArgs e)
         {
-            if (m_currentFolder == null || (m_clipboardFolder == null && m_clipboardFile == null)) return;
-            try
+            if (m_currentFolder == null || m_clipboardEntries.Count == 0) return;
+
+            var failed = new List<FileEntry>();
+            foreach (FileEntry entry in m_clipboardEntries.ToList())
             {
-                if (m_clipboardFolder != null)
+                try
                 {
-                    if (m_clipboardFolder.Path == m_currentFolder.Path) return;
-                    if (m_cutOperation)
-                        await MoveFolderAsync(m_clipboardFolder, m_currentFolder);
-                    else
-                        await CopyFolderAsync(m_clipboardFolder, m_currentFolder);
+                    if (entry.Folder != null)
+                    {
+                        if (entry.Folder.Path == m_currentFolder.Path)
+                        {
+                            failed.Add(entry);
+                            continue;
+                        }
+                        if (m_cutOperation)
+                            await MoveFolderAsync(entry.Folder, m_currentFolder);
+                        else
+                            await CopyFolderAsync(entry.Folder, m_currentFolder);
+                    }
+                    else if (entry.File != null)
+                    {
+                        if (m_cutOperation)
+                            await entry.File.MoveAsync(m_currentFolder, entry.File.Name, NameCollisionOption.GenerateUniqueName);
+                        else
+                            await entry.File.CopyAsync(m_currentFolder, entry.File.Name, NameCollisionOption.GenerateUniqueName);
+                    }
                 }
-                else if (m_clipboardFile != null)
+                catch (Exception)
                 {
-                    if (m_cutOperation)
-                        await m_clipboardFile.MoveAsync(m_currentFolder, m_clipboardFile.Name, NameCollisionOption.GenerateUniqueName);
-                    else
-                        await m_clipboardFile.CopyAsync(m_currentFolder, m_clipboardFile.Name, NameCollisionOption.GenerateUniqueName);
+                    failed.Add(entry);
                 }
-                if (m_cutOperation) { m_clipboardFolder = null; m_clipboardFile = null; }
-                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
             }
-            catch (Exception) { await ShowOperationErrorAsync("CoreShell could not paste this item here."); }
+
+            if (m_cutOperation)
+            {
+                m_clipboardEntries.Clear();
+                m_clipboardEntries.AddRange(failed);
+            }
+            await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+            if (failed.Count > 0)
+                await ShowOperationErrorAsync("CoreShell could not paste " + failed.Count + (failed.Count == 1 ? " item here." : " items here."));
         }
 
         private async void Delete_Click(object sender, RoutedEventArgs e)
         {
-            FileEntry entry = GetEntry(sender);
-            if (entry == null) return;
-            var dialog = new ContentDialog { Title = "Delete", Content = "Delete " + entry.Name + "?", PrimaryButtonText = "Delete", CloseButtonText = "Cancel" };
+            IReadOnlyList<FileEntry> entries = GetOperationEntries(sender);
+            if (entries.Count == 0) return;
+            string prompt = entries.Count == 1 ? "Delete " + entries[0].Name + "?" : "Delete these " + entries.Count + " items?";
+            var dialog = new ContentDialog { Title = "Delete", Content = prompt, PrimaryButtonText = "Delete", CloseButtonText = "Cancel" };
             if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
-            try
+            int failed = 0;
+            foreach (FileEntry entry in entries)
             {
-                if (entry.Folder != null) await entry.Folder.DeleteAsync();
-                else if (entry.File != null) await entry.File.DeleteAsync();
-                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+                try
+                {
+                    if (entry.Folder != null) await entry.Folder.DeleteAsync();
+                    else if (entry.File != null) await entry.File.DeleteAsync();
+                }
+                catch (Exception) { failed++; }
             }
-            catch (Exception) { await ShowOperationErrorAsync("CoreShell could not delete this item."); }
+            await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+            if (failed > 0)
+                await ShowOperationErrorAsync("CoreShell could not delete " + failed + (failed == 1 ? " item." : " items."));
         }
 
         private async void MoveTo_Click(object sender, RoutedEventArgs e)
         {
-            FileEntry entry = GetEntry(sender);
-            if (entry == null) return;
+            IReadOnlyList<FileEntry> entries = GetOperationEntries(sender);
+            if (entries.Count == 0) return;
             var picker = new FolderPicker();
             picker.FileTypeFilter.Add("*");
             StorageFolder destination = await picker.PickSingleFolderAsync();
             if (destination == null) return;
-            try
+            int failed = 0;
+            foreach (FileEntry entry in entries)
             {
-                if (entry.Folder != null)
-                    await MoveFolderAsync(entry.Folder, destination);
-                else if (entry.File != null)
-                    await entry.File.MoveAsync(destination, entry.File.Name, NameCollisionOption.GenerateUniqueName);
-                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+                try
+                {
+                    if (entry.Folder != null)
+                        await MoveFolderAsync(entry.Folder, destination);
+                    else if (entry.File != null)
+                        await entry.File.MoveAsync(destination, entry.File.Name, NameCollisionOption.GenerateUniqueName);
+                }
+                catch (Exception) { failed++; }
             }
-            catch (Exception) { await ShowOperationErrorAsync("CoreShell could not move this item."); }
+            await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+            if (failed > 0)
+                await ShowOperationErrorAsync("CoreShell could not move " + failed + (failed == 1 ? " item." : " items."));
         }
 
         private async void Rename_Click(object sender, RoutedEventArgs e)
@@ -730,8 +812,227 @@ namespace factoryos_10x_shell.Controls
             catch (Exception) { await ShowOperationErrorAsync("CoreShell could not rename this item."); }
         }
 
-        private FileEntry GetEntry(object sender) =>
-            (sender as FrameworkElement)?.DataContext as FileEntry ?? ItemsList.SelectedItem as FileEntry;
+        private async void ArchiveExtractHere_Click(object sender, RoutedEventArgs e)
+        {
+            FileEntry entry = GetEntry(sender);
+            if (entry?.File == null || m_currentFolder == null) return;
+            await ExtractArchiveWithPasswordAsync(entry.File, m_currentFolder);
+        }
+
+        private async void ArchiveExtractTo_Click(object sender, RoutedEventArgs e)
+        {
+            FileEntry entry = GetEntry(sender);
+            if (entry?.File == null) return;
+            var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.Downloads };
+            picker.FileTypeFilter.Add("*");
+            StorageFolder destination = await picker.PickSingleFolderAsync();
+            if (destination != null) await ExtractArchiveWithPasswordAsync(entry.File, destination);
+        }
+
+        private async void ArchiveOpen_Click(object sender, RoutedEventArgs e)
+        {
+            FileEntry entry = GetEntry(sender);
+            if (entry?.File != null) await OpenArchivePreviewAsync(entry.File);
+        }
+
+        private async void CompressZip_Click(object sender, RoutedEventArgs e) =>
+            await CompressEntryAsync(GetEntry(sender), false);
+
+        private async void CompressSevenZip_Click(object sender, RoutedEventArgs e) =>
+            await CompressEntryAsync(GetEntry(sender), true);
+
+        private async Task ExtractArchiveWithPasswordAsync(StorageFile archive, StorageFolder destination)
+        {
+            string password = null;
+            while (true)
+            {
+                try
+                {
+                    await RunArchiveProgressAsync("Extracting " + archive.Name,
+                        (progress, token) => ArchiveService.ExtractAsync(archive, destination, password, progress, token));
+                    if (ReferenceEquals(destination, m_currentFolder) || destination.Path == m_currentFolder?.Path)
+                        await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+                    return;
+                }
+                catch (ArchivePasswordRequiredException)
+                {
+                    password = await RequestArchivePasswordAsync(archive.Name);
+                    if (password == null) return;
+                }
+                catch (OperationCanceledException) { return; }
+                catch (Exception error)
+                {
+                    await ShowOperationErrorAsync("The archive could not be extracted. " + error.Message);
+                    return;
+                }
+            }
+        }
+
+        private async Task OpenArchivePreviewAsync(StorageFile archive)
+        {
+            string password = null;
+            while (true)
+            {
+                try
+                {
+                    IReadOnlyList<ArchiveEntryInfo> entries = await ArchiveService.ListAsync(archive, password);
+                    var list = new ListView
+                    {
+                        ItemsSource = entries,
+                        DisplayMemberPath = nameof(ArchiveEntryInfo.DisplayText),
+                        SelectionMode = ListViewSelectionMode.Single,
+                        MinWidth = 520,
+                        MaxHeight = 430
+                    };
+                    var content = new StackPanel { Spacing = 8 };
+                    content.Children.Add(new TextBlock
+                    {
+                        Text = entries.Count + (entries.Count == 1 ? " item" : " items"),
+                        Opacity = 0.7
+                    });
+                    content.Children.Add(list);
+                    ContentDialogResult result = await new ContentDialog
+                    {
+                        Title = archive.Name,
+                        Content = content,
+                        PrimaryButtonText = "Extract all...",
+                        CloseButtonText = "Close",
+                        DefaultButton = ContentDialogButton.Close
+                    }.ShowAsync();
+                    if (result == ContentDialogResult.Primary)
+                    {
+                        var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.Downloads };
+                        picker.FileTypeFilter.Add("*");
+                        StorageFolder folder = await picker.PickSingleFolderAsync();
+                        if (folder != null) await ExtractArchiveWithPasswordAsync(archive, folder);
+                    }
+                    return;
+                }
+                catch (ArchivePasswordRequiredException)
+                {
+                    password = await RequestArchivePasswordAsync(archive.Name);
+                    if (password == null) return;
+                }
+                catch (Exception error)
+                {
+                    await ShowOperationErrorAsync("The archive could not be opened. " + error.Message);
+                    return;
+                }
+            }
+        }
+
+        private async Task CompressEntryAsync(FileEntry entry, bool sevenZip)
+        {
+            if (entry == null || m_currentFolder == null) return;
+            var selectedEntries = ItemsList.SelectedItems.Cast<FileEntry>().ToList();
+            if (!selectedEntries.Contains(entry)) selectedEntries = new List<FileEntry> { entry };
+            var items = selectedEntries
+                .Select(item => (IStorageItem)item.File ?? item.Folder)
+                .Where(item => item != null)
+                .ToList();
+            if (items.Count == 0) return;
+            string extension = sevenZip ? ".7z" : ".zip";
+            string baseName = selectedEntries.Count == 1
+                ? System.IO.Path.GetFileNameWithoutExtension(entry.Name)
+                : "Archive";
+            StorageFile output = await m_currentFolder.CreateFileAsync(baseName + extension,
+                CreationCollisionOption.GenerateUniqueName);
+            try
+            {
+                await RunArchiveProgressAsync("Creating " + output.Name,
+                    (progress, token) => ArchiveService.CompressAsync(
+                        items, output, sevenZip, progress, token));
+                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+            }
+            catch (OperationCanceledException)
+            {
+                try { await output.DeleteAsync(); } catch { }
+            }
+            catch (Exception error)
+            {
+                try { await output.DeleteAsync(); } catch { }
+                await ShowOperationErrorAsync("The archive could not be created. " + error.Message);
+            }
+        }
+
+        private async Task RunArchiveProgressAsync(string title,
+            Func<IProgress<ArchiveProgress>, CancellationToken, Task> operation)
+        {
+            var status = new TextBlock { Text = "Preparing...", TextTrimming = TextTrimming.CharacterEllipsis };
+            var bar = new ProgressBar { Minimum = 0, Maximum = 100, IsIndeterminate = true };
+            var panel = new StackPanel { Width = 420, Spacing = 12 };
+            panel.Children.Add(status);
+            panel.Children.Add(bar);
+            var dialog = new ContentDialog { Title = title, Content = panel, CloseButtonText = "Cancel" };
+            var cancellation = new CancellationTokenSource();
+            dialog.CloseButtonClick += (s, args) =>
+            {
+                args.Cancel = true;
+                status.Text = "Cancelling...";
+                cancellation.Cancel();
+            };
+            IProgress<ArchiveProgress> progress = new Progress<ArchiveProgress>(value =>
+            {
+                status.Text = value.Item ?? string.Empty;
+                bar.IsIndeterminate = value.Percent < 0;
+                if (!bar.IsIndeterminate)
+                    bar.Value = Math.Max(0, Math.Min(100, value.Percent));
+            });
+
+            IAsyncOperation<ContentDialogResult> shown = dialog.ShowAsync();
+            await Task.Yield();
+            try { await operation(progress, cancellation.Token); }
+            finally
+            {
+                if (shown.Status == AsyncStatus.Started) dialog.Hide();
+                try { await shown; } catch { }
+                cancellation.Dispose();
+            }
+        }
+
+        private static async Task<string> RequestArchivePasswordAsync(string archiveName)
+        {
+            var password = new PasswordBox { PlaceholderText = "Password", MinWidth = 320 };
+            var dialog = new ContentDialog
+            {
+                Title = "Password required",
+                Content = new StackPanel
+                {
+                    Spacing = 10,
+                    Children =
+                    {
+                        new TextBlock { Text = archiveName + " is encrypted. Enter its password.", TextWrapping = TextWrapping.Wrap },
+                        password
+                    }
+                },
+                PrimaryButtonText = "Continue",
+                CloseButtonText = "Cancel",
+                DefaultButton = ContentDialogButton.Primary
+            };
+            return await dialog.ShowAsync() == ContentDialogResult.Primary ? password.Password : null;
+        }
+
+        private FileEntry GetEntry(object sender)
+        {
+            FileEntry senderEntry = (sender as FrameworkElement)?.DataContext as FileEntry;
+            return m_contextEntry ?? senderEntry ?? ItemsList.SelectedItem as FileEntry;
+        }
+
+        private IReadOnlyList<FileEntry> GetOperationEntries(object sender)
+        {
+            FileEntry target = GetEntry(sender);
+            if (target == null)
+                return Array.Empty<FileEntry>();
+
+            List<FileEntry> selected = ItemsList.SelectedItems
+                .OfType<FileEntry>()
+                .Distinct()
+                .ToList();
+
+            // A context menu opened on one of the selected rows operates on the
+            // complete selection. A menu opened on another row targets only it.
+            return selected.Contains(target) ? selected : new List<FileEntry> { target };
+        }
 
         private string GetLocationDisplayName(string location, StorageFolder folder)
         {
@@ -810,6 +1111,7 @@ namespace factoryos_10x_shell.Controls
             public string DateModifiedText { get; set; }
             public StorageFolder Folder { get; set; }
             public StorageFile File { get; set; }
+            public Visibility ArchiveVisibility => ArchiveService.IsArchive(File) ? Visibility.Visible : Visibility.Collapsed;
             private ImageSource m_thumbnail;
             public ImageSource Thumbnail
             {

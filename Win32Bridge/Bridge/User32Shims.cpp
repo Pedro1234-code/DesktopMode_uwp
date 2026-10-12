@@ -33,6 +33,8 @@ using namespace Win32Bridge::Bridge;
 
 namespace
 {
+    constexpr DWORD GuestExitException = 0xE0424242u;
+
     constexpr DWORD BitmapCompressionAlphaBitFields = 6;
     constexpr DWORD GuestBitmapV4HeaderSize = 108;
     constexpr size_t GuestBitmapV4RedMaskOffset = 40;
@@ -152,7 +154,8 @@ namespace
         {
             return procedure(window, message, wParam, lParam);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        __except (GetExceptionCode() == GuestExitException
+            ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
         {
             if (exceptionCode)
             {
@@ -161,6 +164,70 @@ namespace
             return 0;
         }
     }
+
+    // CallWindowProc can form a cycle without returning to the window
+    // manager (for example A -> saved B -> stale A).  ReactOS relies on a
+    // valid saved-procedure chain; reject only a repeatedly identical edge so
+    // ordinary nested window messages remain legal.
+    struct GuestCallWindowProcFrame final
+    {
+        GuestAbi::WndProc procedure = nullptr;
+        HWND window = nullptr;
+        UINT message = 0;
+        GuestCallWindowProcFrame* previous = nullptr;
+    };
+
+    thread_local GuestCallWindowProcFrame* g_guestCallWindowProcFrame = nullptr;
+    constexpr unsigned int MaximumGuestCallWindowProcDepth = 64;
+    constexpr unsigned int MaximumRepeatedGuestCallWindowProc = 12;
+
+    bool IsRunawayGuestCallWindowProc(
+        GuestAbi::WndProc procedure,
+        HWND window,
+        UINT message)
+    {
+        unsigned int depth = 0;
+        unsigned int repeated = 0;
+        for (GuestCallWindowProcFrame* frame = g_guestCallWindowProcFrame;
+            frame; frame = frame->previous)
+        {
+            ++depth;
+            if (frame->procedure == procedure && frame->window == window &&
+                frame->message == message)
+            {
+                ++repeated;
+            }
+        }
+        return depth >= MaximumGuestCallWindowProcDepth ||
+            repeated >= MaximumRepeatedGuestCallWindowProc;
+    }
+
+    class GuestCallWindowProcScope final
+    {
+    public:
+        GuestCallWindowProcScope(
+            GuestAbi::WndProc procedure,
+            HWND window,
+            UINT message)
+        {
+            m_frame.procedure = procedure;
+            m_frame.window = window;
+            m_frame.message = message;
+            m_frame.previous = g_guestCallWindowProcFrame;
+            g_guestCallWindowProcFrame = &m_frame;
+        }
+
+        ~GuestCallWindowProcScope()
+        {
+            g_guestCallWindowProcFrame = m_frame.previous;
+        }
+
+        GuestCallWindowProcScope(const GuestCallWindowProcScope&) = delete;
+        GuestCallWindowProcScope& operator=(const GuestCallWindowProcScope&) = delete;
+
+    private:
+        GuestCallWindowProcFrame m_frame;
+    };
 
     bool ReadGuestMessageValue(
         const GuestAbi::Message* source,
@@ -4303,6 +4370,21 @@ LRESULT WINAPI Win32Bridge::Bridge::BridgeCallWindowProcW(GuestAbi::WndProc proc
         return 0;
     }
 
+    if (IsRunawayGuestCallWindowProc(procedure, window, message))
+    {
+        RuntimeDiagnostics::Record(
+            L"CALL WINDOW PROC: recursive chain was stopped for handle " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) +
+            L", message " + std::to_wstring(message) +
+            L", procedure " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(procedure)) + L".");
+        const LRESULT result = BridgeDefWindowProcW(
+            window, message, wParam, lParam);
+        BridgeSetLastError(ERROR_STACK_OVERFLOW);
+        return result;
+    }
+
+    GuestCallWindowProcScope callScope(procedure, window, message);
     DWORD guestException = ERROR_SUCCESS;
     const LRESULT result = InvokeGuestSubclassProcedure(
         procedure,

@@ -1075,30 +1075,51 @@ PVOID WINAPI BridgeRtlPcToFileHeader(PVOID pc, PVOID* base)
 }
 
 void WINAPI BridgeRtlUnwind(
-    PVOID, PVOID, PEXCEPTION_RECORD record, PVOID)
+    PVOID targetFrame,
+    PVOID targetIp,
+    PEXCEPTION_RECORD record,
+    PVOID returnValue)
 {
-    if (record) ::RaiseException(record->ExceptionCode,
-        record->ExceptionFlags, record->NumberParameters,
-        record->ExceptionInformation);
+    // RtlUnwind is not equivalent to raising the supplied exception again.
+    // Re-raising restarts first-pass dispatch and recursively enters the same
+    // language handler until the thread exhausts its stack.  The mapped x64
+    // images have their .pdata registered with RtlAddFunctionTable, so the
+    // host unwinder can walk guest and bridge frames as one native stack.
+    ::RtlUnwind(targetFrame, targetIp, record, returnValue);
 }
 
 void WINAPI BridgeRtlUnwindEx(
-    PVOID, PVOID, PEXCEPTION_RECORD record, PVOID,
-    PCONTEXT, PUNWIND_HISTORY_TABLE)
+    PVOID targetFrame,
+    PVOID targetIp,
+    PEXCEPTION_RECORD record,
+    PVOID returnValue,
+    PCONTEXT context,
+    PUNWIND_HISTORY_TABLE historyTable)
 {
-    if (record) ::RaiseException(record->ExceptionCode,
-        record->ExceptionFlags, record->NumberParameters,
-        record->ExceptionInformation);
+    if (!context)
+    {
+        // The native contract requires a context for RtlUnwindEx.  Preserve
+        // useful RtlUnwind behavior for malformed callers without fabricating
+        // an exception or recursively dispatching it.
+        ::RtlUnwind(targetFrame, targetIp, record, returnValue);
+        return;
+    }
+    ::RtlUnwindEx(targetFrame, targetIp, record, returnValue,
+        context, historyTable);
 }
 
 void WINAPI BridgeExitProcess(UINT exitCode)
 {
+    if (RequestGuestExit(exitCode, false))
+        return;
     const ULONG_PTR argument = exitCode;
     ::RaiseException(0xE0424242u, EXCEPTION_NONCONTINUABLE, 1, &argument);
 }
 
 void WINAPI BridgeExitThread(DWORD exitCode)
 {
+    if (RequestGuestExit(exitCode, true))
+        return;
     const ULONG_PTR arguments[2] = { exitCode, 1 };
     ::RaiseException(0xE0424242u, EXCEPTION_NONCONTINUABLE, 2, arguments);
 }

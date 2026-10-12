@@ -196,6 +196,15 @@ class EngineView {
   using SetWindowDragSinkFn = void (*)(void (*)(int32_t));
   using SetFilePickerSinkFn = void (*)(int32_t (*)(
       int32_t, const char*, const char*, const char*, char*, int32_t));
+  using SetDownloadDirectoryFn = void (*)(const wchar_t* path);
+  struct FileBroker {
+    intptr_t (*open)(const wchar_t*, int32_t);
+    int32_t (*exists)(const wchar_t*);
+    int32_t (*stat)(const wchar_t*, int64_t*);
+    int32_t (*move)(const wchar_t*, const wchar_t*);
+    int32_t (*remove)(const wchar_t*);
+  };
+  using SetFileBrokerFn = void (*)(const FileBroker* broker);
   using SetBridgeSinkFn = int32_t (*)(void (*)(const char*));
   using BridgeReplyFn = void (*)(const char*);
   using PanelFn = void (*)(void* panel);
@@ -239,6 +248,8 @@ class EngineView {
   SetFullscreenSinkFn set_fullscreen_ = nullptr;
   SetWindowDragSinkFn set_window_drag_ = nullptr;
   SetFilePickerSinkFn set_file_picker_ = nullptr;
+  SetDownloadDirectoryFn set_download_directory_ = nullptr;
+  SetFileBrokerFn set_file_broker_ = nullptr;
   SetVideoLayerSinkFn set_video_layer_ = nullptr;
   // The chrome-to-shell message bridge (client/DrmBridge). Armed once the
   // engine's main thread is up, which is later than the exports resolve.

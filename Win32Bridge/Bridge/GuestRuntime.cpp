@@ -10,6 +10,7 @@
 #include "Bridge/Win32Shims.h"
 
 #include <atomic>
+#include <csetjmp>
 #include <cwchar>
 #include <fileapifromapp.h>
 #include <roapi.h>
@@ -22,6 +23,9 @@ namespace
 {
     constexpr DWORD GuestExitException = 0xE0424242u;
     thread_local GuestRuntime* g_currentGuestRuntime = nullptr;
+    thread_local std::jmp_buf* g_guestExitTarget = nullptr;
+    thread_local DWORD g_guestExitCode = 0;
+    thread_local bool g_guestThreadExit = false;
     std::atomic<unsigned> g_activeGuestRuntimeScopes{ 0 };
     std::atomic<DWORD> g_nextGuestProcessId{ 1000 };
     std::atomic<HANDLE> g_nativeExceptionLog{ INVALID_HANDLE_VALUE };
@@ -265,15 +269,38 @@ namespace
     {
         if (exception) *exception = GuestExceptionDetails{};
 
+        std::jmp_buf exitTarget;
+        std::jmp_buf* previousTarget = g_guestExitTarget;
+        const DWORD previousExitCode = g_guestExitCode;
+        const bool previousThreadExit = g_guestThreadExit;
+        g_guestExitTarget = &exitTarget;
+        if (setjmp(exitTarget) != 0)
+        {
+            if (exitCode) *exitCode = static_cast<int>(g_guestExitCode);
+            if (exception)
+            {
+                exception->code = GuestExitException;
+                exception->requestedExit = true;
+                exception->threadExit = g_guestThreadExit;
+                exception->requestedExitCode = g_guestExitCode;
+            }
+            g_guestExitTarget = previousTarget;
+            g_guestExitCode = previousExitCode;
+            g_guestThreadExit = previousThreadExit;
+            return false;
+        }
+
+        bool completed = false;
         __try
         {
             *exitCode = entryPoint();
-            return true;
+            completed = true;
         }
-        __except (CaptureGuestException(GetExceptionInformation(), exception))
-        {
-            return false;
-        }
+        __except (CaptureGuestException(GetExceptionInformation(), exception)) {}
+        g_guestExitTarget = previousTarget;
+        g_guestExitCode = previousExitCode;
+        g_guestThreadExit = previousThreadExit;
+        return completed;
     }
 
     bool InvokeGuestThreadEntry(
@@ -283,16 +310,50 @@ namespace
         GuestExceptionDetails* exception)
     {
         if (exception) *exception = GuestExceptionDetails{};
+        std::jmp_buf exitTarget;
+        std::jmp_buf* previousTarget = g_guestExitTarget;
+        const DWORD previousExitCode = g_guestExitCode;
+        const bool previousThreadExit = g_guestThreadExit;
+        g_guestExitTarget = &exitTarget;
+        if (setjmp(exitTarget) != 0)
+        {
+            if (exitCode) *exitCode = g_guestExitCode;
+            if (exception)
+            {
+                exception->code = GuestExitException;
+                exception->requestedExit = true;
+                exception->threadExit = g_guestThreadExit;
+                exception->requestedExitCode = g_guestExitCode;
+            }
+            g_guestExitTarget = previousTarget;
+            g_guestExitCode = previousExitCode;
+            g_guestThreadExit = previousThreadExit;
+            return false;
+        }
+
+        bool completed = false;
         __try
         {
             *exitCode = startAddress(parameter);
-            return true;
+            completed = true;
         }
-        __except (CaptureGuestException(GetExceptionInformation(), exception))
-        {
-            return false;
-        }
+        __except (CaptureGuestException(GetExceptionInformation(), exception)) {}
+        g_guestExitTarget = previousTarget;
+        g_guestExitCode = previousExitCode;
+        g_guestThreadExit = previousThreadExit;
+        return completed;
     }
+}
+
+bool Win32Bridge::Bridge::RequestGuestExit(DWORD exitCode, bool threadExit)
+{
+    if (!g_guestExitTarget)
+        return false;
+
+    g_guestExitCode = exitCode;
+    g_guestThreadExit = threadExit;
+    longjmp(*g_guestExitTarget, 1);
+    return true;
 }
 
 bool GuestRuntime::SetResourceSatellite(

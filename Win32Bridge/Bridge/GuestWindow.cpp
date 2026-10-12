@@ -45,6 +45,8 @@ using namespace Windows::UI::Xaml::Media::Imaging;
 
 namespace
 {
+    constexpr DWORD GuestExitException = 0xE0424242u;
+
     // Reserved strictly inside the bridge queues. It is consumed before a
     // message can become visible to guest GetMessage/PeekMessage callers.
     constexpr UINT InternalSentMessage = 0xffffffffu;
@@ -144,6 +146,71 @@ namespace
         }
     }
 
+    // Window procedures are allowed to re-enter, but a malformed subclass
+    // chain can route the same message back to the same procedure forever.
+    // Keep this guard independent from comctl32's subclass bookkeeping: old
+    // GWLP_WNDPROC subclasses and nested SendMessage calls do not necessarily
+    // pass through DefSubclassProc.
+    struct GuestWindowDispatchFrame final
+    {
+        HWND window = nullptr;
+        UINT message = 0;
+        GuestAbi::WndProc procedure = nullptr;
+        GuestWindowDispatchFrame* previous = nullptr;
+    };
+
+    thread_local GuestWindowDispatchFrame* g_guestWindowDispatchFrame = nullptr;
+    constexpr unsigned int MaximumGuestWindowDispatchDepth = 64;
+    constexpr unsigned int MaximumRepeatedGuestWindowDispatch = 12;
+
+    bool IsRunawayGuestWindowDispatch(
+        HWND window,
+        UINT message,
+        GuestAbi::WndProc procedure)
+    {
+        unsigned int depth = 0;
+        unsigned int repeated = 0;
+        for (GuestWindowDispatchFrame* frame = g_guestWindowDispatchFrame;
+            frame; frame = frame->previous)
+        {
+            ++depth;
+            if (frame->window == window && frame->message == message &&
+                frame->procedure == procedure)
+            {
+                ++repeated;
+            }
+        }
+        return depth >= MaximumGuestWindowDispatchDepth ||
+            repeated >= MaximumRepeatedGuestWindowDispatch;
+    }
+
+    class GuestWindowDispatchScope final
+    {
+    public:
+        GuestWindowDispatchScope(
+            HWND window,
+            UINT message,
+            GuestAbi::WndProc procedure)
+        {
+            m_frame.window = window;
+            m_frame.message = message;
+            m_frame.procedure = procedure;
+            m_frame.previous = g_guestWindowDispatchFrame;
+            g_guestWindowDispatchFrame = &m_frame;
+        }
+
+        ~GuestWindowDispatchScope()
+        {
+            g_guestWindowDispatchFrame = m_frame.previous;
+        }
+
+        GuestWindowDispatchScope(const GuestWindowDispatchScope&) = delete;
+        GuestWindowDispatchScope& operator=(const GuestWindowDispatchScope&) = delete;
+
+    private:
+        GuestWindowDispatchFrame m_frame;
+    };
+
     // Guest window procedures are native code from the mapped PE. They run
     // in the same process as the UWP host, so an access violation must never
     // be allowed to tear down CoreShell without leaving diagnostics. Keep the
@@ -166,7 +233,8 @@ namespace
         {
             return procedure(window, message, wParam, lParam);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        __except (GetExceptionCode() == GuestExitException
+            ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
         {
             if (exceptionCode)
             {
@@ -185,7 +253,8 @@ namespace
         {
             procedure(window, message, data, result);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        __except (GetExceptionCode() == GuestExitException
+            ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
         {
             // The callback belongs to the mapped guest. Match the guarded
             // WNDPROC boundary and do not let a stale guest address terminate
@@ -960,6 +1029,8 @@ namespace
     constexpr UINT TabSetItemSize = 0x1329;
     constexpr UINT TabSetPadding = 0x132b;
     constexpr UINT TabGetRowCount = 0x132c;
+    constexpr UINT TabGetTooltips = 0x132d;
+    constexpr UINT TabSetTooltips = 0x132e;
     constexpr UINT TabGetCurrentFocus = 0x132f;
     constexpr UINT TabSetCurrentFocus = 0x1330;
     constexpr UINT TabGetItemW = 0x133c;
@@ -2417,6 +2488,13 @@ struct GuestWindowManager::WindowRecord final
     UINT buttonCheck = 0;
     std::vector<std::wstring> choiceItems;
     HANDLE comboBoxExImageList = nullptr;
+    // ComboBoxEx is a composite common control.  Keep the native hierarchy
+    // (outer ComboBoxEx -> ComboBox -> optional Edit) instead of aliasing all
+    // three identities to the outer HWND.  Applications commonly subclass the
+    // edit HWND returned by CBEM_GETEDITCONTROL.
+    HWND comboBoxExCombo = nullptr;
+    HWND comboBoxExEdit = nullptr;
+    HWND comboBoxExOwner = nullptr;
     int selectedChoice = -1;
     bool comboDropped = false;
     int comboDroppedWidth = 0;
@@ -2485,6 +2563,7 @@ struct GuestWindowManager::WindowRecord final
     std::vector<int> tabItemImages;
     std::vector<UINT> tabItemStates;
     HANDLE tabImageList = nullptr;
+    HWND tabTooltips = nullptr;
     int tabSelectedItem = -1;
     int tabFocusedItem = -1;
     int tabItemWidth = 0;
@@ -3382,6 +3461,98 @@ HWND GuestWindowManager::CreateGuestWindow(
         return nullptr;
     }
 
+    // Native comctl32 (and ReactOS comboex.c) creates a real ComboBox child and
+    // an Edit child for editable ComboBoxEx controls.  A bridge-provided class
+    // has no external comctl32 procedure to create them, so materialize the
+    // same hierarchy here.  If a guest implementation already created the
+    // children, adopt those HWNDs instead of duplicating them.
+    if (registered->name == L"comboboxex32")
+    {
+        HWND combo = nullptr;
+        HWND edit = nullptr;
+        std::vector<std::shared_ptr<WindowRecord>> existing;
+        {
+            std::lock_guard<std::mutex> guard(m_windowsLock);
+            existing.reserve(m_windows.size());
+            for (const auto& item : m_windows) existing.push_back(item.second);
+        }
+        for (const auto& candidate : existing)
+        {
+            std::lock_guard<std::mutex> guard(candidate->lock);
+            if (!candidate->destroyed && candidate->parent == window->handle &&
+                candidate->windowClass &&
+                candidate->windowClass->builtinKind == BuiltinControlKind::ComboBox)
+            {
+                combo = candidate->handle;
+                break;
+            }
+        }
+        if (combo)
+        {
+            for (const auto& candidate : existing)
+            {
+                std::lock_guard<std::mutex> guard(candidate->lock);
+                if (!candidate->destroyed && candidate->parent == combo &&
+                    candidate->windowClass &&
+                    candidate->windowClass->builtinKind == BuiltinControlKind::Edit)
+                {
+                    edit = candidate->handle;
+                    break;
+                }
+            }
+        }
+
+        const int compositeWidth = (std::max)(1, window->surface.Width());
+        const int fieldHeight = (std::min)(window->surface.Height(),
+            GuestMetrics::ControlHeightForText(window->controlTextHeight));
+        const UINT_PTR identifier = window->controlId;
+        DWORD ignored = ERROR_SUCCESS;
+        if (!combo)
+        {
+            constexpr DWORD ComboChildStyle = GuestWsChild | GuestWsVisible |
+                0x04000000u /* WS_CLIPSIBLINGS */ |
+                0x02000000u /* WS_CLIPCHILDREN */ |
+                0x00200000u /* WS_VSCROLL */ |
+                0x00000400u /* CBS_NOINTEGRALHEIGHT */ |
+                0x00000003u /* CBS_DROPDOWNLIST */;
+            combo = CreateGuestWindow(0, L"ComboBox", L"", ComboChildStyle,
+                0, 0, compositeWidth, fieldHeight, window->handle,
+                reinterpret_cast<HMENU>(identifier), instance, nullptr, &ignored);
+        }
+        const bool editable = (style & 0x0003u) == 0x0002u; // CBS_DROPDOWN
+        if (editable && combo && !edit)
+        {
+            const int buttonWidth = (std::min)(GuestMetrics::ScrollBarExtent,
+                (std::max)(1, compositeWidth / 3));
+            constexpr int BorderInset = GuestMetrics::Border +
+                GuestMetrics::ControlVerticalPadding / 2;
+            constexpr DWORD EditChildStyle = GuestWsChild | GuestWsVisible |
+                0x04000000u /* WS_CLIPSIBLINGS */ |
+                GuestAbi::EsAutoHScroll;
+            edit = CreateGuestWindow(0, L"Edit", L"", EditChildStyle,
+                BorderInset, BorderInset,
+                (std::max)(1, compositeWidth - buttonWidth - BorderInset * 2),
+                (std::max)(1, fieldHeight - BorderInset * 2), combo,
+                reinterpret_cast<HMENU>(identifier), instance, nullptr, &ignored);
+        }
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            window->comboBoxExCombo = combo;
+            window->comboBoxExEdit = edit;
+        }
+        if (const auto comboRecord = FindWindow(combo))
+        {
+            std::lock_guard<std::mutex> guard(comboRecord->lock);
+            comboRecord->comboBoxExOwner = window->handle;
+        }
+        if (const auto editRecord = FindWindow(edit))
+        {
+            std::lock_guard<std::mutex> guard(editRecord->lock);
+            editRecord->comboBoxExOwner = window->handle;
+        }
+        RuntimeDiagnostics::Record(L"COMBOBOXEX: established distinct combo/edit child HWNDs.");
+    }
+
     // WS_VISIBLE is state, not merely a style bit, in the virtual window
     // manager. Route it through the ordinary show path so creation gets the
     // same focus, invalidation, WM_SHOWWINDOW and initial WM_SIZE behavior as
@@ -3821,6 +3992,20 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
     }
     if (procedure)
     {
+        if (IsRunawayGuestWindowDispatch(handle, message, procedure))
+        {
+            RuntimeDiagnostics::Record(
+                L"WINDOW PROCEDURE: recursive dispatch was stopped for handle " +
+                std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)) +
+                L", message " + std::to_wstring(message) +
+                L", procedure " +
+                std::to_wstring(reinterpret_cast<ULONG_PTR>(procedure)) + L".");
+            return builtinKind != BuiltinControlKind::None
+                ? BuiltinControlProcedure(window, message, wParam, lParam)
+                : DefaultGuestWindowProcedure(handle, message, wParam, lParam);
+        }
+
+        GuestWindowDispatchScope dispatchScope(handle, message, procedure);
         DWORD guestException = ERROR_SUCCESS;
         const LRESULT result = InvokeGuestWindowProcedure(
             procedure,
@@ -6730,7 +6915,10 @@ LONG_PTR GuestWindowManager::SetGuestWindowLongPtr(HWND window, int index, LONG_
     {
         RuntimeDiagnostics::Record(
             L"CONTROL SUBCLASS: handle " + std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) +
-            L" retained its bridge default procedure.");
+            L" changed procedure from " +
+            std::to_wstring(static_cast<ULONG_PTR>(previous)) + L" to " +
+            std::to_wstring(static_cast<ULONG_PTR>(value)) +
+            L" and retained its bridge default procedure.");
     }
 
     SetWin32Error(win32Error, ERROR_SUCCESS);
@@ -6796,6 +6984,8 @@ BOOL GuestWindowManager::SetGuestWindowPos(
     int previousTop = 0;
     std::wstring className;
     bool resizedRebar = false;
+    HWND comboBoxExCombo = nullptr;
+    HWND comboBoxExEdit = nullptr;
 
     {
         std::lock_guard<std::mutex> guard(record->lock);
@@ -6891,11 +7081,36 @@ BOOL GuestWindowManager::SetGuestWindowPos(
         currentTop = record->bounds.top;
         resizedRebar = changedSize && record->windowClass &&
             record->windowClass->builtinKind == BuiltinControlKind::Rebar;
+        if (changedSize)
+        {
+            comboBoxExCombo = record->comboBoxExCombo;
+            comboBoxExEdit = record->comboBoxExEdit;
+        }
     }
 
     if (resizedRebar)
     {
         LayoutGuestRebar(window);
+    }
+    if (changedSize && comboBoxExCombo)
+    {
+        const int fieldHeight = (std::min)(currentHeight,
+            GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight));
+        DWORD ignored = ERROR_SUCCESS;
+        SetGuestWindowPos(comboBoxExCombo, nullptr, 0, 0,
+            currentWidth, fieldHeight, GuestSwpNoZOrder | GuestSwpNoActivate,
+            &ignored);
+        if (comboBoxExEdit)
+        {
+            const int buttonWidth = (std::min)(GuestMetrics::ScrollBarExtent,
+                (std::max)(1, currentWidth / 3));
+            constexpr int BorderInset = GuestMetrics::Border +
+                GuestMetrics::ControlVerticalPadding / 2;
+            SetGuestWindowPos(comboBoxExEdit, nullptr, BorderInset, BorderInset,
+                (std::max)(1, currentWidth - buttonWidth - BorderInset * 2),
+                (std::max)(1, fieldHeight - BorderInset * 2),
+                GuestSwpNoZOrder | GuestSwpNoActivate, &ignored);
+        }
     }
 
     if (becameVisible)
@@ -7913,11 +8128,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
             if (message == ComboBoxExGetComboControl || message == ComboBoxExGetEditControl)
             {
-                // The bridge renders the editable portion in the ComboBoxEx
-                // surface itself. Returning that guest HWND lets callers use
-                // their usual CB_* / WM_SETTEXT path without exposing a host
-                // child window that could escape UWP composition.
-                return reinterpret_cast<LRESULT>(window->handle);
+                std::lock_guard<std::mutex> guard(window->lock);
+                const HWND child = message == ComboBoxExGetComboControl
+                    ? window->comboBoxExCombo : window->comboBoxExEdit;
+                return reinterpret_cast<LRESULT>(child);
             }
 
             GuestComboBoxExItemW item = {};
@@ -7949,6 +8163,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 return message == ComboBoxExInsertItemW ? -1 : FALSE;
             }
             int result = -1;
+            std::vector<std::wstring> mirroredItems;
+            int mirroredSelection = -1;
+            std::wstring mirroredText;
+            HWND mirroredCombo = nullptr;
+            HWND mirroredEdit = nullptr;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 if (window->destroyed)
@@ -7984,9 +8203,40 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     }
                     result = TRUE;
                 }
+                if (result >= 0)
+                {
+                    mirroredItems = window->choiceItems;
+                    mirroredSelection = window->selectedChoice;
+                    mirroredText = window->title;
+                    mirroredCombo = window->comboBoxExCombo;
+                    mirroredEdit = window->comboBoxExEdit;
+                }
             }
             if (result >= 0)
             {
+                if (const auto comboRecord = FindWindow(mirroredCombo))
+                {
+                    std::lock_guard<std::mutex> guard(comboRecord->lock);
+                    if (!comboRecord->destroyed)
+                    {
+                        comboRecord->choiceItems = mirroredItems;
+                        comboRecord->selectedChoice = mirroredSelection;
+                        comboRecord->title = mirroredText;
+                    }
+                }
+                if (const auto editRecord = FindWindow(mirroredEdit))
+                {
+                    std::lock_guard<std::mutex> guard(editRecord->lock);
+                    if (!editRecord->destroyed)
+                    {
+                        editRecord->title = mirroredText;
+                        editRecord->editCaret = mirroredText.size();
+                        editRecord->editSelectionAnchor = editRecord->editCaret;
+                        editRecord->editSelectionEnd = editRecord->editCaret;
+                    }
+                }
+                if (mirroredCombo) InvalidateGuestRect(mirroredCombo, nullptr, TRUE, nullptr);
+                if (mirroredEdit) InvalidateGuestRect(mirroredEdit, nullptr, TRUE, nullptr);
                 InvalidateGuestRect(window->handle, nullptr, TRUE, nullptr);
             }
             return result;
@@ -11004,6 +11254,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
 
     if (controlKind == BuiltinControlKind::Tab)
     {
+        if (message == TabSetTooltips || message == TabGetTooltips)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            if (message == TabGetTooltips)
+                return reinterpret_cast<LRESULT>(window->tabTooltips);
+            window->tabTooltips = reinterpret_cast<HWND>(wParam);
+            return 0;
+        }
         if (message == TabSetImageList || message == TabGetImageList)
         {
             std::lock_guard<std::mutex> guard(window->lock);
@@ -11501,6 +11759,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
         }
         std::wstring text = source ? std::wstring(source, length) : std::wstring();
+        HWND compositeOwner = nullptr;
+        HWND comboChild = nullptr;
+        HWND editChild = nullptr;
+        std::wstring appliedText;
         {
             std::lock_guard<std::mutex> guard(window->lock);
             if (window->destroyed)
@@ -11514,6 +11776,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 text.resize(window->editTextLimit);
             }
             window->title = std::move(text);
+            appliedText = window->title;
+            compositeOwner = window->comboBoxExOwner;
+            comboChild = window->comboBoxExCombo;
+            editChild = window->comboBoxExEdit;
             window->editCaret = controlKind == BuiltinControlKind::Edit &&
                 (window->style & GuestAbi::EsMultiline) != 0
                     ? 0 : window->title.size();
@@ -11526,6 +11792,39 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
                 window->statusBarTexts[0] = window->title;
             }
+        }
+        // Keep the three native ComboBoxEx identities text-compatible.  The
+        // Edit is the visual/text endpoint for CBS_DROPDOWN, while callers may
+        // still use WM_SETTEXT on the outer or inner combo HWND.
+        if (compositeOwner)
+        {
+            if (const auto ownerRecord = FindWindow(compositeOwner))
+            {
+                std::lock_guard<std::mutex> guard(ownerRecord->lock);
+                if (!ownerRecord->destroyed)
+                {
+                    ownerRecord->title = appliedText;
+                    comboChild = ownerRecord->comboBoxExCombo;
+                    editChild = ownerRecord->comboBoxExEdit;
+                }
+            }
+        }
+        const HWND currentHandle = window->handle;
+        for (const HWND target : { comboChild, editChild })
+        {
+            if (!target || target == currentHandle) continue;
+            if (const auto targetRecord = FindWindow(target))
+            {
+                std::lock_guard<std::mutex> guard(targetRecord->lock);
+                if (!targetRecord->destroyed)
+                {
+                    targetRecord->title = appliedText;
+                    targetRecord->editCaret = appliedText.size();
+                    targetRecord->editSelectionAnchor = targetRecord->editCaret;
+                    targetRecord->editSelectionEnd = targetRecord->editCaret;
+                }
+            }
+            InvalidateGuestRect(target, nullptr, TRUE, nullptr);
         }
         if (controlKind == BuiltinControlKind::Edit) syncEditHandleFromTitle();
         invalidate();

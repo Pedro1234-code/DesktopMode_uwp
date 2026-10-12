@@ -675,6 +675,28 @@ bool EngineView::Resolve() {
       Log::Write(L"file picker: engine connected to the UWP broker");
     }
   }
+  if (!set_download_directory_) {
+    set_download_directory_ = reinterpret_cast<SetDownloadDirectoryFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_download_directory"));
+    if (set_download_directory_) {
+      DownloadBroker::SetDirectoryChangedSink(set_download_directory_);
+      Log::Write(L"download: direct authorized folder connected to Gecko");
+    }
+  }
+  if (!set_file_broker_) {
+    set_file_broker_ = reinterpret_cast<SetFileBrokerFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_file_broker"));
+    if (set_file_broker_) {
+      static const FileBroker broker{
+          &DownloadBroker::OpenAuthorizedFile,
+          &DownloadBroker::AuthorizedFileExists,
+          &DownloadBroker::StatAuthorizedFile,
+          &DownloadBroker::MoveAuthorizedFile,
+          &DownloadBroker::RemoveAuthorizedFile};
+      set_file_broker_(&broker);
+      Log::Write(L"download: Gecko file operations connected to UWP broker");
+    }
+  }
   if (!set_video_layer_ && video_panel_) {
     set_video_layer_ = reinterpret_cast<SetVideoLayerSinkFn>(
         ::GetProcAddress(xul, "gecko_w10m_set_video_layer_sink"));

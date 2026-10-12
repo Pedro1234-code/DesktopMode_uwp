@@ -23,6 +23,8 @@ using namespace Win32Bridge::Bridge;
 
 namespace
 {
+    constexpr DWORD GuestExitException = 0xE0424242u;
+
     HANDLE WINAPI BridgeOpenThemeData(HWND window, LPCWSTR)
     {
         if (!CurrentGuestUsesVisualStyles()) return nullptr;
@@ -275,7 +277,19 @@ namespace
         std::shared_ptr<SubclassEntry> first;
         unsigned int running = 0;
     };
-    std::mutex g_subclassLock;
+    // Keep the subclass registry independent from the C++ runtime's heap-backed
+    // mutex implementation.  Guest callbacks execute arbitrary PE code and may
+    // terminate/re-enter the runtime; an SRW lock has process-lifetime storage
+    // and no separately allocated _Mtx_t state that can become stale across a
+    // callback boundary.
+    SRWLOCK g_subclassLock = SRWLOCK_INIT;
+    struct SubclassRegistryLock final
+    {
+        SubclassRegistryLock() noexcept { ::AcquireSRWLockExclusive(&g_subclassLock); }
+        ~SubclassRegistryLock() noexcept { ::ReleaseSRWLockExclusive(&g_subclassLock); }
+        SubclassRegistryLock(const SubclassRegistryLock&) = delete;
+        SubclassRegistryLock& operator=(const SubclassRegistryLock&) = delete;
+    };
     std::unordered_map<ULONG_PTR, std::shared_ptr<SubclassWindow>> g_subclasses;
     struct SubclassFrame final
     {
@@ -283,13 +297,21 @@ namespace
         UINT message = 0;
         WPARAM wParam = 0;
         LPARAM lParam = 0;
-        std::shared_ptr<SubclassWindow> state;
+        // The map owns the state while running is non-zero.  Keep only a raw
+        // pointer in the dispatch frame: guest callbacks are untrusted and may
+        // unwind/re-enter, so a cached shared_ptr must not be dereferenced or
+        // destroyed after returning from guest code.
+        SubclassWindow* state = nullptr;
         std::shared_ptr<SubclassEntry> next;
         SubclassFrame* previous = nullptr;
     };
     thread_local SubclassFrame* g_subclassFrame = nullptr;
     thread_local unsigned int g_subclassDispatchDepth = 0;
-    constexpr unsigned int MaximumSubclassDispatchDepth = 128;
+    // This is a last-resort ceiling.  GuestWindow and CallWindowProc also
+    // detect repeated procedure/message edges, while this limit protects
+    // chains made entirely from distinct subclass callbacks.  Keep enough
+    // stack in reserve to report the fault and unwind safely.
+    constexpr unsigned int MaximumSubclassDispatchDepth = 32;
 
     LRESULT InvokeSubclassEntry(
         SubclassFrame* frame,
@@ -302,7 +324,8 @@ namespace
             return procedure(frame->window, frame->message, frame->wParam,
                 frame->lParam, identifier, referenceData);
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
+        __except (GetExceptionCode() == GuestExitException
+            ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
         {
             return 0;
         }
@@ -333,11 +356,11 @@ namespace
         frame.wParam = wParam;
         frame.lParam = lParam;
         {
-            std::lock_guard<std::mutex> guard(g_subclassLock);
+            SubclassRegistryLock guard;
             const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
             if (found == g_subclasses.end())
                 return BridgeDefWindowProcW(window, message, wParam, lParam);
-            frame.state = found->second;
+            frame.state = found->second.get();
             frame.next = frame.state->first;
             ++frame.state->running;
         }
@@ -351,21 +374,23 @@ namespace
         GuestAbi::WndProc restore = nullptr;
         bool restoreProcedure = false;
         {
-            std::lock_guard<std::mutex> guard(g_subclassLock);
-            if (frame.state->running != 0)
-                --frame.state->running;
-
+            SubclassRegistryLock guard;
             const bool destroying = message == 0x0082; // WM_NCDESTROY
-            if (destroying)
-                frame.state->first.reset();
-
-            if (!frame.state->first && frame.state->running == 0)
+            const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
+            if (found != g_subclasses.end())
             {
-                const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
-                if (found != g_subclasses.end() && found->second == frame.state)
+                const auto state = found->second;
+                if (state->running != 0)
+                    --state->running;
+                if (destroying)
+                    state->first.reset();
+
+                if (!state->first && state->running == 0)
+                {
                     g_subclasses.erase(found);
-                restore = frame.state->original;
-                restoreProcedure = !destroying;
+                    restore = state->original;
+                    restoreProcedure = !destroying;
+                }
             }
         }
         if (restoreProcedure)
@@ -377,7 +402,7 @@ namespace
         HWND window, GuestSubclassProc procedure, UINT_PTR identifier, DWORD_PTR referenceData)
     {
         if (!window || !procedure) return FALSE;
-        std::lock_guard<std::mutex> guard(g_subclassLock);
+        SubclassRegistryLock guard;
         const ULONG_PTR key = reinterpret_cast<ULONG_PTR>(window);
         auto found = g_subclasses.find(key);
         std::shared_ptr<SubclassWindow> state;
@@ -419,7 +444,7 @@ namespace
         HWND window, GuestSubclassProc procedure, UINT_PTR identifier, DWORD_PTR* referenceData)
     {
         if (!window || !procedure) return FALSE;
-        std::lock_guard<std::mutex> guard(g_subclassLock);
+        SubclassRegistryLock guard;
         const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
         if (found == g_subclasses.end()) return FALSE;
         for (auto entry = found->second->first; entry; entry = entry->next)
@@ -440,7 +465,7 @@ namespace
         GuestAbi::WndProc restore = nullptr;
         bool removed = false;
         {
-            std::lock_guard<std::mutex> guard(g_subclassLock);
+            SubclassRegistryLock guard;
             const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
             if (found == g_subclasses.end()) return FALSE;
 
@@ -487,7 +512,7 @@ namespace
         UINT_PTR identifier = 0;
         DWORD_PTR referenceData = 0;
         {
-            std::lock_guard<std::mutex> guard(g_subclassLock);
+            SubclassRegistryLock guard;
             while (frame->next && frame->next->removed)
                 frame->next = frame->next->next;
             if (frame->next)
