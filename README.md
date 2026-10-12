@@ -43,6 +43,17 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 
 Desktop Mode includes an highly experimental bridge for loading Win32 PEs in .exe format. The .exe has no acess to the real Xbox or PC filesystem, registry or OS, it runs on a virtual drive inside the app's LocalStorage (drive_c). For now, it can render most of 7-Zip, can create a window, and a few more things. Most PEs simply won't load by now, compatibility is meant to be expanded with time.
 
+## Enable Loopback
+In order to be able to use Xbox Device Portal directly from Strawfox, and use the Appx Installer feature, you must enable loopback every reboot. Here's how to do it:
+
+- Start an SSH connection using whatever client on your phone or PC (needs to be on the same network as the Xbox)
+- User: DevToolsUser
+- Password: the Visual Studio PIN showed on Dev Home
+
+Once connected to the shell, run: CheckNetIsolation.exe LoopbackExempt -a -n="Microsoft.MicrosoftEdge.CoreShell_8wekyb3d8bbwe"
+
+You must do it every time the console boots.
+
 ## Discord
 
 Join our server: https://discord.gg/dEKYCqFXt
