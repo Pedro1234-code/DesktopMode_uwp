@@ -32,10 +32,15 @@ namespace factoryos_10x_shell.Services.Helpers
         public bool IsFilesOpen { get; private set; }
         public bool IsFilesMinimized { get; private set; }
         public event Action<bool> OnFilesRequested;
+        public event Action<string> OnFilesRevealRequested;
         public event Action OnFilesStateChanged;
         public event Action OnFilesActivated;
 
         public void RequestFilesOpen(bool resetHome = false) => OnFilesRequested?.Invoke(resetHome);
+        public void RequestFilesReveal(string path)
+        {
+            if (!string.IsNullOrWhiteSpace(path)) OnFilesRevealRequested?.Invoke(path);
+        }
 
         public void SetFilesWindowState(bool isOpen, bool isMinimized)
         {
@@ -112,8 +117,22 @@ namespace factoryos_10x_shell.Services.Helpers
         public event Action OnFirefoxRequested;
         public event Action OnFirefoxStateChanged;
         public event Action OnFirefoxActivated;
+        private StorageFile m_pendingFirefoxFile;
 
-        public void RequestFirefoxOpen() => OnFirefoxRequested?.Invoke();
+        public void RequestFirefoxOpen(StorageFile file = null)
+        {
+            m_pendingFirefoxFile = file;
+            OnFirefoxRequested?.Invoke();
+        }
+
+        public bool HasPendingFirefoxFile => m_pendingFirefoxFile != null;
+
+        public StorageFile TakePendingFirefoxFile()
+        {
+            StorageFile file = m_pendingFirefoxFile;
+            m_pendingFirefoxFile = null;
+            return file;
+        }
         public void SetFirefoxWindowState(bool isOpen, bool isMinimized)
         {
             IsFirefoxOpen = isOpen;

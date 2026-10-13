@@ -27,7 +27,8 @@ namespace Bridge
         GuestStorageContext(
             Windows::Storage::StorageFolder^ localFolder,
             const std::wstring& modulePath,
-            Windows::Storage::StorageFolder^ moduleSourceFolder = nullptr);
+            Windows::Storage::StorageFolder^ moduleSourceFolder = nullptr,
+            Windows::Storage::StorageFolder^ externalFolder = nullptr);
         ~GuestStorageContext();
 
         bool EnsureLayout(std::wstring* error);
@@ -84,6 +85,7 @@ namespace Bridge
         std::wstring CurrentDirectory() const;
         const std::wstring& ModulePath() const { return m_modulePath; }
         Windows::Storage::StorageFolder^ LocalFolder() const { return m_localFolder.Get(); }
+        Windows::Storage::StorageFolder^ ExternalFolder() const { return m_externalFolder.Get(); }
         std::wstring TempPath() const;
 
         void CloseAll();
@@ -150,6 +152,7 @@ namespace Bridge
 
         Platform::Agile<Windows::Storage::StorageFolder^> m_localFolder;
         Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
+        Platform::Agile<Windows::Storage::StorageFolder^> m_externalFolder;
         VirtualPathResolver m_paths;
         std::wstring m_modulePath;
         std::wstring m_moduleDirectory;

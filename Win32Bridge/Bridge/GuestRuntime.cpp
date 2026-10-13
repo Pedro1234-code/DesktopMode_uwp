@@ -696,7 +696,8 @@ bool GuestRuntime::LaunchChildProcess(
     try
     {
         childStorage = std::make_shared<GuestStorageContext>(
-            m_storage->LocalFolder(), logicalPath, m_modules->ModuleSourceFolder());
+            m_storage->LocalFolder(), logicalPath, m_modules->ModuleSourceFolder(),
+            m_storage->ExternalFolder());
         child = std::make_shared<GuestRuntime>();
     }
     catch (const std::bad_alloc&)

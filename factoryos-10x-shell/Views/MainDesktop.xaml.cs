@@ -113,6 +113,7 @@ namespace factoryos_10x_shell.Views
 
             AppState.Instance.OnBgChangeButtonVisibilityChanged += UpdateBgChangeButtonVisibility;
             AppState.Instance.OnFilesRequested += FilesRequested;
+            AppState.Instance.OnFilesRevealRequested += FilesRevealRequested;
             AppState.Instance.OnFilesStateChanged += FilesStateChanged;
             AppState.Instance.OnFilesActivated += FilesActivated;
             AppState.Instance.OnNotepadRequested += NotepadRequested;
@@ -132,6 +133,8 @@ namespace factoryos_10x_shell.Views
             TaskViewGrid.ItemsSource = m_shellWindowCoordinator.Windows;
             SynchronizeShellWindows();
             UpdateBgChangeButtonVisibility(AppState.Instance.IsBgChangeButtonVisible);
+            if (AppState.Instance.HasPendingFirefoxFile)
+                FirefoxRequested();
         }
 
         private void UpdateBgChangeButtonVisibility(bool isVisible)
@@ -144,6 +147,11 @@ namespace factoryos_10x_shell.Views
         {
             if (resetHome) FilesWindow.OpenHome();
             else FilesWindow.Restore();
+        }
+
+        private void FilesRevealRequested(string path)
+        {
+            FilesWindow.OpenFolderAndSelect(path);
         }
 
         private void FilesActivated()
@@ -177,7 +185,12 @@ namespace factoryos_10x_shell.Views
             ActivateShellWindow(ShellWindowKind.Calculator, CalculatorWindowIdentity);
         }
 
-        private void FirefoxRequested() => FirefoxWindow.Open();
+        private void FirefoxRequested()
+        {
+            StorageFile file = AppState.Instance.TakePendingFirefoxFile();
+            if (file == null) FirefoxWindow.Open();
+            else FirefoxWindow.OpenFile(file);
+        }
 
         private void FirefoxActivated()
         {
@@ -468,7 +481,7 @@ namespace factoryos_10x_shell.Views
                 descriptors,
                 ShellWindowKind.Firefox,
                 FirefoxWindowIdentity,
-                "Firefox",
+                "Strawfox",
                 "Web browser",
                 "\uE774",
                 m_firefoxIcon,

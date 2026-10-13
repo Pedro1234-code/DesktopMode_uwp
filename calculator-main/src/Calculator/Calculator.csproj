@@ -790,6 +790,16 @@
   <ItemGroup>
     <Content Include="Assets\CalculatorIcons.ttf" />
   </ItemGroup>
+  <!-- The standalone app keeps its complete localization. When hosted by
+       CoreShell, the shell owns the final multilingual PRI; the component
+       only needs the two fallback languages while compiling its XAML. -->
+  <ItemGroup Condition="'$(CalculatorHostedBuild)' == 'true'">
+    <PRIResource Remove="Resources\**\*.resw" />
+    <PRIResource Include="Resources\en-US\CEngineStrings.resw" />
+    <PRIResource Include="Resources\en-US\Resources.resw" />
+    <PRIResource Include="Resources\pt-br\CEngineStrings.resw" />
+    <PRIResource Include="Resources\pt-br\Resources.resw" />
+  </ItemGroup>
   <PropertyGroup Condition=" '$(VisualStudioVersion)' == '' or '$(VisualStudioVersion)' &lt; '14.0' ">
     <VisualStudioVersion>14.0</VisualStudioVersion>
   </PropertyGroup>

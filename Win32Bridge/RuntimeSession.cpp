@@ -9,6 +9,7 @@
 #include "Bridge\Win32Shims.h"
 
 #include <windows.globalization.h>
+#include <windows.storage.accesscache.h>
 
 #include <atomic>
 #include <algorithm>
@@ -22,6 +23,7 @@ using namespace Platform;
 using namespace Windows::Foundation;
 using namespace Windows::Globalization;
 using namespace Windows::Storage;
+using namespace Windows::Storage::AccessCache;
 using namespace Windows::Storage::Streams;
 using namespace Windows::UI::Core;
 using namespace Windows::UI::Xaml;
@@ -32,10 +34,42 @@ namespace
 {
     constexpr wchar_t RuntimeLogFileName[] = L"Win32Bridge-runtime.log";
     constexpr wchar_t ImportLogFileName[] = L"Win32Bridge-imports.log";
+    constexpr wchar_t ExternalFolderToken[] = L"CoreShell.Files.Mount.Removable media";
 
     std::wstring ToWide(String^ value)
     {
         return value ? std::wstring(value->Data()) : std::wstring();
+    }
+
+    task<StorageFolder^> GetExternalMountFolderAsync()
+    {
+        try
+        {
+            auto accessList = StorageApplicationPermissions::FutureAccessList;
+            auto token = ref new String(ExternalFolderToken);
+            if (!accessList->ContainsItem(token))
+                return task_from_result<StorageFolder^>(nullptr);
+
+            return create_task(accessList->GetFolderAsync(token)).then(
+                [](task<StorageFolder^> pending)
+            {
+                try { return pending.get(); }
+                catch (Exception^ exception)
+                {
+                    RuntimeDiagnostics::Record(
+                        L"STORAGE: authorized removable drive is unavailable; HRESULT " +
+                        std::to_wstring(static_cast<unsigned long>(exception->HResult)) + L".");
+                    return static_cast<StorageFolder^>(nullptr);
+                }
+            });
+        }
+        catch (Exception^ exception)
+        {
+            RuntimeDiagnostics::Record(
+                L"STORAGE: could not inspect the removable-drive authorization; HRESULT " +
+                std::to_wstring(static_cast<unsigned long>(exception->HResult)) + L".");
+            return task_from_result<StorageFolder^>(nullptr);
+        }
     }
 
     task<StorageFile^> TryGetFileAsync(StorageFolder^ folder, String^ name)
@@ -369,44 +403,49 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
                         ToWide(satellite->Name) + L"'.");
                 }
                 return ReadOptionalFileBytesAsync(satellite);
-            }).then([state, moduleSourceFolder, bytes](std::vector<BYTE> satelliteBytes)
+            }).then([state, moduleSourceFolder, bytes](std::vector<BYTE> satelliteBytes) -> task<bool>
             {
                 if (satelliteBytes.empty())
                     RuntimeDiagnostics::Record(
                         L"MUI: no companion resource file was found beside the executable.");
-                const std::wstring virtualModulePath =
-                    L"C:\\Program Files\\Win32Bridge\\" + state->executableName;
-                state->storage = std::make_shared<GuestStorageContext>(
-                    ApplicationData::Current->LocalFolder,
-                    virtualModulePath,
-                    moduleSourceFolder);
-                state->runtime = std::unique_ptr<GuestRuntime>(new GuestRuntime());
-                state->runtime->SetStorageContext(state->storage);
-                state->runtime->SetWindowManager(state->windows);
-                state->runtime->SetModuleSourceFolder(moduleSourceFolder);
+                return GetExternalMountFolderAsync().then(
+                    [state, moduleSourceFolder, bytes, satelliteBytes](StorageFolder^ externalFolder)
+                {
+                    const std::wstring virtualModulePath =
+                        L"C:\\Program Files\\Win32Bridge\\" + state->executableName;
+                    state->storage = std::make_shared<GuestStorageContext>(
+                        ApplicationData::Current->LocalFolder,
+                        virtualModulePath,
+                        moduleSourceFolder,
+                        externalFolder);
+                    state->runtime = std::unique_ptr<GuestRuntime>(new GuestRuntime());
+                    state->runtime->SetStorageContext(state->storage);
+                    state->runtime->SetWindowManager(state->windows);
+                    state->runtime->SetModuleSourceFolder(moduleSourceFolder);
 
-                std::wstring error;
-                if (!satelliteBytes.empty() && !state->runtime->SetResourceSatellite(
-                    satelliteBytes.data(), satelliteBytes.size(), &error))
-                {
-                    RuntimeDiagnostics::Record(
-                        L"MUI: ignoring an invalid companion resource image: " + error);
-                    error.clear();
-                }
-                const bool prepared = state->runtime->Prepare(
-                    bytes->data(), bytes->size(), ResolveRuntimeImport, &error);
-                state->prepared.store(prepared);
-                const auto& bindings = state->runtime->Bindings();
-                state->importSummary = std::to_wstring(bindings.bound) + L" imports bound; " +
-                    std::to_wstring(bindings.unresolved) + L" unresolved.";
-                PersistImportReport(BuildImportReport(state->executableName, *state->runtime));
-                if (!prepared)
-                {
-                    state->lastError = error.empty()
-                        ? L"The runtime could not prepare this executable." : error;
-                }
-                PersistReport(RuntimeDiagnostics::Snapshot());
-                return prepared;
+                    std::wstring error;
+                    if (!satelliteBytes.empty() && !state->runtime->SetResourceSatellite(
+                        satelliteBytes.data(), satelliteBytes.size(), &error))
+                    {
+                        RuntimeDiagnostics::Record(
+                            L"MUI: ignoring an invalid companion resource image: " + error);
+                        error.clear();
+                    }
+                    const bool prepared = state->runtime->Prepare(
+                        bytes->data(), bytes->size(), ResolveRuntimeImport, &error);
+                    state->prepared.store(prepared);
+                    const auto& bindings = state->runtime->Bindings();
+                    state->importSummary = std::to_wstring(bindings.bound) + L" imports bound; " +
+                        std::to_wstring(bindings.unresolved) + L" unresolved.";
+                    PersistImportReport(BuildImportReport(state->executableName, *state->runtime));
+                    if (!prepared)
+                    {
+                        state->lastError = error.empty()
+                            ? L"The runtime could not prepare this executable." : error;
+                    }
+                    PersistReport(RuntimeDiagnostics::Snapshot());
+                    return prepared;
+                });
             });
         });
         return preparation.then([state](task<bool> completed)

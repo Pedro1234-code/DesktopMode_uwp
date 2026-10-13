@@ -74,9 +74,13 @@ namespace factoryos_10x_shell.Library.ViewModels
             StartIconModel firefoxIcon = m_appHelper.StartIcons.FirstOrDefault(app => app.AppId == "CoreShell.Firefox");
             if (firefoxIcon == null)
             {
-                firefoxIcon = new StartIconModel { AppId = "CoreShell.Firefox", IconName = "Firefox" };
+                firefoxIcon = new StartIconModel { AppId = "CoreShell.Firefox", IconName = "Strawfox" };
                 m_appHelper.StartIcons.Insert(4, firefoxIcon);
             }
+            // Normalize models restored from older local settings as well;
+            // changing only the newly-created fallback left existing installs
+            // displaying the previous name indefinitely.
+            firefoxIcon.IconName = "Strawfox";
             firefoxIcon.IconGlyph = null;
             firefoxIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
 

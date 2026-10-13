@@ -194,6 +194,53 @@ namespace factoryos_10x_shell.Controls
             AppState.Instance.ActivateFiles();
         }
 
+        public async void OpenFolderAndSelect(string filePath)
+        {
+            if (string.IsNullOrWhiteSpace(filePath)) return;
+
+            Visibility = Visibility.Visible;
+            SettingsPage.Visibility = Visibility.Collapsed;
+            AppState.Instance.SetFilesWindowState(true, false);
+            AppState.Instance.ActivateFiles();
+
+            try
+            {
+                StorageFile file = await StorageFile.GetFileFromPathAsync(filePath);
+                StorageFolder folder = await file.GetParentAsync();
+                await OpenFolderAsync(folder, folder.DisplayName, true);
+                SelectFile(file.Path, file.Name);
+                return;
+            }
+            catch { }
+
+            // Downloads on Xbox are normally accessible through the same
+            // FutureAccessList grant used by Gecko's FolderPicker. Resolve the
+            // file from that grant when direct path activation is restricted.
+            try
+            {
+                const string downloadToken = "Gecko.Downloads.v1";
+                if (!StorageApplicationPermissions.FutureAccessList.ContainsItem(downloadToken)) return;
+                StorageFolder folder = await StorageApplicationPermissions.FutureAccessList.GetFolderAsync(downloadToken);
+                string name = System.IO.Path.GetFileName(filePath);
+                StorageFile file = await folder.GetFileAsync(name);
+                await OpenFolderAsync(folder, folder.DisplayName, true);
+                SelectFile(file.Path, file.Name);
+            }
+            catch { }
+        }
+
+        private void SelectFile(string path, string name)
+        {
+            FileEntry entry = m_items.FirstOrDefault(item => item.File != null &&
+                ((!string.IsNullOrEmpty(path) && string.Equals(item.File.Path, path, StringComparison.OrdinalIgnoreCase)) ||
+                 string.Equals(item.File.Name, name, StringComparison.OrdinalIgnoreCase)));
+            if (entry == null) return;
+            ItemsList.SelectedItems.Clear();
+            ItemsList.SelectedItem = entry;
+            ItemsList.ScrollIntoView(entry);
+            ItemsList.Focus(FocusState.Programmatic);
+        }
+
         public void CloseFromTaskView() => Close_Click(this, null);
 
         private void Close_Click(object sender, RoutedEventArgs e)
@@ -535,6 +582,8 @@ namespace factoryos_10x_shell.Controls
             }
             else if (entry.File != null && string.Equals(entry.File.FileType, ".txt", StringComparison.OrdinalIgnoreCase))
                 AppState.Instance.RequestNotepadOpen(entry.File);
+            else if (entry.File != null && string.Equals(entry.File.FileType, ".pdf", StringComparison.OrdinalIgnoreCase))
+                AppState.Instance.RequestFirefoxOpen(entry.File);
             else if (entry.File != null && ArchiveService.IsArchive(entry.File))
                 await OpenArchivePreviewAsync(entry.File);
             else if (entry.File != null) await Launcher.LaunchFileAsync(entry.File);

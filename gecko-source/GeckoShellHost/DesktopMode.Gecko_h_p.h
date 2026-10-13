@@ -6,7 +6,7 @@
  /* File created by MIDL compiler version 8.01.0628 */
 /* at Tue Jan 19 00:14:07 2038
  */
-/* Compiler settings for C:\Users\fcvin\AppData\Local\Temp\DesktopMode.Gecko.idl-4a5e1237:
+/* Compiler settings for C:\Users\fcvin\AppData\Local\Temp\DesktopMode.Gecko.idl-5b939ecc:
     Oicf, W1, Zp8, env=Win64 (32b run), target_arch=AMD64 8.01.0628 
     protocol : all , ms_ext, c_ext, robust
     error checks: allocation ref bounds_check enum stub_data 
@@ -97,7 +97,7 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
 
 #if defined(__cplusplus) && !defined(CINTERFACE)
     
-    MIDL_INTERFACE("3eed7c58-c446-5d43-8e92-3b9e1cebfa93")
+    MIDL_INTERFACE("0fa98628-cc3d-5c3e-b126-d9ffbf6dbda7")
     __x_ABI_CDesktopMode_CGecko_CIGeckoHost : public IInspectable
     {
     public:
@@ -124,6 +124,9 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
         
         virtual HRESULT STDMETHODCALLTYPE TakeWindowCommand( 
             /* [retval][out] */ int *result) = 0;
+        
+        virtual HRESULT STDMETHODCALLTYPE TakeRevealPath( 
+            /* [retval][out] */ HSTRING *result) = 0;
         
         virtual HRESULT STDMETHODCALLTYPE OpenUrl( 
             /* [in] */ HSTRING url) = 0;
@@ -212,6 +215,11 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
             __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
             /* [retval][out] */ int *result);
         
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, TakeRevealPath)
+        HRESULT ( STDMETHODCALLTYPE *TakeRevealPath )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
+            /* [retval][out] */ HSTRING *result);
+        
         DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, OpenUrl)
         HRESULT ( STDMETHODCALLTYPE *OpenUrl )( 
             __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
@@ -282,6 +290,9 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
 
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_TakeWindowCommand(This,result)	\
     ( (This)->lpVtbl -> TakeWindowCommand(This,result) ) 
+
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_TakeRevealPath(This,result)	\
+    ( (This)->lpVtbl -> TakeRevealPath(This,result) ) 
 
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_OpenUrl(This,url)	\
     ( (This)->lpVtbl -> OpenUrl(This,url) ) 

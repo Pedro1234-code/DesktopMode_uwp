@@ -4,6 +4,7 @@ using factoryos_10x_shell.Services.Helpers;
 using Microsoft.Extensions.DependencyInjection;
 using System;
 using Windows.Foundation;
+using Windows.Storage;
 using Windows.UI.Core;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
@@ -28,6 +29,8 @@ namespace factoryos_10x_shell.Controls
         private bool m_wasMaximizedBeforeFullscreen;
         private bool m_isWindowActive;
         private bool m_inputSuppressed;
+        private bool m_nativeCursorRequested;
+        private string m_pendingUrl;
         private WindowResizeCorner m_resizeCorner;
         private Point m_startPoint;
         private double m_startWidth;
@@ -82,6 +85,35 @@ namespace factoryos_10x_shell.Controls
             AppState.Instance.ActivateFirefox();
         }
 
+        public async void OpenFile(StorageFile file)
+        {
+            if (file == null) return;
+            Open();
+            try
+            {
+                StorageFolder cache = await ApplicationData.Current.LocalCacheFolder.CreateFolderAsync(
+                    "FirefoxPdf", CreationCollisionOption.OpenIfExists);
+                StorageFile readable = await file.CopyAsync(
+                    cache, file.Name, NameCollisionOption.ReplaceExisting);
+                m_pendingUrl = new System.Uri(readable.Path).AbsoluteUri;
+            }
+            catch
+            {
+                // Keep the direct path as a fallback on desktop systems where
+                // the activation grant is also honored by native file access.
+                m_pendingUrl = new System.Uri(file.Path).AbsoluteUri;
+            }
+            FlushPendingUrl();
+        }
+
+        private void FlushPendingUrl()
+        {
+            if (m_host == null || string.IsNullOrEmpty(m_pendingUrl)) return;
+            string url = m_pendingUrl;
+            m_pendingUrl = null;
+            m_host.OpenUrl(url);
+        }
+
         public void CloseFromTaskView() => Close();
 
         public bool IsFullscreen => m_fullscreen;
@@ -120,6 +152,7 @@ namespace factoryos_10x_shell.Controls
 
                     BrowserSurface.Children.Add(content);
                     m_hostAttached = true;
+                    FlushPendingUrl();
                 }
 
                 await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
@@ -169,7 +202,7 @@ namespace factoryos_10x_shell.Controls
                 Spacing = 12,
                 Children =
                 {
-                    new TextBlock { Text = "Firefox could not be started", FontSize = 24 },
+                    new TextBlock { Text = "Strawfox could not be started", FontSize = 24 },
                     new TextBlock { Text = exception.ToString(), TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true }
                 }
             });
@@ -177,15 +210,27 @@ namespace factoryos_10x_shell.Controls
 
         private void UpdateHostInput()
         {
-            m_host?.SetActive(
-                m_isWindowActive && !m_inputSuppressed && Visibility == Visibility.Visible);
+            bool active = m_isWindowActive && !m_inputSuppressed && Visibility == Visibility.Visible;
+            m_host?.SetActive(active);
+            if (active == m_nativeCursorRequested) return;
+
+            m_nativeCursorRequested = active;
+            // Gecko supplies CSS cursor changes through CoreWindow. While its
+            // surface is active, let that native cursor replace the Shell's
+            // arrow-only bitmap; restore the custom Shell cursor on deactivation.
+            MainPage.SetPopupCursorVisibility(active);
         }
 
         private void Close()
         {
             if (m_fullscreen) SetFullscreen(false);
             SetWindowActive(false);
+            // Closing is distinct from minimizing: stop the embedded host and
+            // put Gecko into its suspended application state so media, timers
+            // and page activity do not keep running behind the Shell.
+            try { m_host?.Close(); } catch { }
             Visibility = Visibility.Collapsed;
+            UpdateHostInput();
             AppState.Instance.SetFirefoxWindowState(false, false);
         }
 
@@ -194,6 +239,7 @@ namespace factoryos_10x_shell.Controls
             if (m_fullscreen) SetFullscreen(false);
             SetWindowActive(false);
             Visibility = Visibility.Collapsed;
+            UpdateHostInput();
             AppState.Instance.SetFirefoxWindowState(true, true);
         }
 
@@ -375,6 +421,11 @@ namespace factoryos_10x_shell.Controls
                 case 6: EndWindowDrag(); break;
                 case 7: SetFullscreen(true); break;
                 case 8: SetFullscreen(false); break;
+                case 9:
+                    string path = m_host.TakeRevealPath();
+                    if (!string.IsNullOrWhiteSpace(path))
+                        AppState.Instance.RequestFilesReveal(path);
+                    break;
             }
         }
 

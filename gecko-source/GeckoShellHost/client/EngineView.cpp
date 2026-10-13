@@ -667,6 +667,14 @@ bool EngineView::Resolve() {
       Log::Write(L"window: Firefox draggable regions connected to DesktopMode");
     }
   }
+  if (!set_cursor_) {
+    set_cursor_ = reinterpret_cast<SetCursorSinkFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_cursor_sink"));
+    if (set_cursor_) {
+      set_cursor_(&CursorChanged);
+      Log::Write(L"cursor: Gecko CSS cursor connected to the UWP pointer");
+    }
+  }
   if (!set_file_picker_) {
     set_file_picker_ = reinterpret_cast<SetFilePickerSinkFn>(
         ::GetProcAddress(xul, "gecko_w10m_set_file_picker_sink"));
@@ -837,10 +845,15 @@ void EngineView::WatchRoom(
 }
 
 void EngineView::PostToUi(std::function<void()> work) {
-  auto dispatcher =
-      winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread().Dispatcher();
-  dispatcher.RunAsync(winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
-                      [work = std::move(work)]() { work(); });
+  // Engine callbacks arrive on Gecko's main/compositor threads. Those threads
+  // do not own a CoreWindow, so GetForCurrentThread() is null there. Always use
+  // the dispatcher captured when EngineView was constructed on the XAML thread.
+  if (!gUiDispatcher) {
+    return;
+  }
+  gUiDispatcher.RunAsync(
+      winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+      [work = std::move(work)]() { work(); });
 }
 
 void EngineView::GivePanelToEngine() {
@@ -1155,6 +1168,54 @@ void EngineView::FullscreenChanged(int32_t on) {
   DrmBridge::DispatchWindowCommand(on ? 7 : 8);
   Log::Write(on ? L"fullscreen: asking the Firefox window to cover DesktopMode"
                 : L"fullscreen: asking the Firefox window to restore");
+}
+
+void EngineView::CursorChanged(int32_t cursor) {
+  PostToUi([cursor]() {
+    using winrt::Windows::UI::Core::CoreCursor;
+    using winrt::Windows::UI::Core::CoreCursorType;
+    auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+    if (!window) {
+      return;
+    }
+    CoreCursorType type = CoreCursorType::Arrow;
+    switch (cursor) {
+      case 1: type = CoreCursorType::Wait; break;
+      case 2:
+      case 28: type = CoreCursorType::IBeam; break;
+      case 3:
+      case 15:
+      case 16:
+      case 17:
+      case 19:
+      case 20: type = CoreCursorType::Hand; break;
+      case 4:
+      case 5:
+      case 26:
+      case 32: type = CoreCursorType::SizeNorthSouth; break;
+      case 6:
+      case 7:
+      case 25:
+      case 33: type = CoreCursorType::SizeWestEast; break;
+      case 8:
+      case 9:
+      case 31: type = CoreCursorType::SizeNorthwestSoutheast; break;
+      case 10:
+      case 11:
+      case 30: type = CoreCursorType::SizeNortheastSouthwest; break;
+      case 12: type = CoreCursorType::Cross; break;
+      case 13:
+      case 29: type = CoreCursorType::SizeAll; break;
+      case 14: type = CoreCursorType::Help; break;
+      case 24:
+      case 27: type = CoreCursorType::UniversalNo; break;
+      case 34:
+        window.PointerCursor(nullptr);
+        return;
+      default: break;
+    }
+    window.PointerCursor(CoreCursor(type, 0));
+  });
 }
 
 void EngineView::WindowDragChanged(int32_t on) {

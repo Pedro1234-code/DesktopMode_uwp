@@ -76,6 +76,7 @@ class EngineView {
   // shape together.
   static void FullscreenChanged(int32_t on);
   static void WindowDragChanged(int32_t on);
+  static void CursorChanged(int32_t cursor);
   static int32_t PickFile(int32_t mode, const char* title,
                           const char* defaultName, const char* extensions,
                           char* result, int32_t resultCapacity);
@@ -194,6 +195,7 @@ class EngineView {
   using SetLauncherFn = void (*)(void (*)(const char*));
   using SetFullscreenSinkFn = void (*)(void (*)(int32_t));
   using SetWindowDragSinkFn = void (*)(void (*)(int32_t));
+  using SetCursorSinkFn = void (*)(void (*)(int32_t));
   using SetFilePickerSinkFn = void (*)(int32_t (*)(
       int32_t, const char*, const char*, const char*, char*, int32_t));
   using SetDownloadDirectoryFn = void (*)(const wchar_t* path);
@@ -247,6 +249,7 @@ class EngineView {
   SetLauncherFn set_launcher_ = nullptr;
   SetFullscreenSinkFn set_fullscreen_ = nullptr;
   SetWindowDragSinkFn set_window_drag_ = nullptr;
+  SetCursorSinkFn set_cursor_ = nullptr;
   SetFilePickerSinkFn set_file_picker_ = nullptr;
   SetDownloadDirectoryFn set_download_directory_ = nullptr;
   SetFileBrokerFn set_file_broker_ = nullptr;

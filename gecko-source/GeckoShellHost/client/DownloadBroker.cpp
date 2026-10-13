@@ -285,6 +285,21 @@ void MonitorDownloads() {
   }
 }
 
+void RememberDestination(StorageFolder const& folder) {
+  StorageApplicationPermissions::FutureAccessList().AddOrReplace(
+      kDestinationToken, folder);
+  ApplicationData::Current().LocalSettings().Values().Insert(
+      L"DownloadFolderName", box_value(folder.DisplayName()));
+  ApplicationData::Current().LocalSettings().Values().Insert(
+      L"DownloadFolderPath", box_value(folder.Path()));
+  CacheDestinationPath(std::wstring(folder.Path()));
+  Log::Write(L"download: destination authorised", std::wstring(folder.Path()));
+  if (auto changed = gDirectoryChanged.load()) {
+    changed(folder.Path().c_str());
+  }
+  Log::Write(L"download: Gecko will write directly to the authorized folder");
+}
+
 void PickDestination() {
   try {
     FolderPicker picker;
@@ -308,20 +323,7 @@ void PickDestination() {
           Log::Write(L"download: folder selection cancelled");
           return;
         }
-        StorageApplicationPermissions::FutureAccessList().AddOrReplace(
-            kDestinationToken, folder);
-        ApplicationData::Current().LocalSettings().Values().Insert(
-            L"DownloadFolderName", box_value(folder.DisplayName()));
-        ApplicationData::Current().LocalSettings().Values().Insert(
-            L"DownloadFolderPath", box_value(folder.Path()));
-        CacheDestinationPath(std::wstring(folder.Path()));
-        Log::Write(L"download: destination authorised",
-                   std::wstring(folder.Path()));
-        if (auto changed = gDirectoryChanged.load()) {
-          changed(folder.Path().c_str());
-        }
-        Log::Write(L"download: Gecko will write directly to the authorized "
-                   L"folder");
+        RememberDestination(folder);
       } catch (winrt::hresult_error const& error) {
         Log::Write(L"download: could not remember destination",
                    std::wstring(error.message()));
@@ -559,7 +561,31 @@ int32_t DownloadBroker::PickFile(int32_t mode, const char* title,
                         extensionsList = std::move(extensionsList), output,
                         completed]() mutable {
     try {
-      if (mode == 1) {
+      if (mode == 2) {
+        FolderPicker picker;
+        picker.ViewMode(PickerViewMode::List);
+        picker.SuggestedStartLocation(PickerLocationId::Downloads);
+        picker.SettingsIdentifier(L"GeckoDownloads");
+        picker.CommitButtonText(L"Use for downloads");
+        picker.FileTypeFilter().Append(L"*");
+        auto operation = picker.PickSingleFolderAsync();
+        operation.Completed([output, completed](auto const& async,
+                                                AsyncStatus status) {
+          try {
+            if (status == AsyncStatus::Completed) {
+              auto folder = async.GetResults();
+              if (folder) {
+                RememberDestination(folder);
+                *output = Narrow(std::wstring(folder.Path()));
+              }
+            }
+          } catch (winrt::hresult_error const& error) {
+            Log::Write(L"download: folder picker completion failed",
+                       std::wstring(error.message()));
+          }
+          ::SetEvent(completed);
+        });
+      } else if (mode == 1) {
         FileSavePicker picker;
         picker.SuggestedStartLocation(PickerLocationId::Downloads);
         picker.SettingsIdentifier(L"GeckoSaveAs");

@@ -196,6 +196,34 @@ namespace factoryos_10x_shell
 
         protected override async void OnActivated(IActivatedEventArgs args)
         {
+            if (args.Kind == ActivationKind.File)
+            {
+                if (!HasServiceProvider)
+                {
+                    ConfigureServices();
+                    PreloadServices();
+                }
+
+                Frame rootFrame = Window.Current.Content as Frame;
+                if (rootFrame == null)
+                {
+                    rootFrame = new Frame();
+                    rootFrame.NavigationFailed += OnNavigationFailed;
+                    Window.Current.Content = rootFrame;
+                }
+                if (rootFrame.Content == null)
+                    rootFrame.Navigate(typeof(MainPage));
+
+                FileActivatedEventArgs fileArgs = (FileActivatedEventArgs)args;
+                StorageFile pdf = fileArgs.Files.OfType<StorageFile>()
+                    .FirstOrDefault(file => string.Equals(file.FileType, ".pdf", StringComparison.OrdinalIgnoreCase));
+                if (pdf != null)
+                    AppState.Instance.RequestFirefoxOpen(pdf);
+
+                Window.Current.Activate();
+                return;
+            }
+
             if (args.Kind == ActivationKind.Protocol)
             {
                 var protocolArgs = args as ProtocolActivatedEventArgs;

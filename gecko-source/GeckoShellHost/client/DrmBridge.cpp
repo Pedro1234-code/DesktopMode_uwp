@@ -28,6 +28,7 @@ using winrt::Windows::Storage::Streams::IBuffer;
 
 void (*gReply)(const char*) = nullptr;
 std::atomic<DrmBridge::WindowCommandSink> gWindowCommandSink{nullptr};
+std::atomic<DrmBridge::RevealFileSink> gRevealFileSink{nullptr};
 std::mutex gLock;
 // One license-acquisition request per session, kept until the response.
 std::map<std::wstring, PlayReadyLicenseAcquisitionServiceRequest> gRequests;
@@ -267,6 +268,14 @@ void Handle(std::string json) {
         sink(command);
         Log::Write(L"window: chrome requested " + op);
       }
+    } else if (op == L"file.reveal") {
+      std::wstring path(msg.GetNamedString(L"path", L""));
+      if (!path.empty()) {
+        if (auto sink = gRevealFileSink.load()) {
+          sink(path.c_str());
+          Log::Write(L"window: Files reveal requested");
+        }
+      }
     } else {
       Send(Failure(id, L"unknown op " + op));
     }
@@ -283,6 +292,10 @@ void DrmBridge::SetReply(void (*reply)(const char*)) { gReply = reply; }
 
 void DrmBridge::SetWindowCommandSink(WindowCommandSink sink) {
   gWindowCommandSink.store(sink);
+}
+
+void DrmBridge::SetRevealFileSink(RevealFileSink sink) {
+  gRevealFileSink.store(sink);
 }
 
 void DrmBridge::DispatchWindowCommand(int32_t command) {

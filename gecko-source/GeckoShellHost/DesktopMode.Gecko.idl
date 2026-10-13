@@ -14,6 +14,7 @@ namespace DesktopMode.Gecko
         void SetScreen(Double width, Double height);
         void SetActive(Boolean active);
         Int32 TakeWindowCommand();
+        String TakeRevealPath();
         void OpenUrl(String url);
         void Suspend();
         void Resume();

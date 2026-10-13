@@ -119,6 +119,27 @@ namespace
         return result;
     }
 
+    bool IsExternalMountPath(const std::vector<std::wstring>& components)
+    {
+        static const wchar_t* const prefix[] =
+        {
+            L"drive_c", L"Users", L"Default", L"Documents", L"external"
+        };
+        if (components.size() < _countof(prefix)) return false;
+        for (size_t index = 0; index < _countof(prefix); ++index)
+        {
+            if (_wcsicmp(components[index].c_str(), prefix[index]) != 0)
+                return false;
+        }
+        return true;
+    }
+
+    bool IsExternalMountRoot(const GuestPath& path)
+    {
+        const auto components = PhysicalComponents(path);
+        return components.size() == 5 && IsExternalMountPath(components);
+    }
+
     std::wstring MetadataKey(const std::wstring& canonicalPath)
     {
         std::wstring key = canonicalPath;
@@ -394,9 +415,17 @@ struct GuestStorageContext::FindRecord final
 };
 
 GuestStorageContext::GuestStorageContext(StorageFolder^ localFolder, const std::wstring& modulePath,
-    StorageFolder^ moduleSourceFolder)
-    : m_localFolder(localFolder), m_moduleSourceFolder(moduleSourceFolder)
+    StorageFolder^ moduleSourceFolder, StorageFolder^ externalFolder)
+    : m_localFolder(localFolder), m_moduleSourceFolder(moduleSourceFolder),
+      m_externalFolder(externalFolder)
 {
+    if (externalFolder)
+    {
+        RuntimeDiagnostics::Record(
+            L"STORAGE: mounted the authorized removable drive at "
+            L"C:\\Users\\Default\\Documents\\external.");
+    }
+
     GuestPath module;
     std::wstring ignored;
     if (m_paths.Resolve(modulePath.c_str(), &module, &ignored))
@@ -476,14 +505,21 @@ bool GuestStorageContext::GetFolder(
     try
     {
         StorageFolder^ current = m_localFolder.Get();
+        size_t firstComponent = 0;
+        if (IsExternalMountPath(physicalComponents) && m_externalFolder.Get())
+        {
+            current = m_externalFolder.Get();
+            firstComponent = 5;
+        }
         if (!current)
         {
             SetWin32Error(win32Error, ERROR_PATH_NOT_FOUND);
             return false;
         }
 
-        for (const auto& component : physicalComponents)
+        for (size_t index = firstComponent; index < physicalComponents.size(); ++index)
         {
+            const auto& component = physicalComponents[index];
             const auto name = ref new String(component.c_str());
             current = createMissing
                 ? create_task(current->CreateFolderAsync(name, CreationCollisionOption::OpenIfExists)).get()
@@ -1500,6 +1536,12 @@ bool GuestStorageContext::CreateDirectory(LPCWSTR path, DWORD* win32Error)
         return false;
     }
 
+    if (m_externalFolder.Get() && IsExternalMountRoot(resolved))
+    {
+        SetWin32Error(win32Error, ERROR_ALREADY_EXISTS);
+        return false;
+    }
+
     StorageFolder^ parent = nullptr;
     std::wstring leaf;
     if (!GetParentFolder(resolved, &parent, &leaf, win32Error))
@@ -1530,6 +1572,11 @@ bool GuestStorageContext::DeleteGuestFile(LPCWSTR path, DWORD* win32Error)
         {
             *win32Error = ERROR_ACCESS_DENIED;
         }
+        return false;
+    }
+    if (m_externalFolder.Get() && IsExternalMountRoot(resolved))
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
         return false;
     }
 
@@ -1611,6 +1658,12 @@ bool GuestStorageContext::MoveGuestPath(
         {
             *win32Error = ERROR_ACCESS_DENIED;
         }
+        return false;
+    }
+    if (m_externalFolder.Get() &&
+        (IsExternalMountRoot(source) || IsExternalMountRoot(destination)))
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
         return false;
     }
 
@@ -1725,6 +1778,11 @@ bool GuestStorageContext::RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error)
         }
         return false;
     }
+    if (m_externalFolder.Get() && IsExternalMountRoot(resolved))
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+        return false;
+    }
 
     StorageFolder^ folder = nullptr;
     if (!GetDirectoryFolder(resolved, &folder, win32Error))
@@ -1767,6 +1825,12 @@ DWORD GuestStorageContext::GetGuestFileAttributes(LPCWSTR path, DWORD* win32Erro
         {
             return INVALID_FILE_ATTRIBUTES;
         }
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return ApplyAttributeOverride(resolved.canonical, FILE_ATTRIBUTE_DIRECTORY);
+    }
+
+    if (m_externalFolder.Get() && IsExternalMountRoot(resolved))
+    {
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return ApplyAttributeOverride(resolved.canonical, FILE_ATTRIBUTE_DIRECTORY);
     }
@@ -1922,6 +1986,28 @@ bool GuestStorageContext::FindFirstGuestFile(
         };
         if ((haveLocalFolder && !appendMatches(folder)) ||
             (haveAuthorizedFolder && !appendMatches(authorizedFolder))) return false;
+
+        // The mount root is virtual, so it has no backing child inside the
+        // LocalStorage Documents directory. Materialize it in directory
+        // enumeration so file managers can discover and open it normally.
+        if (m_externalFolder.Get() &&
+            _wcsicmp(resolvedDirectory.canonical.c_str(),
+                L"C:\\Users\\Default\\Documents") == 0 &&
+            WildcardMatch(pattern, L"external"))
+        {
+            const bool duplicate = std::any_of(matches.begin(), matches.end(),
+                [](const WIN32_FIND_DATAW& entry)
+                { return _wcsicmp(entry.cFileName, L"external") == 0; });
+            if (!duplicate)
+            {
+                WIN32_FIND_DATAW mount = {};
+                mount.dwFileAttributes = ApplyAttributeOverride(
+                    L"C:\\Users\\Default\\Documents\\external",
+                    FILE_ATTRIBUTE_DIRECTORY);
+                wcsncpy_s(mount.cFileName, L"external", _TRUNCATE);
+                matches.push_back(mount);
+            }
+        }
 
         if (matches.empty())
         {

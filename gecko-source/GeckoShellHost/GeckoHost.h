@@ -20,6 +20,7 @@ namespace winrt::DesktopMode::Gecko::implementation
         void SetScreen(double width, double height);
         void SetActive(bool active);
         int32_t TakeWindowCommand() noexcept;
+        winrt::hstring TakeRevealPath();
         void OpenUrl(hstring const& url);
         void Suspend();
         void Resume();
@@ -34,6 +35,7 @@ namespace winrt::DesktopMode::Gecko::implementation
         std::unique_ptr<gecko_w10m::client::EngineView> engineView_;
         bool started_ = false;
         bool active_ = false;
+        bool closed_ = false;
         double rawPerView_ = 1.0;
     };
 }

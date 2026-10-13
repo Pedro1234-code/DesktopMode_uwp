@@ -7,6 +7,7 @@ using System.Collections.ObjectModel;
 using System.Diagnostics;
 using System.Linq;
 using System.Text;
+using System.Threading;
 using System.Threading.Tasks;
 using Windows.ApplicationModel;
 using Windows.ApplicationModel.Core;
@@ -40,6 +41,10 @@ namespace factoryos_10x_shell.Services.Helpers
 
         private Dictionary<string, string> m_pkgFamilyMap;
         private readonly Dictionary<string, string> m_appUriByAumid;
+        private readonly SemaphoreSlim m_appsReloadGate = new SemaphoreSlim(1, 1);
+        private readonly object m_packageRefreshLock = new object();
+        private PackageCatalog m_packageCatalog;
+        private CancellationTokenSource m_packageRefreshDebounce;
 
         public AppHelper() 
         {
@@ -50,6 +55,69 @@ namespace factoryos_10x_shell.Services.Helpers
 
             _logoSize = new Size(176, 176);
             _iconCache = new List<StartIconModel>();
+            WatchPackageCatalog();
+        }
+
+        private void WatchPackageCatalog()
+        {
+            try
+            {
+                m_packageCatalog = PackageCatalog.OpenForCurrentUser();
+                m_packageCatalog.PackageInstalling += (sender, args) =>
+                {
+                    if (args.IsComplete) SchedulePackageRefresh();
+                };
+                m_packageCatalog.PackageRegistering += (sender, args) =>
+                {
+                    if (args.IsComplete) SchedulePackageRefresh();
+                };
+                m_packageCatalog.PackageUpdating += (sender, args) =>
+                {
+                    if (args.IsComplete) SchedulePackageRefresh();
+                };
+                m_packageCatalog.PackageUninstalling += (sender, args) =>
+                {
+                    if (args.IsComplete) SchedulePackageRefresh();
+                };
+                m_packageCatalog.PackageStatusChanged += (sender, args) =>
+                    SchedulePackageRefresh();
+            }
+            catch (Exception ex)
+            {
+                // Package enumeration still works even on editions where the
+                // live catalog is unavailable.
+                Debug.WriteLine("PackageCatalog => Open: " + ex.Message);
+            }
+        }
+
+        private void SchedulePackageRefresh()
+        {
+            CancellationTokenSource debounce = new CancellationTokenSource();
+            lock (m_packageRefreshLock)
+            {
+                m_packageRefreshDebounce?.Cancel();
+                m_packageRefreshDebounce?.Dispose();
+                m_packageRefreshDebounce = debounce;
+            }
+            _ = RefreshPackagesAfterDelayAsync(debounce);
+        }
+
+        private async Task RefreshPackagesAfterDelayAsync(CancellationTokenSource debounce)
+        {
+            try
+            {
+                // Package deployment reports several closely-spaced state
+                // changes. Wait for the catalog to settle before enumerating.
+                await Task.Delay(1000, debounce.Token);
+                if (debounce.IsCancellationRequested) return;
+
+                m_dispatcherQueue.TryEnqueue(async () =>
+                {
+                    if (!debounce.IsCancellationRequested)
+                        await LoadAppsAsync();
+                });
+            }
+            catch (TaskCanceledException) { }
         }
 
         public List<StartIconModel> LoadTaskbarPinnedApps()
@@ -188,7 +256,7 @@ namespace factoryos_10x_shell.Services.Helpers
                         IconName = string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase)
                             ? "Strawfox"
                             : string.IsNullOrWhiteSpace(iconName)
-                            ? (string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ? "Notepad" : string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ? "Settings" : string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ? "Calculator" : string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase) ? "Firefox" : "Files")
+                            ? (string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ? "Notepad" : string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ? "Settings" : string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ? "Calculator" : string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase) ? "Strawfox" : "Files")
                             : iconName
                     });
                     continue;
@@ -236,6 +304,7 @@ namespace factoryos_10x_shell.Services.Helpers
 
         public async Task LoadAppsAsync()
         {
+            await m_appsReloadGate.WaitAsync();
             try
             {
                 _iconCache.Clear(); // Clear the cache before reloading
@@ -289,6 +358,10 @@ namespace factoryos_10x_shell.Services.Helpers
             catch (Exception ex)
             {
                 Debug.WriteLine("LoadApps => Get: " + ex.Message);
+            }
+            finally
+            {
+                m_appsReloadGate.Release();
             }
         }
         public Package PackageFromAumid(string aumid)

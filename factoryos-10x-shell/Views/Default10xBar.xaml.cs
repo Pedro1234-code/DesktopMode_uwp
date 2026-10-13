@@ -442,7 +442,7 @@ namespace factoryos_10x_shell.Views
             if (AppState.Instance.IsFirefoxOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Firefox"))
             {
                 var firefoxButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Firefox"), Content = CreateFirefoxIcon(26) };
-                ToolTipService.SetToolTip(firefoxButton, "Firefox");
+                ToolTipService.SetToolTip(firefoxButton, "Strawfox");
                 firefoxButton.Click += (sender, args) => AppState.Instance.RequestFirefoxOpen();
                 OpenFilesPanel.Children.Add(firefoxButton);
             }

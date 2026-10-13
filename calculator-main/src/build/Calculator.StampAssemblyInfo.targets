@@ -11,7 +11,12 @@
     <CompileDependsOn>StampAssemblyInfo;$(CompileDependsOn)</CompileDependsOn>
   </PropertyGroup>
 
-  <Target Name="StampAssemblyInfo">
+  <!-- Do not rewrite a compile input on every build. Recreating this file on
+       every invocation invalidated the Calculator C# and XAML incremental
+       build even when no Calculator source had changed. -->
+  <Target Name="StampAssemblyInfo"
+          Inputs="$(MSBuildProjectFullPath)"
+          Outputs="$(IntermediateOutputPath)GeneratedAssemblyInfo.cs">
     <ItemGroup>
       <AssemblyAttributes Include="AssemblyVersion">
         <_Parameter1>$(Version)</_Parameter1>

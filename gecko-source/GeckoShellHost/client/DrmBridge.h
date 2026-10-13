@@ -21,12 +21,14 @@ namespace gecko_w10m::client {
 class DrmBridge {
  public:
   using WindowCommandSink = void (*)(int32_t command);
+  using RevealFileSink = void (*)(const wchar_t* path);
 
   // Called by the engine, on its main thread, with each message. Work goes
   // to a worker thread; replies come back through the reply function.
   static void OnMessage(const char* json);
   static void SetReply(void (*reply)(const char*));
   static void SetWindowCommandSink(WindowCommandSink sink);
+  static void SetRevealFileSink(RevealFileSink sink);
   // Used by native engine callbacks (fullscreen and draggable chrome) that
   // need the same serialized path to DesktopMode as the Firefox chrome
   // buttons.

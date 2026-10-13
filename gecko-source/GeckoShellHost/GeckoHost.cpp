@@ -33,6 +33,8 @@ namespace
     // Firefox provide its own tabs inside that one internal window.
     std::atomic<bool> g_runtimeStarted{ false };
     std::atomic<int32_t> g_windowCommand{ 0 };
+    std::mutex g_revealMutex;
+    std::wstring g_revealPath;
     std::once_flag g_memoryHooks;
     std::atomic<unsigned long long> g_lastMemoryPressure{ 0 };
 
@@ -136,6 +138,12 @@ namespace winrt::DesktopMode::Gecko::implementation
         gecko_w10m::client::DrmBridge::SetWindowCommandSink([](int32_t command)
         {
             g_windowCommand.store(command);
+        });
+        gecko_w10m::client::DrmBridge::SetRevealFileSink([](const wchar_t* path)
+        {
+            std::lock_guard<std::mutex> lock(g_revealMutex);
+            g_revealPath = path ? path : L"";
+            g_windowCommand.store(9);
         });
         root_ = Grid();
         root_.Background(MakeSolidColorBrush(ColorHelper::FromArgb(255, 28, 27, 34)));
@@ -337,6 +345,11 @@ namespace winrt::DesktopMode::Gecko::implementation
 
     void GeckoHost::SetActive(bool active)
     {
+        if (active && closed_)
+        {
+            NotifyGeckoAppState(1);
+            closed_ = false;
+        }
         active_ = active;
         if (!engineView_)
         {
@@ -358,6 +371,14 @@ namespace winrt::DesktopMode::Gecko::implementation
     int32_t GeckoHost::TakeWindowCommand() noexcept
     {
         return g_windowCommand.exchange(0);
+    }
+
+    hstring GeckoHost::TakeRevealPath()
+    {
+        std::lock_guard<std::mutex> lock(g_revealMutex);
+        hstring path(g_revealPath);
+        g_revealPath.clear();
+        return path;
     }
 
     void GeckoHost::OpenUrl(hstring const& url)
@@ -392,11 +413,13 @@ namespace winrt::DesktopMode::Gecko::implementation
     void GeckoHost::Close()
     {
         active_ = false;
+        closed_ = true;
         if (engineView_)
         {
             engineView_->SetInputEnabled(false);
             engineView_->Stop();
         }
+        NotifyGeckoAppState(0);
         // The Gecko worker may still be unwinding callbacks when the Shell
         // window is hidden. Keep the view alive until the host itself is
         // destroyed; releasing it synchronously here races that thread.
