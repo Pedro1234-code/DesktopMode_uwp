@@ -42,7 +42,8 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 
 ## Win32 Bridge
 
-<img width="1920" height="1080" alt="Screenshot_2026-09-27_18-21-56" src="https://github.com/user-attachments/assets/8211b974-8c58-4bfc-b5eb-1b995802ff79" />
+<img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/11fe1117-783e-4683-967e-36dc7455e2e7" />
+
 
 Desktop Mode includes an highly experimental bridge for loading Win32 PEs in .exe format. The .exe has no acess to the real Xbox or PC filesystem, registry or OS, it runs on a virtual drive inside the app's LocalStorage (drive_c). For now, it can render most of 7-Zip, can create a window, and a few more things. Most PEs simply won't load by now, compatibility is meant to be expanded with time.
 
