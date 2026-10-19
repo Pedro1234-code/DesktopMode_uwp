@@ -64,7 +64,7 @@ Relevant API categories include:
 - **Comctl32:** Common Windows controls.
 - **Shell32:** Shell-related functionality and application integration.
 
-The availability and compatibility of these APIs depend on the host environment and the implementation of Win32Bridge.
+Many of these APIs have not been implemented yet.
 
 ### 3. Windowing and Graphics
 
@@ -183,6 +183,6 @@ Successful loading, window creation, or partial graphical rendering should not b
 
 Win32Bridge is an experimental compatibility project and is not a complete implementation of the Windows desktop subsystem.
 
-Compatibility varies between applications, host environments, and development revisions.
+At this stage, most PEs you try loading will not even attempt to execute due to missing imports.
 
 The project is not affiliated with or endorsed by Microsoft.
