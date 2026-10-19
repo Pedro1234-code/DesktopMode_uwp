@@ -46,6 +46,8 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 
 Desktop Mode includes an highly experimental bridge for loading Win32 PEs in .exe format. The .exe has no acess to the real Xbox or PC filesystem, registry or OS, it runs on a virtual drive inside the app's LocalStorage (drive_c). For now, it can render most of 7-Zip, can create a window, and a few more things. Most PEs simply won't load by now, compatibility is meant to be expanded with time.
 
+[Win32Bridge Documentation](Win32Bridge/BRIDGE.md)
+
 ## Enable Loopback
 In order to be able to use Xbox Device Portal directly from Strawfox, and use the <planned> Appx Installer feature, you must enable loopback every reboot. Here's how to do it:
 
