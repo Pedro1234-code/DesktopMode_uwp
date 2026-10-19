@@ -23,11 +23,11 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 - Installable Web Apps powered by WebView2, with favicons, multiple windows, resizing, minimize, maximize, and close controls.
 - Files: a file browser built around UWP permissions and folder pickers, with tabs and Files-based UI.
 - Calculator: actual Windows Calculator included as an internal app.
-- Notepad: open, edit, save, and save-as support for `.txt` files.
+- Notepad: open, edit, save, and save-as support for `.txt` files, with tab-based UI.
 - Settings: a built-in app with personalization, taskbar, device information, and a visual Windows Update page.
 - A custom Action Center with volume, network status, and system settings shortcuts.
 - Strawfox: a built-in Firefox port running with its own window, with Download, Upload and Add-on support.
-- Experimental PE loader for Win32 binaries
+- Experimental PE loader for Win32 binaries.
 
 ## Project structure
 
@@ -35,7 +35,10 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 | --- | --- |
 | `factoryos-10x-shell` | Main UWP application and DesktopMode interface. |
 | `factoryos-10x-shell.Library` | Shared models, services, and view models. |
-| `Win32Bridge` | Auxiliary integration components, where applicable. |
+| `Win32Bridge` | Win32Bridge project files. |
+| `Calculator-main` | Windows Calculator project files |
+| `Icons` | Resource Windows 11 icons |
+
 
 ## Win32 Bridge
 
@@ -44,7 +47,7 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 Desktop Mode includes an highly experimental bridge for loading Win32 PEs in .exe format. The .exe has no acess to the real Xbox or PC filesystem, registry or OS, it runs on a virtual drive inside the app's LocalStorage (drive_c). For now, it can render most of 7-Zip, can create a window, and a few more things. Most PEs simply won't load by now, compatibility is meant to be expanded with time.
 
 ## Enable Loopback
-In order to be able to use Xbox Device Portal directly from Strawfox, and use the Appx Installer feature, you must enable loopback every reboot. Here's how to do it:
+In order to be able to use Xbox Device Portal directly from Strawfox, and use the <planned> Appx Installer feature, you must enable loopback every reboot. Here's how to do it:
 
 - Start an SSH connection using whatever client on your phone or PC (needs to be on the same network as the Xbox)
 - User: DevToolsUser
@@ -71,8 +74,8 @@ If Visual Studio reports that the signing certificate is unavailable, create or 
 
 - Access to files outside the application's local storage depends on access granted by the user through UWP file and folder pickers.
 - External applications are launched through URIs when the package supports them. If a UWP app doesn't include an URI, it can't be launched through Desktop Mode on Xbox.
-- The Windows Update button in Settings is currently visual only; real system updates remain managed by the operating system.
-- It has not been tested with a controller.
+- Strawfox is not resizable and crashes on fullscreen.
+- I strongly recommend you to use it with a mouse and a keyboard
 
 ## Credits and license
 
