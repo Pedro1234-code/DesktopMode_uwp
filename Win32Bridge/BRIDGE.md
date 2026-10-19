@@ -1,6 +1,7 @@
 # Win32Bridge
 
-<img width="1920" height="1080" alt="Screenshot_2026-09-27_18-21-56" src="https://github.com/user-attachments/assets/8211b974-8c58-4bfc-b5eb-1b995802ff79" />
+<img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/46d8e2f3-2ae6-495b-bfb1-903d148ac57a" />
+
 
 A proof-of-concept compatibility layer designed to load and execute Windows Win32 binaries (`.exe`) within a Universal Windows Platform (UWP) application.
 
