@@ -79,12 +79,15 @@ If Visual Studio reports that the signing certificate is unavailable, create or 
 - External applications are launched through URIs when the package supports them. If a UWP app doesn't include an URI, it can't be launched through Desktop Mode on Xbox.
 - Strawfox is not resizable and crashes on fullscreen.
 - I strongly recommend you to use it with a mouse and a keyboard
+- Some microstutters on Xbox that are being investigated.
 
 ## Credits and license
 
 This project builds on the original Windows 10X shell recreation by [Pdawg-bytes](https://github.com/Pdawg-bytes/factoryos-10x-shell), expanded into DesktopMode with Xbox- and desktop-focused features.
 
 Credits to Wine for concept and code used as reference.
+
+Special thanks to ReactOS devs for their code which was used as reference.
 
 Credits to https://github.com/Futur3Sn0w/Windows10x for inspiration and some Icons from there.
 
