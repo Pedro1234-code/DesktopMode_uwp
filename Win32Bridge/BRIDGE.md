@@ -2,7 +2,6 @@
 
 <img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/46d8e2f3-2ae6-495b-bfb1-903d148ac57a" />
 
-
 A proof-of-concept compatibility layer designed to load and execute Windows Win32 binaries (`.exe`) within a Universal Windows Platform (UWP) application.
 
 ## Overview
