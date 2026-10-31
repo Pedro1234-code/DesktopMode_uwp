@@ -35,6 +35,7 @@ namespace
     constexpr wchar_t RuntimeLogFileName[] = L"Win32Bridge-runtime.log";
     constexpr wchar_t ImportLogFileName[] = L"Win32Bridge-imports.log";
     constexpr wchar_t ExternalFolderToken[] = L"CoreShell.Files.Mount.Removable media";
+    std::atomic<bool> g_diagnosticsSnapshotPending{ false };
 
     std::wstring ToWide(String^ value)
     {
@@ -411,8 +412,20 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
                 return GetExternalMountFolderAsync().then(
                     [state, moduleSourceFolder, bytes, satelliteBytes](StorageFolder^ externalFolder)
                 {
+                    // Give a picked executable a stable guest-visible directory that
+                    // represents the folder the user actually selected.  Treating every
+                    // loose executable as if it were installed below Program Files changes
+                    // observable application behaviour (portable applications commonly
+                    // use their module directory to select their configuration mode).
+                    // GuestStorageContext overlays writes in LocalStorage while continuing
+                    // to expose the authorised source folder as the read-only lower layer.
+                    std::wstring sourceDirectoryName = moduleSourceFolder && moduleSourceFolder->Name
+                        ? ToWide(moduleSourceFolder->Name)
+                        : std::wstring(L"Application");
+                    if (sourceDirectoryName.empty()) sourceDirectoryName = L"Application";
                     const std::wstring virtualModulePath =
-                        L"C:\\Program Files\\Win32Bridge\\" + state->executableName;
+                        L"C:\\PortableApps\\" + sourceDirectoryName + L"\\" +
+                        state->executableName;
                     state->storage = std::make_shared<GuestStorageContext>(
                         ApplicationData::Current->LocalFolder,
                         virtualModulePath,
@@ -532,7 +545,28 @@ void Win32Bridge::RuntimeSession::SetInputEnabled(bool enabled)
 
 void Win32Bridge::RuntimeSession::FlushDiagnostics()
 {
-    PersistDiagnostics();
+    // This method is called by a DispatcherTimer. Building the report copies
+    // and concatenates up to 1024 diagnostic lines under a mutex, so doing it
+    // inline periodically pauses the Shell UI and its custom mouse pointer.
+    if (g_diagnosticsSnapshotPending.exchange(true)) return;
+    try
+    {
+        create_task([]
+        {
+            try
+            {
+                PersistReport(RuntimeDiagnostics::Snapshot());
+            }
+            catch (...)
+            {
+            }
+            g_diagnosticsSnapshotPending.store(false);
+        });
+    }
+    catch (...)
+    {
+        g_diagnosticsSnapshotPending.store(false);
+    }
 }
 
 void Win32Bridge::RuntimeSession::Close()

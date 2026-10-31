@@ -60,6 +60,7 @@ namespace factoryos_10x_shell.Library.ViewModels
 
 
             m_timeService.UpdateClockBinding += TimeService_UpdateClockBinding;
+            TimeText = DateTime.Now.ToString(m_timeService.ClockFormat);
 
             m_powerService.BatteryStatusChanged += BatteryService_BatteryStatusChanged;
             DetectBatteryPresence();
@@ -81,7 +82,10 @@ namespace factoryos_10x_shell.Library.ViewModels
         {
             get
             {
-                switch (m_netService.InternetType)
+                InternetConnection type;
+                try { type = m_netService.InternetType; }
+                catch (Exception) { type = InternetConnection.Unknown; }
+                switch (type)
                 {
                     case InternetConnection.Wired:
                         return new Thickness(0, 0, 10, 6);
@@ -164,29 +168,30 @@ namespace factoryos_10x_shell.Library.ViewModels
         {
             string statusTextBuf = "\uE774";
             string statusBackgroundBuf = string.Empty;
-            if (m_netService.IsInternetAvailable)
+            try
             {
-                switch (m_netService.InternetType)
+                if (m_netService.IsInternetAvailable)
                 {
-                    case InternetConnection.Wired:
-                        statusTextBuf = "\uE839";
-                        break;
-                    case InternetConnection.Wireless:
-                        int wifiIconIndex = Math.Min(IconConstants.WiFiIcons.Length - 1, m_netService.SignalStrength);
-                        statusTextBuf = IconConstants.WiFiIcons[wifiIconIndex];
-                        break;
-                    case InternetConnection.Data:
-                        int dataIconIndex = Math.Min(IconConstants.DataIcons.Length - 1, m_netService.SignalStrength);
-                        statusTextBuf = IconConstants.DataIcons[dataIconIndex];
-                        break;
-                    case InternetConnection.Unknown:
-                    default:
-                        statusTextBuf = "\uE774";
-                        break;
+                    switch (m_netService.InternetType)
+                    {
+                        case InternetConnection.Wired:
+                            statusTextBuf = "\uE839";
+                            break;
+                        case InternetConnection.Wireless:
+                            int wifiIconIndex = Math.Min(IconConstants.WiFiIcons.Length - 1, m_netService.SignalStrength);
+                            statusTextBuf = IconConstants.WiFiIcons[wifiIconIndex];
+                            break;
+                        case InternetConnection.Data:
+                            int dataIconIndex = Math.Min(IconConstants.DataIcons.Length - 1, m_netService.SignalStrength);
+                            statusTextBuf = IconConstants.DataIcons[dataIconIndex];
+                            break;
+                    }
                 }
+                else statusTextBuf = "\uEB55";
             }
-            else
+            catch (Exception)
             {
+                // A failed or unavailable profile must not prevent the Shell UI.
                 statusTextBuf = "\uEB55";
             }
             m_dispatcherService.DispatcherQueue.TryEnqueue(() =>

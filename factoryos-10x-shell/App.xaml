@@ -13,6 +13,19 @@
             <ResourceDictionary.ThemeDictionaries>
                 <ResourceDictionary x:Key="Default">
                     <BitmapImage x:Key="PowerButtonImageSource" UriSource="ms-appx:///powerDark.png" />
+                    <AcrylicBrush
+                        x:Key="ElementAcrylicBrush"
+                        BackgroundSource="Backdrop"
+                        FallbackColor="DimGray"
+                        TintColor="Black"
+                        TintOpacity="0.2" />
+                    <AcrylicBrush
+                        x:Key="TaskbarAcrylicBrush"
+                        BackgroundSource="Backdrop"
+                        FallbackColor="#FF242424"
+                        TintColor="#FF202020"
+                        TintLuminosityOpacity="0.95"
+                        TintOpacity="0" />
                 </ResourceDictionary>
                 <ResourceDictionary x:Key="Dark">
                     <BitmapImage x:Key="PowerButtonImageSource" UriSource="ms-appx:///powerDark.png" />

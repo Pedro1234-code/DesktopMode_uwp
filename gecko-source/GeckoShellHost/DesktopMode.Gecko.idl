@@ -7,15 +7,22 @@ namespace DesktopMode.Gecko
         GeckoHost();
 
         Object Content{ get; };
+        Object ExternalContent{ get; };
         Boolean IsStarted{ get; };
+        Boolean IsExternalWindowOpen{ get; };
 
         void Start(Double width, Double height);
         void SetViewport(Double width, Double height);
+        void SetExternalViewport(Double width, Double height);
+        void SetExternalActive(Boolean active);
+        void CloseExternalWindow();
         void SetScreen(Double width, Double height);
         void SetActive(Boolean active);
         Int32 TakeWindowCommand();
         String TakeRevealPath();
+        String TakeWallpaperPath();
         void OpenUrl(String url);
+        Boolean DragFiles(Int32 state, Double x, Double y, String paths);
         void Suspend();
         void Resume();
         void Close();

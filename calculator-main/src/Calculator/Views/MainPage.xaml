@@ -12,11 +12,18 @@
       xmlns:utils="using:CalculatorApp.Utils"
       xmlns:vmcom="using:CalculatorApp.ViewModel.Common"
       x:Name="PageRoot"
-      muxc:BackdropMaterial.ApplyToRootOrPageBackground="True"
+      muxc:BackdropMaterial.ApplyToRootOrPageBackground="False"
       Loaded="OnPageLoaded"
       mc:Ignorable="d">
 
     <Page.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <!-- The Calculator is hosted inside Desktop Mode, so its original
+                     App.xaml is not the process Application dictionary. Keep its
+                     resources local to this page instead of polluting the Shell. -->
+                <ResourceDictionary Source="ms-appx:///CalculatorApp/App.xaml"/>
+            </ResourceDictionary.MergedDictionaries>
         <automation:NarratorNotifier x:Name="NarratorNotifier"/>
         <Style x:Name="CalculatorBaseStyle" TargetType="local:Calculator">
             <Setter Property="Margin" Value="0,0,0,0"/>
@@ -53,6 +60,7 @@
 
         <converters:BooleanToVisibilityNegationConverter x:Key="BooleanToVisibilityNegationConverter"/>
         <converters:BooleanNegationConverter x:Key="BooleanNegationConverter"/>
+        </ResourceDictionary>
     </Page.Resources>
 
     <Grid>

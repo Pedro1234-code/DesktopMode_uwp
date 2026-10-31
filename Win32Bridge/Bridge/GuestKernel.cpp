@@ -236,6 +236,26 @@ bool GuestKernelContext::GetExitCode(
     return true;
 }
 
+bool GuestKernelContext::GetThreadId(
+    HANDLE guestHandle, LPDWORD threadId, DWORD* win32Error) const
+{
+    const auto object = Lookup(guestHandle);
+    if (!object || !threadId)
+    {
+        SetWin32Error(win32Error, object ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE);
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(object->lock);
+    if (object->closed || object->kind != ObjectKind::Thread)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    *threadId = object->objectId;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
 bool GuestKernelContext::SetEvent(HANDLE guestHandle, DWORD* win32Error)
 {
     const auto object = Lookup(guestHandle);

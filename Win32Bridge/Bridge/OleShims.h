@@ -1,6 +1,7 @@
 #pragma once
 #include "Bridge/CompatibilityCatalog.h"
 namespace Win32Bridge { namespace Bridge {
+void ResetGuestOleState();
 HRESULT WINAPI BridgeCoInitialize(LPVOID); HRESULT WINAPI BridgeCoInitializeEx(LPVOID,DWORD); HRESULT WINAPI BridgeOleInitialize(LPVOID); void WINAPI BridgeCoUninitialize(); void WINAPI BridgeOleUninitialize();
 LPVOID WINAPI BridgeCoTaskMemAlloc(SIZE_T); void WINAPI BridgeCoTaskMemFree(LPVOID); HRESULT WINAPI BridgeCoCreateInstance(REFCLSID,LPUNKNOWN,DWORD,REFIID,LPVOID*);
 void WINAPI BridgeReleaseStgMedium(PVOID); HRESULT WINAPI BridgeRegisterDragDrop(HWND,PVOID); HRESULT WINAPI BridgeRevokeDragDrop(HWND);

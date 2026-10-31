@@ -13,15 +13,22 @@ namespace winrt::DesktopMode::Gecko::implementation
         GeckoHost();
 
         Windows::Foundation::IInspectable Content() const;
+        Windows::Foundation::IInspectable ExternalContent() const;
         bool IsStarted() const noexcept;
+        bool IsExternalWindowOpen() const noexcept;
 
         void Start(double width, double height);
         void SetViewport(double width, double height);
+        void SetExternalViewport(double width, double height);
+        void SetExternalActive(bool active);
+        void CloseExternalWindow();
         void SetScreen(double width, double height);
         void SetActive(bool active);
         int32_t TakeWindowCommand() noexcept;
         winrt::hstring TakeRevealPath();
+        winrt::hstring TakeWallpaperPath();
         void OpenUrl(hstring const& url);
+        bool DragFiles(int32_t state, double x, double y, hstring const& paths);
         void Suspend();
         void Resume();
         void Close();

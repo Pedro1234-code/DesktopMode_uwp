@@ -27,6 +27,107 @@ namespace factoryos_10x_shell.Controls
 {
     public sealed partial class FilesWindow : UserControl
     {
+        private bool m_fileDragCursorRequested;
+        private FileEntry m_fileDragCandidate;
+        private ListViewItem m_fileDragRow;
+        private Point m_fileDragOrigin;
+        private uint m_fileDragPointerId;
+        private bool m_fileDragInProgress;
+        private List<IStorageItem> m_dragFiles;
+
+        private void ItemsList_FilePointerPressed(object sender, PointerRoutedEventArgs e)
+        {
+            if (m_fileDragInProgress) return;
+            m_fileDragCandidate = null;
+            var point = e.GetCurrentPoint(ItemsList);
+            if (e.Pointer.PointerDeviceType != Windows.Devices.Input.PointerDeviceType.Mouse ||
+                !point.Properties.IsLeftButtonPressed) return;
+            var row = FindVisualAncestor<ListViewItem>(e.OriginalSource as DependencyObject);
+            int index = row == null ? -1 : ItemsList.IndexFromContainer(row);
+            if (index < 0 || !(ItemsList.Items[index] is FileEntry entry) || entry.File == null) return;
+            m_fileDragCandidate = entry;
+            m_fileDragRow = row;
+            m_fileDragOrigin = point.Position;
+            m_fileDragPointerId = e.Pointer.PointerId;
+        }
+
+        private async void ItemsList_FilePointerMoved(object sender, PointerRoutedEventArgs e)
+        {
+            if (m_fileDragInProgress || m_fileDragCandidate == null || e.Pointer.PointerId != m_fileDragPointerId) return;
+            var point = e.GetCurrentPoint(ItemsList);
+            if (!point.Properties.IsLeftButtonPressed) { m_fileDragCandidate = null; return; }
+            double dx = point.Position.X - m_fileDragOrigin.X;
+            double dy = point.Position.Y - m_fileDragOrigin.Y;
+            if (dx * dx + dy * dy < 36) return;
+
+            FileEntry candidate = m_fileDragCandidate;
+            // Use the item visual as the source so the drag preview contains
+            // one row, rather than a screenshot of the entire file list.
+            UIElement source = m_fileDragRow.ContentTemplateRoot ?? (UIElement)m_fileDragRow;
+            m_fileDragCandidate = null;
+            var selection = ItemsList.SelectedItems.OfType<FileEntry>().ToList();
+            if (!selection.Contains(candidate)) selection = new List<FileEntry> { candidate };
+            m_dragFiles = selection.Select(entry => entry.File).Where(file => file != null)
+                .Cast<IStorageItem>().ToList();
+            if (m_dragFiles.Count == 0) return;
+            m_fileDragInProgress = true;
+            source.DragStarting += ItemsList_DragStarting;
+            e.Handled = true;
+            try
+            {
+                LogFileDrag("start requested; files=" + m_dragFiles.Count);
+                var result = await source.StartDragAsync(e.GetCurrentPoint(source));
+                LogFileDrag("completed; result=" + result);
+            }
+            catch (Exception exception)
+            {
+                LogFileDrag($"start failed; type={exception.GetType().Name}; HRESULT=0x{exception.HResult:X8}");
+            }
+            finally
+            {
+                source.DragStarting -= ItemsList_DragStarting;
+                FirefoxWindow.EndFileDrag();
+                if (m_fileDragCursorRequested) MainPage.SetPopupCursorVisibility(false);
+                m_fileDragCursorRequested = false;
+                m_fileDragInProgress = false;
+                m_dragFiles = null;
+            }
+        }
+
+        private void ItemsList_FilePointerReleased(object sender, PointerRoutedEventArgs e)
+        {
+            if (e.Pointer.PointerId == m_fileDragPointerId) m_fileDragCandidate = null;
+        }
+
+        private void ItemsList_DragStarting(UIElement sender, DragStartingEventArgs e)
+        {
+            if (!m_fileDragInProgress || m_dragFiles == null || m_dragFiles.Count == 0)
+            { e.Cancel = true; return; }
+            e.Cancel = false;
+            e.AllowedOperations = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
+            e.Data.SetStorageItems(m_dragFiles, true);
+            e.Data.RequestedOperation = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
+            FirefoxWindow.BeginFileDrag();
+            LogFileDrag("DragStarting; storage items supplied");
+            if (!m_fileDragCursorRequested)
+            {
+                m_fileDragCursorRequested = true;
+                MainPage.SetPopupCursorVisibility(true);
+            }
+        }
+
+        private static void LogFileDrag(string detail)
+        {
+            System.Diagnostics.Debug.WriteLine("[FilesDrag] " + detail);
+            try
+            {
+                string path = System.IO.Path.Combine(ApplicationData.Current.LocalFolder.Path, "Files-drag-drop.log");
+                string line = DateTimeOffset.Now.ToString("O") + " " + detail + System.Environment.NewLine;
+                _ = Task.Run(() => { try { System.IO.File.AppendAllText(path, line); } catch (Exception) { } });
+            }
+            catch (Exception) { }
+        }
+
         private const string MountPrefix = "CoreShell.Files.Mount.";
         private const string RemovableMediaNameKey = "CoreShell.Files.RemovableMediaName";
         private StorageFolder m_currentFolder;
@@ -39,6 +140,8 @@ namespace factoryos_10x_shell.Controls
         private int m_folderLoadRevision;
         private readonly List<FileEntry> m_clipboardEntries = new List<FileEntry>();
         private bool m_cutOperation;
+        private bool m_cutPasteInProgress;
+        private int m_clipboardRevision;
         private FileEntry m_contextEntry;
         private readonly ObservableCollection<FileEntry> m_items = new ObservableCollection<FileEntry>();
         private readonly List<FileEntry> m_allItems = new List<FileEntry>();
@@ -54,10 +157,17 @@ namespace factoryos_10x_shell.Controls
         public FilesWindow()
         {
             InitializeComponent();
+            // ListView handles row pointer events internally. Observe handled
+            // events too so its selection/capture does not hide the mouse gesture.
+            ItemsList.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler(ItemsList_FilePointerPressed), true);
+            ItemsList.AddHandler(UIElement.PointerMovedEvent, new PointerEventHandler(ItemsList_FilePointerMoved), true);
+            ItemsList.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler(ItemsList_FilePointerReleased), true);
+            ItemsList.AddHandler(UIElement.PointerCanceledEvent, new PointerEventHandler(ItemsList_FilePointerReleased), true);
             ItemsList.ItemsSource = m_items;
             LocationsNavigation.SelectedItem = HomeNavigationItem;
             RestoreRemovableMediaName();
             CreateInitialTab();
+            FileOperationService.Instance.OperationCompleted += RefreshAfterFileOperation;
         }
 
         private void CreateInitialTab()
@@ -277,49 +387,64 @@ namespace factoryos_10x_shell.Controls
         private void ContextFlyout_Opened(object sender, object e) => MainPage.SetPopupCursorVisibility(true);
         private void ContextFlyout_Closed(object sender, object e)
         {
-            m_contextEntry = null;
             MainPage.SetPopupCursorVisibility(false);
-        }
-
-        private void FileItem_RightTapped(object sender, RightTappedRoutedEventArgs e)
-        {
-            FrameworkElement element = sender as FrameworkElement;
-            FileEntry entry = element?.DataContext as FileEntry;
-            if (entry == null)
-                return;
-
-            // Bind this invocation to the item under the pointer instead of relying
-            // on a possibly stale ListView selection.
-            m_contextEntry = entry;
-            if (!ItemsList.SelectedItems.Contains(entry))
-            {
-                ItemsList.SelectedItems.Clear();
-                ItemsList.SelectedItem = entry;
-            }
-
-            MenuFlyout flyout = element.Resources["ItemContextMenu"] as MenuFlyout;
-            MenuFlyoutSubItem archiveMenu = flyout?.Items
-                .OfType<MenuFlyoutSubItem>()
-                .FirstOrDefault(item => item.Text == "Archive");
-            if (archiveMenu != null)
-                archiveMenu.Visibility = ArchiveService.IsArchive(entry.File)
-                    ? Visibility.Visible
-                    : Visibility.Collapsed;
-            flyout?.ShowAt(element, e.GetPosition(element));
-            e.Handled = true;
         }
 
         private void ItemsList_RightTapped(object sender, RightTappedRoutedEventArgs e)
         {
-            // Item right-clicks are handled above. Reaching here means that the
-            // pointer is on the list background, so never reuse an old item.
-            m_contextEntry = null;
-            ItemsList.SelectedItems.Clear();
-
             ListView list = sender as ListView;
-            MenuFlyout flyout = list?.Resources["BackgroundContextMenu"] as MenuFlyout;
+            if (list == null)
+                return;
+
+            ListViewItem container = FindVisualAncestor<ListViewItem>(e.OriginalSource as DependencyObject);
+            FileEntry entry = container != null && ItemsList.IndexFromContainer(container) >= 0
+                ? container.Content as FileEntry
+                : null;
+
+            MenuFlyout flyout;
+            if (entry != null)
+            {
+                // Right-clicking an unselected row makes that row the sole target.
+                // Right-clicking one of several selected rows preserves the group.
+                if (!list.SelectedItems.Contains(entry))
+                {
+                    list.SelectedItems.Clear();
+                    list.SelectedItem = entry;
+                }
+
+                m_contextEntry = entry;
+                flyout = list.Resources["ItemContextMenu"] as MenuFlyout;
+                MenuFlyoutSubItem archiveMenu = flyout?.Items
+                    .OfType<MenuFlyoutSubItem>()
+                    .FirstOrDefault(item => string.Equals(item.Tag as string, "ArchiveActions", StringComparison.Ordinal));
+                if (archiveMenu != null)
+                    archiveMenu.Visibility = ArchiveService.IsArchive(entry.File)
+                        ? Visibility.Visible
+                        : Visibility.Collapsed;
+            }
+            else
+            {
+                // A background click is never allowed to inherit a previous target.
+                m_contextEntry = null;
+                list.SelectedItems.Clear();
+                flyout = list.Resources["BackgroundContextMenu"] as MenuFlyout;
+            }
+
             flyout?.ShowAt(list, e.GetPosition(list));
             e.Handled = true;
+        }
+
+        private static T FindVisualAncestor<T>(DependencyObject source) where T : DependencyObject
+        {
+            DependencyObject current = source;
+            while (current != null)
+            {
+                if (current is T match)
+                    return match;
+                current = VisualTreeHelper.GetParent(current);
+            }
+
+            return null;
         }
 
         private void TitleBar_PointerPressed(object sender, PointerRoutedEventArgs e)
@@ -492,7 +617,7 @@ namespace factoryos_10x_shell.Controls
             catch { StorageApplicationPermissions.FutureAccessList.Remove(token); return null; }
         }
 
-        private async Task OpenFolderAsync(StorageFolder folder, string displayName, bool addToHistory = false)
+        private async Task OpenFolderAsync(StorageFolder folder, string displayName, bool addToHistory = false, bool reportErrors = true, bool preserveSearch = false)
         {
             if (folder == null) return;
             FileTabState targetTab = m_activeTab;
@@ -512,7 +637,7 @@ namespace factoryos_10x_shell.Controls
                     m_activeTab.TabItem.Header = displayName;
             }
             PathText.Text = displayName;
-            SearchBox.Text = string.Empty;
+            if (!preserveSearch) SearchBox.Text = string.Empty;
             m_items.Clear();
             m_allItems.Clear();
             try
@@ -554,6 +679,11 @@ namespace factoryos_10x_shell.Controls
             catch (Exception)
             {
                 if (loadRevision != m_folderLoadRevision || !ReferenceEquals(targetTab, m_activeTab)) return;
+                if (!reportErrors)
+                {
+                    StatusText.Text = "This folder changed during the operation. Refresh or choose another folder.";
+                    return;
+                }
                 await new ContentDialog { Title = "Folder unavailable", Content = "CoreShell no longer has access to this folder. Choose it again from the sidebar.", CloseButtonText = "OK" }.ShowAsync();
             }
         }
@@ -747,51 +877,29 @@ namespace factoryos_10x_shell.Controls
             m_clipboardEntries.Clear();
             m_clipboardEntries.AddRange(entries);
             m_cutOperation = cut;
+            m_clipboardRevision++;
         }
 
         private async void Paste_Click(object sender, RoutedEventArgs e)
         {
             if (m_currentFolder == null || m_clipboardEntries.Count == 0) return;
-
-            var failed = new List<FileEntry>();
-            foreach (FileEntry entry in m_clipboardEntries.ToList())
+            bool cut = m_cutOperation;
+            if (cut && m_cutPasteInProgress) return;
+            List<FileEntry> entries = m_clipboardEntries.ToList();
+            int revision = m_clipboardRevision;
+            if (cut) m_cutPasteInProgress = true;
+            try
             {
-                try
-                {
-                    if (entry.Folder != null)
-                    {
-                        if (entry.Folder.Path == m_currentFolder.Path)
-                        {
-                            failed.Add(entry);
-                            continue;
-                        }
-                        if (m_cutOperation)
-                            await MoveFolderAsync(entry.Folder, m_currentFolder);
-                        else
-                            await CopyFolderAsync(entry.Folder, m_currentFolder);
-                    }
-                    else if (entry.File != null)
-                    {
-                        if (m_cutOperation)
-                            await entry.File.MoveAsync(m_currentFolder, entry.File.Name, NameCollisionOption.GenerateUniqueName);
-                        else
-                            await entry.File.CopyAsync(m_currentFolder, entry.File.Name, NameCollisionOption.GenerateUniqueName);
-                    }
-                }
-                catch (Exception)
-                {
-                    failed.Add(entry);
-                }
+                FileOperationModel operation = FileOperationService.Instance.StartTransfer(
+                    StorageItems(entries), m_currentFolder, cut ? FileOperationKind.Move : FileOperationKind.Copy);
+                FileOperationResult result = await operation.Completion;
+                if (cut && revision == m_clipboardRevision)
+                    m_clipboardEntries.RemoveAll(entry => result.Succeeded.Contains((IStorageItem)entry.File ?? entry.Folder));
             }
-
-            if (m_cutOperation)
+            finally
             {
-                m_clipboardEntries.Clear();
-                m_clipboardEntries.AddRange(failed);
+                if (cut) m_cutPasteInProgress = false;
             }
-            await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
-            if (failed.Count > 0)
-                await ShowOperationErrorAsync("CoreShell could not paste " + failed.Count + (failed.Count == 1 ? " item here." : " items here."));
         }
 
         private async void Delete_Click(object sender, RoutedEventArgs e)
@@ -801,19 +909,7 @@ namespace factoryos_10x_shell.Controls
             string prompt = entries.Count == 1 ? "Delete " + entries[0].Name + "?" : "Delete these " + entries.Count + " items?";
             var dialog = new ContentDialog { Title = "Delete", Content = prompt, PrimaryButtonText = "Delete", CloseButtonText = "Cancel" };
             if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
-            int failed = 0;
-            foreach (FileEntry entry in entries)
-            {
-                try
-                {
-                    if (entry.Folder != null) await entry.Folder.DeleteAsync();
-                    else if (entry.File != null) await entry.File.DeleteAsync();
-                }
-                catch (Exception) { failed++; }
-            }
-            await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
-            if (failed > 0)
-                await ShowOperationErrorAsync("CoreShell could not delete " + failed + (failed == 1 ? " item." : " items."));
+            FileOperationService.Instance.StartTransfer(StorageItems(entries), null, FileOperationKind.Delete);
         }
 
         private async void MoveTo_Click(object sender, RoutedEventArgs e)
@@ -824,21 +920,7 @@ namespace factoryos_10x_shell.Controls
             picker.FileTypeFilter.Add("*");
             StorageFolder destination = await picker.PickSingleFolderAsync();
             if (destination == null) return;
-            int failed = 0;
-            foreach (FileEntry entry in entries)
-            {
-                try
-                {
-                    if (entry.Folder != null)
-                        await MoveFolderAsync(entry.Folder, destination);
-                    else if (entry.File != null)
-                        await entry.File.MoveAsync(destination, entry.File.Name, NameCollisionOption.GenerateUniqueName);
-                }
-                catch (Exception) { failed++; }
-            }
-            await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
-            if (failed > 0)
-                await ShowOperationErrorAsync("CoreShell could not move " + failed + (failed == 1 ? " item." : " items."));
+            FileOperationService.Instance.StartTransfer(StorageItems(entries), destination, FileOperationKind.Move);
         }
 
         private async void Rename_Click(object sender, RoutedEventArgs e)
@@ -890,31 +972,10 @@ namespace factoryos_10x_shell.Controls
         private async void CompressSevenZip_Click(object sender, RoutedEventArgs e) =>
             await CompressEntryAsync(GetEntry(sender), true);
 
-        private async Task ExtractArchiveWithPasswordAsync(StorageFile archive, StorageFolder destination)
+        private Task ExtractArchiveWithPasswordAsync(StorageFile archive, StorageFolder destination)
         {
-            string password = null;
-            while (true)
-            {
-                try
-                {
-                    await RunArchiveProgressAsync("Extracting " + archive.Name,
-                        (progress, token) => ArchiveService.ExtractAsync(archive, destination, password, progress, token));
-                    if (ReferenceEquals(destination, m_currentFolder) || destination.Path == m_currentFolder?.Path)
-                        await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
-                    return;
-                }
-                catch (ArchivePasswordRequiredException)
-                {
-                    password = await RequestArchivePasswordAsync(archive.Name);
-                    if (password == null) return;
-                }
-                catch (OperationCanceledException) { return; }
-                catch (Exception error)
-                {
-                    await ShowOperationErrorAsync("The archive could not be extracted. " + error.Message);
-                    return;
-                }
-            }
+            FileOperationService.Instance.StartExtraction(archive, destination);
+            return Task.CompletedTask;
         }
 
         private async Task OpenArchivePreviewAsync(StorageFile archive)
@@ -970,74 +1031,40 @@ namespace factoryos_10x_shell.Controls
             }
         }
 
-        private async Task CompressEntryAsync(FileEntry entry, bool sevenZip)
+        private Task CompressEntryAsync(FileEntry entry, bool sevenZip)
         {
-            if (entry == null || m_currentFolder == null) return;
+            if (entry == null || m_currentFolder == null) return Task.CompletedTask;
             var selectedEntries = ItemsList.SelectedItems.Cast<FileEntry>().ToList();
             if (!selectedEntries.Contains(entry)) selectedEntries = new List<FileEntry> { entry };
             var items = selectedEntries
                 .Select(item => (IStorageItem)item.File ?? item.Folder)
                 .Where(item => item != null)
                 .ToList();
-            if (items.Count == 0) return;
+            if (items.Count == 0) return Task.CompletedTask;
             string extension = sevenZip ? ".7z" : ".zip";
             string baseName = selectedEntries.Count == 1
                 ? System.IO.Path.GetFileNameWithoutExtension(entry.Name)
                 : "Archive";
-            StorageFile output = await m_currentFolder.CreateFileAsync(baseName + extension,
-                CreationCollisionOption.GenerateUniqueName);
+            FileOperationService.Instance.StartCompression(items, m_currentFolder, baseName + extension, sevenZip);
+            return Task.CompletedTask;
+        }
+
+        private async void RefreshAfterFileOperation(FileOperationModel operation)
+        {
+            if (Visibility != Visibility.Visible || SettingsPage.Visibility == Visibility.Visible || m_currentFolder == null) return;
+            if (operation.AffectedFolderPaths.Count > 0 && !operation.AffectedFolderPaths.Any(path =>
+                string.Equals(path, m_currentFolder.Path, StringComparison.OrdinalIgnoreCase) ||
+                FileTransferService.IsDescendant(m_currentFolder.Path, path))) return;
+            StorageFolder folder = m_currentFolder;
             try
             {
-                await RunArchiveProgressAsync("Creating " + output.Name,
-                    (progress, token) => ArchiveService.CompressAsync(
-                        items, output, sevenZip, progress, token));
-                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+                await OpenFolderAsync(folder, m_currentDisplayName, false, false, true);
             }
-            catch (OperationCanceledException)
-            {
-                try { await output.DeleteAsync(); } catch { }
-            }
-            catch (Exception error)
-            {
-                try { await output.DeleteAsync(); } catch { }
-                await ShowOperationErrorAsync("The archive could not be created. " + error.Message);
-            }
+            catch { }
         }
 
-        private async Task RunArchiveProgressAsync(string title,
-            Func<IProgress<ArchiveProgress>, CancellationToken, Task> operation)
-        {
-            var status = new TextBlock { Text = "Preparing...", TextTrimming = TextTrimming.CharacterEllipsis };
-            var bar = new ProgressBar { Minimum = 0, Maximum = 100, IsIndeterminate = true };
-            var panel = new StackPanel { Width = 420, Spacing = 12 };
-            panel.Children.Add(status);
-            panel.Children.Add(bar);
-            var dialog = new ContentDialog { Title = title, Content = panel, CloseButtonText = "Cancel" };
-            var cancellation = new CancellationTokenSource();
-            dialog.CloseButtonClick += (s, args) =>
-            {
-                args.Cancel = true;
-                status.Text = "Cancelling...";
-                cancellation.Cancel();
-            };
-            IProgress<ArchiveProgress> progress = new Progress<ArchiveProgress>(value =>
-            {
-                status.Text = value.Item ?? string.Empty;
-                bar.IsIndeterminate = value.Percent < 0;
-                if (!bar.IsIndeterminate)
-                    bar.Value = Math.Max(0, Math.Min(100, value.Percent));
-            });
-
-            IAsyncOperation<ContentDialogResult> shown = dialog.ShowAsync();
-            await Task.Yield();
-            try { await operation(progress, cancellation.Token); }
-            finally
-            {
-                if (shown.Status == AsyncStatus.Started) dialog.Hide();
-                try { await shown; } catch { }
-                cancellation.Dispose();
-            }
-        }
+        private static IReadOnlyList<IStorageItem> StorageItems(IEnumerable<FileEntry> entries) =>
+            entries.Select(entry => (IStorageItem)entry.File ?? entry.Folder).Where(item => item != null).ToList();
 
         private static async Task<string> RequestArchivePasswordAsync(string archiveName)
         {
@@ -1109,24 +1136,6 @@ namespace factoryos_10x_shell.Controls
             string drive = string.IsNullOrWhiteSpace(root) ? "Removable media" : root.TrimEnd('\\');
             string label = string.IsNullOrWhiteSpace(folder?.DisplayName) ? folder?.Name : folder.DisplayName;
             return string.IsNullOrWhiteSpace(label) ? drive : drive + " - " + label;
-        }
-
-        // StorageFolder does not expose CopyAsync/MoveAsync on the UWP contract used
-        // by this Xbox target. Recreate the folder tree using APIs that are available.
-        private static async Task<StorageFolder> CopyFolderAsync(StorageFolder source, StorageFolder destination)
-        {
-            StorageFolder copy = await destination.CreateFolderAsync(source.Name, CreationCollisionOption.GenerateUniqueName);
-            foreach (StorageFile file in await source.GetFilesAsync())
-                await file.CopyAsync(copy, file.Name, NameCollisionOption.GenerateUniqueName);
-            foreach (StorageFolder child in await source.GetFoldersAsync())
-                await CopyFolderAsync(child, copy);
-            return copy;
-        }
-
-        private static async Task MoveFolderAsync(StorageFolder source, StorageFolder destination)
-        {
-            await CopyFolderAsync(source, destination);
-            await source.DeleteAsync();
         }
 
         private async Task ShowOperationErrorAsync(string message)

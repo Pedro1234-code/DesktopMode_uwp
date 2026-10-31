@@ -269,6 +269,18 @@ namespace
         bool listColumnCreated = false;
     };
 
+    constexpr UINT ColorDialogRedId = 0x3040;
+    constexpr UINT ColorDialogGreenId = 0x3041;
+    constexpr UINT ColorDialogBlueId = 0x3042;
+
+    struct ColorDialogRuntime final
+    {
+        HWND window = nullptr;
+        COLORREF selected = RGB(0, 0, 0);
+        DLGPROC hook = nullptr;
+        LPARAM hookParameter = 0;
+    };
+
     struct ModalDialogState final
     {
         ModalDialogState* previous = nullptr;
@@ -1978,6 +1990,98 @@ namespace
         return FALSE;
     }
 
+    bool ReadColorComponent(HWND dialog, UINT identifier, BYTE* component)
+    {
+        if (!component) return false;
+        wchar_t text[16] = {};
+        if (!BridgeGetDlgItemTextW(dialog, static_cast<int>(identifier), text,
+            ARRAYSIZE(text)))
+            return false;
+        wchar_t* end = nullptr;
+        const unsigned long value = wcstoul(text, &end, 10);
+        while (end && *end && iswspace(*end)) ++end;
+        if (end == text || (end && *end) || value > 255) return false;
+        *component = static_cast<BYTE>(value);
+        return true;
+    }
+
+    INT_PTR CALLBACK ColorDialogProcedure(HWND dialog, UINT message,
+        WPARAM wParam, LPARAM lParam)
+    {
+        ColorDialogRuntime* runtime = reinterpret_cast<ColorDialogRuntime*>(
+            BridgeGetWindowLongPtrW(dialog, GWLP_USERDATA));
+        if (message == WM_INITDIALOG)
+        {
+            runtime = reinterpret_cast<ColorDialogRuntime*>(lParam);
+            if (!runtime) return FALSE;
+            runtime->window = dialog;
+            BridgeSetWindowLongPtrW(dialog, GWLP_USERDATA,
+                reinterpret_cast<LONG_PTR>(runtime));
+            wchar_t component[16] = {};
+            swprintf_s(component, ARRAYSIZE(component), L"%u",
+                static_cast<unsigned>(GetRValue(runtime->selected)));
+            BridgeSetDlgItemTextW(dialog, ColorDialogRedId, component);
+            swprintf_s(component, ARRAYSIZE(component), L"%u",
+                static_cast<unsigned>(GetGValue(runtime->selected)));
+            BridgeSetDlgItemTextW(dialog, ColorDialogGreenId, component);
+            swprintf_s(component, ARRAYSIZE(component), L"%u",
+                static_cast<unsigned>(GetBValue(runtime->selected)));
+            BridgeSetDlgItemTextW(dialog, ColorDialogBlueId, component);
+            if (runtime->hook)
+            {
+                DWORD exceptionCode = ERROR_SUCCESS;
+                ULONG_PTR exceptionAddress = 0;
+                InvokeGuestDialogProcedure(runtime->hook, dialog, message,
+                    wParam, runtime->hookParameter, &exceptionCode,
+                    &exceptionAddress);
+            }
+            return TRUE;
+        }
+        if (!runtime) return FALSE;
+
+        if (runtime->hook)
+        {
+            DWORD exceptionCode = ERROR_SUCCESS;
+            ULONG_PTR exceptionAddress = 0;
+            if (InvokeGuestDialogProcedure(runtime->hook, dialog, message,
+                wParam, lParam, &exceptionCode, &exceptionAddress))
+                return TRUE;
+        }
+        if (message == WM_COMMAND)
+        {
+            const UINT command = LOWORD(wParam);
+            if (command == IDOK)
+            {
+                BYTE red = 0;
+                BYTE green = 0;
+                BYTE blue = 0;
+                if (!ReadColorComponent(dialog, ColorDialogRedId, &red) ||
+                    !ReadColorComponent(dialog, ColorDialogGreenId, &green) ||
+                    !ReadColorComponent(dialog, ColorDialogBlueId, &blue))
+                {
+                    ShowGuestMessageBox(dialog,
+                        L"Enter a number from 0 through 255 for each color component.",
+                        L"Color", MB_OK | MB_ICONWARNING);
+                    return TRUE;
+                }
+                runtime->selected = RGB(red, green, blue);
+                EndGuestResourceDialog(dialog, IDOK);
+                return TRUE;
+            }
+            if (command == IDCANCEL)
+            {
+                EndGuestResourceDialog(dialog, IDCANCEL);
+                return TRUE;
+            }
+        }
+        if (message == WM_CLOSE)
+        {
+            EndGuestResourceDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
     DialogItem FileDialogItem(
         DWORD id, LPCWSTR windowClass, LPCWSTR text,
         short x, short y, short width, short height, DWORD style)
@@ -2020,6 +2124,224 @@ namespace
         if (message == WM_CLOSE)
         {
             EndGuestResourceDialog(dialog, IDCANCEL);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    constexpr UINT TaskDialogVerificationId = 0x7f10;
+    constexpr UINT TaskDialogRadioBaseId = 0x7000;
+    constexpr UINT TaskDialogNotificationCreated = 0;
+    constexpr UINT TaskDialogNotificationButtonClicked = 2;
+    constexpr UINT TaskDialogNotificationDestroyed = 5;
+    constexpr UINT TaskDialogNotificationRadioButtonClicked = 6;
+    constexpr UINT TaskDialogNotificationConstructed = 7;
+    constexpr UINT TaskDialogNotificationVerificationClicked = 8;
+    constexpr UINT TaskDialogClickButtonMessage = WM_USER + 102;
+    constexpr UINT TaskDialogClickRadioButtonMessage = WM_USER + 110;
+    constexpr UINT TaskDialogEnableButtonMessage = WM_USER + 111;
+    constexpr UINT TaskDialogEnableRadioButtonMessage = WM_USER + 112;
+    constexpr UINT TaskDialogClickVerificationMessage = WM_USER + 113;
+    constexpr UINT ButtonGetCheckMessage = 0x00f0;
+    constexpr UINT ButtonSetCheckMessage = 0x00f1;
+    constexpr DWORD ButtonAutoCheckBox = 0x00000003u;
+    constexpr DWORD ButtonAutoRadio = 0x00000009u;
+    constexpr LRESULT ButtonChecked = 1;
+
+    struct TaskDialogRuntime final
+    {
+        GuestTaskDialogDescriptor descriptor;
+        HWND window = nullptr;
+        int selectedButton = 0;
+        int defaultButton = 0;
+        int selectedRadio = 0;
+        BOOL verificationChecked = FALSE;
+    };
+
+    HRESULT InvokeTaskDialogCallbackSeh(TaskDialogRuntime* runtime,
+        UINT notification, WPARAM wParam, LPARAM lParam,
+        DWORD* exceptionCode) noexcept
+    {
+        if (exceptionCode) *exceptionCode = ERROR_SUCCESS;
+        __try
+        {
+            return runtime->descriptor.callback(runtime->window, notification,
+                wParam, lParam, runtime->descriptor.callbackData);
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (exceptionCode) *exceptionCode = GetExceptionCode();
+            return E_FAIL;
+        }
+    }
+
+    HRESULT InvokeTaskDialogCallback(TaskDialogRuntime* runtime, UINT notification,
+        WPARAM wParam = 0, LPARAM lParam = 0) noexcept
+    {
+        if (!runtime || !runtime->descriptor.callback) return S_OK;
+        DWORD exceptionCode = ERROR_SUCCESS;
+        const HRESULT result = InvokeTaskDialogCallbackSeh(
+            runtime, notification, wParam, lParam, &exceptionCode);
+        if (exceptionCode != ERROR_SUCCESS)
+        {
+            RuntimeDiagnostics::Record(
+                L"TASKDIALOG: guest callback raised exception " +
+                std::to_wstring(exceptionCode) + L".");
+        }
+        return result;
+    }
+
+    bool IsTaskDialogButton(const TaskDialogRuntime* runtime, int identifier)
+    {
+        if (!runtime) return false;
+        for (UINT index = 0; index < runtime->descriptor.buttonCount; ++index)
+        {
+            if (runtime->descriptor.buttons[index].identifier == identifier)
+                return true;
+        }
+        return false;
+    }
+
+    INT_PTR CALLBACK TaskDialogProcedure(HWND dialog, UINT message,
+        WPARAM wParam, LPARAM lParam)
+    {
+        TaskDialogRuntime* runtime = reinterpret_cast<TaskDialogRuntime*>(
+            BridgeGetWindowLongPtrW(dialog, GWLP_USERDATA));
+        if (message == WM_INITDIALOG)
+        {
+            runtime = reinterpret_cast<TaskDialogRuntime*>(lParam);
+            if (!runtime) return FALSE;
+            runtime->window = dialog;
+            BridgeSetWindowLongPtrW(dialog, GWLP_USERDATA,
+                reinterpret_cast<LONG_PTR>(runtime));
+            if (runtime->verificationChecked)
+            {
+                BridgeSendDlgItemMessageW(dialog, TaskDialogVerificationId,
+                    ButtonSetCheckMessage, ButtonChecked, 0);
+            }
+            if (runtime->selectedRadio)
+            {
+                for (UINT index = 0; index < runtime->descriptor.radioButtonCount; ++index)
+                {
+                    const bool selected = runtime->descriptor.radioButtons[index].identifier ==
+                        runtime->selectedRadio;
+                    BridgeSendDlgItemMessageW(dialog, TaskDialogRadioBaseId + index,
+                        ButtonSetCheckMessage, selected ? ButtonChecked : 0, 0);
+                }
+            }
+            InvokeTaskDialogCallback(runtime, TaskDialogNotificationConstructed);
+            InvokeTaskDialogCallback(runtime, TaskDialogNotificationCreated);
+            return TRUE;
+        }
+        if (!runtime) return FALSE;
+
+        if (message == TaskDialogClickButtonMessage)
+        {
+            return TaskDialogProcedure(dialog, WM_COMMAND,
+                MAKEWPARAM(static_cast<UINT>(wParam), BN_CLICKED), 0);
+        }
+        if (message == TaskDialogClickRadioButtonMessage ||
+            message == TaskDialogEnableRadioButtonMessage)
+        {
+            for (UINT index = 0; index < runtime->descriptor.radioButtonCount; ++index)
+            {
+                if (runtime->descriptor.radioButtons[index].identifier !=
+                    static_cast<int>(wParam)) continue;
+                if (message == TaskDialogEnableRadioButtonMessage)
+                {
+                    BridgeEnableWindow(BridgeGetDlgItem(dialog,
+                        TaskDialogRadioBaseId + index), lParam != 0);
+                    return TRUE;
+                }
+                return TaskDialogProcedure(dialog, WM_COMMAND,
+                    MAKEWPARAM(TaskDialogRadioBaseId + index, BN_CLICKED), 0);
+            }
+            return FALSE;
+        }
+        if (message == TaskDialogEnableButtonMessage)
+        {
+            if (!IsTaskDialogButton(runtime, static_cast<int>(wParam))) return FALSE;
+            BridgeEnableWindow(BridgeGetDlgItem(dialog, static_cast<int>(wParam)),
+                lParam != 0);
+            return TRUE;
+        }
+        if (message == TaskDialogClickVerificationMessage)
+        {
+            runtime->verificationChecked = wParam != 0;
+            BridgeSendDlgItemMessageW(dialog, TaskDialogVerificationId,
+                ButtonSetCheckMessage,
+                runtime->verificationChecked ? ButtonChecked : 0, 0);
+            if (lParam)
+            {
+                InvokeTaskDialogCallback(runtime,
+                    TaskDialogNotificationVerificationClicked,
+                    runtime->verificationChecked, 0);
+            }
+            return TRUE;
+        }
+
+        if (message == WM_COMMAND)
+        {
+            const int command = LOWORD(wParam);
+            if (IsTaskDialogButton(runtime, command))
+            {
+                // S_FALSE is the documented way for TDN_BUTTON_CLICKED to keep
+                // the task dialog open while the application validates input.
+                if (InvokeTaskDialogCallback(runtime,
+                    TaskDialogNotificationButtonClicked, command, 0) == S_FALSE)
+                    return TRUE;
+                runtime->selectedButton = command;
+                if (runtime->descriptor.verificationText)
+                {
+                    runtime->verificationChecked = BridgeSendDlgItemMessageW(
+                        dialog, TaskDialogVerificationId, ButtonGetCheckMessage,
+                        0, 0) == ButtonChecked;
+                }
+                InvokeTaskDialogCallback(runtime, TaskDialogNotificationDestroyed);
+                EndGuestResourceDialog(dialog, command);
+                return TRUE;
+            }
+            for (UINT index = 0; index < runtime->descriptor.radioButtonCount; ++index)
+            {
+                if (command != static_cast<int>(TaskDialogRadioBaseId + index)) continue;
+                runtime->selectedRadio =
+                    runtime->descriptor.radioButtons[index].identifier;
+                for (UINT other = 0; other < runtime->descriptor.radioButtonCount; ++other)
+                {
+                    BridgeSendDlgItemMessageW(dialog, TaskDialogRadioBaseId + other,
+                        ButtonSetCheckMessage, other == index ? ButtonChecked : 0, 0);
+                }
+                InvokeTaskDialogCallback(runtime,
+                    TaskDialogNotificationRadioButtonClicked,
+                    runtime->selectedRadio, 0);
+                return TRUE;
+            }
+            if (command == static_cast<int>(TaskDialogVerificationId))
+            {
+                runtime->verificationChecked = BridgeSendDlgItemMessageW(
+                    dialog, TaskDialogVerificationId, ButtonGetCheckMessage,
+                    0, 0) == ButtonChecked;
+                InvokeTaskDialogCallback(runtime,
+                    TaskDialogNotificationVerificationClicked,
+                    runtime->verificationChecked, 0);
+                return TRUE;
+            }
+        }
+        if (message == WM_CLOSE)
+        {
+            int command = runtime->defaultButton;
+            if (!IsTaskDialogButton(runtime, command))
+            {
+                command = IsTaskDialogButton(runtime, IDCANCEL) ? IDCANCEL :
+                    (runtime->descriptor.buttonCount
+                        ? runtime->descriptor.buttons[0].identifier : IDCANCEL);
+            }
+            if (InvokeTaskDialogCallback(runtime,
+                TaskDialogNotificationButtonClicked, command, 0) == S_FALSE)
+                return TRUE;
+            runtime->selectedButton = command;
+            InvokeTaskDialogCallback(runtime, TaskDialogNotificationDestroyed);
+            EndGuestResourceDialog(dialog, command);
             return TRUE;
         }
         return FALSE;
@@ -2107,6 +2429,19 @@ INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResourceWithStyles(
 
     return RunGuestDialog(instance, dialog, parent, procedure, initParameter,
         modal, createdWindow);
+}
+
+void Win32Bridge::Bridge::ResetGuestDialogState()
+{
+    // The window manager has already made abandoned HWNDs unreachable when
+    // this runs.  Discard dialog-side ownership without calling a DLGPROC that
+    // may belong to an unloaded guest module.
+    {
+        std::lock_guard<std::mutex> guard(g_dialogWindowsLock);
+        g_dialogWindows.clear();
+    }
+    g_activeModalDialog = nullptr;
+    g_nextDialogClass.store(1);
 }
 
 INT_PTR Win32Bridge::Bridge::ShowGuestDialogFromResource(
@@ -2387,6 +2722,59 @@ bool Win32Bridge::Bridge::ShowGuestFileDialog(
     return true;
 }
 
+bool Win32Bridge::Bridge::ShowGuestColorDialog(HWND owner, HINSTANCE instance,
+    COLORREF initialColor, COLORREF* selectedColor, DLGPROC hookProcedure,
+    LPARAM hookParameter)
+{
+    if (!selectedColor)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    DialogTemplate dialog;
+    dialog.style = DialogPopupStyle | DialogCaptionStyle | DialogSystemMenuStyle |
+        DialogModalFrameStyle | DialogCenterStyle | DialogSetFont;
+    dialog.width = 188;
+    dialog.height = 92;
+    dialog.title.text = L"Color";
+    dialog.font.present = true;
+    dialog.font.pointSize = 9;
+    dialog.font.weight = FW_NORMAL;
+    dialog.font.face.text = L"Segoe UI";
+    const DWORD editStyle = DialogTabStopStyle | WindowBorderStyle |
+        EditAutoHorizontalScroll;
+    dialog.items.push_back(FileDialogItem(static_cast<DWORD>(-1), L"static",
+        L"Red:", 10, 13, 36, 10, StaticLeft));
+    dialog.items.push_back(FileDialogItem(ColorDialogRedId, L"edit", L"",
+        48, 10, 36, 14, editStyle));
+    dialog.items.push_back(FileDialogItem(static_cast<DWORD>(-1), L"static",
+        L"Green:", 10, 33, 36, 10, StaticLeft));
+    dialog.items.push_back(FileDialogItem(ColorDialogGreenId, L"edit", L"",
+        48, 30, 36, 14, editStyle));
+    dialog.items.push_back(FileDialogItem(static_cast<DWORD>(-1), L"static",
+        L"Blue:", 10, 53, 36, 10, StaticLeft));
+    dialog.items.push_back(FileDialogItem(ColorDialogBlueId, L"edit", L"",
+        48, 50, 36, 14, editStyle));
+    dialog.items.push_back(PropertySheetButton(IDOK, 96, 49, 38, L"OK", true));
+    dialog.items.push_back(PropertySheetButton(IDCANCEL, 139, 49, 40,
+        L"Cancel", false));
+
+    ColorDialogRuntime runtime;
+    runtime.selected = initialColor;
+    runtime.hook = hookProcedure;
+    runtime.hookParameter = hookParameter;
+    const HINSTANCE dialogInstance = instance ? instance :
+        reinterpret_cast<HINSTANCE>(const_cast<BYTE*>(CurrentGuestImageBase()));
+    RuntimeDiagnostics::Record(L"COMMON DIALOG: opening virtual color picker.");
+    const INT_PTR result = RunGuestDialog(dialogInstance, dialog, owner,
+        &ColorDialogProcedure, reinterpret_cast<LPARAM>(&runtime));
+    if (result != IDOK) return false;
+    *selectedColor = runtime.selected;
+    BridgeSetLastError(ERROR_SUCCESS);
+    return true;
+}
+
 int Win32Bridge::Bridge::ShowGuestShellAbout(
     HWND owner,
     LPCWSTR title,
@@ -2530,6 +2918,102 @@ int Win32Bridge::Bridge::ShowGuestMessageBox(
     const INT_PTR result = RunGuestDialog(
         instance, dialog, owner, &MessageBoxDialogProcedure, 0);
     return result < 0 ? 0 : static_cast<int>(result);
+}
+
+HRESULT Win32Bridge::Bridge::ShowGuestTaskDialog(
+    const GuestTaskDialogDescriptor& descriptor,
+    int* selectedButton,
+    int* selectedRadioButton,
+    BOOL* verificationChecked)
+{
+    if (!descriptor.buttons || descriptor.buttonCount == 0 ||
+        descriptor.buttonCount > 32 || descriptor.radioButtonCount > 32 ||
+        (descriptor.radioButtonCount && !descriptor.radioButtons))
+        return E_INVALIDARG;
+
+    DialogTemplate dialog;
+    dialog.style = DialogPopupStyle | DialogCaptionStyle | DialogSystemMenuStyle |
+        DialogModalFrameStyle | DialogCenterStyle | DialogSetFont;
+    dialog.width = 250;
+    short cursorY = 10;
+    dialog.title.text = descriptor.title ? descriptor.title : L"Win32 application";
+    dialog.font.present = true;
+    dialog.font.pointSize = 9;
+    dialog.font.weight = FW_NORMAL;
+    dialog.font.face.text = L"Segoe UI";
+
+    if (descriptor.mainInstruction && *descriptor.mainInstruction)
+    {
+        dialog.items.push_back(FileDialogItem(static_cast<DWORD>(-1), L"static",
+            descriptor.mainInstruction, 12, cursorY, 226, 24, StaticLeft));
+        cursorY = static_cast<short>(cursorY + 28);
+    }
+    if (descriptor.content && *descriptor.content)
+    {
+        dialog.items.push_back(FileDialogItem(static_cast<DWORD>(-1), L"static",
+            descriptor.content, 12, cursorY, 226, 38, StaticLeft));
+        cursorY = static_cast<short>(cursorY + 42);
+    }
+
+    for (UINT index = 0; index < descriptor.radioButtonCount; ++index)
+    {
+        DialogItem radio = FileDialogItem(TaskDialogRadioBaseId + index, L"button",
+            descriptor.radioButtons[index].text, 16, cursorY, 218, 13,
+            DialogTabStopStyle | ButtonAutoRadio);
+        dialog.items.push_back(std::move(radio));
+        cursorY = static_cast<short>(cursorY + 15);
+    }
+    if (descriptor.verificationText && *descriptor.verificationText)
+    {
+        dialog.items.push_back(FileDialogItem(TaskDialogVerificationId, L"button",
+            descriptor.verificationText, 12, cursorY, 226, 13,
+            DialogTabStopStyle | ButtonAutoCheckBox));
+        cursorY = static_cast<short>(cursorY + 18);
+    }
+
+    const short buttonY = static_cast<short>(cursorY + 6);
+    constexpr short buttonHeight = 15;
+    constexpr short buttonGap = 4;
+    const UINT buttonColumns = (std::min)(descriptor.buttonCount, 4u);
+    const UINT buttonRows = (descriptor.buttonCount + buttonColumns - 1) / buttonColumns;
+    const short buttonWidth = static_cast<short>((std::max)(45,
+        (dialog.width - 24 - static_cast<short>(buttonColumns - 1) * buttonGap) /
+            static_cast<short>(buttonColumns)));
+    int defaultButton = descriptor.defaultButton;
+    bool hasDefault = false;
+    for (UINT index = 0; index < descriptor.buttonCount; ++index)
+    {
+        if (descriptor.buttons[index].identifier == defaultButton) hasDefault = true;
+    }
+    if (!hasDefault) defaultButton = descriptor.buttons[0].identifier;
+    for (UINT index = 0; index < descriptor.buttonCount; ++index)
+    {
+        const UINT row = index / buttonColumns;
+        const UINT column = index % buttonColumns;
+        const short x = static_cast<short>(12 + column * (buttonWidth + buttonGap));
+        const short y = static_cast<short>(buttonY + row * (buttonHeight + buttonGap));
+        DialogItem button = PropertySheetButton(
+            static_cast<DWORD>(descriptor.buttons[index].identifier), x, y,
+            buttonWidth, descriptor.buttons[index].text,
+            descriptor.buttons[index].identifier == defaultButton);
+        dialog.items.push_back(std::move(button));
+    }
+    dialog.height = static_cast<short>(buttonY +
+        buttonRows * (buttonHeight + buttonGap) + 8);
+
+    TaskDialogRuntime runtime;
+    runtime.descriptor = descriptor;
+    runtime.defaultButton = defaultButton;
+    runtime.selectedButton = defaultButton;
+    runtime.selectedRadio = descriptor.defaultRadioButton;
+    runtime.verificationChecked = descriptor.verificationChecked;
+    const INT_PTR result = RunGuestDialog(descriptor.instance, dialog,
+        descriptor.owner, &TaskDialogProcedure, reinterpret_cast<LPARAM>(&runtime));
+    if (result < 0) return E_FAIL;
+    if (selectedButton) *selectedButton = runtime.selectedButton;
+    if (selectedRadioButton) *selectedRadioButton = runtime.selectedRadio;
+    if (verificationChecked) *verificationChecked = runtime.verificationChecked;
+    return S_OK;
 }
 
 BOOL Win32Bridge::Bridge::HandleGuestDialogMessage(HWND dialog, const MSG* message)

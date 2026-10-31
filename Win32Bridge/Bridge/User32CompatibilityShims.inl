@@ -11,13 +11,13 @@ namespace
     using GuestWinEventProc = void (CALLBACK*)(HWINEVENTHOOK, DWORD, HWND, LONG, LONG, DWORD, DWORD);
     using GuestWndEnumProc = BOOL (CALLBACK*)(HWND, LPARAM);
     using GuestMonitorEnumProc = BOOL (CALLBACK*)(HMONITOR, HDC, LPRECT, LPARAM);
-    using GuestHookProc = LRESULT (CALLBACK*)(int, WPARAM, LPARAM);
     using GuestSendAsyncProc = void (CALLBACK*)(HWND, UINT, ULONG_PTR, LRESULT);
     struct GuestTrackMouseEvent { DWORD cbSize; DWORD dwFlags; HWND hwndTrack; DWORD dwHoverTime; };
     struct GuestScrollInfo { UINT cbSize; UINT fMask; int nMin; int nMax; UINT nPage; int nPos; int nTrackPos; };
     struct GuestFlashWindowInfo { UINT cbSize; HWND hwnd; DWORD dwFlags; UINT uCount; DWORD dwTimeout; };
     struct GuestComboBoxInfo { DWORD cbSize; RECT rcItem; RECT rcButton; DWORD stateButton; HWND hwndCombo; HWND hwndItem; HWND hwndList; };
     struct GuestMenuBarInfo { DWORD cbSize; RECT rcBar; HMENU hMenu; HWND hwndMenu; BOOL fBarFocused : 1; BOOL fFocused : 1; };
+    struct GuestWindowInfo { DWORD cbSize; RECT rcWindow; RECT rcClient; DWORD dwStyle; DWORD dwExStyle; DWORD dwWindowStatus; UINT cxWindowBorders; UINT cyWindowBorders; ATOM atomWindowType; WORD wCreatorVersion; };
     struct GuestIconInfo { BOOL fIcon; DWORD xHotspot; DWORD yHotspot; HBITMAP hbmMask; HBITMAP hbmColor; };
     constexpr UINT GuestGwHwndFirst = 0;
     constexpr UINT GuestGwHwndLast = 1;
@@ -283,12 +283,80 @@ BOOL WINAPI BridgeEnumChildWindows(HWND parent, GuestWndEnumProc callback, LPARA
     return TRUE;
 }
 
-BOOL WINAPI BridgeEnumThreadWindows(DWORD, GuestWndEnumProc callback, LPARAM parameter)
+BOOL WINAPI BridgeEnumWindows(GuestWndEnumProc callback, LPARAM parameter)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager || !callback) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     for (const HWND window : manager->SnapshotGuestWindows(nullptr, false))
         if (!InvokeGuestWindowEnumProc(callback, window, parameter)) return FALSE;
+    BridgeSetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL WINAPI BridgeEnumThreadWindows(DWORD threadId, GuestWndEnumProc callback, LPARAM parameter)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager || !callback || !threadId)
+    { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    for (const HWND window : manager->SnapshotGuestWindows(nullptr, false))
+    {
+        DWORD error = ERROR_SUCCESS;
+        if (manager->GetGuestWindowThreadId(window, &error) == threadId &&
+            !InvokeGuestWindowEnumProc(callback, window, parameter))
+            return FALSE;
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+HWND WINAPI BridgeGetTopWindow(HWND parent)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return nullptr;
+    if (parent && !manager->IsGuestWindow(parent))
+    {
+        BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return nullptr;
+    }
+    const auto windows = manager->SnapshotGuestWindows(parent, false);
+    BridgeSetLastError(ERROR_SUCCESS);
+    return windows.empty() ? nullptr : windows.front();
+}
+
+BOOL WINAPI BridgeGetWindowInfo(HWND window, GuestWindowInfo* info)
+{
+    constexpr int WindowStyleIndex = -16;
+    constexpr int WindowExStyleIndex = -20;
+    constexpr int ClassAtomIndex = -32;
+    constexpr int MetricBorderWidth = 5;
+    constexpr int MetricBorderHeight = 6;
+    if (!info || info->cbSize != sizeof(GuestWindowInfo))
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    if (!BridgeIsWindow(window) ||
+        !BridgeGetWindowRect(window, &info->rcWindow) ||
+        !BridgeGetClientRect(window, &info->rcClient))
+    {
+        BridgeSetLastError(ERROR_INVALID_WINDOW_HANDLE);
+        return FALSE;
+    }
+    POINT clientOrigin{ info->rcClient.left, info->rcClient.top };
+    POINT clientEnd{ info->rcClient.right, info->rcClient.bottom };
+    if (!BridgeClientToScreen(window, &clientOrigin) ||
+        !BridgeClientToScreen(window, &clientEnd))
+        return FALSE;
+    info->rcClient = { clientOrigin.x, clientOrigin.y, clientEnd.x, clientEnd.y };
+    info->dwStyle = static_cast<DWORD>(BridgeGetWindowLongW(window, WindowStyleIndex));
+    info->dwExStyle = static_cast<DWORD>(BridgeGetWindowLongW(window, WindowExStyleIndex));
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return FALSE;
+    info->dwWindowStatus = manager->GetGuestForegroundWindow() == window ? 0x0001u : 0u;
+    info->cxWindowBorders = static_cast<UINT>((std::max)(0, BridgeGetSystemMetrics(MetricBorderWidth)));
+    info->cyWindowBorders = static_cast<UINT>((std::max)(0, BridgeGetSystemMetrics(MetricBorderHeight)));
+    info->atomWindowType = static_cast<ATOM>(BridgeGetClassLongPtrW(window, ClassAtomIndex));
+    info->wCreatorVersion = 0x0501;
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -864,26 +932,112 @@ BOOL WINAPI BridgeEndDeferWindowPos(HANDLE handle)
     return TRUE;
 }
 
+struct GuestHookRecord final
+{
+    ULONG_PTR token = 0;
+    int type = 0;
+    GuestHookProc procedure = nullptr;
+    HINSTANCE module = nullptr;
+    DWORD threadId = 0;
+};
+
+struct GuestHookDispatchFrame final
+{
+    std::vector<GuestHookRecord> chain;
+    size_t next = 0;
+    int code = 0;
+    WPARAM wParam = 0;
+    LPARAM lParam = 0;
+    GuestHookDispatchFrame* previous = nullptr;
+};
+
 std::mutex g_hookLock;
 ULONG_PTR g_nextHook = 0x7fff9000;
-std::unordered_map<ULONG_PTR, GuestHookProc> g_hooks;
+std::unordered_map<ULONG_PTR, GuestHookRecord> g_hooks;
+thread_local GuestHookDispatchFrame* g_hookDispatchFrame = nullptr;
 
-HANDLE WINAPI BridgeSetWindowsHookExW(int, GuestHookProc procedure, HINSTANCE, DWORD)
+LRESULT InvokeNextGuestHook(GuestHookDispatchFrame* frame)
+{
+    if (!frame || frame->next >= frame->chain.size()) return 0;
+    const GuestHookRecord record = frame->chain[frame->next++];
+    DWORD exceptionCode = ERROR_SUCCESS;
+    const LRESULT result = InvokeGuestHookProcedure(record.procedure,
+        frame->code, frame->wParam, frame->lParam, &exceptionCode);
+    if (exceptionCode != ERROR_SUCCESS)
+    {
+        RuntimeDiagnostics::Record(
+            L"GUEST HOOK EXCEPTION: code " +
+            std::to_wstring(static_cast<unsigned long>(exceptionCode)) +
+            L", hook " + std::to_wstring(record.type) + L".");
+    }
+    return result;
+}
+
+LRESULT InvokeGuestHookChain(int hookType, int code, WPARAM wParam,
+    LPARAM lParam, DWORD targetThreadId)
+{
+    GuestHookDispatchFrame frame;
+    frame.code = code;
+    frame.wParam = wParam;
+    frame.lParam = lParam;
+    {
+        std::lock_guard<std::mutex> guard(g_hookLock);
+        for (const auto& entry : g_hooks)
+        {
+            const GuestHookRecord& hook = entry.second;
+            if (hook.type == hookType &&
+                (hook.threadId == 0 || hook.threadId == targetThreadId))
+                frame.chain.push_back(hook);
+        }
+    }
+    // Windows calls the most recently installed matching hook first.
+    std::sort(frame.chain.begin(), frame.chain.end(),
+        [](const GuestHookRecord& left, const GuestHookRecord& right)
+        { return left.token > right.token; });
+    frame.previous = g_hookDispatchFrame;
+    g_hookDispatchFrame = &frame;
+    const LRESULT result = InvokeNextGuestHook(&frame);
+    g_hookDispatchFrame = frame.previous;
+    return result;
+}
+
+void ResetGuestHookState()
+{
+    std::lock_guard<std::mutex> guard(g_hookLock);
+    g_hooks.clear();
+    g_nextHook = 0x7fff9000;
+    g_hookDispatchFrame = nullptr;
+}
+
+HANDLE WINAPI BridgeSetWindowsHookExW(int type, GuestHookProc procedure,
+    HINSTANCE module, DWORD threadId)
 {
     if (!procedure) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return nullptr; }
     std::lock_guard<std::mutex> guard(g_hookLock);
     const ULONG_PTR token = ++g_nextHook;
-    g_hooks[token] = procedure;
+    GuestHookRecord record;
+    record.token = token;
+    record.type = type;
+    record.procedure = procedure;
+    record.module = module;
+    record.threadId = threadId;
+    g_hooks[token] = record;
+    BridgeSetLastError(ERROR_SUCCESS);
     return reinterpret_cast<HANDLE>(token);
 }
 
 BOOL WINAPI BridgeUnhookWindowsHookEx(HANDLE hook)
 {
     std::lock_guard<std::mutex> guard(g_hookLock);
-    return g_hooks.erase(reinterpret_cast<ULONG_PTR>(hook)) != 0;
+    const BOOL removed = g_hooks.erase(reinterpret_cast<ULONG_PTR>(hook)) != 0;
+    BridgeSetLastError(removed ? ERROR_SUCCESS : ERROR_INVALID_HANDLE);
+    return removed;
 }
 
-LRESULT WINAPI BridgeCallNextHookEx(HANDLE, int, WPARAM, LPARAM) { return 0; }
+LRESULT WINAPI BridgeCallNextHookEx(HANDLE, int, WPARAM, LPARAM)
+{
+    return InvokeNextGuestHook(g_hookDispatchFrame);
+}
 
 struct GuestScrollState final
 {

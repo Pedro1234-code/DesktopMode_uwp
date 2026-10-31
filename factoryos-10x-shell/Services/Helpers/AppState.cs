@@ -44,6 +44,7 @@ namespace factoryos_10x_shell.Services.Helpers
 
         public void SetFilesWindowState(bool isOpen, bool isMinimized)
         {
+            if (IsFilesOpen == isOpen && IsFilesMinimized == isMinimized) return;
             IsFilesOpen = isOpen;
             IsFilesMinimized = isMinimized;
             OnFilesStateChanged?.Invoke();
@@ -73,6 +74,7 @@ namespace factoryos_10x_shell.Services.Helpers
 
         public void SetNotepadWindowState(bool isOpen, bool isMinimized)
         {
+            if (IsNotepadOpen == isOpen && IsNotepadMinimized == isMinimized) return;
             IsNotepadOpen = isOpen;
             IsNotepadMinimized = isMinimized;
             OnNotepadStateChanged?.Invoke();
@@ -90,6 +92,7 @@ namespace factoryos_10x_shell.Services.Helpers
         public void RequestSettingsOpen() => OnSettingsRequested?.Invoke();
         public void SetSettingsWindowState(bool isOpen, bool isMinimized)
         {
+            if (IsSettingsOpen == isOpen && IsSettingsMinimized == isMinimized) return;
             IsSettingsOpen = isOpen;
             IsSettingsMinimized = isMinimized;
             OnSettingsStateChanged?.Invoke();
@@ -106,6 +109,7 @@ namespace factoryos_10x_shell.Services.Helpers
         public void RequestCalculatorOpen() => OnCalculatorRequested?.Invoke();
         public void SetCalculatorWindowState(bool isOpen, bool isMinimized)
         {
+            if (IsCalculatorOpen == isOpen && IsCalculatorMinimized == isMinimized) return;
             IsCalculatorOpen = isOpen;
             IsCalculatorMinimized = isMinimized;
             OnCalculatorStateChanged?.Invoke();
@@ -118,6 +122,20 @@ namespace factoryos_10x_shell.Services.Helpers
         public event Action OnFirefoxStateChanged;
         public event Action OnFirefoxActivated;
         private StorageFile m_pendingFirefoxFile;
+        private readonly Queue<string> m_pendingFirefoxUrls = new Queue<string>();
+        public event Action OnFirefoxUrlRequested;
+        public bool HasPendingFirefoxUrls => m_pendingFirefoxUrls.Count > 0;
+
+        public void RequestFirefoxUrl(string url)
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out Uri uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)) return;
+            m_pendingFirefoxUrls.Enqueue(uri.AbsoluteUri);
+            OnFirefoxUrlRequested?.Invoke();
+        }
+
+        public string TakePendingFirefoxUrl() => m_pendingFirefoxUrls.Count == 0
+            ? null : m_pendingFirefoxUrls.Dequeue();
 
         public void RequestFirefoxOpen(StorageFile file = null)
         {
@@ -135,6 +153,7 @@ namespace factoryos_10x_shell.Services.Helpers
         }
         public void SetFirefoxWindowState(bool isOpen, bool isMinimized)
         {
+            if (IsFirefoxOpen == isOpen && IsFirefoxMinimized == isMinimized) return;
             IsFirefoxOpen = isOpen;
             IsFirefoxMinimized = isMinimized;
             OnFirefoxStateChanged?.Invoke();

@@ -167,13 +167,14 @@
                                         <Button Width="90" Height="90" Click="WebAppButton_Click" Style="{StaticResource AppIconBackgroundStyle}">
                                             <Button.ContextFlyout>
                                             <MenuFlyout Opened="ContextFlyout_Opened" Closed="ContextFlyout_Closed">
-                                                <MenuFlyoutItem Click="NewWebAppWindow_Click" Text="New window" />
+                                                <MenuFlyoutItem Click="NewWebAppWindow_Click" Text="{Binding NewInstanceText}" />
                                                 <MenuFlyoutItem Click="PinWebApp_Click" Text="Pin to taskbar" />
                                                     <MenuFlyoutItem Click="UninstallWebApp_Click" Text="Uninstall" />
                                                 </MenuFlyout>
                                             </Button.ContextFlyout>
                                             <StackPanel VerticalAlignment="Center">
                                                 <Grid Width="32" Height="32" HorizontalAlignment="Center">
+                                                    <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="26" Opacity="{Binding FallbackGlyphOpacity}" Text="&#xE774;" />
                                                     <Image Width="32" Height="32" Source="{Binding IconUri}" Stretch="Uniform" />
                                                 </Grid>
                                                 <TextBlock Margin="5,5,5,0" HorizontalAlignment="Center" FontSize="11" MaxLines="1" Text="{Binding Name}" TextAlignment="Center" TextTrimming="CharacterEllipsis" />

@@ -13,6 +13,10 @@ namespace Win32Bridge
 {
 namespace Bridge
 {
+    // Clears bridge-owned USER32 handle tables at an emulated process
+    // boundary.  It intentionally does not invoke guest callbacks.
+    void ResetGuestUser32State();
+
     // A read-only snapshot consumed by the guest compositor.  Menu handles
     // remain private to USER32; the window layer receives only presentation
     // metadata and never exposes a host menu object to the PE.
@@ -75,6 +79,7 @@ namespace Bridge
     BOOL WINAPI BridgeAdjustWindowRectEx(LPRECT rect, DWORD style, BOOL hasMenu, DWORD extendedStyle);
     BOOL WINAPI BridgeDestroyWindow(HWND window);
     BOOL WINAPI BridgeShowWindow(HWND window, int command);
+    BOOL WINAPI BridgeExitWindowsEx(UINT flags, DWORD reason);
     BOOL WINAPI BridgeGetClientRect(HWND window, LPRECT rect);
     BOOL WINAPI BridgeGetWindowRect(HWND window, LPRECT rect);
     BOOL WINAPI BridgeSetWindowTextW(HWND window, LPCWSTR text);
@@ -145,6 +150,11 @@ namespace Bridge
     HANDLE WINAPI BridgeSetClipboardData(UINT format, HANDLE memory);
     INT_PTR WINAPI BridgeDialogBoxParamW(HINSTANCE instance, LPCWSTR templateName, HWND parent, DLGPROC dialogProcedure, LPARAM initParameter);
     BOOL WINAPI BridgeIsDialogMessageW(HWND dialog, const GuestAbi::Message* message);
+    // Dispatches an installed guest hook chain.  The caller supplies the
+    // thread whose queue/window is being observed so thread-local hooks follow
+    // USER32 routing instead of the host thread currently executing the shim.
+    LRESULT DispatchGuestHook(int hookType, int code, WPARAM wParam,
+        LPARAM lParam, DWORD targetThreadId);
     UINT WINAPI BridgeRegisterClipboardFormatW(LPCWSTR formatName);
     HMENU WINAPI BridgeCreateMenu();
     HMENU WINAPI BridgeCreatePopupMenu();

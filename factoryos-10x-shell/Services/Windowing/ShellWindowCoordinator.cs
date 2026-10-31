@@ -16,7 +16,8 @@ namespace factoryos_10x_shell.Services.Windowing
         Notepad,
         Settings,
         Calculator,
-        Firefox
+        Firefox,
+        FileOperation
     }
 
     internal sealed class ShellWindowReference

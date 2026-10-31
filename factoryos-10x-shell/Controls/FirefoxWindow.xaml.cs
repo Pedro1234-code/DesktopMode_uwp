@@ -3,6 +3,10 @@ using factoryos_10x_shell.Library.Services.Input;
 using factoryos_10x_shell.Services.Helpers;
 using Microsoft.Extensions.DependencyInjection;
 using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using Windows.ApplicationModel.DataTransfer;
 using Windows.Foundation;
 using Windows.Storage;
 using Windows.UI.Core;
@@ -16,9 +20,197 @@ namespace factoryos_10x_shell.Controls
     public sealed partial class FirefoxWindow : UserControl
     {
         public event Action<bool> FullscreenChanged;
+        public event Action<bool> ExternalWindowChanged;
 
         private static FirefoxWindow s_current;
         private GeckoHost m_host;
+        private readonly List<StorageFolder> m_droppedUploadFolders = new List<StorageFolder>();
+        private sealed class UploadDrag
+        {
+            public Task<string> Paths;
+            public StorageFolder StagingFolder;
+            public bool Cancelled;
+            public bool Entered;
+            public bool Dropped;
+            public bool Dropping;
+        }
+        private UploadDrag m_uploadDrag;
+        internal static void BeginFileDrag()
+        {
+            if (s_current != null)
+                s_current.UploadDropTarget.IsHitTestVisible = true;
+        }
+
+        internal static void EndFileDrag()
+        {
+            if (s_current != null)
+                s_current.UploadDropTarget.IsHitTestVisible = false;
+            // A source completion notification must not cancel a Drop deferral
+            // that is still resolving brokered StorageFiles.
+            if (s_current?.m_uploadDrag?.Dropping != true)
+                s_current?.CancelUploadDrag();
+        }
+
+        private async Task<string> PrepareUploadFilesAsync(UploadDrag drag, DataPackageView data)
+        {
+            StorageFolder folder = null;
+            try
+            {
+                var items = await data.GetStorageItemsAsync();
+                var files = items.OfType<StorageFile>().ToList();
+                if (files.Count == 0) return null;
+                var uploads = await ApplicationData.Current.TemporaryFolder.CreateFolderAsync(
+                    "StrawfoxUploads", CreationCollisionOption.OpenIfExists);
+                folder = await uploads.CreateFolderAsync(Guid.NewGuid().ToString("N"));
+                drag.StagingFolder = folder;
+                var paths = new System.Collections.Generic.List<string>();
+                foreach (StorageFile file in files)
+                {
+                    if (drag.Cancelled) return null;
+                    // Different selected folders can contain files with the
+                    // same name. Isolate each copy so DOM File.name is preserved.
+                    StorageFolder fileFolder = await folder.CreateFolderAsync(paths.Count.ToString());
+                    StorageFile copy = await file.CopyAsync(fileFolder, file.Name, NameCollisionOption.FailIfExists);
+                    paths.Add(copy.Path);
+                }
+                return drag.Cancelled ? null : string.Join("\n", paths);
+            }
+            finally
+            {
+                // Files delivered to DOM File objects must remain readable after
+                // Drop returns: uploads and FileReader can start asynchronously.
+                if (folder != null && drag.Cancelled && !drag.Dropped)
+                    await DeleteUploadFolderAsync(folder);
+            }
+        }
+
+        private static async Task DeleteUploadFolderAsync(StorageFolder folder)
+        {
+            if (folder == null) return;
+            try { await folder.DeleteAsync(StorageDeleteOption.PermanentDelete); }
+            catch (Exception) { }
+        }
+
+        private bool CanAcceptUpload(DragEventArgs e) => m_host?.IsStarted == true &&
+            e.DataView.Contains(StandardDataFormats.StorageItems);
+
+        private async void BrowserSurface_DragEnter(object sender, DragEventArgs e)
+        {
+            if (!CanAcceptUpload(e)) return;
+            e.Handled = true;
+            e.AcceptedOperation = DataPackageOperation.Copy;
+            var deferral = e.GetDeferral();
+            var drag = m_uploadDrag;
+            try
+            {
+                if (drag == null)
+                {
+                    drag = new UploadDrag();
+                    m_uploadDrag = drag;
+                    drag.Paths = PrepareUploadFilesAsync(drag, e.DataView);
+                }
+                string paths = await drag.Paths;
+                if (drag.Cancelled || m_uploadDrag != drag || string.IsNullOrEmpty(paths))
+                {
+                    e.AcceptedOperation = DataPackageOperation.None;
+                    return;
+                }
+                Point point = e.GetPosition(BrowserSurface);
+                if (!drag.Entered)
+                    drag.Entered = m_host?.DragFiles(0, point.X, point.Y, paths) == true;
+                if (!drag.Entered)
+                {
+                    e.AcceptedOperation = DataPackageOperation.None;
+                    if (m_uploadDrag == drag) CancelUploadDrag();
+                }
+            }
+            catch (Exception exception)
+            {
+                e.AcceptedOperation = DataPackageOperation.None;
+                if (m_uploadDrag == drag) CancelUploadDrag();
+                System.Diagnostics.Debug.WriteLine($"Upload drag preparation failed: 0x{exception.HResult:X8}");
+            }
+            finally { deferral.Complete(); }
+        }
+
+        private void BrowserSurface_DragOver(object sender, DragEventArgs e)
+        {
+            if (!CanAcceptUpload(e)) return;
+            e.Handled = true;
+            e.AcceptedOperation = m_uploadDrag != null ? DataPackageOperation.Copy : DataPackageOperation.None;
+            e.DragUIOverride.Caption = "Upload files";
+            if (m_uploadDrag?.Entered != true) return;
+            Point point = e.GetPosition(BrowserSurface);
+            m_host.DragFiles(1, point.X, point.Y, string.Empty);
+        }
+
+        private void BrowserSurface_DragLeave(object sender, DragEventArgs e)
+        {
+            if (m_uploadDrag?.Dropping == true) return;
+            Point point = e.GetPosition(BrowserSurface);
+            if (point.X >= 0 && point.Y >= 0 && point.X < BrowserSurface.ActualWidth &&
+                point.Y < BrowserSurface.ActualHeight) return;
+            CancelUploadDrag();
+        }
+
+        private void CancelUploadDrag()
+        {
+            var drag = m_uploadDrag;
+            m_uploadDrag = null;
+            if (drag == null) return;
+            drag.Cancelled = true;
+            if (drag.Entered) m_host?.DragFiles(2, 0, 0, string.Empty);
+            // If file staging already finished, PrepareUploadFilesAsync has
+            // already passed its cleanup point. Remove canceled uploads here;
+            // an in-progress staging task performs the same cleanup in finally.
+            if (!drag.Dropped && drag.Paths?.IsCompleted == true)
+                _ = DeleteUploadFolderAsync(drag.StagingFolder);
+        }
+
+        private async void BrowserSurface_Drop(object sender, DragEventArgs e)
+        {
+            if (!CanAcceptUpload(e)) return;
+            e.Handled = true;
+            e.AcceptedOperation = DataPackageOperation.None;
+            var deferral = e.GetDeferral();
+            var drag = m_uploadDrag;
+            Point point = e.GetPosition(BrowserSurface);
+            try
+            {
+                if (drag == null)
+                {
+                    drag = new UploadDrag();
+                    m_uploadDrag = drag;
+                    drag.Paths = PrepareUploadFilesAsync(drag, e.DataView);
+                }
+                drag.Dropping = true;
+                string paths = await drag.Paths;
+                if (drag.Cancelled || m_uploadDrag != drag || string.IsNullOrEmpty(paths)) return;
+                AppState.Instance.ActivateFirefox();
+                if (!drag.Entered)
+                    drag.Entered = m_host?.DragFiles(0, point.X, point.Y, paths) == true;
+                // Even a fast enter-and-release must let Gecko hit-test the
+                // target and negotiate dropEffect before receiving the drop.
+                if (drag.Entered && m_host.DragFiles(1, point.X, point.Y, string.Empty) &&
+                    m_host.DragFiles(3, point.X, point.Y, paths))
+                {
+                    e.AcceptedOperation = DataPackageOperation.Copy;
+                    drag.Dropped = true;
+                    drag.Entered = false;
+                    if (drag.StagingFolder != null)
+                        m_droppedUploadFolders.Add(drag.StagingFolder);
+                }
+            }
+            catch (Exception exception)
+            {
+                System.Diagnostics.Debug.WriteLine($"Upload drop failed: 0x{exception.HResult:X8}");
+            }
+            finally
+            {
+                if (m_uploadDrag == drag) CancelUploadDrag();
+                deferral.Complete();
+            }
+        }
         private bool m_hostAttached;
         private bool m_hostStarting;
         private bool m_hostFailed;
@@ -30,7 +222,11 @@ namespace factoryos_10x_shell.Controls
         private bool m_isWindowActive;
         private bool m_inputSuppressed;
         private bool m_nativeCursorRequested;
-        private string m_pendingUrl;
+        private bool m_pointerInsideWindow;
+        private bool m_externalWindowOpen;
+        private bool m_initialWindowStateApplied;
+        private readonly System.Collections.Generic.Queue<string> m_pendingUrls =
+            new System.Collections.Generic.Queue<string>();
         private WindowResizeCorner m_resizeCorner;
         private Point m_startPoint;
         private double m_startWidth;
@@ -46,6 +242,9 @@ namespace factoryos_10x_shell.Controls
         private int m_restoreHostZIndex;
         private readonly IMouseInputService m_mouseInput;
         private readonly DispatcherTimer m_windowCommandTimer;
+        private readonly DispatcherTimer m_viewportResizeTimer;
+        private Canvas m_hookedHost;
+        private FrameworkElement m_hookedScreen;
 
         public FirefoxWindow()
         {
@@ -53,9 +252,24 @@ namespace factoryos_10x_shell.Controls
             s_current = this;
             m_mouseInput = App.ServiceProvider.GetRequiredService<IMouseInputService>();
             m_mouseInput.InputChanged += MouseInput_InputChanged;
-            m_windowCommandTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
+            Loaded += FirefoxWindow_Loaded;
+            UpdateResizeGripVisibility();
+            // Window commands are rare. Every tick crosses the managed/WinRT
+            // boundary at least twice, so polling at rendering frequency can
+            // steal enough UI-thread slices to make the Shell pointer hitch.
+            // 100 ms is still immediate for title-bar buttons and popups; an
+            // active native title-bar drag temporarily switches to 60 Hz below.
+            m_windowCommandTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(100) };
             m_windowCommandTimer.Tick += WindowCommandTimer_Tick;
-            m_windowCommandTimer.Start();
+            // A fullscreen transition changes the host margin, the window
+            // border and the window bounds in separate XAML layout passes.
+            // Publish only the settled viewport; Gecko already knows the
+            // final screen rectangle before it announces DOM fullscreen.
+            m_viewportResizeTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(75)
+            };
+            m_viewportResizeTimer.Tick += ViewportResizeTimer_Tick;
         }
 
         public static bool SuspendRuntime()
@@ -80,9 +294,16 @@ namespace factoryos_10x_shell.Controls
         public void Open()
         {
             Visibility = Visibility.Visible;
+            HookHostCanvas();
+            ApplyInitialWindowState();
+            m_windowCommandTimer.Interval = TimeSpan.FromMilliseconds(100);
+            if (!m_windowCommandTimer.IsEnabled)
+                m_windowCommandTimer.Start();
             EnsureHost();
             AppState.Instance.SetFirefoxWindowState(true, false);
             AppState.Instance.ActivateFirefox();
+            if (m_externalWindowOpen)
+                ExternalWindowChanged?.Invoke(true);
         }
 
         public async void OpenFile(StorageFile file)
@@ -95,23 +316,34 @@ namespace factoryos_10x_shell.Controls
                     "FirefoxPdf", CreationCollisionOption.OpenIfExists);
                 StorageFile readable = await file.CopyAsync(
                     cache, file.Name, NameCollisionOption.ReplaceExisting);
-                m_pendingUrl = new System.Uri(readable.Path).AbsoluteUri;
+                m_pendingUrls.Enqueue(new System.Uri(readable.Path).AbsoluteUri);
             }
             catch
             {
                 // Keep the direct path as a fallback on desktop systems where
                 // the activation grant is also honored by native file access.
-                m_pendingUrl = new System.Uri(file.Path).AbsoluteUri;
+                m_pendingUrls.Enqueue(new System.Uri(file.Path).AbsoluteUri);
             }
+            FlushPendingUrl();
+        }
+
+        public void OpenUrl(string url)
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out Uri uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)) return;
+            Open();
+            m_pendingUrls.Enqueue(uri.AbsoluteUri);
             FlushPendingUrl();
         }
 
         private void FlushPendingUrl()
         {
-            if (m_host == null || string.IsNullOrEmpty(m_pendingUrl)) return;
-            string url = m_pendingUrl;
-            m_pendingUrl = null;
-            m_host.OpenUrl(url);
+            if (m_host?.IsStarted != true) return;
+            while (m_pendingUrls.Count > 0)
+            {
+                m_host.OpenUrl(m_pendingUrls.Peek());
+                m_pendingUrls.Dequeue();
+            }
         }
 
         public void CloseFromTaskView() => Close();
@@ -121,6 +353,11 @@ namespace factoryos_10x_shell.Controls
         public void SetWindowActive(bool active)
         {
             m_isWindowActive = active;
+            // Activation does not make commands more frequent. Keep the idle
+            // cadence stable; BeginWindowDrag is the only operation that needs
+            // frame-rate polling and switches it temporarily below.
+            if (!m_dragging)
+                m_windowCommandTimer.Interval = TimeSpan.FromMilliseconds(100);
             UpdateHostInput();
         }
 
@@ -151,6 +388,9 @@ namespace factoryos_10x_shell.Controls
                     }
 
                     BrowserSurface.Children.Add(content);
+                    // UploadDropTarget sits above the mixed XAML/DirectX tree
+                    // only during a Files drag. Its hit target is unambiguous
+                    // regardless of which compositor child currently presents.
                     m_hostAttached = true;
                     FlushPendingUrl();
                 }
@@ -164,6 +404,7 @@ namespace factoryos_10x_shell.Controls
                         m_host.SetViewport(BrowserSurface.ActualWidth, BrowserSurface.ActualHeight);
                     UpdateGeckoScreen();
                     UpdateHostInput();
+                    FlushPendingUrl();
                 });
 
                 // MainDesktop is created after the Shell's first activation on
@@ -195,6 +436,7 @@ namespace factoryos_10x_shell.Controls
         {
             m_hostFailed = true;
             try { m_host?.SetActive(false); } catch { }
+            UploadDropTarget.IsHitTestVisible = false;
             BrowserSurface.Children.Clear();
             BrowserSurface.Children.Add(new StackPanel
             {
@@ -212,24 +454,43 @@ namespace factoryos_10x_shell.Controls
         {
             bool active = m_isWindowActive && !m_inputSuppressed && Visibility == Visibility.Visible;
             m_host?.SetActive(active);
-            if (active == m_nativeCursorRequested) return;
+            UpdateNativeCursorRequest();
+        }
 
-            m_nativeCursorRequested = active;
+        private void UpdateNativeCursorRequest()
+        {
+            bool requested = m_pointerInsideWindow && Visibility == Visibility.Visible;
+            if (requested == m_nativeCursorRequested) return;
+
+            m_nativeCursorRequested = requested;
             // Gecko supplies CSS cursor changes through CoreWindow. While its
-            // surface is active, let that native cursor replace the Shell's
-            // arrow-only bitmap; restore the custom Shell cursor on deactivation.
-            MainPage.SetPopupCursorVisibility(active);
+            // window is under the pointer, let that native cursor replace the
+            // Shell bitmap; restore the custom cursor after leaving the window.
+            MainPage.SetPopupCursorVisibility(requested);
         }
 
         private void Close()
         {
+            UploadDropTarget.IsHitTestVisible = false;
+            CancelUploadDrag();
+            foreach (StorageFolder folder in m_droppedUploadFolders)
+                _ = DeleteUploadFolderAsync(folder);
+            m_droppedUploadFolders.Clear();
+            m_pendingUrls.Clear();
             if (m_fullscreen) SetFullscreen(false);
             SetWindowActive(false);
             // Closing is distinct from minimizing: stop the embedded host and
             // put Gecko into its suspended application state so media, timers
             // and page activity do not keep running behind the Shell.
             try { m_host?.Close(); } catch { }
+            m_externalWindowOpen = false;
+            m_initialWindowStateApplied = false;
+            ExternalWindowChanged?.Invoke(false);
             Visibility = Visibility.Collapsed;
+            m_pointerInsideWindow = false;
+            m_windowCommandTimer.Stop();
+            m_viewportResizeTimer.Stop();
+            m_windowCommandTimer.Interval = TimeSpan.FromMilliseconds(100);
             UpdateHostInput();
             AppState.Instance.SetFirefoxWindowState(false, false);
         }
@@ -239,12 +500,29 @@ namespace factoryos_10x_shell.Controls
             if (m_fullscreen) SetFullscreen(false);
             SetWindowActive(false);
             Visibility = Visibility.Collapsed;
+            m_pointerInsideWindow = false;
+            ExternalWindowChanged?.Invoke(false);
+            m_windowCommandTimer.Stop();
+            m_viewportResizeTimer.Stop();
+            m_windowCommandTimer.Interval = TimeSpan.FromMilliseconds(100);
             UpdateHostInput();
             AppState.Instance.SetFirefoxWindowState(true, true);
         }
 
         private void Root_PointerPressed(object sender, PointerRoutedEventArgs e) =>
             AppState.Instance.ActivateFirefox();
+
+        private void Root_PointerEntered(object sender, PointerRoutedEventArgs e)
+        {
+            m_pointerInsideWindow = true;
+            UpdateNativeCursorRequest();
+        }
+
+        private void Root_PointerExited(object sender, PointerRoutedEventArgs e)
+        {
+            m_pointerInsideWindow = false;
+            UpdateNativeCursorRequest();
+        }
 
         private void BrowserSurface_SizeChanged(object sender, SizeChangedEventArgs e)
         {
@@ -254,15 +532,87 @@ namespace factoryos_10x_shell.Controls
                 return;
             }
 
+            // Keep only the final layout size. Fullscreen removes the border
+            // and taskbar reservation separately, producing two sizes only a
+            // few milliseconds apart on Xbox.
+            m_viewportResizeTimer.Stop();
+            m_viewportResizeTimer.Start();
+        }
+
+        private void ViewportResizeTimer_Tick(object sender, object e)
+        {
+            m_viewportResizeTimer.Stop();
+            if (m_host?.IsStarted != true ||
+                BrowserSurface.ActualWidth <= 0 || BrowserSurface.ActualHeight <= 0)
+                return;
+
             try
             {
-                m_host.SetViewport(e.NewSize.Width, e.NewSize.Height);
+                m_host.SetViewport(BrowserSurface.ActualWidth, BrowserSurface.ActualHeight);
                 UpdateGeckoScreen();
             }
             catch (Exception exception)
             {
                 ShowHostFailure(exception);
             }
+        }
+
+        private void FirefoxWindow_Loaded(object sender, RoutedEventArgs e)
+        {
+            HookHostCanvas();
+            ApplyInitialWindowState();
+        }
+
+        private void HookHostCanvas()
+        {
+            Canvas host = VisualTreeHelper.GetParent(this) as Canvas;
+            if (host == null || ReferenceEquals(host, m_hookedHost)) return;
+            if (m_hookedHost != null) m_hookedHost.SizeChanged -= HostCanvas_SizeChanged;
+            if (m_hookedScreen != null) m_hookedScreen.SizeChanged -= ScreenRoot_SizeChanged;
+            m_hookedHost = host;
+            m_hookedHost.SizeChanged += HostCanvas_SizeChanged;
+            m_hookedScreen = VisualTreeHelper.GetParent(host) as FrameworkElement;
+            if (m_hookedScreen != null) m_hookedScreen.SizeChanged += ScreenRoot_SizeChanged;
+        }
+
+        private void HostCanvas_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (m_maximized || m_fullscreen)
+                ApplyMaximizedBounds();
+        }
+
+        private void ScreenRoot_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            UpdateGeckoScreen();
+        }
+
+        private void ApplyInitialWindowState()
+        {
+            if (m_initialWindowStateApplied) return;
+            SetMaximized(true);
+            m_initialWindowStateApplied = m_maximized;
+        }
+
+        private void ApplyMaximizedBounds()
+        {
+            Canvas host = VisualTreeHelper.GetParent(this) as Canvas;
+            if (host == null || host.ActualWidth <= 0 || host.ActualHeight <= 0) return;
+            Canvas.SetLeft(this, 0);
+            Canvas.SetTop(this, 0);
+            Width = host.ActualWidth;
+            Height = host.ActualHeight;
+            UpdateResizeGripVisibility();
+        }
+
+        private void UpdateResizeGripVisibility()
+        {
+            Visibility visibility = (m_maximized || m_fullscreen)
+                ? Visibility.Collapsed
+                : Visibility.Visible;
+            ResizeGripTopLeft.Visibility = visibility;
+            ResizeGripTopRight.Visibility = visibility;
+            ResizeGripBottomLeft.Visibility = visibility;
+            ResizeGrip.Visibility = visibility;
         }
 
         private void SetMaximized(bool maximized)
@@ -278,10 +628,8 @@ namespace factoryos_10x_shell.Controls
                 m_restoreTop = Canvas.GetTop(this);
                 m_restoreWidth = Width;
                 m_restoreHeight = Height;
-                Canvas.SetLeft(this, 0);
-                Canvas.SetTop(this, 0);
-                Width = host.ActualWidth;
-                Height = host.ActualHeight;
+                m_maximized = true;
+                ApplyMaximizedBounds();
             }
             else
             {
@@ -289,21 +637,34 @@ namespace factoryos_10x_shell.Controls
                 Canvas.SetTop(this, m_restoreTop);
                 Width = m_restoreWidth;
                 Height = m_restoreHeight;
+                m_maximized = false;
+                UpdateResizeGripVisibility();
             }
-
-            m_maximized = maximized;
         }
 
         private void UpdateGeckoScreen()
         {
-            if (m_host?.IsStarted != true) return;
-            // Gecko runs inside a virtual Shell window, not directly on the
-            // physical desktop. Its screen rect must match the framebuffer it
-            // owns. Passing the whole DesktopMode canvas here made chrome
-            // popups (notably the hamburger menu) constrain themselves to a
-            // wider screen than the browser window and appear displaced.
-            if (BrowserSurface.ActualWidth > 0 && BrowserSurface.ActualHeight > 0)
-                m_host.SetScreen(BrowserSurface.ActualWidth, BrowserSurface.ActualHeight);
+            if (m_host == null) return;
+            // A screen and a viewport are different things. Gecko uses the
+            // screen rectangle to synchronously size its widget before it
+            // announces DOM fullscreen; the viewport is the current virtual
+            // DesktopMode window and is published separately by SetViewport.
+            // Treating the current viewport as the screen forced a second
+            // resize in the middle of the fullscreen/video transition.
+            FrameworkElement screen = m_hookedScreen;
+            if (screen == null && m_hookedHost != null)
+                screen = VisualTreeHelper.GetParent(m_hookedHost) as FrameworkElement;
+
+            double width = screen?.ActualWidth ?? 0;
+            double height = screen?.ActualHeight ?? 0;
+            if (width <= 0 || height <= 0)
+            {
+                width = BrowserSurface.ActualWidth;
+                height = BrowserSurface.ActualHeight;
+            }
+
+            if (width > 0 && height > 0)
+                m_host.SetScreen(width, height);
         }
 
         private Point CurrentPointerInHost(Canvas host)
@@ -320,16 +681,33 @@ namespace factoryos_10x_shell.Controls
 
         private void BeginWindowDrag()
         {
-            if (m_maximized || m_fullscreen || !m_mouseInput.Current.IsLeftButtonPressed) return;
+            if (m_fullscreen || !m_mouseInput.Current.IsLeftButtonPressed) return;
             Canvas host = VisualTreeHelper.GetParent(this) as Canvas;
             if (host == null) return;
+
+            Point pointer = CurrentPointerInHost(host);
+            if (m_maximized)
+            {
+                double horizontalRatio = Width > 0
+                    ? Math.Max(0, Math.Min(1, pointer.X / Width))
+                    : 0.5;
+                SetMaximized(false);
+                Canvas.SetLeft(this, Math.Max(0, Math.Min(
+                    host.ActualWidth - Width, pointer.X - Width * horizontalRatio)));
+                Canvas.SetTop(this, Math.Max(0, pointer.Y - 18));
+            }
+
             m_dragging = true;
-            m_dragStartPointer = CurrentPointerInHost(host);
+            m_dragStartPointer = pointer;
             m_dragStartLeft = Canvas.GetLeft(this);
             m_dragStartTop = Canvas.GetTop(this);
         }
 
-        private void EndWindowDrag() => m_dragging = false;
+        private void EndWindowDrag()
+        {
+            m_dragging = false;
+            m_windowCommandTimer.Interval = TimeSpan.FromMilliseconds(100);
+        }
 
         private void MouseInput_InputChanged(object sender, MouseInputChangedEventArgs e)
         {
@@ -377,8 +755,10 @@ namespace factoryos_10x_shell.Controls
                 host.UpdateLayout();
                 if (m_wasMaximizedBeforeFullscreen)
                 {
+                    m_maximized = true;
                     Width = host.ActualWidth;
                     Height = host.ActualHeight;
+                    ApplyMaximizedBounds();
                 }
                 else
                 {
@@ -386,20 +766,33 @@ namespace factoryos_10x_shell.Controls
                 }
                 WindowBorder.BorderThickness = new Thickness(1);
                 WindowBorder.CornerRadius = new CornerRadius(4);
-                ResizeGripTopLeft.Visibility = Visibility.Visible;
-                ResizeGripTopRight.Visibility = Visibility.Visible;
-                ResizeGripBottomLeft.Visibility = Visibility.Visible;
-                ResizeGrip.Visibility = Visibility.Visible;
             }
 
             m_fullscreen = fullscreen;
+            // Update this only after the fullscreen flag changes. Otherwise a
+            // restored window keeps its resize grips hidden because the old
+            // fullscreen state is still observed above.
+            UpdateResizeGripVisibility();
             FullscreenChanged?.Invoke(fullscreen);
-            UpdateGeckoScreen();
+            // FullscreenChanged also hides or restores the Shell taskbar. Let
+            // that final parent layout join the same coalesced viewport update
+            // instead of publishing another intermediate screen rectangle.
+            m_viewportResizeTimer.Stop();
+            m_viewportResizeTimer.Start();
         }
 
         private void WindowCommandTimer_Tick(object sender, object e)
         {
             if (m_host == null || !m_host.IsStarted) return;
+
+            bool externalOpen;
+            try { externalOpen = m_host.IsExternalWindowOpen; }
+            catch { externalOpen = false; }
+            if (externalOpen != m_externalWindowOpen)
+            {
+                m_externalWindowOpen = externalOpen;
+                ExternalWindowChanged?.Invoke(externalOpen);
+            }
 
             int command;
             try
@@ -417,8 +810,14 @@ namespace factoryos_10x_shell.Controls
                 case 2: SetMaximized(true); break;
                 case 3: SetMaximized(false); break;
                 case 4: Close(); break;
-                case 5: BeginWindowDrag(); break;
-                case 6: EndWindowDrag(); break;
+                case 5:
+                    BeginWindowDrag();
+                    if (m_dragging)
+                        m_windowCommandTimer.Interval = TimeSpan.FromMilliseconds(16);
+                    break;
+                case 6:
+                    EndWindowDrag();
+                    break;
                 case 7: SetFullscreen(true); break;
                 case 8: SetFullscreen(false); break;
                 case 9:
@@ -426,12 +825,38 @@ namespace factoryos_10x_shell.Controls
                     if (!string.IsNullOrWhiteSpace(path))
                         AppState.Instance.RequestFilesReveal(path);
                     break;
+                case 10:
+                    string wallpaperPath = m_host.TakeWallpaperPath();
+                    if (!string.IsNullOrWhiteSpace(wallpaperPath))
+                        AppState.Instance.RequestWallpaper(wallpaperPath);
+                    break;
             }
+        }
+
+        public UIElement ExternalContent => m_host?.ExternalContent as UIElement;
+
+        public void SetExternalViewport(double width, double height)
+        {
+            if (width > 0 && height > 0)
+                m_host?.SetExternalViewport(width, height);
+        }
+
+        public void SetExternalActive(bool active) => m_host?.SetExternalActive(active);
+
+        public void RestoreExternalWindowIfOpen()
+        {
+            if (m_externalWindowOpen)
+                ExternalWindowChanged?.Invoke(true);
+        }
+
+        public void CloseExternalWindow()
+        {
+            try { m_host?.CloseExternalWindow(); } catch { }
         }
 
         private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
-            if (m_maximized) return;
+            if (m_maximized || m_fullscreen) return;
             m_resizing = true;
             m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
             m_startPoint = e.GetCurrentPoint(null).Position;

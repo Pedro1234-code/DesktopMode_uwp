@@ -194,6 +194,8 @@ BOOL WINAPI BridgePathAppendW(LPWSTR path, LPCWSTR more)
     return TRUE;
 }
 
+BOOL WINAPI BridgePathCanonicalizeW(LPWSTR destination, LPCWSTR source);
+
 LPWSTR WINAPI BridgePathCombineW(LPWSTR destination, LPCWSTR directory, LPCWSTR file)
 {
     if (!destination || (!directory && !file)) return nullptr;
@@ -203,6 +205,9 @@ LPWSTR WINAPI BridgePathCombineW(LPWSTR destination, LPCWSTR directory, LPCWSTR 
         const bool absolute = (iswalpha(file[0]) && file[1] == L':') ||
             (file[0] == L'\\' && file[1] == L'\\');
         if (absolute) result = file;
+        else if ((file[0] == L'\\' || file[0] == L'/') &&
+            result.size() >= 2 && result[1] == L':')
+            result = result.substr(0, 2) + file;
         else
         {
             if (!result.empty() && result.back() != L'\\' && result.back() != L'/') result.push_back(L'\\');
@@ -211,7 +216,9 @@ LPWSTR WINAPI BridgePathCombineW(LPWSTR destination, LPCWSTR directory, LPCWSTR 
         }
     }
     if (result.size() >= MAX_PATH) return nullptr;
-    wcscpy_s(destination, MAX_PATH, result.c_str());
+    wchar_t canonical[MAX_PATH] = {};
+    if (!BridgePathCanonicalizeW(canonical, result.c_str())) return nullptr;
+    wcscpy_s(destination, MAX_PATH, canonical);
     return destination;
 }
 
@@ -222,15 +229,27 @@ BOOL WINAPI BridgePathCanonicalizeW(LPWSTR destination, LPCWSTR source)
     std::replace(input.begin(), input.end(), L'/', L'\\');
     std::wstring prefix;
     size_t offset = 0;
+    bool driveRelative = false;
+    size_t protectedComponents = 0;
     if (input.size() >= 2 && input[1] == L':')
     {
-        prefix = input.substr(0, (input.size() >= 3 && input[2] == L'\\') ? 3 : 2);
+        const bool rooted = input.size() >= 3 && input[2] == L'\\';
+        prefix = input.substr(0, rooted ? 3 : 2);
+        driveRelative = !rooted;
         offset = prefix.size();
     }
     else if (input.rfind(L"\\\\", 0) == 0)
     {
         prefix = L"\\\\";
         offset = 2;
+        // A UNC server/share pair is the namespace root and cannot be removed
+        // by a following ".." component.
+        protectedComponents = 2;
+    }
+    else if (!input.empty() && input[0] == L'\\')
+    {
+        prefix = L"\\";
+        offset = 1;
     }
     std::vector<std::wstring> components;
     while (offset <= input.size())
@@ -240,17 +259,22 @@ BOOL WINAPI BridgePathCanonicalizeW(LPWSTR destination, LPCWSTR source)
             next == std::wstring::npos ? std::wstring::npos : next - offset);
         if (!part.empty() && part != L".")
         {
-            if (part == L".." && !components.empty() && components.back() != L"..") components.pop_back();
-            else if (part != L".." || prefix.empty()) components.push_back(part);
+            if (part == L".." && components.size() > protectedComponents &&
+                components.back() != L"..")
+                components.pop_back();
+            else if (part != L".." || prefix.empty() || driveRelative)
+                components.push_back(part);
         }
         if (next == std::wstring::npos) break;
         offset = next + 1;
     }
     std::wstring result = prefix;
-    for (const auto& part : components)
+    for (size_t index = 0; index < components.size(); ++index)
     {
-        if (!result.empty() && result.back() != L'\\') result.push_back(L'\\');
-        result += part;
+        if (!result.empty() && result.back() != L'\\' &&
+            !(driveRelative && index == 0))
+            result.push_back(L'\\');
+        result += components[index];
     }
     if (result.empty()) result = L".";
     if (result.size() >= MAX_PATH) return FALSE;
@@ -322,8 +346,11 @@ BOOL WINAPI BridgePathMatchSpecW(LPCWSTR path, LPCWSTR specification)
     while (*current)
     {
         const wchar_t* separator = wcschr(current, L';');
-        const std::wstring pattern(current,
+        std::wstring pattern(current,
             separator ? separator : current + wcslen(current));
+        // Shell wildcards historically treat *.* as the all-files pattern,
+        // including names without a period.
+        if (pattern == L"*.*") pattern = L"*";
         if (matches(path, pattern.c_str(), matches)) return TRUE;
         if (!separator) break;
         current = separator + 1;
@@ -563,7 +590,21 @@ ImportResolution ResolveAuxiliaryImport(const ImportedSymbol& symbol)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWinVerifyTrust);
     else if (_wcsicmp(symbol.library.c_str(), L"wininet.dll") == 0 && _wcsicmp(symbol.name.c_str(), L"internetcrackurlw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInternetCrackUrlW);
-    if (resolution.targetAddress) resolution.disposition = ImportDisposition::NeedsBridge;
+    if (resolution.targetAddress)
+    {
+        resolution.disposition = ImportDisposition::NeedsBridge;
+        if (_wcsicmp(symbol.library.c_str(), L"shlwapi.dll") == 0)
+            resolution.note = L"SHLWAPI adapter with Win32-compatible virtual path and color helpers.";
+        else if (_wcsicmp(symbol.library.c_str(), L"dwmapi.dll") == 0)
+            resolution.note = L"DWM compatibility adapter for the bridge-owned top-level surface.";
+        else if (_wcsicmp(symbol.library.c_str(), L"sensapi.dll") == 0 ||
+            _wcsicmp(symbol.library.c_str(), L"wininet.dll") == 0)
+            resolution.note = L"Sandbox-aware networking compatibility adapter.";
+        else if (_wcsicmp(symbol.library.c_str(), L"dbghelp.dll") == 0)
+            resolution.note = L"PE metadata helper operating on guest-mapped images.";
+        else if (_wcsicmp(symbol.library.c_str(), L"wintrust.dll") == 0)
+            resolution.note = L"Isolated trust adapter; host certificate state is not exposed.";
+    }
     return resolution;
 }
 

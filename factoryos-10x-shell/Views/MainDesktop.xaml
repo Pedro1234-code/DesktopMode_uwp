@@ -65,20 +65,58 @@
                 <DataTemplate><controls:Win32GuestWindow /></DataTemplate>
             </ItemsControl.ItemTemplate>
         </ItemsControl>
-        <Canvas x:Name="FilesWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
-            <controls:FilesWindow x:Name="FilesWindow" Canvas.Left="160" Canvas.Top="80" Visibility="Collapsed" />
-        </Canvas>
-        <Canvas x:Name="NotepadWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
-            <controls:NotepadWindow x:Name="NotepadWindow" Canvas.Left="210" Canvas.Top="105" Visibility="Collapsed" />
-        </Canvas>
-        <Canvas x:Name="SettingsWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
-            <controls:SettingsWindow x:Name="SettingsWindow" Canvas.Left="90" Canvas.Top="45" Visibility="Collapsed" />
-        </Canvas>
-        <Canvas x:Name="CalculatorWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
-            <controls:CalculatorWindow x:Name="CalculatorWindow" Canvas.Left="185" Canvas.Top="70" Visibility="Collapsed" />
-        </Canvas>
+        <Canvas x:Name="FilesWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
+        <Canvas x:Name="FileOperationWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
+        <Canvas x:Name="NotepadWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
+        <Canvas x:Name="SettingsWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
+        <Canvas x:Name="CalculatorWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
         <Canvas x:Name="FirefoxWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
-            <controls:FirefoxWindow x:Name="FirefoxWindow" Canvas.Left="70" Canvas.Top="25" Visibility="Collapsed" />
+            <Border
+                x:Name="FirefoxExternalWindow"
+                Canvas.Left="250"
+                Canvas.Top="105"
+                Canvas.ZIndex="5"
+                Width="850"
+                Height="570"
+                Background="#FF1C1B22"
+                BorderBrush="#FF5A5A5A"
+                BorderThickness="1"
+                CornerRadius="4"
+                Visibility="Collapsed"
+                PointerPressed="FirefoxExternalWindow_PointerPressed">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="36" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <Grid x:Name="FirefoxExternalTitleBar" Background="#FF25242B" PointerPressed="FirefoxExternalTitleBar_PointerPressed" PointerMoved="FirefoxExternalTitleBar_PointerMoved" PointerReleased="FirefoxExternalTitleBar_PointerReleased">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="46" />
+                            <ColumnDefinition Width="46" />
+                            <ColumnDefinition Width="46" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Margin="12,0,0,0" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                            <Image Width="18" Height="18" Source="ms-appx:///Assets/Firefox/firefox.png" />
+                            <TextBlock VerticalAlignment="Center" Foreground="White" Text="Strawfox" />
+                        </StackPanel>
+                        <Button Grid.Column="1" Padding="0" Background="Transparent" BorderThickness="0" Click="FirefoxExternalMinimize_Click" ToolTipService.ToolTip="Minimize">
+                            <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="11" Text="&#xE921;" />
+                        </Button>
+                        <Button Grid.Column="2" Padding="0" Background="Transparent" BorderThickness="0" Click="FirefoxExternalMaximize_Click" ToolTipService.ToolTip="Maximize">
+                            <TextBlock x:Name="FirefoxExternalMaximizeGlyph" FontFamily="Segoe MDL2 Assets" FontSize="11" Text="&#xE922;" />
+                        </Button>
+                        <Button Grid.Column="3" Padding="0" Background="Transparent" BorderThickness="0" Click="FirefoxExternalClose_Click" ToolTipService.ToolTip="Close">
+                            <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="11" Text="&#xE8BB;" />
+                        </Button>
+                    </Grid>
+                    <Grid x:Name="FirefoxExternalSurface" Grid.Row="1" Background="#FF1C1B22" SizeChanged="FirefoxExternalSurface_SizeChanged" />
+                    <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerPressed="FirefoxExternalResize_PointerPressed" PointerMoved="FirefoxExternalResize_PointerMoved" PointerReleased="FirefoxExternalResize_PointerReleased" />
+                    <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Tag="TopRight" PointerPressed="FirefoxExternalResize_PointerPressed" PointerMoved="FirefoxExternalResize_PointerMoved" PointerReleased="FirefoxExternalResize_PointerReleased" />
+                    <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomLeft" PointerPressed="FirefoxExternalResize_PointerPressed" PointerMoved="FirefoxExternalResize_PointerMoved" PointerReleased="FirefoxExternalResize_PointerReleased" />
+                    <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomRight" PointerPressed="FirefoxExternalResize_PointerPressed" PointerMoved="FirefoxExternalResize_PointerMoved" PointerReleased="FirefoxExternalResize_PointerReleased" />
+                </Grid>
+            </Border>
         </Canvas>
         <Grid
             x:Name="TaskViewOverlay"

@@ -48,6 +48,41 @@ namespace
     };
     static_assert(sizeof(GuestShellFileInfoW) == 696, "SHFILEINFOW x64 guest ABI mismatch");
 
+    struct GuestShellExecuteInfoW final
+    {
+        DWORD structureSize;
+        ULONG mask;
+        HWND owner;
+        LPCWSTR verb;
+        LPCWSTR file;
+        LPCWSTR parameters;
+        LPCWSTR directory;
+        INT showCommand;
+        HINSTANCE resultInstance;
+        PVOID idList;
+        LPCWSTR className;
+        HKEY classKey;
+        DWORD hotKey;
+        HANDLE iconOrMonitor;
+        HANDLE process;
+    };
+    static_assert(sizeof(GuestShellExecuteInfoW) == 112,
+        "SHELLEXECUTEINFOW x64 guest ABI mismatch");
+
+    constexpr ULONG SeeMaskNoCloseProcess = 0x00000040;
+    constexpr INT_PTR ShellErrorFileNotFound = 2;
+    constexpr INT_PTR ShellErrorAccessDenied = 5;
+    constexpr INT_PTR ShellErrorNoAssociation = 31;
+
+    bool IsExecutableShellTarget(const std::wstring& path)
+    {
+        const size_t dot = path.find_last_of(L'.');
+        if (dot == std::wstring::npos) return false;
+        const wchar_t* extension = path.c_str() + dot;
+        return _wcsicmp(extension, L".exe") == 0 ||
+            _wcsicmp(extension, L".com") == 0;
+    }
+
     constexpr UINT ShellFileMove = 0x0001;
     constexpr UINT ShellFileCopy = 0x0002;
     constexpr UINT ShellFileDelete = 0x0003;
@@ -564,7 +599,37 @@ namespace
     }
 
     HRESULT STDMETHODCALLTYPE FolderBindToStorage(void*, PVOID, PVOID, REFIID, void**) { return E_NOINTERFACE; }
-    HRESULT STDMETHODCALLTYPE FolderCompareIds(void*, LPARAM, PVOID, PVOID) { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE FolderCompareIds(void*, LPARAM columnAndFlags,
+        PVOID leftValue, PVOID rightValue)
+    {
+        VirtualPidlData left{};
+        VirtualPidlData right{};
+        if (!ReadVirtualPidl(leftValue, &left) ||
+            !ReadVirtualPidl(rightValue, &right))
+            return E_INVALIDARG;
+
+        const bool leftFolder = left.node != VirtualShellNode::File;
+        const bool rightFolder = right.node != VirtualShellNode::File;
+        int comparison = 0;
+        if (leftFolder != rightFolder)
+            comparison = leftFolder ? -1 : 1;
+        else
+        {
+            // Column zero is the canonical display-name ordering.  Unknown
+            // columns retain a stable filesystem ordering rather than
+            // returning E_NOTIMPL and breaking shell list controls.
+            const UINT column = LOWORD(columnAndFlags);
+            const std::wstring leftText = column == 0
+                ? ShellDisplayName(left.node, left.path) : std::wstring(left.path);
+            const std::wstring rightText = column == 0
+                ? ShellDisplayName(right.node, right.path) : std::wstring(right.path);
+            comparison = _wcsicmp(leftText.c_str(), rightText.c_str());
+            if (!comparison) comparison = wcscmp(leftText.c_str(), rightText.c_str());
+        }
+        const SHORT order = comparison < 0 ? static_cast<SHORT>(-1) :
+            (comparison > 0 ? static_cast<SHORT>(1) : static_cast<SHORT>(0));
+        return static_cast<HRESULT>(static_cast<USHORT>(order));
+    }
     HRESULT STDMETHODCALLTYPE FolderCreateViewObject(void*, HWND, REFIID, void**) { return E_NOINTERFACE; }
     HRESULT STDMETHODCALLTYPE FolderGetAttributesOf(void*, UINT count, PVOID const* items, DWORD* attributes)
     {
@@ -949,7 +1014,37 @@ namespace
         output->value = copy;
         return S_OK;
     }
-    HRESULT STDMETHODCALLTYPE FolderSetNameOf(void*, HWND, PVOID, LPCWSTR, DWORD, PVOID*) { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE FolderSetNameOf(void*, HWND, PVOID itemValue,
+        LPCWSTR requestedName, DWORD, PVOID* renamedItem)
+    {
+        if (renamedItem) *renamedItem = nullptr;
+        if (!requestedName || !*requestedName) return E_INVALIDARG;
+        VirtualPidlData item{};
+        if (!ReadVirtualPidl(itemValue, &item) || item.path[0] == L'\0' ||
+            item.node == VirtualShellNode::Desktop ||
+            item.node == VirtualShellNode::Computer ||
+            item.node == VirtualShellNode::Drive)
+            return E_INVALIDARG;
+
+        std::wstring destination;
+        if (wcschr(requestedName, L'\\') || wcschr(requestedName, L'/') ||
+            (wcslen(requestedName) >= 2 && requestedName[1] == L':'))
+            destination = requestedName;
+        else
+            destination = JoinGuestPath(ParentGuestPath(item.path), requestedName);
+        if (!Win32Bridge::Bridge::BridgeMoveFileExW(item.path,
+            destination.c_str(), 0))
+            return HRESULT_FROM_WIN32(Win32Bridge::Bridge::BridgeGetLastError());
+
+        if (renamedItem)
+        {
+            *renamedItem = CreateVirtualPidl(item.node, destination.c_str());
+            if (!*renamedItem) return E_OUTOFMEMORY;
+        }
+        Win32Bridge::Bridge::RuntimeDiagnostics::Record(
+            L"SHELL: renamed a virtual namespace item to '" + destination + L"'.");
+        return S_OK;
+    }
 
     const EnumIdListVTable g_virtualEnumIdListVTable =
     {
@@ -1449,19 +1544,170 @@ int WINAPI Win32Bridge::Bridge::BridgeSHFileOperationW(PVOID operation)
     return 0;
 }
 void WINAPI Win32Bridge::Bridge::BridgeSHChangeNotify(LONG, UINT, LPCVOID, LPCVOID) { }
-BOOL WINAPI Win32Bridge::Bridge::BridgeShellExecuteExW(PVOID) { return FALSE; }
-HINSTANCE WINAPI Win32Bridge::Bridge::BridgeShellExecuteW(HWND, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, INT)
+BOOL WINAPI Win32Bridge::Bridge::BridgeShellExecuteExW(PVOID executeInfo)
 {
-    return reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(5)); // SE_ERR_ACCESSDENIED
+    auto* request = static_cast<GuestShellExecuteInfoW*>(executeInfo);
+    if (!request || request->structureSize < sizeof(GuestShellExecuteInfoW) ||
+        !request->file || !*request->file)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    request->process = nullptr;
+    request->resultInstance = reinterpret_cast<HINSTANCE>(
+        ShellErrorFileNotFound);
+    if (request->verb && *request->verb &&
+        _wcsicmp(request->verb, L"open") != 0 &&
+        _wcsicmp(request->verb, L"runas") != 0)
+    {
+        BridgeSetLastError(ERROR_NO_ASSOCIATION);
+        request->resultInstance = reinterpret_cast<HINSTANCE>(
+            ShellErrorNoAssociation);
+        return FALSE;
+    }
+
+    const std::wstring executable(request->file);
+    if (!IsExecutableShellTarget(executable))
+    {
+        BridgeSetLastError(ERROR_NO_ASSOCIATION);
+        request->resultInstance = reinterpret_cast<HINSTANCE>(
+            ShellErrorNoAssociation);
+        return FALSE;
+    }
+
+    std::wstring commandLine = L"\"" + executable + L"\"";
+    if (request->parameters && *request->parameters)
+    {
+        commandLine.push_back(L' ');
+        commandLine.append(request->parameters);
+    }
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    // STARTF_USESHOWWINDOW is absent from some reduced UWP SDK header sets,
+    // although STARTUPINFO keeps the desktop ABI.  Keep the ABI value local
+    // instead of making ShellExecute depend on that header surface.
+    constexpr DWORD StartupUseShowWindow = 0x00000001u;
+    startup.dwFlags = StartupUseShowWindow;
+    startup.wShowWindow = static_cast<WORD>(request->showCommand);
+    PROCESS_INFORMATION process{};
+    if (!BridgeCreateProcessW(executable.c_str(), mutableCommand.data(),
+        nullptr, nullptr, FALSE, 0, nullptr, request->directory,
+        &startup, &process))
+    {
+        const DWORD error = BridgeGetLastError();
+        request->resultInstance = reinterpret_cast<HINSTANCE>(
+            error == ERROR_FILE_NOT_FOUND
+                ? ShellErrorFileNotFound : ShellErrorAccessDenied);
+        return FALSE;
+    }
+
+    request->resultInstance = reinterpret_cast<HINSTANCE>(static_cast<INT_PTR>(33));
+    if ((request->mask & SeeMaskNoCloseProcess) != 0)
+        request->process = process.hProcess;
+    else
+        BridgeCloseHandle(process.hProcess);
+    BridgeCloseHandle(process.hThread);
+    BridgeSetLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+HINSTANCE WINAPI Win32Bridge::Bridge::BridgeShellExecuteW(
+    HWND owner, LPCWSTR operation, LPCWSTR file, LPCWSTR parameters,
+    LPCWSTR directory, INT showCommand)
+{
+    GuestShellExecuteInfoW request{};
+    request.structureSize = sizeof(request);
+    request.owner = owner;
+    request.verb = operation;
+    request.file = file;
+    request.parameters = parameters;
+    request.directory = directory;
+    request.showCommand = showCommand;
+    BridgeShellExecuteExW(&request);
+    return request.resultInstance;
 }
 
 HRESULT WINAPI Win32Bridge::Bridge::BridgeSHGetFolderPathW(
     HWND, int folder, HANDLE, DWORD, LPWSTR path)
 {
     if (!path) return E_INVALIDARG;
-    const wchar_t* value = folder == 5 ? L"C:\\Users\\Default\\Documents" :
-        folder == 26 ? L"C:\\Users\\Default\\AppData\\Roaming" :
-        L"C:\\Users\\Default";
+    // CSIDL_FLAG_* values occupy the high bits; the low byte identifies the
+    // folder. All paths belong to the guest namespace and never expose host
+    // profile or system directories.
+    const int identifier = folder & 0xff;
+    const wchar_t* value = nullptr;
+    switch (identifier)
+    {
+    case 0:  // CSIDL_DESKTOP
+    case 16: // CSIDL_DESKTOPDIRECTORY
+        value = L"C:\\Users\\Default\\Desktop"; break;
+    case 2:  // CSIDL_PROGRAMS
+        value = L"C:\\Users\\Default\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs"; break;
+    case 5:  // CSIDL_PERSONAL
+        value = L"C:\\Users\\Default\\Documents"; break;
+    case 6:  // CSIDL_FAVORITES
+        value = L"C:\\Users\\Default\\Favorites"; break;
+    case 7:  // CSIDL_STARTUP
+        value = L"C:\\Users\\Default\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"; break;
+    case 8:  // CSIDL_RECENT
+        value = L"C:\\Users\\Default\\AppData\\Roaming\\Microsoft\\Windows\\Recent"; break;
+    case 9:  // CSIDL_SENDTO
+        value = L"C:\\Users\\Default\\AppData\\Roaming\\Microsoft\\Windows\\SendTo"; break;
+    case 11: // CSIDL_STARTMENU
+        value = L"C:\\Users\\Default\\AppData\\Roaming\\Microsoft\\Windows\\Start Menu"; break;
+    case 13: // CSIDL_MYMUSIC
+        value = L"C:\\Users\\Default\\Music"; break;
+    case 14: // CSIDL_MYVIDEO
+        value = L"C:\\Users\\Default\\Videos"; break;
+    case 20: // CSIDL_FONTS
+        value = L"C:\\Windows\\Fonts"; break;
+    case 22: // CSIDL_COMMON_STARTMENU
+        value = L"C:\\ProgramData\\Microsoft\\Windows\\Start Menu"; break;
+    case 23: // CSIDL_COMMON_PROGRAMS
+        value = L"C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs"; break;
+    case 24: // CSIDL_COMMON_STARTUP
+        value = L"C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"; break;
+    case 25: // CSIDL_COMMON_DESKTOPDIRECTORY
+        value = L"C:\\Users\\Public\\Desktop"; break;
+    case 26: // CSIDL_APPDATA
+        value = L"C:\\Users\\Default\\AppData\\Roaming"; break;
+    case 28: // CSIDL_LOCAL_APPDATA
+        value = L"C:\\Users\\Default\\AppData\\Local"; break;
+    case 32: // CSIDL_INTERNET_CACHE
+        value = L"C:\\Users\\Default\\AppData\\Local\\Microsoft\\Windows\\INetCache"; break;
+    case 34: // CSIDL_HISTORY
+        value = L"C:\\Users\\Default\\AppData\\Local\\Microsoft\\Windows\\History"; break;
+    case 35: // CSIDL_COMMON_APPDATA
+        value = L"C:\\ProgramData"; break;
+    case 36: // CSIDL_WINDOWS
+        value = L"C:\\Windows"; break;
+    case 37: // CSIDL_SYSTEM
+    case 41: // CSIDL_SYSTEMX86 (the guest platform is x64-only)
+        value = L"C:\\Windows\\System32"; break;
+    case 38: // CSIDL_PROGRAM_FILES
+    case 42: // CSIDL_PROGRAM_FILESX86
+        value = L"C:\\Program Files"; break;
+    case 39: // CSIDL_MYPICTURES
+        value = L"C:\\Users\\Default\\Pictures"; break;
+    case 40: // CSIDL_PROFILE
+        value = L"C:\\Users\\Default"; break;
+    case 43: // CSIDL_PROGRAM_FILES_COMMON
+    case 44: // CSIDL_PROGRAM_FILES_COMMONX86
+        value = L"C:\\Program Files\\Common Files"; break;
+    case 46: // CSIDL_COMMON_DOCUMENTS
+        value = L"C:\\Users\\Public\\Documents"; break;
+    case 53: // CSIDL_COMMON_MUSIC
+        value = L"C:\\Users\\Public\\Music"; break;
+    case 54: // CSIDL_COMMON_PICTURES
+        value = L"C:\\Users\\Public\\Pictures"; break;
+    case 55: // CSIDL_COMMON_VIDEO
+        value = L"C:\\Users\\Public\\Videos"; break;
+    default:
+        path[0] = L'\0';
+        return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+    }
     wcscpy_s(path, MAX_PATH, value);
     return S_OK;
 }

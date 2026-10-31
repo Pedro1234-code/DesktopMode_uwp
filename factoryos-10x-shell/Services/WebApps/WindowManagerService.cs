@@ -24,6 +24,7 @@ namespace factoryos_10x_shell.Services.WebApps
 
         public void Open(WebAppDefinition app)
         {
+            if (OpenInStrawfox(app)) return;
             WebAppWindowModel existing = Windows
                 .Where(window => window.App.Id == app.Id)
                 .OrderByDescending(window => window.ZIndex)
@@ -40,6 +41,7 @@ namespace factoryos_10x_shell.Services.WebApps
 
         public void OpenNewWindow(WebAppDefinition app)
         {
+            if (OpenInStrawfox(app)) return;
             var window = new WebAppWindowModel
             {
                 App = app,
@@ -53,6 +55,7 @@ namespace factoryos_10x_shell.Services.WebApps
 
         public void ToggleFromTaskbar(WebAppDefinition app)
         {
+            if (OpenInStrawfox(app)) return;
             WebAppWindowModel visible = Windows
                 .Where(window => window.App.Id == app.Id && window.Visibility == Visibility.Visible)
                 .OrderByDescending(window => window.ZIndex)
@@ -75,6 +78,14 @@ namespace factoryos_10x_shell.Services.WebApps
                 Activate(minimized);
             }
             else OpenNewWindow(app);
+        }
+
+        private bool OpenInStrawfox(WebAppDefinition app)
+        {
+            if (app?.UseStrawfox != true) return false;
+            CloseTaskView();
+            factoryos_10x_shell.Services.Helpers.AppState.Instance.RequestFirefoxUrl(app.StartUri);
+            return true;
         }
 
         public void ToggleTaskView()

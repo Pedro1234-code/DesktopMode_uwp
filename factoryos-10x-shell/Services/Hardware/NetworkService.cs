@@ -85,7 +85,14 @@ namespace factoryos_10x_shell.Services.Hardware
 
         public NetworkService()
         {
-            NetworkInformation.NetworkStatusChanged += NetworkInformation_NetworkStatusChanged;
+            try
+            {
+                NetworkInformation.NetworkStatusChanged += NetworkInformation_NetworkStatusChanged;
+            }
+            catch (Exception)
+            {
+                // Network status monitoring is optional for the taskbar.
+            }
         }
 
         private void NetworkInformation_NetworkStatusChanged(object sender)

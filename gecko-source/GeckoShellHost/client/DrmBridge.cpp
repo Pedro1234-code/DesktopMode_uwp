@@ -29,6 +29,7 @@ using winrt::Windows::Storage::Streams::IBuffer;
 void (*gReply)(const char*) = nullptr;
 std::atomic<DrmBridge::WindowCommandSink> gWindowCommandSink{nullptr};
 std::atomic<DrmBridge::RevealFileSink> gRevealFileSink{nullptr};
+std::atomic<DrmBridge::WallpaperSink> gWallpaperSink{nullptr};
 std::mutex gLock;
 // One license-acquisition request per session, kept until the response.
 std::map<std::wstring, PlayReadyLicenseAcquisitionServiceRequest> gRequests;
@@ -298,9 +299,19 @@ void DrmBridge::SetRevealFileSink(RevealFileSink sink) {
   gRevealFileSink.store(sink);
 }
 
+void DrmBridge::SetWallpaperSink(WallpaperSink sink) {
+  gWallpaperSink.store(sink);
+}
+
 void DrmBridge::DispatchWindowCommand(int32_t command) {
   if (auto sink = gWindowCommandSink.load()) {
     sink(command);
+  }
+}
+
+void DrmBridge::DispatchWallpaper(const wchar_t* path) {
+  if (auto sink = gWallpaperSink.load()) {
+    sink(path);
   }
 }
 

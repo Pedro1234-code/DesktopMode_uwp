@@ -4,6 +4,7 @@
 #include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestWindow.h"
 #include "Bridge/Gdi32Shims.h"
+#include "Bridge/Kernel32Shims.h"
 #include "Bridge/User32Shims.h"
 #include "Bridge/DialogResources.h"
 #include "Bridge/RuntimeDiagnostics.h"
@@ -12,6 +13,7 @@
 #include <algorithm>
 #include <memory>
 #include <mutex>
+#include <new>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -179,6 +181,53 @@ namespace
         PVOID callback;
     };
 
+    struct GuestTaskDialogButton final
+    {
+        int identifier;
+        LPCWSTR text;
+    };
+
+    struct GuestTaskDialogConfig final
+    {
+        UINT size;
+        HWND parent;
+        HINSTANCE instance;
+        DWORD flags;
+        DWORD commonButtons;
+        LPCWSTR windowTitle;
+        ULONG_PTR mainIcon;
+        LPCWSTR mainInstruction;
+        LPCWSTR content;
+        UINT buttonCount;
+        const GuestTaskDialogButton* buttons;
+        int defaultButton;
+        UINT radioButtonCount;
+        const GuestTaskDialogButton* radioButtons;
+        int defaultRadioButton;
+        LPCWSTR verificationText;
+        LPCWSTR expandedInformation;
+        LPCWSTR expandedControlText;
+        LPCWSTR collapsedControlText;
+        ULONG_PTR footerIcon;
+        LPCWSTR footer;
+        GuestTaskDialogCallback callback;
+        LONG_PTR callbackData;
+        UINT width;
+    };
+    static_assert(sizeof(GuestTaskDialogButton) == 16,
+        "TASKDIALOG_BUTTON x64 ABI drifted.");
+    static_assert(sizeof(GuestTaskDialogConfig) == 176,
+        "TASKDIALOGCONFIG x64 ABI drifted.");
+
+    constexpr DWORD TaskDialogCommonOk = 0x0001;
+    constexpr DWORD TaskDialogCommonYes = 0x0002;
+    constexpr DWORD TaskDialogCommonNo = 0x0004;
+    constexpr DWORD TaskDialogCommonCancel = 0x0008;
+    constexpr DWORD TaskDialogCommonRetry = 0x0010;
+    constexpr DWORD TaskDialogCommonClose = 0x0020;
+    constexpr DWORD TaskDialogVerificationChecked = 0x0100;
+    constexpr DWORD TaskDialogNoDefaultRadioButton = 0x4000;
+
     constexpr DWORD PropertySheetHeaderPagesAreStructures = 0x00000008;
     constexpr DWORD PropertySheetHeaderUsesStartPageName = 0x00000040;
 
@@ -201,6 +250,96 @@ namespace
             result->clear();
             return false;
         }
+    }
+
+    bool ResolveTaskDialogText(HINSTANCE instance, LPCWSTR source,
+        std::wstring* result)
+    {
+        if (!result) return false;
+        result->clear();
+        if (!source) return true;
+        if (reinterpret_cast<ULONG_PTR>(source) <= 0xffff)
+        {
+            wchar_t buffer[4096] = {};
+            const int length = LoadGuestStringResource(instance,
+                static_cast<UINT>(reinterpret_cast<ULONG_PTR>(source)),
+                buffer, ARRAYSIZE(buffer));
+            if (length <= 0) return false;
+            result->assign(buffer, buffer + length);
+            return true;
+        }
+        return ReadBoundedGuestString(source, result);
+    }
+
+    bool ReadTaskDialogConfig(const GuestTaskDialogConfig* source,
+        GuestTaskDialogConfig* result)
+    {
+        if (!source || !result || reinterpret_cast<ULONG_PTR>(source) <= 0xffff)
+            return false;
+        __try
+        {
+            if (source->size != sizeof(*result)) return false;
+            *result = *source;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool ReadTaskDialogButtonEntry(const GuestTaskDialogButton* source,
+        UINT index, GuestTaskDialogButton* result) noexcept
+    {
+        if (!source || !result) return false;
+        __try
+        {
+            *result = source[index];
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    bool ReadTaskDialogButtons(const GuestTaskDialogButton* source, UINT count,
+        HINSTANCE instance, std::vector<GuestTaskDialogButtonDescriptor>* buttons,
+        std::vector<std::wstring>* labels)
+    {
+        if (!buttons || !labels || count > 64 || (count && !source)) return false;
+        buttons->clear();
+        labels->clear();
+        buttons->reserve(count);
+        labels->reserve(count);
+        for (UINT index = 0; index < count; ++index)
+        {
+            GuestTaskDialogButton entry{};
+            if (!ReadTaskDialogButtonEntry(source, index, &entry)) return false;
+            std::wstring label;
+            if (!ResolveTaskDialogText(instance, entry.text, &label)) return false;
+            labels->push_back(std::move(label));
+            GuestTaskDialogButtonDescriptor descriptor;
+            descriptor.identifier = entry.identifier;
+            buttons->push_back(descriptor);
+        }
+        for (UINT index = 0; index < count; ++index)
+            (*buttons)[index].text = (*labels)[index].c_str();
+        return true;
+    }
+
+    bool WriteTaskDialogIntResult(int* destination, int value) noexcept
+    {
+        if (!destination) return true;
+        __try { *destination = value; return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    bool WriteTaskDialogBooleanResult(BOOL* destination, BOOL value) noexcept
+    {
+        if (!destination) return true;
+        __try { *destination = value; return true; }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
 
     bool ReadPropertySheetHeader(const void* source, GuestPropertySheetHeaderW* result)
@@ -269,13 +408,15 @@ namespace
         UINT_PTR identifier = 0;
         DWORD_PTR referenceData = 0;
         bool removed = false;
-        std::shared_ptr<SubclassEntry> next;
+        SubclassEntry* next = nullptr;
     };
     struct SubclassWindow final
     {
+        HWND window = nullptr;
         GuestAbi::WndProc original = nullptr;
-        std::shared_ptr<SubclassEntry> first;
+        SubclassEntry* first = nullptr;
         unsigned int running = 0;
+        SubclassWindow* next = nullptr;
     };
     // Keep the subclass registry independent from the C++ runtime's heap-backed
     // mutex implementation.  Guest callbacks execute arbitrary PE code and may
@@ -290,19 +431,84 @@ namespace
         SubclassRegistryLock(const SubclassRegistryLock&) = delete;
         SubclassRegistryLock& operator=(const SubclassRegistryLock&) = delete;
     };
-    std::unordered_map<ULONG_PTR, std::shared_ptr<SubclassWindow>> g_subclasses;
+    // Keep the subclass stack in the same deliberately simple form used by
+    // comctl32: one window record and a linked list of procedures.  This path
+    // is entered from arbitrary guest callbacks and must not depend on a C++
+    // hash container remaining internally consistent after SEH/re-entry.
+    SubclassWindow* g_subclasses = nullptr;
+
+    SubclassWindow* FindSubclassWindowUnlocked(HWND window) noexcept
+    {
+        for (SubclassWindow* state = g_subclasses; state; state = state->next)
+        {
+            if (state->window == window) return state;
+        }
+        return nullptr;
+    }
+
+    SubclassWindow** FindSubclassWindowLinkUnlocked(HWND window) noexcept
+    {
+        SubclassWindow** link = &g_subclasses;
+        while (*link && (*link)->window != window) link = &(*link)->next;
+        return link;
+    }
+
+    void PurgeRemovedSubclassEntriesUnlocked(SubclassWindow* state) noexcept
+    {
+        if (!state || state->running != 0) return;
+        SubclassEntry** link = &state->first;
+        while (*link)
+        {
+            SubclassEntry* entry = *link;
+            if (!entry->removed)
+            {
+                link = &entry->next;
+                continue;
+            }
+            *link = entry->next;
+            delete entry;
+        }
+    }
+
+    void DeleteSubclassWindowUnlocked(SubclassWindow* state) noexcept
+    {
+        if (!state) return;
+        SubclassEntry* entry = state->first;
+        while (entry)
+        {
+            SubclassEntry* next = entry->next;
+            delete entry;
+            entry = next;
+        }
+        delete state;
+    }
+
+    bool TryWriteSubclassReference(DWORD_PTR* destination, DWORD_PTR value) noexcept
+    {
+        if (!destination) return true;
+        __try
+        {
+            *destination = value;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
     struct SubclassFrame final
     {
         HWND window = nullptr;
         UINT message = 0;
         WPARAM wParam = 0;
         LPARAM lParam = 0;
-        // The map owns the state while running is non-zero.  Keep only a raw
-        // pointer in the dispatch frame: guest callbacks are untrusted and may
-        // unwind/re-enter, so a cached shared_ptr must not be dereferenced or
-        // destroyed after returning from guest code.
-        SubclassWindow* state = nullptr;
-        std::shared_ptr<SubclassEntry> next;
+        // A subclass callback may synchronously destroy its HWND, remove the
+        // final subclass, or dispatch WM_NCDESTROY before returning.  The
+        // original procedure is therefore part of the active call frame.
+        // Snapshot it before entering guest code so DefSubclassProc never has
+        // to follow mutable registry storage after a re-entrant callback.
+        GuestAbi::WndProc original = nullptr;
+        SubclassEntry* next = nullptr;
         SubclassFrame* previous = nullptr;
     };
     thread_local SubclassFrame* g_subclassFrame = nullptr;
@@ -357,12 +563,12 @@ namespace
         frame.lParam = lParam;
         {
             SubclassRegistryLock guard;
-            const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
-            if (found == g_subclasses.end())
+            SubclassWindow* state = FindSubclassWindowUnlocked(window);
+            if (!state)
                 return BridgeDefWindowProcW(window, message, wParam, lParam);
-            frame.state = found->second.get();
-            frame.next = frame.state->first;
-            ++frame.state->running;
+            frame.original = state->original;
+            frame.next = state->first;
+            ++state->running;
         }
         frame.previous = g_subclassFrame;
         g_subclassFrame = &frame;
@@ -376,25 +582,34 @@ namespace
         {
             SubclassRegistryLock guard;
             const bool destroying = message == 0x0082; // WM_NCDESTROY
-            const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
-            if (found != g_subclasses.end())
+            SubclassWindow** stateLink = FindSubclassWindowLinkUnlocked(window);
+            SubclassWindow* state = *stateLink;
+            if (state)
             {
-                const auto state = found->second;
                 if (state->running != 0)
                     --state->running;
                 if (destroying)
-                    state->first.reset();
+                {
+                    for (SubclassEntry* entry = state->first; entry; entry = entry->next)
+                        entry->removed = true;
+                }
 
+                PurgeRemovedSubclassEntriesUnlocked(state);
                 if (!state->first && state->running == 0)
                 {
-                    g_subclasses.erase(found);
                     restore = state->original;
                     restoreProcedure = !destroying;
+                    *stateLink = state->next;
+                    DeleteSubclassWindowUnlocked(state);
                 }
             }
         }
-        if (restoreProcedure)
+        if (restoreProcedure &&
+            reinterpret_cast<GuestAbi::WndProc>(BridgeGetWindowLongPtrW(window, -4)) ==
+                &SubclassDispatcher)
+        {
             BridgeSetWindowLongPtrW(window, -4, reinterpret_cast<LONG_PTR>(restore));
+        }
         return result;
     }
 
@@ -402,58 +617,101 @@ namespace
         HWND window, GuestSubclassProc procedure, UINT_PTR identifier, DWORD_PTR referenceData)
     {
         if (!window || !procedure) return FALSE;
-        SubclassRegistryLock guard;
-        const ULONG_PTR key = reinterpret_cast<ULONG_PTR>(window);
-        auto found = g_subclasses.find(key);
-        std::shared_ptr<SubclassWindow> state;
-        if (found == g_subclasses.end())
+        GuestAbi::WndProc rollback = nullptr;
+        bool createdWindowState = false;
+        bool updated = false;
+        bool registered = false;
         {
-            state = std::make_shared<SubclassWindow>();
-            state->original = reinterpret_cast<GuestAbi::WndProc>(
-                BridgeSetWindowLongPtrW(window, -4,
-                    reinterpret_cast<LONG_PTR>(&SubclassDispatcher)));
-            g_subclasses.emplace(key, state);
-        }
-        else
-        {
-            state = found->second;
-        }
-
-        for (auto entry = state->first; entry; entry = entry->next)
-        {
-            if (!entry->removed && entry->procedure == procedure &&
-                entry->identifier == identifier)
+            SubclassRegistryLock guard;
+            SubclassWindow* state = FindSubclassWindowUnlocked(window);
+            if (!state)
             {
-                entry->referenceData = referenceData;
-                return TRUE;
+                state = new (std::nothrow) SubclassWindow();
+                if (!state) return FALSE;
+                state->window = window;
+                state->original = reinterpret_cast<GuestAbi::WndProc>(
+                    BridgeSetWindowLongPtrW(window, -4,
+                        reinterpret_cast<LONG_PTR>(&SubclassDispatcher)));
+                if (!state->original)
+                {
+                    delete state;
+                    RuntimeDiagnostics::Record(
+                        L"CONTROL SUBCLASS FAILED: the original procedure for handle " +
+                        std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) +
+                        L" could not be obtained.");
+                    return FALSE;
+                }
+                rollback = state->original;
+                state->next = g_subclasses;
+                g_subclasses = state;
+                createdWindowState = true;
+            }
+
+            for (SubclassEntry* entry = state->first; entry; entry = entry->next)
+            {
+                if (!entry->removed && entry->procedure == procedure &&
+                    entry->identifier == identifier)
+                {
+                    entry->referenceData = referenceData;
+                    updated = true;
+                    break;
+                }
+            }
+
+            if (!updated)
+            {
+                // COMCTL32 inserts new procedures at the head of the chain.
+                SubclassEntry* entry = new (std::nothrow) SubclassEntry();
+                if (entry)
+                {
+                    entry->procedure = procedure;
+                    entry->identifier = identifier;
+                    entry->referenceData = referenceData;
+                    entry->next = state->first;
+                    state->first = entry;
+                    registered = true;
+                }
+                else if (createdWindowState)
+                {
+                    g_subclasses = state->next;
+                    DeleteSubclassWindowUnlocked(state);
+                }
             }
         }
 
-        // COMCTL32 inserts new procedures at the head of the chain.  This is
-        // observable when multiple libraries subclass the same control.
-        auto entry = std::make_shared<SubclassEntry>();
-        entry->procedure = procedure;
-        entry->identifier = identifier;
-        entry->referenceData = referenceData;
-        entry->next = state->first;
-        state->first = std::move(entry);
+        if (!updated && !registered)
+        {
+            if (createdWindowState && rollback)
+                BridgeSetWindowLongPtrW(window, -4, reinterpret_cast<LONG_PTR>(rollback));
+            RuntimeDiagnostics::Record(
+                L"CONTROL SUBCLASS FAILED: allocation failed for handle " +
+                std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) + L".");
+            return FALSE;
+        }
+
+        RuntimeDiagnostics::Record(
+            L"CONTROL SUBCLASS: " + std::wstring(updated ? L"updated" : L"registered") +
+            L" handle " + std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) +
+            L", identifier " + std::to_wstring(identifier) + L", procedure " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(procedure)) + L".");
         return TRUE;
     }
 
     BOOL WINAPI BridgeGetWindowSubclass(
         HWND window, GuestSubclassProc procedure, UINT_PTR identifier, DWORD_PTR* referenceData)
     {
+        if (!TryWriteSubclassReference(referenceData, 0)) return FALSE;
         if (!window || !procedure) return FALSE;
         SubclassRegistryLock guard;
-        const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
-        if (found == g_subclasses.end()) return FALSE;
-        for (auto entry = found->second->first; entry; entry = entry->next)
+        const SubclassWindow* state = FindSubclassWindowUnlocked(window);
+        if (!state) return FALSE;
+        for (const SubclassEntry* entry = state->first; entry; entry = entry->next)
         {
             if (!entry->removed && entry->procedure == procedure &&
                 entry->identifier == identifier)
             {
-                if (referenceData) *referenceData = entry->referenceData;
-                return TRUE;
+                return TryWriteSubclassReference(referenceData, entry->referenceData)
+                    ? TRUE : FALSE;
             }
         }
         return FALSE;
@@ -466,35 +724,45 @@ namespace
         bool removed = false;
         {
             SubclassRegistryLock guard;
-            const auto found = g_subclasses.find(reinterpret_cast<ULONG_PTR>(window));
-            if (found == g_subclasses.end()) return FALSE;
-
-            const auto state = found->second;
-            std::shared_ptr<SubclassEntry>* link = &state->first;
+            SubclassWindow** stateLink = FindSubclassWindowLinkUnlocked(window);
+            SubclassWindow* state = *stateLink;
+            if (!state) return FALSE;
+            SubclassEntry** link = &state->first;
             while (*link)
             {
-                const auto entry = *link;
+                SubclassEntry* entry = *link;
                 if (!entry->removed && entry->procedure == procedure &&
                     entry->identifier == identifier)
                 {
-                    *link = entry->next;
-                    entry->removed = true;
-                    removed = true;
-                    if (!state->first && state->running == 0)
+                    if (state->running != 0)
+                        entry->removed = true;
+                    else
                     {
-                        restore = state->original;
-                        g_subclasses.erase(found);
+                        *link = entry->next;
+                        delete entry;
                     }
+                    removed = true;
                     break;
                 }
                 link = &entry->next;
+            }
+            PurgeRemovedSubclassEntriesUnlocked(state);
+            if (!state->first && state->running == 0)
+            {
+                restore = state->original;
+                *stateLink = state->next;
+                DeleteSubclassWindowUnlocked(state);
             }
         }
 
         if (!removed)
             return FALSE;
-        if (restore)
+        if (restore &&
+            reinterpret_cast<GuestAbi::WndProc>(BridgeGetWindowLongPtrW(window, -4)) ==
+                &SubclassDispatcher)
+        {
             BridgeSetWindowLongPtrW(window, -4, reinterpret_cast<LONG_PTR>(restore));
+        }
         return TRUE;
     }
 
@@ -517,7 +785,7 @@ namespace
                 frame->next = frame->next->next;
             if (frame->next)
             {
-                const auto entry = frame->next;
+                const SubclassEntry* entry = frame->next;
                 frame->next = entry->next;
                 procedure = entry->procedure;
                 identifier = entry->identifier;
@@ -527,7 +795,7 @@ namespace
         if (procedure)
             return InvokeSubclassEntry(frame, procedure, identifier, referenceData);
 
-        const GuestAbi::WndProc original = frame->state->original;
+        const GuestAbi::WndProc original = frame->original;
         return original && original != &SubclassDispatcher
             ? BridgeCallWindowProcW(original, window, message, wParam, lParam)
             : BridgeDefWindowProcW(window, message, wParam, lParam);
@@ -551,6 +819,80 @@ namespace
         return result;
     }
 
+    bool TryWriteGuestIcon(HICON* destination, HICON value) noexcept
+    {
+        if (!destination || reinterpret_cast<ULONG_PTR>(destination) <= 0xffff)
+            return false;
+        __try
+        {
+            *destination = value;
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return false;
+        }
+    }
+
+    HRESULT WINAPI BridgeLoadIconWithScaleDown(
+        HINSTANCE instance, LPCWSTR name, int width, int height, HICON* icon)
+    {
+        // COMCTL32 v6 ordinal 381.  The output pointer belongs to the guest,
+        // so clear it defensively before validating the remaining arguments.
+        if (!TryWriteGuestIcon(icon, nullptr))
+            return E_INVALIDARG;
+        if (!name)
+            return E_INVALIDARG;
+
+        const bool integerResource = reinterpret_cast<ULONG_PTR>(name) <= 0xffff;
+        const UINT flags = (instance || integerResource) ? 0u : LR_LOADFROMFILE;
+        const HICON loaded = reinterpret_cast<HICON>(BridgeLoadImageW(
+            instance, name, IMAGE_ICON, width, height, flags));
+        if (!loaded)
+        {
+            DWORD error = BridgeGetLastError();
+            if (error == ERROR_SUCCESS) error = ERROR_RESOURCE_NAME_NOT_FOUND;
+            return HRESULT_FROM_WIN32(error);
+        }
+
+        if (!TryWriteGuestIcon(icon, loaded))
+        {
+            BridgeDestroyIcon(loaded);
+            return E_INVALIDARG;
+        }
+        return S_OK;
+    }
+
+    HRESULT WINAPI BridgeLoadIconMetric(
+        HINSTANCE instance, LPCWSTR name, int size, HICON* icon)
+    {
+        // LIM_SMALL and LIM_LARGE are part of the comctl32 ABI.  Keep their
+        // numeric values local so this UWP target does not depend on desktop
+        // commctrl headers exposing them.
+        constexpr int LoadIconMetricSmall = 0;
+        constexpr int LoadIconMetricLarge = 1;
+
+        int width = 0;
+        int height = 0;
+        if (size == LoadIconMetricSmall)
+        {
+            width = BridgeGetSystemMetrics(SM_CXSMICON);
+            height = BridgeGetSystemMetrics(SM_CYSMICON);
+        }
+        else if (size == LoadIconMetricLarge)
+        {
+            width = BridgeGetSystemMetrics(SM_CXICON);
+            height = BridgeGetSystemMetrics(SM_CYICON);
+        }
+        else
+        {
+            if (!TryWriteGuestIcon(icon, nullptr)) return E_INVALIDARG;
+            return E_INVALIDARG;
+        }
+
+        return BridgeLoadIconWithScaleDown(instance, name, width, height, icon);
+    }
+
     MiniGdi::Surface ScaleImage(const MiniGdi::Surface& source, int width, int height)
     {
         MiniGdi::Surface result(width, height, MiniGdi::Transparent);
@@ -570,6 +912,32 @@ namespace
     }
 }
 
+void Win32Bridge::Bridge::ResetGuestCommonControlState()
+{
+    // No guest callback is made here.  A failed PE may have already unloaded
+    // the module that owned a subclass procedure, so cleanup must only discard
+    // bridge-owned bookkeeping.
+    {
+        SubclassRegistryLock guard;
+        SubclassWindow* state = g_subclasses;
+        g_subclasses = nullptr;
+        while (state)
+        {
+            SubclassWindow* next = state->next;
+            DeleteSubclassWindowUnlocked(state);
+            state = next;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_imageListsLock);
+        g_imageLists.clear();
+        g_nextImageList = 0x60000000;
+        g_dragState = ImageListDragState{};
+    }
+    g_subclassFrame = nullptr;
+    g_subclassDispatchDepth = 0;
+}
+
 BOOL WINAPI Win32Bridge::Bridge::BridgeInitCommonControlsEx(const GuestInitCommonControlsEx*) { return TRUE; }
 Win32Bridge::Bridge::GuestImageList WINAPI Win32Bridge::Bridge::BridgeImageListCreate(int width, int height, UINT, int, int)
 {
@@ -580,6 +948,9 @@ Win32Bridge::Bridge::GuestImageList WINAPI Win32Bridge::Bridge::BridgeImageListC
     record.width = width;
     record.height = height;
     g_imageLists.emplace(token, std::move(record));
+    RuntimeDiagnostics::Record(
+        L"IMAGELIST: created " + std::to_wstring(width) + L"x" +
+        std::to_wstring(height) + L" list " + std::to_wstring(token) + L".");
     return reinterpret_cast<GuestImageList>(token);
 }
 BOOL WINAPI Win32Bridge::Bridge::BridgeImageListDestroy(GuestImageList imageList)
@@ -633,7 +1004,13 @@ int WINAPI Win32Bridge::Bridge::BridgeImageListReplaceIcon(GuestImageList imageL
     const auto found = g_imageLists.find(reinterpret_cast<ULONG_PTR>(imageList));
     if (found == g_imageLists.end()) return -1;
     MiniGdi::Surface source;
-    if (!CopyGuestIconPixels(icon, &source) || source.Empty()) return -1;
+    if (!CopyGuestIconPixels(icon, &source) || source.Empty())
+    {
+        RuntimeDiagnostics::Record(
+            L"IMAGELIST: rejected an invalid icon for list " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(imageList)) + L".");
+        return -1;
+    }
     ImageListRecord& list = found->second;
     MiniGdi::Surface tile = ScaleImage(source, list.width, list.height);
     if (index < 0)
@@ -981,9 +1358,133 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreatePropertySheetPageW(const void* pa
     return page ? const_cast<void*>(page) : nullptr;
 }
 
-ULONG_PTR WINAPI Win32Bridge::Bridge::BridgeCommonControlOrdinal345()
+HRESULT WINAPI BridgeTaskDialogIndirect(const GuestTaskDialogConfig* source,
+    int* selectedButton, int* selectedRadioButton, BOOL* verificationChecked)
 {
-    return TRUE;
+    GuestTaskDialogConfig config{};
+    if (!ReadTaskDialogConfig(source, &config)) return E_INVALIDARG;
+
+    std::wstring title;
+    std::wstring instruction;
+    std::wstring content;
+    std::wstring verification;
+    std::wstring expanded;
+    std::wstring footer;
+    if (!ResolveTaskDialogText(config.instance, config.windowTitle, &title) ||
+        !ResolveTaskDialogText(config.instance, config.mainInstruction, &instruction) ||
+        !ResolveTaskDialogText(config.instance, config.content, &content) ||
+        !ResolveTaskDialogText(config.instance, config.verificationText, &verification) ||
+        !ResolveTaskDialogText(config.instance, config.expandedInformation, &expanded) ||
+        !ResolveTaskDialogText(config.instance, config.footer, &footer))
+    {
+        return HRESULT_FROM_WIN32(ERROR_RESOURCE_NAME_NOT_FOUND);
+    }
+    if (!expanded.empty())
+    {
+        if (!content.empty()) content.append(L"\n\n");
+        content.append(expanded);
+    }
+    if (!footer.empty())
+    {
+        if (!content.empty()) content.append(L"\n\n");
+        content.append(footer);
+    }
+
+    std::vector<GuestTaskDialogButtonDescriptor> buttons;
+    std::vector<std::wstring> buttonLabels;
+    if (!ReadTaskDialogButtons(config.buttons, config.buttonCount,
+        config.instance, &buttons, &buttonLabels)) return E_INVALIDARG;
+    buttons.reserve(static_cast<size_t>(config.buttonCount) + 6);
+    buttonLabels.reserve(static_cast<size_t>(config.buttonCount) + 6);
+    auto containsButton = [&buttons](int identifier)
+    {
+        return std::any_of(buttons.begin(), buttons.end(),
+            [identifier](const GuestTaskDialogButtonDescriptor& candidate)
+            { return candidate.identifier == identifier; });
+    };
+    auto addCommonButton = [&](DWORD flag, int identifier, LPCWSTR label)
+    {
+        if ((config.commonButtons & flag) == 0 || containsButton(identifier)) return;
+        buttonLabels.emplace_back(label);
+        GuestTaskDialogButtonDescriptor button;
+        button.identifier = identifier;
+        buttons.push_back(button);
+    };
+    addCommonButton(TaskDialogCommonOk, IDOK, L"OK");
+    addCommonButton(TaskDialogCommonYes, IDYES, L"Yes");
+    addCommonButton(TaskDialogCommonNo, IDNO, L"No");
+    addCommonButton(TaskDialogCommonCancel, IDCANCEL, L"Cancel");
+    addCommonButton(TaskDialogCommonRetry, IDRETRY, L"Retry");
+    addCommonButton(TaskDialogCommonClose, 8 /* IDCLOSE */, L"Close");
+    if (buttons.empty())
+    {
+        buttonLabels.emplace_back(L"OK");
+        GuestTaskDialogButtonDescriptor button;
+        button.identifier = IDOK;
+        buttons.push_back(button);
+    }
+    for (size_t index = 0; index < buttons.size(); ++index)
+        buttons[index].text = buttonLabels[index].c_str();
+
+    std::vector<GuestTaskDialogButtonDescriptor> radioButtons;
+    std::vector<std::wstring> radioLabels;
+    if (!ReadTaskDialogButtons(config.radioButtons, config.radioButtonCount,
+        config.instance, &radioButtons, &radioLabels)) return E_INVALIDARG;
+
+    GuestTaskDialogDescriptor descriptor;
+    descriptor.owner = config.parent;
+    descriptor.instance = config.instance;
+    descriptor.title = title.empty() ? nullptr : title.c_str();
+    descriptor.mainInstruction = instruction.empty() ? nullptr : instruction.c_str();
+    descriptor.content = content.empty() ? nullptr : content.c_str();
+    descriptor.buttons = buttons.data();
+    descriptor.buttonCount = static_cast<UINT>(buttons.size());
+    descriptor.defaultButton = config.defaultButton;
+    descriptor.radioButtons = radioButtons.empty() ? nullptr : radioButtons.data();
+    descriptor.radioButtonCount = static_cast<UINT>(radioButtons.size());
+    descriptor.defaultRadioButton = config.defaultRadioButton;
+    if ((config.flags & TaskDialogNoDefaultRadioButton) != 0)
+    {
+        descriptor.defaultRadioButton = 0;
+    }
+    else if (!radioButtons.empty() &&
+        std::none_of(radioButtons.begin(), radioButtons.end(),
+            [&descriptor](const GuestTaskDialogButtonDescriptor& candidate)
+            { return candidate.identifier == descriptor.defaultRadioButton; }))
+    {
+        descriptor.defaultRadioButton = radioButtons[0].identifier;
+    }
+    descriptor.verificationText = verification.empty() ? nullptr : verification.c_str();
+    descriptor.verificationChecked =
+        (config.flags & TaskDialogVerificationChecked) != 0;
+    descriptor.callback = config.callback;
+    descriptor.callbackData = config.callbackData;
+
+    int button = 0;
+    int radio = 0;
+    BOOL checked = FALSE;
+    const HRESULT result = ShowGuestTaskDialog(descriptor, &button, &radio, &checked);
+    if (FAILED(result)) return result;
+    if (!WriteTaskDialogIntResult(selectedButton, button) ||
+        !WriteTaskDialogIntResult(selectedRadioButton, radio) ||
+        !WriteTaskDialogBooleanResult(verificationChecked, checked))
+        return E_INVALIDARG;
+    return S_OK;
+}
+
+HRESULT WINAPI BridgeTaskDialog(HWND parent, HINSTANCE instance,
+    LPCWSTR windowTitle, LPCWSTR mainInstruction, LPCWSTR content,
+    DWORD commonButtons, LPCWSTR, int* selectedButton)
+{
+    GuestTaskDialogConfig config{};
+    config.size = sizeof(config);
+    config.parent = parent;
+    config.instance = instance;
+    config.windowTitle = windowTitle;
+    config.mainInstruction = mainInstruction;
+    config.content = content;
+    config.commonButtons = commonButtons;
+    return BridgeTaskDialogIndirect(&config, selectedButton, nullptr, nullptr);
 }
 
 Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControlsImport(const ImportedSymbol& symbol)
@@ -991,20 +1492,29 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
     auto resolution = CompatibilityCatalog::Resolve(symbol);
     if (_wcsicmp(symbol.library.c_str(), L"comctl32.dll") == 0 &&
         symbol.importedByOrdinal && (symbol.ordinal == 17 || symbol.ordinal == 345 ||
-            symbol.ordinal == 381 || (symbol.ordinal >= 410 && symbol.ordinal <= 413)))
+            (symbol.ordinal >= 380 && symbol.ordinal <= 381) ||
+            (symbol.ordinal >= 410 && symbol.ordinal <= 413)))
     {
         switch (symbol.ordinal)
         {
         case 17: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitCommonControls); break;
-        case 381: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawShadowText); break;
+        case 380: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadIconMetric); break;
+        case 381: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadIconWithScaleDown); break;
         case 410: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowSubclass); break;
         case 411: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowSubclass); break;
         case 412: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRemoveWindowSubclass); break;
         case 413: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDefSubclassProc); break;
-        default: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCommonControlOrdinal345); break;
+        default: resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTaskDialogIndirect); break;
         }
         resolution.disposition = ImportDisposition::NeedsBridge;
-        resolution.note = L"Common-controls bootstrap: uses bridge-owned controls rather than a desktop DLL.";
+        if (symbol.ordinal == 345)
+            resolution.note = L"COMCTL32 v6 TaskDialogIndirect: virtual modal dialog with custom/common buttons and callbacks.";
+        else if (symbol.ordinal == 380 || symbol.ordinal == 381)
+            resolution.note = L"COMCTL32 v6 icon loader: resolves resource/file icons through the guest image pipeline.";
+        else if (symbol.ordinal >= 410 && symbol.ordinal <= 413)
+            resolution.note = L"COMCTL32 subclass chain with re-entrant DefSubclassProc semantics.";
+        else
+            resolution.note = L"Common-controls bootstrap: uses bridge-owned controls rather than a desktop DLL.";
     }
     else if (_wcsicmp(symbol.library.c_str(), L"uxtheme.dll") == 0 && !symbol.importedByOrdinal)
     {
@@ -1060,6 +1570,11 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
         else if (_wcsicmp(symbol.name.c_str(), L"propertysheetw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePropertySheetW);
         else if (_wcsicmp(symbol.name.c_str(), L"createpropertysheetpagew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePropertySheetPageW);
         else if (_wcsicmp(symbol.name.c_str(), L"dllgetversion") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDllGetVersion);
+        else if (_wcsicmp(symbol.name.c_str(), L"drawshadowtext") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawShadowText);
+        else if (_wcsicmp(symbol.name.c_str(), L"loadiconmetric") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadIconMetric);
+        else if (_wcsicmp(symbol.name.c_str(), L"loadiconwithscaledown") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeLoadIconWithScaleDown);
+        else if (_wcsicmp(symbol.name.c_str(), L"taskdialog") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTaskDialog);
+        else if (_wcsicmp(symbol.name.c_str(), L"taskdialogindirect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTaskDialogIndirect);
         if (resolution.targetAddress)
         {
             resolution.disposition = ImportDisposition::NeedsBridge;

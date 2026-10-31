@@ -28,6 +28,13 @@ namespace Bridge
     };
 
     void ResetGuestResourceHandles();
+    // Storage mutations feed the virtual ReadDirectoryChangesW implementation.
+    // Paths are canonical guest paths; no host filesystem identity escapes.
+    void NotifyGuestDirectoryChange(
+        const std::wstring& path, DWORD action, DWORD changeFilter);
+    void NotifyGuestDirectoryRename(
+        const std::wstring& oldPath, const std::wstring& newPath,
+        DWORD changeFilter);
     // Runs guest FLS destructors while the calling thread still has all bridge
     // scopes installed. Guest callback addresses must never be registered with
     // the host FLS implementation, which would invoke them from ntdll after
@@ -122,6 +129,7 @@ namespace Bridge
     BOOL WINAPI BridgeGetDiskFreeSpaceW(LPCWSTR rootPath, LPDWORD sectorsPerCluster, LPDWORD bytesPerSector, LPDWORD freeClusters, LPDWORD totalClusters);
     BOOL WINAPI BridgeGetVolumeInformationW(LPCWSTR rootPath, LPWSTR volumeName, DWORD volumeNameSize, LPDWORD serial, LPDWORD maximumComponentLength, LPDWORD fileSystemFlags, LPWSTR fileSystemName, DWORD fileSystemNameSize);
     UINT WINAPI BridgeGetWindowsDirectoryW(LPWSTR buffer, UINT bufferLength);
+    UINT WINAPI BridgeGetSystemDirectoryW(LPWSTR buffer, UINT bufferLength);
     DWORD WINAPI BridgeExpandEnvironmentStringsW(LPCWSTR source, LPWSTR destination, DWORD destinationLength);
     DWORD WINAPI BridgeGetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD bufferLength);
     HMODULE WINAPI BridgeGetModuleHandleW(LPCWSTR moduleName);
@@ -223,9 +231,16 @@ namespace Bridge
     BOOL WINAPI BridgeSetProcessAffinityMask(HANDLE process, DWORD_PTR processMask);
     DWORD_PTR WINAPI BridgeSetThreadAffinityMask(HANDLE thread, DWORD_PTR threadMask);
     BOOL WINAPI BridgeSetDefaultDllDirectories(DWORD directoryFlags);
+    PVOID WINAPI BridgeAddDllDirectory(LPCWSTR path);
+    BOOL WINAPI BridgeRemoveDllDirectory(PVOID cookie);
+    BOOL WINAPI BridgeSetDllDirectoryW(LPCWSTR path);
+    BOOL WINAPI BridgeSetDllDirectoryA(LPCSTR path);
+    DWORD WINAPI BridgeGetDllDirectoryW(DWORD bufferLength, LPWSTR buffer);
+    DWORD WINAPI BridgeGetDllDirectoryA(DWORD bufferLength, LPSTR buffer);
     HMODULE WINAPI BridgeLoadLibraryW(LPCWSTR fileName);
     HMODULE WINAPI BridgeLoadLibraryA(LPCSTR fileName);
     HMODULE WINAPI BridgeLoadLibraryExW(LPCWSTR fileName, HANDLE file, DWORD flags);
+    HMODULE WINAPI BridgeLoadLibraryExA(LPCSTR fileName, HANDLE file, DWORD flags);
     FARPROC WINAPI BridgeGetProcAddress(HMODULE module, LPCSTR nameOrOrdinal);
     BOOL WINAPI BridgeFreeLibrary(HMODULE module);
     BOOL WINAPI BridgeDisableThreadLibraryCalls(HMODULE module);

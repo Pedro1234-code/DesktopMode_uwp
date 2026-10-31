@@ -10,7 +10,7 @@ namespace factoryos_10x_shell.Library.Services.WebApps
         ObservableCollection<WebAppDefinition> InstalledApps { get; }
         event EventHandler AppsChanged;
         Task InitializeAsync();
-        Task<WebAppDefinition> InstallAsync(string name, string startUri);
+        Task<WebAppDefinition> InstallAsync(string name, string startUri, bool useStrawfox = false);
         void SetPinned(WebAppDefinition app, bool isPinned);
         void Uninstall(WebAppDefinition app);
         Task SaveFaviconAsync(WebAppDefinition app, string faviconUri);

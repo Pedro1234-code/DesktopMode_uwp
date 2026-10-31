@@ -16,11 +16,13 @@
 #include <functional>
 #include <utility>
 #include <vector>
+#include <deque>
 
 #include "winrt/Windows.UI.Xaml.Controls.h"
 #include "winrt/Windows.UI.Xaml.Media.Imaging.h"
 #include "winrt/Windows.UI.Core.h"
 #include "winrt/Windows.UI.ViewManagement.h"
+#include "winrt/Windows.Gaming.Input.h"
 
 namespace gecko_w10m::client {
 
@@ -36,6 +38,9 @@ class EngineView {
              bool withPanel, bool usePhysicalScreenRoom = false);
 
   winrt::Windows::UI::Xaml::Controls::Image Surface() const { return image_; }
+  winrt::Windows::UI::Xaml::Controls::Image ExternalSurface() const {
+    return externalImage_;
+  }
   // What the engine presents to when it is drawing on the GPU. It sits under
   // the picture and stays empty while the software path is in use, so whichever
   // of the two produces a frame is the one that shows.
@@ -58,6 +63,10 @@ class EngineView {
   // The space assigned to this embedded browser window. Unlike SetScreen,
   // this resizes Gecko's widget and the ANGLE swap chain together.
   void SetViewport(double viewWidth, double viewHeight);
+  bool HasExternalWindow();
+  void SetExternalViewport(double viewWidth, double viewHeight);
+  void SetExternalActive(bool active);
+  void CloseExternalWindow();
   // The display's density. APZ measures how far a finger may wander and still
   // count as a tap against this; left to itself it assumes a 96 dpi monitor
   // and lets a tap move nine pixels, which on this screen is a fifth of a
@@ -66,6 +75,8 @@ class EngineView {
   // Hands a URL to the engine as soon as it can take one. Safe to call before
   // the engine has started.
   void OpenUrl(std::wstring_view url);
+  void CloseSession();
+  bool DragFiles(int32_t state, double x, double y, const wchar_t* paths);
   // Handed to the engine so it can open mailto:, tel: and ms-settings: URIs
   // through the system. Static because the engine keeps a plain pointer.
   static void LaunchSystemUri(const char* utf8);
@@ -131,7 +142,10 @@ class EngineView {
  private:
   void Tick();
   bool Resolve();
+  void CompleteFirstFrame();
   void EnsureBitmap(int32_t width, int32_t height);
+  void EnsureExternalBitmap(int32_t width, int32_t height);
+  void TickExternalWindow();
 
   // A drag scrolls and a tap clicks, which is what a phone means by touch. The
   // engine is told in the pixels of the frame it drew, so every point has to
@@ -158,11 +172,17 @@ class EngineView {
       winrt::Windows::Foundation::Point const& point) const;
   bool ToFrame(winrt::Windows::Foundation::Point const& point, int32_t* x,
                int32_t* y) const;
+  bool ToExternalFrameFromWindow(
+      winrt::Windows::Foundation::Point const& point, int32_t* x,
+      int32_t* y) const;
+  bool IsPointInExternalWindow(
+      winrt::Windows::Foundation::Point const& point) const;
 
   void FollowTextInput();
   // Tells the engine how much room the picture has, whenever that changes.
   void PushSize();
   void PushSizePixels(int32_t width, int32_t height);
+  void PublishPanelCapacity();
   // Runs work on a later turn of the UI loop, never inside the handler that
   // asked for it.
   static void PostToUi(std::function<void()> work);
@@ -192,6 +212,9 @@ class EngineView {
   using ScreenFn = void (*)(int32_t width, int32_t height);
   using DpiFn = void (*)(int32_t dpi);
   using OpenUrlFn = int32_t (*)(const char* url);
+  using CloseSessionFn = void (*)();
+  using ExternalActiveFn = void (*)(int32_t active);
+  using ExternalCloseFn = void (*)();
   using SetLauncherFn = void (*)(void (*)(const char*));
   using SetFullscreenSinkFn = void (*)(void (*)(int32_t));
   using SetWindowDragSinkFn = void (*)(void (*)(int32_t));
@@ -199,6 +222,7 @@ class EngineView {
   using SetFilePickerSinkFn = void (*)(int32_t (*)(
       int32_t, const char*, const char*, const char*, char*, int32_t));
   using SetDownloadDirectoryFn = void (*)(const wchar_t* path);
+  using SetWallpaperSinkFn = void (*)(void (*)(const wchar_t* path));
   struct FileBroker {
     intptr_t (*open)(const wchar_t*, int32_t);
     int32_t (*exists)(const wchar_t*);
@@ -211,7 +235,9 @@ class EngineView {
   using BridgeReplyFn = void (*)(const char*);
   using PanelFn = void (*)(void* panel);
   using PanelPresentingFn = int32_t (*)();
+  using SoftwareMainPresentingFn = int32_t (*)();
   using PanelSizeFn = void (*)(int32_t width, int32_t height);
+  using PanelCapacityFn = void (*)(int32_t width, int32_t height, int32_t mode);
   using PanelScaleFn = void (*)(float x, float y);
   using AngleLogFn = void (*)(void (*)(const char*));
   using AngleModeFn = void (*)(int32_t);
@@ -229,9 +255,18 @@ class EngineView {
   using SetVideoLayerSinkFn = void (*)(const VideoLayerSink*);
 
   CopyFn copy_ = nullptr;
+  CopyFn externalCopy_ = nullptr;
+  WantedFn externalOpen_ = nullptr;
+  MouseButtonFn externalMouse_ = nullptr;
+  WheelFn externalWheel_ = nullptr;
+  ResizeFn externalResize_ = nullptr;
+  ExternalActiveFn externalActive_ = nullptr;
+  ExternalCloseFn externalClose_ = nullptr;
   MouseFn mouse_ = nullptr;
   MouseButtonFn mouseButton_ = nullptr;
   WheelFn wheel_ = nullptr;
+  using DragFilesFn = void (*)(int32_t, int32_t, int32_t, const wchar_t*);
+  DragFilesFn dragFiles_ = nullptr;
   WantedFn wanted_ = nullptr;
   // The focused field's kind and the engine's focus serial (see
   // gecko_w10m_text_input_state); null with an engine that has no such export.
@@ -246,12 +281,14 @@ class EngineView {
   DpiFn dpi_fn_ = nullptr;
   int32_t dpi_ = 0;
   OpenUrlFn open_url_ = nullptr;
+  CloseSessionFn close_session_ = nullptr;
   SetLauncherFn set_launcher_ = nullptr;
   SetFullscreenSinkFn set_fullscreen_ = nullptr;
   SetWindowDragSinkFn set_window_drag_ = nullptr;
   SetCursorSinkFn set_cursor_ = nullptr;
   SetFilePickerSinkFn set_file_picker_ = nullptr;
   SetDownloadDirectoryFn set_download_directory_ = nullptr;
+  SetWallpaperSinkFn set_wallpaper_sink_ = nullptr;
   SetFileBrokerFn set_file_broker_ = nullptr;
   SetVideoLayerSinkFn set_video_layer_ = nullptr;
   // The chrome-to-shell message bridge (client/DrmBridge). Armed once the
@@ -264,7 +301,7 @@ class EngineView {
   // A URL the phone handed us -- from a tap on a link in another app, or from
   // this being the browser it opens links with. Kept until the engine has a
   // window to put it in.
-  std::string pendingUrl_;
+  std::deque<std::string> pendingUrls_;
   unsigned long long lastOpenAttempt_ = 0;
   // The fingers on the glass, and where the last touch move actually sent for
   // each was, so a finger resting on the glass stops producing them.
@@ -281,28 +318,51 @@ class EngineView {
   int32_t screenHeight_ = 0;
   PanelFn panel_fn_ = nullptr;
   PanelPresentingFn panel_presenting_fn_ = nullptr;
+  SoftwareMainPresentingFn software_main_presenting_fn_ = nullptr;
   PanelSizeFn panel_size_fn_ = nullptr;
+  PanelCapacityFn panel_capacity_fn_ = nullptr;
+  int32_t capacityWidthSent_ = 0;
+  int32_t capacityHeightSent_ = 0;
   PanelScaleFn panel_scale_fn_ = nullptr;
 
   winrt::Windows::UI::Xaml::Controls::Image image_{nullptr};
+  winrt::Windows::UI::Xaml::Controls::Image externalImage_{nullptr};
   winrt::Windows::UI::Xaml::Controls::SwapChainPanel panel_{nullptr};
   winrt::Windows::UI::Xaml::Controls::SwapChainPanel video_panel_{nullptr};
   winrt::Windows::UI::Xaml::FrameworkElement host_{nullptr};
   winrt::Windows::UI::Xaml::Controls::TextBox sink_{nullptr};
   winrt::Windows::UI::Xaml::Media::Imaging::WriteableBitmap bitmap_{nullptr};
+  winrt::Windows::UI::Xaml::Media::Imaging::WriteableBitmap externalBitmap_{nullptr};
   winrt::event_token tick_{};
 
   uint64_t seen_ = 0;
+  uint64_t externalSeen_ = 0;
+  unsigned long long lastExternalFrameCopy_ = 0;
   int32_t width_ = 0;
   int32_t height_ = 0;
+  int32_t externalWidth_ = 0;
+  int32_t externalHeight_ = 0;
+  // Last external viewport sent to Gecko. XAML may report the same measured
+  // size more than once while a shell window is being shown or maximized.
+  int32_t externalViewportWidth_ = 0;
+  int32_t externalViewportHeight_ = 0;
   // Chrome popups are software-composited over the GPU-backed browser. Track
   // their transition so the final transparent frame is copied when one closes,
   // and cap those large UI-thread copies while it remains open.
   bool chromeOverlayVisible_ = false;
+  bool softwareMainVisible_ = false;
   unsigned long long lastChromeOverlayCopy_ = 0;
   bool reported_ = false;
   bool panelGiven_ = false;
+  bool panelLayoutWaitReported_ = false;
   bool sizeSent_ = false;
+  // A window can be maximized while Gecko is still constructing its first
+  // compositor. Replacing that compositor's dimensions mid-startup can make
+  // ANGLE tear down a surface which has not presented yet. Keep only the last
+  // requested size and apply it after the first successful frame.
+  bool firstFrameReady_ = false;
+  int32_t pendingStartupWidth_ = 0;
+  int32_t pendingStartupHeight_ = 0;
   bool textInputPending_ = false;
   int experimentMode_ = 0;
   bool panelWithheld_ = false;
@@ -328,12 +388,17 @@ class EngineView {
   bool coreLeftDown_ = false;
   bool coreMiddleDown_ = false;
   bool coreRightDown_ = false;
+  bool corePointerExternal_ = false;
+  int32_t lastExternalInputX_ = 0;
+  int32_t lastExternalInputY_ = 0;
   // The most recent point inside Gecko. Controller scrolling uses it so an
   // open menu is scrolled under the cursor; before there is one, use center.
   int32_t lastInputX_ = 0;
   int32_t lastInputY_ = 0;
   bool haveInputPoint_ = false;
   unsigned long long lastGamepadPoll_ = 0;
+  unsigned long long lastGamepadDiscovery_ = 0;
+  winrt::Windows::Gaming::Input::Gamepad gamepad_{nullptr};
   bool gamepadApiUnavailable_ = false;
   bool inputEnabled_ = false;
 
@@ -344,6 +409,9 @@ class EngineView {
   int32_t sinkKind_ = -1;
   void ApplyInputKind(int32_t kind);
   bool clearing_ = false;  // emptying the sink, so ignore its own change
+  uint64_t textRevision_ = 0;
+  uint64_t hardwareTextRevision_ = 0;
+  bool hardwareCharacterPending_ = false;
   // KeyUp must follow the same path as its KeyDown even if Gecko changes text
   // focus in between the two events.
   std::array<bool, 256> forwardedKeys_{};

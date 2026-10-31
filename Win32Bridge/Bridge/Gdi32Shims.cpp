@@ -9,6 +9,7 @@
 #include "Bridge\\RuntimeDiagnostics.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -486,7 +487,7 @@ HFONT WINAPI Win32Bridge::Bridge::BridgeCreateFontIndirectW(const GuestAbi::LogF
         return nullptr;
     }
 
-    return CreateGuestFont(
+    HFONT result = CreateGuestFont(
         manager,
         MakeMiniGdiFont(
             logFont->lfHeight,
@@ -503,6 +504,11 @@ HFONT WINAPI Win32Bridge::Bridge::BridgeCreateFontIndirectW(const GuestAbi::LogF
             logFont->lfQuality,
             logFont->lfPitchAndFamily,
             logFont->lfFaceName));
+    RuntimeDiagnostics::Record(
+        L"FONT: CreateFontIndirectW " + std::to_wstring(logFont->lfHeight) +
+        L"x" + std::to_wstring(logFont->lfWidth) +
+        (result ? L" succeeded." : L" failed."));
+    return result;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetTextMetricsW(HDC dc, GuestAbi::TextMetricW* metrics)
@@ -1319,6 +1325,12 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"createrectrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateRectRgn);
     else if (_wcsicmp(symbol.name.c_str(), L"createrectrgnindirect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateRectRgnIndirect);
     else if (_wcsicmp(symbol.name.c_str(), L"createellipticrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateEllipticRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"createellipticrgnindirect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateEllipticRgnIndirect);
+    else if (_wcsicmp(symbol.name.c_str(), L"createroundrectrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateRoundRectRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"createpolygonrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePolygonRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"createpolypolygonrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePolyPolygonRgn);
+    else if (_wcsicmp(symbol.name.c_str(), L"extcreateregion") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtCreateRegion);
+    else if (_wcsicmp(symbol.name.c_str(), L"getregiondata") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetRegionData);
     else if (_wcsicmp(symbol.name.c_str(), L"setrectrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetRectRgn);
     else if (_wcsicmp(symbol.name.c_str(), L"offsetrgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOffsetRgn);
     else if (_wcsicmp(symbol.name.c_str(), L"getrgnbox") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetRgnBox);

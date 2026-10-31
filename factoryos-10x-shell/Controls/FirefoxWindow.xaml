@@ -5,8 +5,11 @@
     Width="1080"
     Height="650">
     <Border x:Name="WindowBorder" Background="#FF1C1B22" BorderBrush="#FF5A5A5A" BorderThickness="1" CornerRadius="4">
-        <Grid PointerPressed="Root_PointerPressed">
+        <Grid PointerEntered="Root_PointerEntered" PointerExited="Root_PointerExited" PointerPressed="Root_PointerPressed">
             <Grid x:Name="BrowserSurface" Background="#FF1C1B22" SizeChanged="BrowserSurface_SizeChanged" />
+            <Border x:Name="UploadDropTarget" Background="Transparent" AllowDrop="True" IsHitTestVisible="False"
+                    DragEnter="BrowserSurface_DragEnter" DragOver="BrowserSurface_DragOver"
+                    DragLeave="BrowserSurface_DragLeave" Drop="BrowserSurface_Drop" />
             <Border x:Name="ResizeGripTopLeft" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased" />
             <Border x:Name="ResizeGripTopRight" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Tag="TopRight" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased" />
             <Border x:Name="ResizeGripBottomLeft" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomLeft" PointerMoved="ResizeGrip_PointerMoved" PointerPressed="ResizeGrip_PointerPressed" PointerReleased="ResizeGrip_PointerReleased" />

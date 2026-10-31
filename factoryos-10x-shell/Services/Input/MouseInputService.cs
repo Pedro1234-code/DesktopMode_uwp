@@ -14,11 +14,24 @@ namespace factoryos_10x_shell.Services.Input
     public sealed class MouseInputService : IMouseInputService
     {
         private CoreWindow m_coreWindow;
+        private readonly MouseInputChangedEventArgs m_movedEvent;
+        private readonly MouseInputChangedEventArgs m_pressedEvent;
+        private readonly MouseInputChangedEventArgs m_releasedEvent;
 
         public bool IsMouseDetected { get; private set; }
         public MouseInputSnapshot Current { get; } = new MouseInputSnapshot();
 
         public event EventHandler<MouseInputChangedEventArgs> InputChanged;
+
+        public MouseInputService()
+        {
+            // PointerMoved can arrive hundreds of times per second. Reuse event
+            // objects backed by the shared Current snapshot instead of feeding
+            // the GC with one short-lived allocation per raw mouse packet.
+            m_movedEvent = new MouseInputChangedEventArgs(MouseInputChangeKind.Moved, Current);
+            m_pressedEvent = new MouseInputChangedEventArgs(MouseInputChangeKind.Pressed, Current);
+            m_releasedEvent = new MouseInputChangedEventArgs(MouseInputChangeKind.Released, Current);
+        }
 
         public void Attach(CoreWindow coreWindow)
         {
@@ -75,7 +88,23 @@ namespace factoryos_10x_shell.Services.Input
             Current.IsXButton1Pressed = properties.IsXButton1Pressed;
             Current.IsXButton2Pressed = properties.IsXButton2Pressed;
 
-            InputChanged?.Invoke(this, new MouseInputChangedEventArgs(kind, Current, wheelDelta));
+            MouseInputChangedEventArgs eventArgs;
+            switch (kind)
+            {
+                case MouseInputChangeKind.Moved:
+                    eventArgs = m_movedEvent;
+                    break;
+                case MouseInputChangeKind.Pressed:
+                    eventArgs = m_pressedEvent;
+                    break;
+                case MouseInputChangeKind.Released:
+                    eventArgs = m_releasedEvent;
+                    break;
+                default:
+                    eventArgs = new MouseInputChangedEventArgs(kind, Current, wheelDelta);
+                    break;
+            }
+            InputChanged?.Invoke(this, eventArgs);
         }
     }
 }

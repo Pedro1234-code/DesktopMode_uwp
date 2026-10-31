@@ -8,6 +8,23 @@ namespace
     constexpr DWORD kCdErrInitialization = 0x0002;
     constexpr DWORD kFnErrBufferTooSmall = 0x3003;
     constexpr DWORD kOfnExtensionDifferent = 0x00000400;
+    constexpr DWORD kCcRgbInit = 0x00000001;
+    constexpr DWORD kCcEnableHook = 0x00000010;
+
+    struct GuestChooseColorW final
+    {
+        DWORD structureSize;
+        HWND owner;
+        HWND instance;
+        COLORREF result;
+        COLORREF* customColors;
+        DWORD flags;
+        LPARAM customData;
+        DLGPROC hook;
+        LPCWSTR templateName;
+    };
+    static_assert(sizeof(GuestChooseColorW) == 72,
+        "CHOOSECOLORW guest ABI must remain x64-compatible.");
 
     bool IsComdlgLibrary(const std::wstring& library)
     {
@@ -147,7 +164,29 @@ HWND WINAPI BridgeFindTextW(PVOID) { SetCommonDialogError(0); return nullptr; }
 HWND WINAPI BridgeReplaceTextW(PVOID) { SetCommonDialogError(0); return nullptr; }
 BOOL WINAPI BridgePageSetupDlgW(PVOID) { SetCommonDialogError(0); return FALSE; }
 BOOL WINAPI BridgeChooseFontW(PVOID) { SetCommonDialogError(0); return FALSE; }
-BOOL WINAPI BridgeChooseColorW(PVOID) { SetCommonDialogError(0); return FALSE; }
+BOOL WINAPI BridgeChooseColorW(PVOID value)
+{
+    auto* request = static_cast<GuestChooseColorW*>(value);
+    if (!request || request->structureSize < sizeof(GuestChooseColorW))
+    {
+        SetCommonDialogError(kCdErrInitialization);
+        return FALSE;
+    }
+    COLORREF selected = (request->flags & kCcRgbInit) != 0
+        ? request->result : RGB(0, 0, 0);
+    const bool accepted = ShowGuestColorDialog(request->owner,
+        reinterpret_cast<HINSTANCE>(request->instance), selected, &selected,
+        (request->flags & kCcEnableHook) != 0 ? request->hook : nullptr,
+        reinterpret_cast<LPARAM>(request));
+    if (!accepted)
+    {
+        SetCommonDialogError(0);
+        return FALSE;
+    }
+    request->result = selected;
+    SetCommonDialogError(0);
+    return TRUE;
+}
 // Printing is intentionally unavailable in the sandbox.  Report the same
 // observable result as a user-cancelled common dialog, rather than inventing a
 // printer or allowing the guest to reach the host print subsystem.
@@ -199,6 +238,10 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveComdlg32Import
     if (resolution.targetAddress)
     {
         resolution.disposition = ImportDisposition::NeedsBridge;
+        if (IsName(symbol.name, L"printdlgw") || IsName(symbol.name, L"printdlgexw"))
+            resolution.note = L"Printing compatibility stub; no host printer surface is exposed.";
+        else
+            resolution.note = L"Virtual common-dialog adapter backed by guest storage and guest windows.";
     }
     return resolution;
 }

@@ -24,7 +24,28 @@
             <Image x:Name="MouseCursor"
                    Source="ms-appx:///Assets/Cursor/aero_arrow_xl_fix.png"
                    Stretch="Uniform"
-                   Visibility="Collapsed" />
+                   Visibility="Collapsed">
+                <Image.RenderTransform>
+                    <TranslateTransform x:Name="MouseCursorTransform" />
+                </Image.RenderTransform>
+            </Image>
+            <Viewbox x:Name="ResizeCursor"
+                     Width="24"
+                     Height="24"
+                     Visibility="Collapsed">
+                <Viewbox.RenderTransform>
+                    <TranslateTransform x:Name="ResizeCursorTransform" />
+                </Viewbox.RenderTransform>
+                <Canvas Width="24" Height="24">
+                    <Canvas.RenderTransform>
+                        <RotateTransform x:Name="ResizeCursorRotation" CenterX="12" CenterY="12" />
+                    </Canvas.RenderTransform>
+                    <Path Data="M3,3 L21,21 M3,9 L3,3 L9,3 M15,21 L21,21 L21,15"
+                          Stroke="Black" StrokeThickness="3.5" StrokeLineJoin="Round" />
+                    <Path Data="M3,3 L21,21 M3,9 L3,3 L9,3 M15,21 L21,21 L21,15"
+                          Stroke="White" StrokeThickness="1.5" StrokeLineJoin="Round" />
+                </Canvas>
+            </Viewbox>
         </Canvas>
     </Grid>
 </Page>

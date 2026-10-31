@@ -18,7 +18,6 @@
     <!-- We want to manually control the MinVersion/MaxVersionTested in the manifest so turn of the replacement. -->
     <AppxOSMinVersionReplaceManifestVersion>false</AppxOSMinVersionReplaceManifestVersion>
     <AppxOSMaxVersionTestedReplaceManifestVersion>false</AppxOSMaxVersionTestedReplaceManifestVersion>
-    <MinimumVisualStudioVersion>18</MinimumVisualStudioVersion>
     <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
     <AppxDefaultResourceQualifierUAP_Contrast>black</AppxDefaultResourceQualifierUAP_Contrast>
     <FileAlignment>512</FileAlignment>
@@ -36,6 +35,12 @@
     <GenerateTestArtifacts>False</GenerateTestArtifacts>
     <IlcParameters>/disableStackTraceMetadata /disableExceptionMessages</IlcParameters>
     <LangVersion>9.0</LangVersion>
+    <!-- Calculator is an in-process DesktopMode component in this solution.
+         Keeping the hosted property stable lets MSBuild reuse the solution
+         build instead of creating a second project instance with the same
+         output directory. Pass /p:CalculatorHostedBuild=false explicitly only
+         when working on the original standalone packaging flow. -->
+    <CalculatorHostedBuild Condition="'$(CalculatorHostedBuild)'==''">true</CalculatorHostedBuild>
   </PropertyGroup>
   <!-- This has to be exactly in this place for this to work -->
   <PropertyGroup Condition="'$(Configuration)|$(Platform)' == 'Debug|x86'">
@@ -527,7 +532,12 @@
     <Content Include="Assets\Standard.targetsize-32_contrast-white.png" />
     <Content Include="Assets\Standard.targetsize-64_contrast-black.png" />
     <Content Include="Assets\Standard.targetsize-64_contrast-white.png" />
-    <Content Include="Properties\Default.rd.xml" />
+    <!-- DesktopMode owns the single application-level .NET Native policy when
+         Calculator is hosted in-process. Copying this file into the Shell
+         creates a second <Application> directive (ILT0027) and expands the
+         native-analysis closure. Keep it only for the standalone package. -->
+    <Content Include="Properties\Default.rd.xml"
+             Condition="'$(CalculatorHostedBuild)' != 'true'" />
   </ItemGroup>
   <ItemGroup>
     <PRIResource Include="Resources\af-ZA\CEngineStrings.resw" />

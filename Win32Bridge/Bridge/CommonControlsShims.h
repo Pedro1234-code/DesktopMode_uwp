@@ -26,6 +26,10 @@ namespace Bridge
 
     using GuestImageList = HANDLE;
 
+    // These tables emulate process-owned comctl32 state.  GuestRuntime calls
+    // this at the emulated process boundary so callbacks and HWND keys from a
+    // previous PE cannot be observed by the next one.
+    void ResetGuestCommonControlState();
     void WINAPI BridgeInitCommonControls();
     BOOL WINAPI BridgeInitCommonControlsEx(const GuestInitCommonControlsEx* controls);
     GuestImageList WINAPI BridgeImageListCreate(int width, int height, UINT flags, int initial, int grow);
@@ -45,7 +49,6 @@ namespace Bridge
     INT_PTR WINAPI BridgePropertySheetW(const void* header);
     HRESULT WINAPI BridgeDllGetVersion(GuestDllVersionInfo* versionInfo);
     HANDLE WINAPI BridgeCreatePropertySheetPageW(const void* page);
-    ULONG_PTR WINAPI BridgeCommonControlOrdinal345();
     ImportResolution ResolveCommonControlsImport(const ImportedSymbol& symbol);
 }
 }

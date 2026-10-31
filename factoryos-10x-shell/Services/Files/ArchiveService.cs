@@ -145,6 +145,8 @@ namespace factoryos_10x_shell.Services.Files
 
                 ulong total = sources.Aggregate<ArchiveSource, ulong>(0, (sum, item) => sum + item.Size);
                 ulong completed = 0;
+                var progressClock = Stopwatch.StartNew();
+                long lastProgressMilliseconds = -1000;
                 using (Stream output = destination.OpenStreamForWriteAsync().GetAwaiter().GetResult())
                 {
                     output.SetLength(0);
@@ -158,15 +160,54 @@ namespace factoryos_10x_shell.Services.Files
                         foreach (ArchiveSource source in sources)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
-                            progress?.Report(new ArchiveProgress { Item = source.Path, Percent = total == 0 ? 0 : completed * 100d / total });
+                            ReportProgress(progress, source.Path, completed, total, progressClock,
+                                ref lastProgressMilliseconds, false);
                             using (Stream input = source.File.OpenStreamForReadAsync().GetAwaiter().GetResult())
-                                writer.Write(source.Path, input, source.File.DateCreated.DateTime);
+                            using (Stream tracked = new ArchiveReadStream(input, cancellationToken, read =>
+                            {
+                                ReportProgress(progress, source.Path, completed + Math.Min(read, source.Size),
+                                    total, progressClock, ref lastProgressMilliseconds, false);
+                            }))
+                                writer.Write(source.Path, tracked, source.File.DateCreated.DateTime);
                             completed += source.Size;
                         }
                     }
                 }
                 progress?.Report(new ArchiveProgress { Item = "Completed", Percent = 100 });
             }, cancellationToken);
+        }
+
+        private sealed class ArchiveReadStream : Stream
+        {
+            private readonly Stream m_input;
+            private readonly CancellationToken m_token;
+            private readonly Action<ulong> m_progress;
+            private ulong m_read;
+
+            public ArchiveReadStream(Stream input, CancellationToken token, Action<ulong> progress)
+            {
+                m_input = input;
+                m_token = token;
+                m_progress = progress;
+            }
+
+            public override bool CanRead => m_input.CanRead;
+            public override bool CanSeek => m_input.CanSeek;
+            public override bool CanWrite => false;
+            public override long Length => m_input.Length;
+            public override long Position { get => m_input.Position; set => m_input.Position = value; }
+            public override int Read(byte[] buffer, int offset, int count)
+            {
+                m_token.ThrowIfCancellationRequested();
+                int read = m_input.Read(buffer, offset, count);
+                m_read += (uint)read;
+                m_progress(m_input.CanSeek ? (ulong)m_input.Position : m_read);
+                return read;
+            }
+            public override long Seek(long offset, SeekOrigin origin) => m_input.Seek(offset, origin);
+            public override void Flush() { }
+            public override void SetLength(long value) => throw new NotSupportedException();
+            public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
         }
 
         private static ulong GetUncompressedSize(StorageFile file, string password)

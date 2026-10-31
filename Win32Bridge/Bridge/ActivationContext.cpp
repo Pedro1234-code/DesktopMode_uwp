@@ -10,6 +10,7 @@
 #include <atomic>
 #include <cstring>
 #include <cwctype>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -555,8 +556,24 @@ GuestActivationContextScope::GuestActivationContextScope()
     std::vector<GuestResourceIdentifier> names;
     if (EnumerateGuestResourceNames(nullptr, MAKEINTRESOURCEW(24), &names) != GuestResourceStatus::Success || names.empty())
         return;
-    const GuestResourceIdentifier& name = names.front();
-    const LPCWSTR resourceName = name.ordinal ? MAKEINTRESOURCEW(name.id) : name.text.c_str();
+    // Executables conventionally use resource ID 1. Keep a deterministic
+    // fallback for images produced by non-Microsoft resource compilers.
+    const GuestResourceIdentifier* selected = nullptr;
+    for (const WORD preferred : { static_cast<WORD>(1), static_cast<WORD>(2), static_cast<WORD>(3) })
+    {
+        for (const auto& name : names)
+        {
+            if (name.ordinal && name.id == preferred)
+            {
+                selected = &name;
+                break;
+            }
+        }
+        if (selected) break;
+    }
+    if (!selected) selected = &names.front();
+    const LPCWSTR resourceName = selected->ordinal
+        ? MAKEINTRESOURCEW(selected->id) : selected->text.c_str();
     std::shared_ptr<ContextRecord> record;
     GuestStorageContext* storage = CurrentGuestStorageContext();
     const std::wstring source = storage ? storage->ModulePath() : L"<embedded process manifest>";

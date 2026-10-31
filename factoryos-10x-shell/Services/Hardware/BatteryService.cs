@@ -26,13 +26,31 @@ namespace factoryos_10x_shell.Services.Hardware
 
         public BatteryService()
         {
-            Battery.AggregateBattery.ReportUpdated += AggregateBattery_ReportUpdated;
+            try
+            {
+                Battery.AggregateBattery.ReportUpdated += AggregateBattery_ReportUpdated;
+            }
+            catch (Exception)
+            {
+                // A battery sensor is optional on Xbox and desktop devices.
+            }
         }
 
         public BatteryReport GetStatusReport()
         {
-            Battery aggBattery = Battery.AggregateBattery;
-            Windows.Devices.Power.BatteryReport report = aggBattery.GetReport();
+            Windows.Devices.Power.BatteryReport report;
+            try
+            {
+                report = Battery.AggregateBattery.GetReport();
+            }
+            catch (Exception)
+            {
+                return new BatteryReport
+                {
+                    PowerStatus = BatteryPowerStatus.NotInstalled,
+                    ChargePercentage = 0
+                };
+            }
 
             BatteryReport batteryReport = new BatteryReport()
             {
@@ -50,10 +68,18 @@ namespace factoryos_10x_shell.Services.Hardware
                 _ => BatteryPowerStatus.NotInstalled
             };
 
-            if (batteryReport.PowerStatus != BatteryPowerStatus.NotInstalled)
-                batteryReport.ChargePercentage = (int)Math.Ceiling((double)(batteryReport.RemainingCapacity / batteryReport.FullCapacity) * 100);
+            // Some devices report Idle/Charging without a known full capacity.
+            // A zero denominator here used to abort creation of the taskbar.
+            if (batteryReport.PowerStatus != BatteryPowerStatus.NotInstalled &&
+                batteryReport.FullCapacity > 0)
+            {
+                double percentage = 100.0 * batteryReport.RemainingCapacity / batteryReport.FullCapacity;
+                batteryReport.ChargePercentage = (int)Math.Max(0, Math.Min(100, Math.Ceiling(percentage)));
+            }
             else
+            {
                 batteryReport.ChargePercentage = 0;
+            }
 
             return batteryReport;
         }

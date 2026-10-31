@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Copy this file to GeckoBuild.local.props and fill in the paths for the
+    current workstation. GeckoBuild.local.props is intentionally ignored by
+    Git. The same values may instead be supplied as MSBuild properties or as
+    GECKO_W10M_OBJ, GECKO_W10M_SOURCE and GECKO_W10M_CLANG_CL environment
+    variables.
+  -->
+  <PropertyGroup>
+    <GeckoW10mObj Condition="'$(GeckoW10mObj)'==''">PATH_TO_GECKO_OBJECT_DIRECTORY</GeckoW10mObj>
+    <GeckoW10mSource Condition="'$(GeckoW10mSource)'==''">PATH_TO_GECKO_SOURCE_DIRECTORY</GeckoW10mSource>
+    <!-- Optional when clang-cl.exe is available on PATH. -->
+    <GeckoW10mClangCl Condition="'$(GeckoW10mClangCl)'==''">PATH_TO_CLANG_CL_EXE</GeckoW10mClangCl>
+  </PropertyGroup>
+</Project>

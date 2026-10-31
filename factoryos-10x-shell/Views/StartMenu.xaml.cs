@@ -125,9 +125,14 @@ namespace factoryos_10x_shell.Views
         {
             var nameBox = new TextBox { PlaceholderText = "App name (optional)" };
             var urlBox = new TextBox { PlaceholderText = "https://example.com" };
+            var browserBox = new ComboBox { Header = "Open with", HorizontalAlignment = HorizontalAlignment.Stretch };
+            browserBox.Items.Add("Edge WebView2");
+            browserBox.Items.Add("Strawfox app");
+            browserBox.SelectedIndex = 0;
             var panel = new StackPanel { Spacing = 10 };
             panel.Children.Add(nameBox);
             panel.Children.Add(urlBox);
+            panel.Children.Add(browserBox);
             var dialog = new ContentDialog { Title = "Install web app", Content = panel, PrimaryButtonText = "Install", CloseButtonText = "Cancel" };
             ContentDialogResult installResult;
             MainPage.SetPopupCursorVisibility(true);
@@ -137,7 +142,7 @@ namespace factoryos_10x_shell.Views
 
             try
             {
-                var app = await webAppService.InstallAsync(nameBox.Text, urlBox.Text);
+                var app = await webAppService.InstallAsync(nameBox.Text, urlBox.Text, browserBox.SelectedIndex == 1);
                 windowManager.Open(app);
                 startManager.RequestStartVisibilityChange(false);
             }

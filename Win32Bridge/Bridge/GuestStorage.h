@@ -54,6 +54,7 @@ namespace Bridge
         bool SetEndOfFile(HANDLE guestHandle, DWORD* win32Error);
         bool FlushFile(HANDLE guestHandle, DWORD* win32Error);
         bool GetFilePath(HANDLE guestHandle, std::wstring* path, DWORD* win32Error) const;
+        bool IsDirectoryHandle(HANDLE guestHandle, DWORD* win32Error) const;
         bool LockFileRange(HANDLE guestHandle, ULONGLONG offset, ULONGLONG length,
             bool exclusive, bool failImmediately, DWORD* win32Error);
         bool UnlockFileRange(HANDLE guestHandle, ULONGLONG offset, ULONGLONG length,
@@ -128,6 +129,13 @@ namespace Bridge
             bool deleteOnClose,
             HANDLE* guestHandle,
             DWORD* win32Error);
+        bool AddDirectory(
+            Windows::Storage::StorageFolder^ folder,
+            const std::wstring& canonicalPath,
+            DWORD desiredAccess,
+            DWORD shareMode,
+            HANDLE* guestHandle,
+            DWORD* win32Error);
         bool AddFind(
             const std::shared_ptr<FindRecord>& record,
             HANDLE* guestHandle,
@@ -143,6 +151,8 @@ namespace Bridge
         void MoveAttributeOverrides(
             const std::wstring& sourceCanonicalPath,
             const std::wstring& destinationCanonicalPath);
+        bool IsLowerLayerTombstoned(const std::wstring& canonicalPath) const;
+        void SetLowerLayerTombstone(const std::wstring& canonicalPath, bool present);
 
         // Keep storage tokens separate from GuestKernelContext, whose
         // synchronization-object namespace begins at 0x40000000.
@@ -167,6 +177,7 @@ namespace Bridge
         ULONG_PTR m_nextHandle = FirstHandleToken;
         mutable std::mutex m_metadataLock;
         std::unordered_map<std::wstring, DWORD> m_attributeOverrides;
+        std::unordered_set<std::wstring> m_lowerLayerTombstones;
     };
 
     // File shims resolve their environment through TLS, so a later CreateThread

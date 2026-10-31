@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cwctype>
+#include <exception>
 #include <functional>
 #include <limits>
 #include <new>
@@ -54,6 +55,42 @@ namespace
     constexpr DWORD GuestIsmexSend = 0x00000001u;
     constexpr DWORD GuestIsmexNotify = 0x00000002u;
     constexpr DWORD GuestIsmexCallback = 0x00000004u;
+
+    // The UWP partition omits these desktop USER32 declarations, but hook
+    // callbacks in an x64 guest still consume their documented binary layout.
+    // Keep bridge-local names so the host SDK surface remains irrelevant.
+    struct GuestMouseLowLevelHook final
+    {
+        POINT point;
+        DWORD mouseData;
+        DWORD flags;
+        DWORD time;
+        ULONG_PTR extraInformation;
+    };
+    struct GuestMouseHook final
+    {
+        POINT point;
+        HWND window;
+        UINT hitTestCode;
+        ULONG_PTR extraInformation;
+    };
+    struct GuestKeyboardLowLevelHook final
+    {
+        DWORD virtualKey;
+        DWORD scanCode;
+        DWORD flags;
+        DWORD time;
+        ULONG_PTR extraInformation;
+    };
+    static_assert(sizeof(GuestMouseLowLevelHook) == 32,
+        "MSLLHOOKSTRUCT x64 ABI drifted.");
+    static_assert(sizeof(GuestMouseHook) == 32,
+        "MOUSEHOOKSTRUCT x64 ABI drifted.");
+    static_assert(sizeof(GuestKeyboardLowLevelHook) == 24,
+        "KBDLLHOOKSTRUCT x64 ABI drifted.");
+    constexpr DWORD GuestLowLevelKeyExtended = 0x00000001u;
+    constexpr DWORD GuestLowLevelKeyAltDown = 0x00000020u;
+    constexpr DWORD GuestLowLevelKeyUp = 0x00000080u;
     // WriteableBitmap exposes its storage through this documented internal
     // interface. The surface data never leaves the UWP app container.
     // IBufferByteAccess is the SDK COM interface behind WriteableBitmap's
@@ -2801,9 +2838,14 @@ GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHos
             std::lock_guard<std::mutex> guard(callbacks->lock);
             if (callbacks->owner && args)
             {
-                callbacks->owner->HandleHostSizeChanged(
-                    (std::max)(1, static_cast<int>(std::lround(args->Size.Width))),
-                    (std::max)(1, static_cast<int>(std::lround(args->Size.Height))));
+                // CoreWindow covers the entire shell. The embedded runtime
+                // viewport is the panel, including when another host window
+                // or the shell itself changes size.
+                const auto panel = callbacks->owner->m_surfaceHost.Get();
+                if (panel && panel->ActualWidth > 0 && panel->ActualHeight > 0)
+                    callbacks->owner->HandleHostSizeChanged(
+                        static_cast<int>(std::lround(panel->ActualWidth)),
+                        static_cast<int>(std::lround(panel->ActualHeight)));
             }
         }
         catch (Exception^ error)
@@ -3981,17 +4023,31 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
     GuestAbi::WndProc procedure = nullptr;
     HWND handle = nullptr;
     BuiltinControlKind builtinKind = BuiltinControlKind::None;
+    DWORD targetThreadId = 0;
+    std::wstring className;
     {
         std::lock_guard<std::mutex> guard(window->lock);
         procedure = window->procedure;
         handle = window->handle;
+        targetThreadId = window->threadId;
         if (window->windowClass)
         {
             builtinKind = window->windowClass->builtinKind;
+            className = window->windowClass->displayName;
         }
     }
     if (procedure)
     {
+        struct GuestCallWndProc final
+        {
+            LPARAM lParam;
+            WPARAM wParam;
+            UINT message;
+            HWND window;
+        } call{ lParam, wParam, message, handle };
+        DispatchGuestHook(WH_CALLWNDPROC, HC_ACTION, 0,
+            reinterpret_cast<LPARAM>(&call), targetThreadId);
+
         if (IsRunawayGuestWindowDispatch(handle, message, procedure))
         {
             RuntimeDiagnostics::Record(
@@ -4020,23 +4076,50 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
                 L"GUEST CALLBACK EXCEPTION: code " +
                 std::to_wstring(static_cast<unsigned long>(guestException)) +
                 L", message " + std::to_wstring(message) +
-                L", window " + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)) + L".");
+                L", window " + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)) +
+                L", class '" + className + L"'.");
             return 0;
         }
         if (message == GuestAbi::WmPaint)
         {
             bool paintActive = false;
             bool paintStillPending = false;
+            int surfaceWidth = 0;
+            int surfaceHeight = 0;
+            MiniGdi::Color topLeft = MiniGdi::Transparent;
+            MiniGdi::Color center = MiniGdi::Transparent;
+            MiniGdi::Color bottomRight = MiniGdi::Transparent;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 paintActive = window->paintActive;
                 paintStillPending = window->invalidated ||
                     window->internalPaintPending;
+                surfaceWidth = window->surface.Width();
+                surfaceHeight = window->surface.Height();
+                if (surfaceWidth > 0 && surfaceHeight > 0 &&
+                    window->surface.Pixels().size() ==
+                        static_cast<size_t>(surfaceWidth) * static_cast<size_t>(surfaceHeight))
+                {
+                    const auto& pixels = window->surface.Pixels();
+                    topLeft = pixels.front();
+                    center = pixels[static_cast<size_t>(surfaceHeight / 2) *
+                        static_cast<size_t>(surfaceWidth) + static_cast<size_t>(surfaceWidth / 2)];
+                    bottomRight = pixels.back();
+                }
             }
             RuntimeDiagnostics::Record(
                 L"PAINT CALLBACK: handle " + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)) +
+                L", class '" + className + L"', proc " +
+                std::to_wstring(reinterpret_cast<ULONG_PTR>(procedure)) +
+                L", builtin " + std::to_wstring(static_cast<unsigned int>(builtinKind)) +
+                L", surface " + std::to_wstring(surfaceWidth) + L"x" +
+                std::to_wstring(surfaceHeight) + L", samples " +
+                std::to_wstring(static_cast<unsigned long>(topLeft)) + L"/" +
+                std::to_wstring(static_cast<unsigned long>(center)) + L"/" +
+                std::to_wstring(static_cast<unsigned long>(bottomRight)) +
                 L" used a custom procedure (result=" + std::to_wstring(result) +
-                L", BeginPaint active=" + (paintActive ? L"yes" : L"no") + L").");
+                L", BeginPaint active=" + (paintActive ? L"yes" : L"no") +
+                L", update pending=" + (paintStillPending ? L"yes" : L"no") + L").");
 
             // A number of common controls install a thin/subclass procedure
             // and rely on the class default procedure to consume WM_PAINT.
@@ -8136,8 +8219,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
 
             GuestComboBoxExItemW item = {};
             if (!TryReadGuestValue(reinterpret_cast<const GuestComboBoxExItemW*>(lParam), &item) ||
-                (item.item < 0 &&
-                    !(message == ComboBoxExInsertItemW && item.item == -1)))
+                item.item < -1)
             {
                 return message == ComboBoxExInsertItemW ? -1 : FALSE;
             }
@@ -8145,6 +8227,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             if (message == ComboBoxExGetItemW)
             {
                 std::lock_guard<std::mutex> guard(window->lock);
+                if (item.item == -1)
+                {
+                    if ((item.mask & 0x00000001u) != 0)
+                        return TryWriteGuestWideString(item.text,
+                            static_cast<size_t>((std::max)(0, item.textCapacity)),
+                            window->title, nullptr) ? TRUE : FALSE;
+                    return TRUE;
+                }
                 if (static_cast<size_t>(item.item) >= window->choiceItems.size())
                 {
                     return FALSE;
@@ -8190,6 +8280,14 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         window->selectedChoice = result;
                         window->title = window->choiceItems[insertion];
                     }
+                }
+                else if (item.item == -1)
+                {
+                    // ComboBoxEx reserves -1 for the edit field rather than
+                    // an entry in the drop-down list (ReactOS COMBOEX_SetItemW).
+                    if ((item.mask & 0x00000001u) != 0)
+                        window->title = std::move(caption);
+                    result = TRUE;
                 }
                 else if (static_cast<size_t>(item.item) < window->choiceItems.size())
                 {
@@ -11699,6 +11797,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
     case GuestAbi::WmEraseBkgnd:
         // BeginPaint owns the class-brush fallback. Returning zero gives it
         // the same negotiation as DefWindowProc without double-erasing.
+        return 0;
+    case GuestAbi::WmQueryEndSession:
+        // Win32 DefWindowProc permits the session transition unless the
+        // application explicitly handles WM_QUERYENDSESSION and vetoes it.
+        return TRUE;
+    case GuestAbi::WmEndSession:
         return 0;
     case GuestAbi::WmSysCommand:
         if ((wParam & GuestAbi::ScMask) == GuestAbi::ScClose)
@@ -15506,6 +15610,12 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
         // normal DefWindowProc negotiation without pretending a background
         // was painted when it was not.
         return 0;
+    case GuestAbi::WmQueryEndSession:
+        // DefWindowProc permits the transition unless the application
+        // explicitly handles WM_QUERYENDSESSION and returns FALSE.
+        return TRUE;
+    case GuestAbi::WmEndSession:
+        return 0;
     case GuestAbi::WmSysCommand:
         if ((wParam & GuestAbi::ScMask) == GuestAbi::ScClose)
             return CallWindowProcedure(record, GuestAbi::WmClose, 0, 0);
@@ -16673,6 +16783,8 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
     // at the same time.  Serializing the complete snapshot/composition keeps
     // temporary MiniGDI DCs and menu-level snapshots from racing each other.
     std::lock_guard<std::mutex> compositionGuard(m_compositionLock);
+    HWND composingWindow = nullptr;
+    std::wstring compositionStage = L"begin";
 
     try
     {
@@ -16684,6 +16796,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             }
         }
 
+        compositionStage = L"resolve requested window";
         HWND requested = nullptr;
         {
             std::lock_guard<std::mutex> guard(window->lock);
@@ -16697,6 +16810,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
         {
             return;
         }
+        composingWindow = requested;
 
         // One XAML Image represents the visible desktop of this guest. Build
         // that frame from the requested top-level window and its visible child
@@ -16723,6 +16837,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             std::shared_ptr<WindowRecord> record;
         };
 
+        compositionStage = L"snapshot guest windows";
         std::vector<std::shared_ptr<WindowRecord>> records;
         {
             std::lock_guard<std::mutex> guard(m_windowsLock);
@@ -16856,6 +16971,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             }
         }
 
+        compositionStage = L"compose window surfaces";
         MiniGdi::Surface composite;
         {
             const auto rootRecord = snapshots[root].record;
@@ -17056,8 +17172,11 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                             }
                         }
                     }
-                    composeChildren(childIndex, childX, childY);
                 }
+                // WS_CLIPCHILDREN can remove every pixel of a container's
+                // own surface. Its descendants still have visible surfaces:
+                // traversal must not depend on copying a pixel of the parent.
+                composeChildren(childIndex, childX, childY);
             }
         };
         composeChildren(root, 0, 0);
@@ -17301,6 +17420,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             composite = std::move(desktop);
         }
 
+        compositionStage = L"publish composed frame";
         const size_t changedPixels = static_cast<size_t>(std::count_if(
             composite.Pixels().cbegin(),
             composite.Pixels().cend(),
@@ -17348,11 +17468,25 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
         // may be allowed to unwind into guest code.
         RuntimeDiagnostics::Record(
             L"FRAME EXCEPTION: composition failed; HRESULT " +
-            std::to_wstring(static_cast<unsigned long>(error->HResult)) + L".");
+            std::to_wstring(static_cast<unsigned long>(error->HResult)) +
+            L", stage '" + compositionStage + L"', window " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(composingWindow)) + L".");
+    }
+    catch (const std::exception& error)
+    {
+        const char* what = error.what();
+        const std::string narrow = what ? what : "unknown std::exception";
+        RuntimeDiagnostics::Record(
+            L"FRAME EXCEPTION: std::exception '" +
+            std::wstring(narrow.begin(), narrow.end()) + L"', stage '" +
+            compositionStage + L"', window " +
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(composingWindow)) + L".");
     }
     catch (...)
     {
-        RuntimeDiagnostics::Record(L"FRAME EXCEPTION: composition raised an unknown exception.");
+        RuntimeDiagnostics::Record(
+            L"FRAME EXCEPTION: unknown exception, stage '" + compositionStage +
+            L"', window " + std::to_wstring(reinterpret_cast<ULONG_PTR>(composingWindow)) + L".");
     }
 }
 
@@ -17589,6 +17723,18 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
     const int screenY = SaturatingAdd(targetTop, localY);
     const LPARAM screenPosition = GuestAbi::MakeMouseLParam(
         SignedCoordinateWord(screenX), SignedCoordinateWord(screenY));
+    const DWORD hookThread = GetGuestWindowThreadId(target, nullptr);
+    GuestMouseLowLevelHook lowLevel{};
+    lowLevel.point.x = screenX;
+    lowLevel.point.y = screenY;
+    lowLevel.time = BridgeGetTickCount();
+    if ((message == GuestAbi::WmXButtonDown ||
+        message == GuestAbi::WmXButtonUp) && properties)
+        lowLevel.mouseData = static_cast<DWORD>(
+            XButtonFromUpdate(properties->PointerUpdateKind)) << 16;
+    if (DispatchGuestHook(WH_MOUSE_LL, HC_ACTION, message,
+        reinterpret_cast<LPARAM>(&lowLevel), hookThread) != 0)
+        return;
     const LRESULT hit = SendGuestMessage(target, GuestAbi::WmNcHitTest, 0,
         screenPosition, nullptr);
     if (hit != GuestAbi::HtClient && hit != GuestAbi::HtNowhere &&
@@ -17608,6 +17754,14 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         }
         if (nonClientMessage)
         {
+            GuestMouseHook hook{};
+            hook.point.x = screenX;
+            hook.point.y = screenY;
+            hook.window = target;
+            hook.hitTestCode = static_cast<UINT>(hit);
+            if (DispatchGuestHook(WH_MOUSE, HC_ACTION, nonClientMessage,
+                reinterpret_cast<LPARAM>(&hook), hookThread) != 0)
+                return;
             if (message == GuestAbi::WmLButtonDown)
                 SetGuestForegroundWindow(target, true, nullptr);
             PostGuestMessage(target, nonClientMessage,
@@ -17615,6 +17769,14 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
             return;
         }
     }
+    GuestMouseHook hook{};
+    hook.point.x = screenX;
+    hook.point.y = screenY;
+    hook.window = target;
+    hook.hitTestCode = static_cast<UINT>(hit);
+    if (DispatchGuestHook(WH_MOUSE, HC_ACTION, message,
+        reinterpret_cast<LPARAM>(&hook), hookThread) != 0)
+        return;
     if (message == GuestAbi::WmLButtonDown)
         SetGuestForegroundWindow(target, true, nullptr);
     WPARAM state = MouseKeyState(properties);
@@ -17724,9 +17886,42 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
         targetTop,
         point->Position,
         m_surfaceImage.Get());
+    const int localX = static_cast<int>(static_cast<short>(position & 0xffff));
+    const int localY = static_cast<int>(static_cast<short>((position >> 16) & 0xffff));
+    const int screenX = SaturatingAdd(targetLeft, localX);
+    const int screenY = SaturatingAdd(targetTop, localY);
+    const LPARAM screenPosition = GuestAbi::MakeMouseLParam(
+        SignedCoordinateWord(screenX), SignedCoordinateWord(screenY));
+    const DWORD hookThread = GetGuestWindowThreadId(target, nullptr);
+    const DWORD wheelData = static_cast<DWORD>(
+        static_cast<WORD>(point->Properties->MouseWheelDelta)) << 16;
+    GuestMouseLowLevelHook lowLevel{};
+    lowLevel.point.x = screenX;
+    lowLevel.point.y = screenY;
+    lowLevel.mouseData = wheelData;
+    lowLevel.time = BridgeGetTickCount();
+    if (DispatchGuestHook(WH_MOUSE_LL, HC_ACTION, GuestAbi::WmMouseWheel,
+        reinterpret_cast<LPARAM>(&lowLevel), hookThread) != 0)
+        return;
+
+    struct MouseHookStructExAbi
+    {
+        GuestMouseHook base;
+        DWORD mouseData;
+    } hook{};
+    hook.base.point.x = screenX;
+    hook.base.point.y = screenY;
+    hook.base.window = target;
+    hook.base.hitTestCode = GuestAbi::HtClient;
+    hook.mouseData = wheelData;
+    if (DispatchGuestHook(WH_MOUSE, HC_ACTION, GuestAbi::WmMouseWheel,
+        reinterpret_cast<LPARAM>(&hook), hookThread) != 0)
+        return;
     const WPARAM wParam = MouseKeyState(point->Properties) |
-        (static_cast<WPARAM>(static_cast<WORD>(point->Properties->MouseWheelDelta)) << 16);
-        PostGuestMessage(target, GuestAbi::WmMouseWheel, wParam, position, nullptr);
+        static_cast<WPARAM>(wheelData);
+    // WM_MOUSEWHEEL is one of the mouse messages whose lParam is expressed in
+    // screen coordinates, including when the target is a child window.
+    PostGuestMessage(target, GuestAbi::WmMouseWheel, wParam, screenPosition, nullptr);
     }
     catch (Exception^ error)
     {
@@ -17759,6 +17954,24 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
     MouseInput().UpdateKeyState(static_cast<int>(key),
         message == GuestAbi::WmKeyDown, keyStatus.ScanCode,
         keyStatus.IsExtendedKey);
+    HWND hookTarget = reinterpret_cast<HWND>(m_focusWindow.load());
+    if (!hookTarget) hookTarget = reinterpret_cast<HWND>(m_foregroundWindow.load());
+    const DWORD hookThread = hookTarget
+        ? GetGuestWindowThreadId(hookTarget, nullptr)
+        : BridgeGetCurrentThreadId();
+    GuestKeyboardLowLevelHook lowLevel{};
+    lowLevel.virtualKey = static_cast<DWORD>(key);
+    lowLevel.scanCode = keyStatus.ScanCode;
+    if (keyStatus.IsExtendedKey) lowLevel.flags |= GuestLowLevelKeyExtended;
+    if (keyStatus.IsMenuKeyDown) lowLevel.flags |= GuestLowLevelKeyAltDown;
+    if (message == GuestAbi::WmKeyUp || keyStatus.IsKeyReleased)
+        lowLevel.flags |= GuestLowLevelKeyUp;
+    lowLevel.time = BridgeGetTickCount();
+    if (DispatchGuestHook(WH_KEYBOARD_LL, HC_ACTION, message,
+        reinterpret_cast<LPARAM>(&lowLevel), hookThread) != 0 ||
+        DispatchGuestHook(WH_KEYBOARD, HC_ACTION, key,
+            static_cast<LPARAM>(keyData), hookThread) != 0)
+        return;
     if (message == GuestAbi::WmKeyDown)
     {
         PopupMenuSession popup;
@@ -18105,12 +18318,12 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
     {
         return;
     }
-    if (m_viewportWidth.exchange(width) == width &&
-        m_viewportHeight.exchange(height) == height)
+    const int previousWidth = m_viewportWidth.exchange(width);
+    const int previousHeight = m_viewportHeight.exchange(height);
+    if (previousWidth == width && previousHeight == height)
     {
         return;
     }
-    m_viewportHeight.store(height);
     GuestMetrics::SetCurrentScreenSize(width, height);
 
     {
@@ -18144,8 +18357,17 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
             handle = root->handle;
             const int oldWidth = root->bounds.right - root->bounds.left;
             const int oldHeight = root->bounds.bottom - root->bounds.top;
-            bindWidth = root->viewportWidthBound;
-            bindHeight = root->viewportHeightBound;
+            // The host supplies the frame for an ownerless resizable guest
+            // application. Restoring saved bounds with SetWindowPos must not
+            // detach that application from subsequent host-frame resizing.
+            // Owned/popup dialogs keep their application-selected dimensions.
+            constexpr DWORD ResizableFrame = 0x00040000u; // WS_THICKFRAME
+            constexpr DWORD PopupWindow = 0x80000000u; // WS_POPUP
+            const bool hostedApplication = !root->owner &&
+                (root->style & ResizableFrame) != 0 &&
+                (root->style & PopupWindow) == 0;
+            bindWidth = root->viewportWidthBound || hostedApplication;
+            bindHeight = root->viewportHeightBound || hostedApplication;
             resizedWidth = bindWidth ? width : oldWidth;
             resizedHeight = bindHeight ? height : oldHeight;
             if (oldWidth == resizedWidth && oldHeight == resizedHeight) continue;
@@ -18163,7 +18385,7 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
                 root->viewportWidthBound = bindWidth;
                 root->viewportHeightBound = bindHeight;
             }
-            RuntimeDiagnostics::Record(L"VIEWPORT: resized default-bound root to " +
+            RuntimeDiagnostics::Record(L"VIEWPORT: resized host-bound root to " +
                 std::to_wstring(resizedWidth) + L"x" +
                 std::to_wstring(resizedHeight) + L".");
         }

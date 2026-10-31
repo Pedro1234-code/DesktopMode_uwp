@@ -26,7 +26,7 @@
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="Configuration">
     <ConfigurationType>DynamicLibrary</ConfigurationType>
-    <PlatformToolset>v145</PlatformToolset>
+    <PlatformToolset>v143</PlatformToolset>
     <CppWinRTProjectLanguage>C++/WinRT</CppWinRTProjectLanguage>
     <UseDebugLibraries Condition="'$(Configuration)'=='Debug'">true</UseDebugLibraries>
     <UseDebugLibraries Condition="'$(Configuration)'=='Release'">false</UseDebugLibraries>
@@ -34,10 +34,13 @@
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <Import Project="$(ProjectDir)GeckoBuild.local.props" Condition="Exists('$(ProjectDir)GeckoBuild.local.props')" />
   <PropertyGroup>
-    <GeckoW10mObj Condition="'$(GeckoW10mObj)'==''">C:\rw-obj</GeckoW10mObj>
-    <GeckoW10mSource Condition="'$(GeckoW10mSource)'==''">C:\firefox-source\engine\firefox</GeckoW10mSource>
-    <GeckoW10mClangCl Condition="'$(GeckoW10mClangCl)'==''">C:\Program Files\LLVM\bin\clang-cl.exe</GeckoW10mClangCl>
+    <GeckoW10mObj Condition="'$(GeckoW10mObj)'=='' and '$(GECKO_W10M_OBJ)'!=''">$(GECKO_W10M_OBJ)</GeckoW10mObj>
+    <GeckoW10mSource Condition="'$(GeckoW10mSource)'=='' and '$(GECKO_W10M_SOURCE)'!=''">$(GECKO_W10M_SOURCE)</GeckoW10mSource>
+    <GeckoW10mClangCl Condition="'$(GeckoW10mClangCl)'=='' and '$(GECKO_W10M_CLANG_CL)'!=''">$(GECKO_W10M_CLANG_CL)</GeckoW10mClangCl>
+    <GeckoW10mClangCl Condition="'$(GeckoW10mClangCl)'==''">clang-cl.exe</GeckoW10mClangCl>
+    <GeckoW10mBin Condition="'$(GeckoW10mObj)'!=''">$(GeckoW10mObj)\dist\bin</GeckoW10mBin>
     <CppWinRTOptimized>true</CppWinRTOptimized>
     <CppWinRTRootNamespaceAutoMerge>true</CppWinRTRootNamespaceAutoMerge>
     <CppWinRTGenerateWindowsMetadata>true</CppWinRTGenerateWindowsMetadata>
@@ -45,6 +48,7 @@
     <GeckoCppWinRTTool>$(WindowsSdkDir)bin\$(WindowsTargetPlatformVersion)\x64\cppwinrt.exe</GeckoCppWinRTTool>
     <GeckoWinmd>$(OutDir)DesktopMode.Gecko.winmd</GeckoWinmd>
   </PropertyGroup>
+  <Import Project="$(ProjectDir)GeckoRuntimeFiles.props" />
   <PropertyGroup Condition="'$(Configuration)'=='Debug'">
     <GeckoW10mBootstrapFlags>/Od /MDd /D_DEBUG /D_ITERATOR_DEBUG_LEVEL=2</GeckoW10mBootstrapFlags>
   </PropertyGroup>
@@ -99,15 +103,20 @@
     <CustomBuild Include="engine\gecko_bootstrap.cpp">
       <Command>"$(GeckoW10mClangCl)" --target=x86_64-pc-windows-msvc /nologo /c "%(FullPath)" /Fo:"$(IntDir)gecko_bootstrap_$(Configuration).obj" /std:c++20 /EHs-c- /GR- $(GeckoW10mBootstrapFlags) /Zl /utf-8 /DWIN32 /D_WIN32 /DWIN64 /DNOMINMAX /DUNICODE /D_UNICODE /DWINAPI_FAMILY=WINAPI_FAMILY_DESKTOP_APP /DXP_WIN /DGECKO_W10M=1 /I"$(GeckoW10mObj)\dist\include" /I"$(GeckoW10mSource)\toolkit\components\startup"</Command>
       <Outputs>$(IntDir)gecko_bootstrap_$(Configuration).obj</Outputs>
-      <AdditionalInputs>$(GeckoW10mObj)\dist\include\mozilla-config.h;%(AdditionalInputs)</AdditionalInputs>
+      <!-- The embedded host binary itself may be unchanged while the external
+           Gecko/ANGLE runtime was rebuilt. Treat the core runtime binaries as
+           real inputs so Visual Studio does not mark the project (and then the
+           Shell package layout) up to date while AppX still contains old DLLs. -->
+      <AdditionalInputs>$(GeckoW10mObj)\dist\include\mozilla-config.h;$(GeckoW10mBin)\xul.dll;$(GeckoW10mBin)\libEGL.dll;$(GeckoW10mBin)\libGLESv2.dll;%(AdditionalInputs)</AdditionalInputs>
       <Message>Compiling embedded Gecko bootstrap with clang-cl</Message>
     </CustomBuild>
   </ItemGroup>
   <ItemGroup>
-    <None Include="$(GeckoW10mObj)\dist\bin\**\*">
-      <Link>%(RecursiveDir)%(Filename)%(Extension)</Link>
-      <DeploymentContent>false</DeploymentContent>
-    </None>
+    <!-- Also expose every curated payload file to Visual Studio's fast
+         up-to-date check. CollectGeckoRuntimeOutputs remains the only package
+         transport, so these inputs do not enter PRI or create duplicates. -->
+    <UpToDateCheckInput Include="@(GeckoRuntimeFile)" />
+    <UpToDateCheckInput Include="$(GeckoW10mBin)\application.ini" />
   </ItemGroup>
   <ItemGroup>
     <None Include="GeckoShellHost.def" />
@@ -119,8 +128,9 @@
   <Target Name="GenerateGeckoCppWinRT"
           AfterTargets="Midl"
           BeforeTargets="ClCompile"
-          Inputs="$(GeckoWinmd)"
-          Outputs="$(GeneratedFilesDir)\module.g.cpp;$(GeneratedFilesDir)\DesktopMode\Gecko\GeckoHost.g.h;$(GeneratedFilesDir)\DesktopMode\Gecko\GeckoHost.g.cpp">
+          DependsOnTargets="Midl"
+          Inputs="$(ProjectDir)DesktopMode.Gecko.idl;$(GeckoWinmd)"
+          Outputs="$(GeneratedFilesDir)\module.g.cpp;$(GeneratedFilesDir)\GeckoHost.g.h;$(GeneratedFilesDir)\GeckoHost.g.cpp;$(GeneratedFilesDir)\winrt\DesktopMode.Gecko.h">
     <MakeDir Directories="$(GeneratedFilesDir)" />
     <Exec Command="&quot;$(GeckoCppWinRTTool)&quot; -input &quot;$(GeckoWinmd)&quot; -reference $(WindowsTargetPlatformVersion) -output &quot;$(GeneratedFilesDir)&quot; -component -optimize" />
   </Target>
@@ -130,16 +140,20 @@
       CollectGeckoRuntimeOutputs
     </BuiltProjectOutputGroupDependsOn>
   </PropertyGroup>
-  <Target Name="CollectGeckoRuntimeOutputs">
+  <Target Name="ValidateGeckoBuildConfiguration">
+    <Error Condition="'$(GeckoW10mObj)'==''" Text="GeckoW10mObj is not configured. Copy GeckoBuild.local.props.example to GeckoBuild.local.props or set GECKO_W10M_OBJ." />
+    <Error Condition="'$(GeckoW10mSource)'==''" Text="GeckoW10mSource is not configured. Copy GeckoBuild.local.props.example to GeckoBuild.local.props or set GECKO_W10M_SOURCE." />
+    <Error Condition="'$(GeckoW10mObj)'!='' and !Exists('$(GeckoW10mObj)\dist\include\mozilla-config.h')" Text="The Gecko object directory '$(GeckoW10mObj)' is incomplete: dist\include\mozilla-config.h was not found." />
+    <Error Condition="'$(GeckoW10mSource)'!='' and !Exists('$(GeckoW10mSource)\toolkit\components\startup')" Text="The Gecko source directory '$(GeckoW10mSource)' is invalid: toolkit\components\startup was not found." />
+    <Error Condition="'$(GeckoW10mBin)'!='' and !Exists('$(GeckoW10mBin)\xul.dll')" Text="The Gecko runtime at '$(GeckoW10mBin)' is incomplete: xul.dll was not found." />
+    <Error Condition="'$(GeckoW10mBin)'!='' and !Exists('$(GeckoW10mBin)\application.ini')" Text="The Gecko runtime at '$(GeckoW10mBin)' is incomplete: application.ini was not found." />
+  </Target>
+  <Target Name="CollectGeckoRuntimeOutputs" DependsOnTargets="ValidateGeckoBuildConfiguration">
     <ItemGroup>
-      <!-- Keep the complete Gecko runtime payload.  XRE expects the launcher
-           and helper images to be present even though the embedded host does
-           not invoke them directly. -->
-      <_GeckoRuntimeFile Include="$(GeckoW10mObj)\dist\bin\**\*" Exclude="$(GeckoW10mObj)\dist\bin\application.ini" />
-      <_GeckoApplicationIni Include="$(GeckoW10mObj)\dist\bin\application.ini" />
-      <_BuiltProjectOutputGroupOutputIntermediate Include="@(_GeckoRuntimeFile->'%(FullPath)')">
-        <FinalOutputPath>%(_GeckoRuntimeFile.FullPath)</FinalOutputPath>
-        <TargetPath>%(_GeckoRuntimeFile.RecursiveDir)%(_GeckoRuntimeFile.Filename)%(_GeckoRuntimeFile.Extension)</TargetPath>
+      <_GeckoApplicationIni Include="$(GeckoW10mBin)\application.ini" />
+      <_BuiltProjectOutputGroupOutputIntermediate Include="@(GeckoRuntimeFile->'%(FullPath)')">
+        <FinalOutputPath>%(GeckoRuntimeFile.FullPath)</FinalOutputPath>
+        <TargetPath>%(GeckoRuntimeFile.TargetPath)</TargetPath>
       </_BuiltProjectOutputGroupOutputIntermediate>
       <_BuiltProjectOutputGroupOutputIntermediate Include="@(_GeckoApplicationIni->'%(FullPath)')">
         <FinalOutputPath>%(_GeckoApplicationIni.FullPath)</FinalOutputPath>

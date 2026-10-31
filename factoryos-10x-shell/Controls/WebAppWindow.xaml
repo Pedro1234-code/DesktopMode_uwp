@@ -28,6 +28,12 @@
                 </Button>
             </Grid>
             <muxc:WebView2 x:Name="Browser" Grid.Row="1" />
+            <Border x:Name="BrowserError" Grid.Row="1" Background="#FF202020" Visibility="Collapsed">
+                <StackPanel Margin="24" Spacing="12" HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="420">
+                    <TextBlock x:Name="BrowserErrorText" TextWrapping="Wrap" Foreground="White" />
+                    <Button Content="Try again" Click="RetryBrowser_Click" HorizontalAlignment="Center" />
+                </StackPanel>
+            </Border>
             <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />
             <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Tag="TopRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />
             <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />

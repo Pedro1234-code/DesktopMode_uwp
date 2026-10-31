@@ -34,6 +34,24 @@ struct GuestNewTextMetricExW final
     GuestFontSignature signature;
 };
 
+// The desktop SDK's RGNDATA declarations are not consistently exposed to the
+// UWP projection.  These structures intentionally mirror the Win32 ABI.
+struct GuestRegionDataHeader final
+{
+    DWORD dwSize;
+    DWORD iType;
+    DWORD nCount;
+    DWORD nRgnSize;
+    RECT rcBound;
+};
+static_assert(sizeof(GuestRegionDataHeader) == 32, "RGNDATAHEADER ABI mismatch");
+
+struct PolygonIntersection final
+{
+    double x;
+    int windingDelta;
+};
+
 // Several desktop-only wingdi declarations are hidden by the UWP SDK
 // partition.  Keep private ABI-identical definitions instead of depending on
 // those declarations being exposed by a particular SDK version.
@@ -282,6 +300,161 @@ int RegionComplexity(const MiniGdi::Region& region)
 {
     if (region.Empty()) return NULLREGION;
     return region.rectangles.size() == 1 ? SIMPLEREGION : COMPLEXREGION;
+}
+
+LONG PixelBoundaryToLong(double value)
+{
+    if (!std::isfinite(value))
+        return value < 0.0 ? (std::numeric_limits<LONG>::min)() :
+            (std::numeric_limits<LONG>::max)();
+    const double rounded = std::ceil(value - 0.5);
+    if (rounded <= static_cast<double>((std::numeric_limits<LONG>::min)()))
+        return (std::numeric_limits<LONG>::min)();
+    if (rounded >= static_cast<double>((std::numeric_limits<LONG>::max)()))
+        return (std::numeric_limits<LONG>::max)();
+    return static_cast<LONG>(rounded);
+}
+
+LONG RoundedCoordinateToLong(double value)
+{
+    if (!std::isfinite(value))
+        return value < 0.0 ? (std::numeric_limits<LONG>::min)() :
+            (std::numeric_limits<LONG>::max)();
+    if (value <= static_cast<double>((std::numeric_limits<LONG>::min)()))
+        return (std::numeric_limits<LONG>::min)();
+    if (value >= static_cast<double>((std::numeric_limits<LONG>::max)()))
+        return (std::numeric_limits<LONG>::max)();
+    return static_cast<LONG>(std::llround(value));
+}
+
+void AppendRegionSpan(MiniGdi::Region* region, LONG left, LONG top, LONG right)
+{
+    if (!region || left >= right) return;
+    if (!region->rectangles.empty())
+    {
+        MiniGdi::Rect& previous = region->rectangles.back();
+        if (previous.left == left && previous.right == right && previous.bottom == top)
+        {
+            previous.bottom = SaturateToLong(static_cast<long long>(top) + 1);
+            return;
+        }
+    }
+    region->rectangles.push_back({ left, top, right,
+        SaturateToLong(static_cast<long long>(top) + 1) });
+}
+
+bool RasterizePolygonRegion(
+    const POINT* points,
+    const int* polygonPointCounts,
+    int polygonCount,
+    int fillMode,
+    MiniGdi::Region* result)
+{
+    constexpr int AlternateFillMode = 1;
+    constexpr int WindingFillMode = 2;
+    constexpr std::size_t MaximumRegionPoints = 1u << 20;
+    constexpr long long MaximumScanlines = 1ll << 20;
+    if (!points || !polygonPointCounts || !result || polygonCount <= 0 ||
+        (fillMode != AlternateFillMode && fillMode != WindingFillMode))
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return false;
+    }
+
+    std::size_t totalPoints = 0;
+    LONG minimumY = (std::numeric_limits<LONG>::max)();
+    LONG maximumY = (std::numeric_limits<LONG>::min)();
+    for (int polygon = 0; polygon < polygonCount; ++polygon)
+    {
+        const int pointCount = polygonPointCounts[polygon];
+        if (pointCount < 2 || totalPoints > MaximumRegionPoints - static_cast<std::size_t>(pointCount))
+        {
+            BridgeSetLastError(ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        for (int index = 0; index < pointCount; ++index)
+        {
+            const POINT& point = points[totalPoints + static_cast<std::size_t>(index)];
+            minimumY = (std::min)(minimumY, point.y);
+            maximumY = (std::max)(maximumY, point.y);
+        }
+        totalPoints += static_cast<std::size_t>(pointCount);
+    }
+
+    result->rectangles.clear();
+    const long long scanlineCount = static_cast<long long>(maximumY) - minimumY;
+    if (scanlineCount <= 0)
+    {
+        BridgeSetLastError(ERROR_SUCCESS);
+        return true;
+    }
+    if (scanlineCount > MaximumScanlines)
+    {
+        BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return false;
+    }
+
+    std::vector<PolygonIntersection> intersections;
+    intersections.reserve(totalPoints);
+    for (long long row = minimumY; row < maximumY; ++row)
+    {
+        const double scanY = static_cast<double>(row) + 0.5;
+        intersections.clear();
+        std::size_t polygonStart = 0;
+        for (int polygon = 0; polygon < polygonCount; ++polygon)
+        {
+            const int pointCount = polygonPointCounts[polygon];
+            for (int index = 0; index < pointCount; ++index)
+            {
+                const POINT& first = points[polygonStart + static_cast<std::size_t>(index)];
+                const POINT& second = points[polygonStart +
+                    static_cast<std::size_t>((index + 1) % pointCount)];
+                if (first.y == second.y) continue;
+                const bool crosses =
+                    (static_cast<double>(first.y) <= scanY && scanY < static_cast<double>(second.y)) ||
+                    (static_cast<double>(second.y) <= scanY && scanY < static_cast<double>(first.y));
+                if (!crosses) continue;
+                const double x = static_cast<double>(first.x) +
+                    (scanY - static_cast<double>(first.y)) *
+                    (static_cast<double>(second.x) - first.x) /
+                    (static_cast<double>(second.y) - first.y);
+                intersections.push_back({ x, second.y > first.y ? 1 : -1 });
+            }
+            polygonStart += static_cast<std::size_t>(pointCount);
+        }
+        std::sort(intersections.begin(), intersections.end(),
+            [](const PolygonIntersection& left, const PolygonIntersection& right)
+            {
+                if (left.x != right.x) return left.x < right.x;
+                return left.windingDelta < right.windingDelta;
+            });
+
+        if (fillMode == AlternateFillMode)
+        {
+            for (std::size_t index = 0; index + 1 < intersections.size(); index += 2)
+                AppendRegionSpan(result, PixelBoundaryToLong(intersections[index].x),
+                    static_cast<LONG>(row), PixelBoundaryToLong(intersections[index + 1].x));
+            continue;
+        }
+
+        int winding = 0;
+        double previousX = 0.0;
+        std::size_t index = 0;
+        while (index < intersections.size())
+        {
+            const double x = intersections[index].x;
+            if (winding != 0)
+                AppendRegionSpan(result, PixelBoundaryToLong(previousX),
+                    static_cast<LONG>(row), PixelBoundaryToLong(x));
+            int delta = 0;
+            while (index < intersections.size() && intersections[index].x == x)
+                delta += intersections[index++].windingDelta;
+            winding += delta;
+            previousX = x;
+        }
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return true;
 }
 
 MiniGdi::Region LogicalToDeviceRegion(
@@ -548,6 +721,199 @@ HRGN WINAPI BridgeCreateEllipticRgn(int left, int top, int right, int bottom)
         geometry.rectangles.push_back({ runLeft, y, runRight, y + 1 });
     }
     return StoreRegion(geometry);
+}
+
+HRGN WINAPI BridgeCreateEllipticRgnIndirect(const RECT* rect)
+{
+    if (!rect)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    return BridgeCreateEllipticRgn(rect->left, rect->top, rect->right, rect->bottom);
+}
+
+HRGN WINAPI BridgeCreateRoundRectRgn(
+    int left, int top, int right, int bottom, int ellipseWidth, int ellipseHeight)
+{
+    if (left > right) (std::swap)(left, right);
+    if (top > bottom) (std::swap)(top, bottom);
+    MiniGdi::Region geometry;
+    if (left >= right || top >= bottom) return StoreRegion(geometry);
+    const long long rectangleWidth = static_cast<long long>(right) - left;
+    const long long rectangleHeight = static_cast<long long>(bottom) - top;
+    ellipseWidth = static_cast<int>((std::min)(
+        static_cast<long long>((std::max)(0, ellipseWidth)),
+        (std::min)(rectangleWidth,
+            static_cast<long long>((std::numeric_limits<int>::max)()))));
+    ellipseHeight = static_cast<int>((std::min)(
+        static_cast<long long>((std::max)(0, ellipseHeight)),
+        (std::min)(rectangleHeight,
+            static_cast<long long>((std::numeric_limits<int>::max)()))));
+    if (ellipseWidth == 0 || ellipseHeight == 0)
+        return StoreRegion({ left, top, right, bottom });
+
+    const double radiusX = static_cast<double>(ellipseWidth) / 2.0;
+    const double radiusY = static_cast<double>(ellipseHeight) / 2.0;
+    const double topCenter = static_cast<double>(top) + radiusY;
+    const double bottomCenter = static_cast<double>(bottom) - radiusY;
+    for (int y = top; y < bottom; ++y)
+    {
+        const double centerY = static_cast<double>(y) + 0.5;
+        double inset = 0.0;
+        if (centerY < topCenter || centerY > bottomCenter)
+        {
+            const double cornerCenter = centerY < topCenter ? topCenter : bottomCenter;
+            const double normalizedY = (centerY - cornerCenter) / radiusY;
+            const double squared = (std::max)(0.0, 1.0 - normalizedY * normalizedY);
+            inset = radiusX - radiusX * std::sqrt(squared);
+        }
+        AppendRegionSpan(&geometry,
+            PixelBoundaryToLong(static_cast<double>(left) + inset), y,
+            PixelBoundaryToLong(static_cast<double>(right) - inset));
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return StoreRegion(geometry);
+}
+
+HRGN WINAPI BridgeCreatePolygonRgn(const POINT* points, int pointCount, int fillMode)
+{
+    MiniGdi::Region geometry;
+    if (!RasterizePolygonRegion(points, &pointCount, 1, fillMode, &geometry))
+        return nullptr;
+    return StoreRegion(geometry);
+}
+
+HRGN WINAPI BridgeCreatePolyPolygonRgn(
+    const POINT* points, const int* polygonPointCounts, int polygonCount, int fillMode)
+{
+    MiniGdi::Region geometry;
+    if (!RasterizePolygonRegion(
+        points, polygonPointCounts, polygonCount, fillMode, &geometry))
+        return nullptr;
+    return StoreRegion(geometry);
+}
+
+HRGN WINAPI BridgeExtCreateRegion(
+    const XFORM* transform, DWORD byteCount, const void* regionData)
+{
+    constexpr DWORD RectangleRegionData = 1;
+    if (!regionData || byteCount < sizeof(GuestRegionDataHeader))
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    const auto* header = static_cast<const GuestRegionDataHeader*>(regionData);
+    const std::size_t headerSize = header->dwSize;
+    if (headerSize < sizeof(GuestRegionDataHeader) || headerSize > byteCount ||
+        header->iType != RectangleRegionData ||
+        header->nCount > header->nRgnSize / sizeof(RECT) ||
+        static_cast<std::size_t>(header->nRgnSize) > byteCount - headerSize)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    const auto* rectangles = reinterpret_cast<const RECT*>(
+        static_cast<const BYTE*>(regionData) + headerSize);
+    MiniGdi::Region geometry;
+    if (!transform)
+    {
+        for (DWORD index = 0; index < header->nCount; ++index)
+        {
+            const RECT& rect = rectangles[index];
+            geometry = MiniGdi::UnionRegion(geometry, MiniGdi::RectRegion(
+                { rect.left, rect.top, rect.right, rect.bottom }));
+        }
+        BridgeSetLastError(ERROR_SUCCESS);
+        return StoreRegion(geometry);
+    }
+
+    if (!std::isfinite(transform->eM11) || !std::isfinite(transform->eM12) ||
+        !std::isfinite(transform->eM21) || !std::isfinite(transform->eM22) ||
+        !std::isfinite(transform->eDx) || !std::isfinite(transform->eDy))
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    constexpr DWORD MaximumTransformedRectangles = (1u << 20) / 4;
+    if (header->nCount > MaximumTransformedRectangles)
+    {
+        BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+    std::vector<POINT> points;
+    std::vector<int> pointCounts;
+    points.reserve(static_cast<std::size_t>(header->nCount) * 4);
+    pointCounts.reserve(header->nCount);
+    const auto appendPoint = [&points, transform](LONG x, LONG y)
+    {
+        const double transformedX = static_cast<double>(x) * transform->eM11 +
+            static_cast<double>(y) * transform->eM21 + transform->eDx;
+        const double transformedY = static_cast<double>(x) * transform->eM12 +
+            static_cast<double>(y) * transform->eM22 + transform->eDy;
+        points.push_back({ RoundedCoordinateToLong(transformedX),
+            RoundedCoordinateToLong(transformedY) });
+    };
+    for (DWORD index = 0; index < header->nCount; ++index)
+    {
+        const RECT& rect = rectangles[index];
+        appendPoint(rect.left, rect.top);
+        appendPoint(rect.right, rect.top);
+        appendPoint(rect.right, rect.bottom);
+        appendPoint(rect.left, rect.bottom);
+        pointCounts.push_back(4);
+    }
+    if (pointCounts.empty()) return StoreRegion(geometry);
+    constexpr int WindingFillMode = 2;
+    if (!RasterizePolygonRegion(points.data(), pointCounts.data(),
+        static_cast<int>(pointCounts.size()), WindingFillMode, &geometry))
+        return nullptr;
+    return StoreRegion(geometry);
+}
+
+DWORD WINAPI BridgeGetRegionData(HRGN region, DWORD byteCount, void* regionData)
+{
+    constexpr DWORD RectangleRegionData = 1;
+    MiniGdi::Region geometry;
+    if (!CopyRegionHandle(region, &geometry))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return 0;
+    }
+    if (geometry.rectangles.size() >
+        ((std::numeric_limits<DWORD>::max)() - sizeof(GuestRegionDataHeader)) / sizeof(RECT))
+    {
+        BridgeSetLastError(ERROR_ARITHMETIC_OVERFLOW);
+        return 0;
+    }
+    const DWORD rectangleBytes = static_cast<DWORD>(geometry.rectangles.size() * sizeof(RECT));
+    const DWORD required = static_cast<DWORD>(sizeof(GuestRegionDataHeader)) + rectangleBytes;
+    if (!regionData || byteCount == 0)
+    {
+        BridgeSetLastError(ERROR_SUCCESS);
+        return required;
+    }
+    if (byteCount < required)
+    {
+        BridgeSetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return 0;
+    }
+    auto* header = static_cast<GuestRegionDataHeader*>(regionData);
+    const MiniGdi::Rect bounds = geometry.Bounds();
+    header->dwSize = sizeof(GuestRegionDataHeader);
+    header->iType = RectangleRegionData;
+    header->nCount = static_cast<DWORD>(geometry.rectangles.size());
+    header->nRgnSize = rectangleBytes;
+    header->rcBound = { bounds.left, bounds.top, bounds.right, bounds.bottom };
+    auto* rectangles = reinterpret_cast<RECT*>(
+        static_cast<BYTE*>(regionData) + sizeof(GuestRegionDataHeader));
+    for (std::size_t index = 0; index < geometry.rectangles.size(); ++index)
+    {
+        const MiniGdi::Rect& rect = geometry.rectangles[index];
+        rectangles[index] = { rect.left, rect.top, rect.right, rect.bottom };
+    }
+    BridgeSetLastError(ERROR_SUCCESS);
+    return required;
 }
 
 BOOL WINAPI BridgeSetRectRgn(HRGN region, int left, int top, int right, int bottom)

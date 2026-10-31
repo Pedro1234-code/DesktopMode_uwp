@@ -215,8 +215,10 @@ namespace GuestAbi
     constexpr UINT WmGetTextLength = 0x000E;
     constexpr UINT WmPaint = 0x000F;
     constexpr UINT WmClose = 0x0010;
+    constexpr UINT WmQueryEndSession = 0x0011;
     constexpr UINT WmQuit = 0x0012;
     constexpr UINT WmEraseBkgnd = 0x0014;
+    constexpr UINT WmEndSession = 0x0016;
     constexpr UINT WmShowWindow = 0x0018;
     constexpr UINT WmActivateApp = 0x001C;
     constexpr UINT WmSetFont = 0x0030;

@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 #include <agile.h>
 #include <windows.storage.h>
@@ -33,9 +34,17 @@ namespace Bridge
             LPCWSTR requestedName,
             HMODULE* module,
             DWORD* win32Error,
-            DWORD searchFlags = 0);
+            DWORD searchFlags = 0,
+            DWORD loadBehaviorFlags = 0);
         ImportResolution ResolveImport(const ImportedSymbol& symbol, DWORD searchFlags = 0);
         bool GetModuleHandle(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error) const;
+        bool GetModuleHandleFromAddress(
+            ULONG_PTR address, HMODULE* module, DWORD* win32Error) const;
+        bool AddReference(HMODULE module, bool pin, DWORD* win32Error);
+        bool AddDllDirectory(LPCWSTR path, PVOID* cookie, DWORD* win32Error);
+        bool RemoveDllDirectory(PVOID cookie, DWORD* win32Error);
+        bool SetDllDirectory(LPCWSTR path, DWORD* win32Error);
+        DWORD GetDllDirectory(DWORD bufferLength, LPWSTR buffer, DWORD* win32Error) const;
         bool GetModulePath(HMODULE module, std::wstring* path, DWORD* win32Error) const;
         FARPROC GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, DWORD* win32Error);
         bool GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const;
@@ -80,9 +89,18 @@ namespace Bridge
         std::shared_ptr<GuestStorageContext> m_storage;
         ImportResolver m_resolver;
         Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
+        // The native loader serializes mapping, import snapping and entry-point
+        // notification under a re-entrant loader lock.  Dependency loading is
+        // recursive on the owning thread, hence std::recursive_mutex rather
+        // than exposing half-initialized modules to a competing guest thread.
+        mutable std::recursive_mutex m_loaderLock;
         mutable std::mutex m_lock;
         std::vector<std::shared_ptr<Module>> m_modules;
         std::unordered_map<std::wstring, HMODULE> m_importModules;
+        std::vector<std::pair<ULONG_PTR, std::wstring>> m_userDllDirectories;
+        std::wstring m_legacyDllDirectory;
+        bool m_legacyDllDirectorySpecified = false;
+        ULONG_PTR m_nextDllDirectoryCookie = 1;
         std::uint64_t m_nextAttachSequence = 1;
     };
 

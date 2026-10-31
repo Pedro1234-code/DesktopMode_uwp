@@ -6,7 +6,7 @@
  /* File created by MIDL compiler version 8.01.0628 */
 /* at Tue Jan 19 00:14:07 2038
  */
-/* Compiler settings for C:\Users\fcvin\AppData\Local\Temp\DesktopMode.Gecko.idl-5b939ecc:
+/* Compiler settings for C:\Users\fcvin\AppData\Local\Temp\DesktopMode.Gecko.idl-b725bb48:
     Oicf, W1, Zp8, env=Win64 (32b run), target_arch=AMD64 8.01.0628 
     protocol : all , ms_ext, c_ext, robust
     error checks: allocation ref bounds_check enum stub_data 
@@ -97,14 +97,20 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
 
 #if defined(__cplusplus) && !defined(CINTERFACE)
     
-    MIDL_INTERFACE("0fa98628-cc3d-5c3e-b126-d9ffbf6dbda7")
+    MIDL_INTERFACE("6c4d0339-4e32-57c3-8867-504a2d3a53e6")
     __x_ABI_CDesktopMode_CGecko_CIGeckoHost : public IInspectable
     {
     public:
         virtual /* [propget] */ HRESULT STDMETHODCALLTYPE get_Content( 
             /* [retval][out] */ IInspectable **value) = 0;
         
+        virtual /* [propget] */ HRESULT STDMETHODCALLTYPE get_ExternalContent( 
+            /* [retval][out] */ IInspectable **value) = 0;
+        
         virtual /* [propget] */ HRESULT STDMETHODCALLTYPE get_IsStarted( 
+            /* [retval][out] */ boolean *value) = 0;
+        
+        virtual /* [propget] */ HRESULT STDMETHODCALLTYPE get_IsExternalWindowOpen( 
             /* [retval][out] */ boolean *value) = 0;
         
         virtual HRESULT STDMETHODCALLTYPE Start( 
@@ -114,6 +120,15 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
         virtual HRESULT STDMETHODCALLTYPE SetViewport( 
             /* [in] */ double width,
             /* [in] */ double height) = 0;
+        
+        virtual HRESULT STDMETHODCALLTYPE SetExternalViewport( 
+            /* [in] */ double width,
+            /* [in] */ double height) = 0;
+        
+        virtual HRESULT STDMETHODCALLTYPE SetExternalActive( 
+            /* [in] */ boolean active) = 0;
+        
+        virtual HRESULT STDMETHODCALLTYPE CloseExternalWindow( void) = 0;
         
         virtual HRESULT STDMETHODCALLTYPE SetScreen( 
             /* [in] */ double width,
@@ -128,8 +143,18 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
         virtual HRESULT STDMETHODCALLTYPE TakeRevealPath( 
             /* [retval][out] */ HSTRING *result) = 0;
         
+        virtual HRESULT STDMETHODCALLTYPE TakeWallpaperPath( 
+            /* [retval][out] */ HSTRING *result) = 0;
+        
         virtual HRESULT STDMETHODCALLTYPE OpenUrl( 
             /* [in] */ HSTRING url) = 0;
+        
+        virtual HRESULT STDMETHODCALLTYPE DragFiles( 
+            /* [in] */ int state,
+            /* [in] */ double x,
+            /* [in] */ double y,
+            /* [in] */ HSTRING paths,
+            /* [retval][out] */ boolean *result) = 0;
         
         virtual HRESULT STDMETHODCALLTYPE Suspend( void) = 0;
         
@@ -182,8 +207,18 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
             __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
             /* [retval][out] */ IInspectable **value);
         
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, get_ExternalContent)
+        /* [propget] */ HRESULT ( STDMETHODCALLTYPE *get_ExternalContent )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
+            /* [retval][out] */ IInspectable **value);
+        
         DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, get_IsStarted)
         /* [propget] */ HRESULT ( STDMETHODCALLTYPE *get_IsStarted )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
+            /* [retval][out] */ boolean *value);
+        
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, get_IsExternalWindowOpen)
+        /* [propget] */ HRESULT ( STDMETHODCALLTYPE *get_IsExternalWindowOpen )( 
             __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
             /* [retval][out] */ boolean *value);
         
@@ -198,6 +233,21 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
             __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
             /* [in] */ double width,
             /* [in] */ double height);
+        
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, SetExternalViewport)
+        HRESULT ( STDMETHODCALLTYPE *SetExternalViewport )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
+            /* [in] */ double width,
+            /* [in] */ double height);
+        
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, SetExternalActive)
+        HRESULT ( STDMETHODCALLTYPE *SetExternalActive )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
+            /* [in] */ boolean active);
+        
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, CloseExternalWindow)
+        HRESULT ( STDMETHODCALLTYPE *CloseExternalWindow )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This);
         
         DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, SetScreen)
         HRESULT ( STDMETHODCALLTYPE *SetScreen )( 
@@ -220,10 +270,24 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
             __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
             /* [retval][out] */ HSTRING *result);
         
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, TakeWallpaperPath)
+        HRESULT ( STDMETHODCALLTYPE *TakeWallpaperPath )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
+            /* [retval][out] */ HSTRING *result);
+        
         DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, OpenUrl)
         HRESULT ( STDMETHODCALLTYPE *OpenUrl )( 
             __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
             /* [in] */ HSTRING url);
+        
+        DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, DragFiles)
+        HRESULT ( STDMETHODCALLTYPE *DragFiles )( 
+            __x_ABI_CDesktopMode_CGecko_CIGeckoHost * This,
+            /* [in] */ int state,
+            /* [in] */ double x,
+            /* [in] */ double y,
+            /* [in] */ HSTRING paths,
+            /* [retval][out] */ boolean *result);
         
         DECLSPEC_XFGVIRT(__x_ABI_CDesktopMode_CGecko_CIGeckoHost, Suspend)
         HRESULT ( STDMETHODCALLTYPE *Suspend )( 
@@ -273,14 +337,29 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_get_Content(This,value)	\
     ( (This)->lpVtbl -> get_Content(This,value) ) 
 
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_get_ExternalContent(This,value)	\
+    ( (This)->lpVtbl -> get_ExternalContent(This,value) ) 
+
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_get_IsStarted(This,value)	\
     ( (This)->lpVtbl -> get_IsStarted(This,value) ) 
+
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_get_IsExternalWindowOpen(This,value)	\
+    ( (This)->lpVtbl -> get_IsExternalWindowOpen(This,value) ) 
 
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_Start(This,width,height)	\
     ( (This)->lpVtbl -> Start(This,width,height) ) 
 
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_SetViewport(This,width,height)	\
     ( (This)->lpVtbl -> SetViewport(This,width,height) ) 
+
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_SetExternalViewport(This,width,height)	\
+    ( (This)->lpVtbl -> SetExternalViewport(This,width,height) ) 
+
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_SetExternalActive(This,active)	\
+    ( (This)->lpVtbl -> SetExternalActive(This,active) ) 
+
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_CloseExternalWindow(This)	\
+    ( (This)->lpVtbl -> CloseExternalWindow(This) ) 
 
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_SetScreen(This,width,height)	\
     ( (This)->lpVtbl -> SetScreen(This,width,height) ) 
@@ -294,8 +373,14 @@ EXTERN_C const IID IID___x_ABI_CDesktopMode_CGecko_CIGeckoHost;
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_TakeRevealPath(This,result)	\
     ( (This)->lpVtbl -> TakeRevealPath(This,result) ) 
 
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_TakeWallpaperPath(This,result)	\
+    ( (This)->lpVtbl -> TakeWallpaperPath(This,result) ) 
+
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_OpenUrl(This,url)	\
     ( (This)->lpVtbl -> OpenUrl(This,url) ) 
+
+#define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_DragFiles(This,state,x,y,paths,result)	\
+    ( (This)->lpVtbl -> DragFiles(This,state,x,y,paths,result) ) 
 
 #define __x_ABI_CDesktopMode_CGecko_CIGeckoHost_Suspend(This)	\
     ( (This)->lpVtbl -> Suspend(This) ) 

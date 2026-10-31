@@ -211,7 +211,11 @@ void Log::Write(std::wstring_view line) {
       std::string utf8 = ToUtf8(stamped) + "\r\n";
       DWORD written = 0;
       ::WriteFile(g_file, utf8.data(), (DWORD)utf8.size(), &written, nullptr);
-      ::FlushFileBuffers(g_file);  // a phone can die at any moment
+      // Do not synchronously flush storage for every diagnostic line. Log::Write
+      // is called from UI/compositor-sensitive paths and FlushFileBuffers can
+      // stall those threads long enough to freeze the Shell pointer. WriteFile
+      // keeps the log current in the system cache; Mirror and the fault path
+      // explicitly flush it when durable contents are required.
     }
 
     g_ring.push_back(stamped);

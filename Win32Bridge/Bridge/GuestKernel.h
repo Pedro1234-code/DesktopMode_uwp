@@ -40,6 +40,7 @@ namespace Bridge
         HANDLE CreateCompletionObject(DWORD objectId, bool process, DWORD* win32Error);
         bool CompleteObject(HANDLE guestHandle, DWORD exitCode, DWORD* win32Error);
         bool GetExitCode(HANDLE guestHandle, bool process, LPDWORD exitCode, DWORD* win32Error) const;
+        bool GetThreadId(HANDLE guestHandle, LPDWORD threadId, DWORD* win32Error) const;
 
         // This is intentionally separate from storage's CloseFile: Kernel32's
         // CloseHandle shim tries this table first, then its existing file path.

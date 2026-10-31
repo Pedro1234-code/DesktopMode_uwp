@@ -8,10 +8,23 @@ namespace factoryos_10x_shell.Library.Models.InternalData
         public string Id { get; set; }
         public string Name { get; set; }
         public string StartUri { get; set; }
+        public bool UseStrawfox { get; set; }
+        public string NewInstanceText => UseStrawfox ? "New tab" : "New window";
         private string m_iconUri;
         private bool m_isPinned;
 
-        public string IconUri { get => m_iconUri; set => Set(ref m_iconUri, value); }
+        public string IconUri
+        {
+            get => m_iconUri;
+            set
+            {
+                if (Equals(m_iconUri, value)) return;
+                m_iconUri = value;
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IconUri)));
+                PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(FallbackGlyphOpacity)));
+            }
+        }
+        public double FallbackGlyphOpacity => string.IsNullOrWhiteSpace(IconUri) ? 1.0 : 0.0;
         public bool IsPinned { get => m_isPinned; set => Set(ref m_isPinned, value); }
 
         public event PropertyChangedEventHandler PropertyChanged;

@@ -18,14 +18,21 @@
 <Directives xmlns="http://schemas.microsoft.com/netfx/2013/01/metadata">
   <Application>
     <!--
-      An Assembly element with Name="*Application*" applies to all assemblies in
-      the application package. The asterisks are not wildcards.
+      Do not use *Application* / Required All here. It applies the most
+      expensive reflection policy to every managed module in the package
+      (including NuGet framework assemblies), which makes .NET Native generate
+      code and metadata for far more than DesktopMode can ever activate.
+
+      Keep full metadata only for the four assemblies whose types are hosted
+      directly by the Shell. Framework/package assemblies retain the policies
+      supplied by their own libraries.
     -->
-    <Assembly Name="*Application*" Dynamic="Required All" />
-    
-    
-    <!-- Add your application specific runtime directives here. -->
+    <Assembly Name="DesktopMode" Dynamic="Required All" />
+    <Assembly Name="factoryos-10x-shell.Library" Dynamic="Required All" />
+    <Assembly Name="CalculatorApp" Dynamic="Required All" />
+    <Assembly Name="Calculator.ViewModels" Dynamic="Required All" />
 
-
+    <!-- System.Text.Json creates these internal calculator DTOs dynamically. -->
+    <Namespace Name="CalculatorApp.JsonUtils" Serialize="Required Public" />
   </Application>
 </Directives>

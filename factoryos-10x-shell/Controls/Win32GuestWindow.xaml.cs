@@ -17,6 +17,8 @@ namespace factoryos_10x_shell.Controls
 {
     public sealed partial class Win32GuestWindow : UserControl
     {
+        private static readonly double s_pointerScale =
+            string.Equals(AnalyticsInfo.VersionInfo.DeviceFamily, "Windows.Xbox", StringComparison.OrdinalIgnoreCase) ? 0.75 : 1.0;
         private readonly Win32WindowManagerService m_windowManager = Win32WindowManagerService.Instance;
         private IMouseInputService m_mouseInput;
         private Win32WindowModel m_window;
@@ -235,9 +237,8 @@ namespace factoryos_10x_shell.Controls
         private void MouseInput_InputChanged(object sender, MouseInputChangedEventArgs e)
         {
             if (m_window == null || m_window.Visibility != Visibility.Visible) return;
-            double scale = string.Equals(AnalyticsInfo.VersionInfo.DeviceFamily, "Windows.Xbox", StringComparison.OrdinalIgnoreCase) ? 0.75 : 1.0;
             if (e.Kind == MouseInputChangeKind.Released) { m_dragging = false; m_resizing = false; }
-            if (m_dragging) MoveWindow(new Point(e.Snapshot.X / scale - m_window.Left, e.Snapshot.Y / scale - m_window.Top));
+            if (m_dragging) MoveWindow(new Point(e.Snapshot.X / s_pointerScale - m_window.Left, e.Snapshot.Y / s_pointerScale - m_window.Top));
         }
 
         private async void Minimize_Click(object sender, RoutedEventArgs e)

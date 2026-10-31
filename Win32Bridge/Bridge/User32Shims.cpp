@@ -34,6 +34,9 @@ using namespace Win32Bridge::Bridge;
 namespace
 {
     constexpr DWORD GuestExitException = 0xE0424242u;
+    using GuestHookProc = LRESULT (CALLBACK*)(int, WPARAM, LPARAM);
+
+    void ResetGuestHookState();
 
     constexpr DWORD BitmapCompressionAlphaBitFields = 6;
     constexpr DWORD GuestBitmapV4HeaderSize = 108;
@@ -67,6 +70,7 @@ namespace
     // the opaque pseudo-handle as its integral representation and cast only at
     // the ABI boundary.
     thread_local LONG_PTR g_guestThreadDpiAwareness = GuestDpiAwarenessSystem;
+    std::atomic<int> g_guestProcessDpiAwareness{ 1 }; // PROCESS_SYSTEM_DPI_AWARE.
 
 #pragma pack(push, 2)
     struct GuestBitmapFileHeader final
@@ -161,6 +165,26 @@ namespace
             {
                 *exceptionCode = GetExceptionCode();
             }
+            return 0;
+        }
+    }
+
+    LRESULT InvokeGuestHookProcedure(
+        GuestHookProc procedure,
+        int code,
+        WPARAM wParam,
+        LPARAM lParam,
+        DWORD* exceptionCode)
+    {
+        if (exceptionCode) *exceptionCode = ERROR_SUCCESS;
+        __try
+        {
+            return procedure(code, wParam, lParam);
+        }
+        __except (GetExceptionCode() == GuestExitException
+            ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
+        {
+            if (exceptionCode) *exceptionCode = GetExceptionCode();
             return 0;
         }
     }
@@ -1323,6 +1347,48 @@ namespace
     }
 }
 
+void Win32Bridge::Bridge::ResetGuestUser32State()
+{
+    // These are process-owned USER objects on desktop Windows.  The bridge DLL
+    // outlives an emulated process, so retaining any of them would allow a new
+    // PE to observe stale handles (and, for accelerators/subclasses, stale code
+    // addresses) from the previous image.
+    {
+        std::lock_guard<std::mutex> guard(g_iconLock);
+        g_guestIcons.clear();
+        g_nextGuestIcon = GuestIconToken + 1;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_cursorLock);
+        g_guestCursors.clear();
+        g_nextGuestCursor = GuestCursorToken + 1;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_ansiClassStringLock);
+        g_ansiClassStrings.clear();
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_acceleratorLock);
+        g_accelerators.clear();
+        g_nextAccelerator = 0x7fff7000;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_menuLock);
+        g_menus.clear();
+        g_windowMenus.clear();
+        g_systemMenus.clear();
+        g_nextMenu = 0x7fff5000;
+        g_nextClipboardFormat = 0xc000;
+        g_clipboardData.clear();
+        g_clipboardFormats.clear();
+        g_clipboardSequence = 0;
+    }
+    g_guestThreadDpiAwareness = GuestDpiAwarenessSystem;
+    g_guestProcessDpiAwareness.store(1);
+    g_guestCallWindowProcFrame = nullptr;
+    ResetGuestHookState();
+}
+
 ATOM WINAPI Win32Bridge::Bridge::BridgeRegisterClassExW(const GuestAbi::WndClassExW* windowClass)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
@@ -1686,6 +1752,10 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeLoadImageW(
         BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
+    RuntimeDiagnostics::Record(
+        L"IMAGE LOAD: type " + std::to_wstring(type) + L", requested " +
+        std::to_wstring(width) + L"x" + std::to_wstring(height) +
+        L", flags " + std::to_wstring(flags) + L".");
     if ((flags & LR_DEFAULTSIZE) != 0)
     {
         if (width <= 0) width = type == IMAGE_BITMAP ? 0 : 32;
@@ -1745,6 +1815,9 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeLoadImageW(
     else if (type == IMAGE_ICON) result = StoreGuestIcon(std::move(image));
     else result = StoreGuestCursor(std::move(image), hotspot);
     BridgeSetLastError(result ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    RuntimeDiagnostics::Record(result
+        ? L"IMAGE LOAD: decoded guest image successfully."
+        : L"IMAGE LOAD: decoded pixels could not be stored.");
     return result;
 }
 
@@ -2154,6 +2227,58 @@ namespace
         return first == second ? TRUE : FALSE;
     }
 
+    HRESULT WINAPI BridgeSetProcessDpiAwareness(int awareness)
+    {
+        if (awareness < 0 || awareness > 2) return E_INVALIDARG;
+        g_guestProcessDpiAwareness.store(awareness);
+        return S_OK;
+    }
+
+    HRESULT WINAPI BridgeGetProcessDpiAwareness(HANDLE, int* awareness)
+    {
+        if (!awareness) return E_INVALIDARG;
+        __try
+        {
+            *awareness = g_guestProcessDpiAwareness.load();
+            return S_OK;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return E_INVALIDARG;
+        }
+    }
+
+    HRESULT WINAPI BridgeGetDpiForMonitor(HMONITOR monitor, int dpiType,
+        UINT* horizontal, UINT* vertical)
+    {
+        if (!monitor || dpiType < 0 || dpiType > 2 || !horizontal || !vertical)
+            return E_INVALIDARG;
+        __try
+        {
+            *horizontal = GuestDefaultDpi;
+            *vertical = GuestDefaultDpi;
+            return S_OK;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return E_INVALIDARG;
+        }
+    }
+
+    HRESULT WINAPI BridgeGetScaleFactorForMonitor(HMONITOR monitor, int* scale)
+    {
+        if (!monitor || !scale) return E_INVALIDARG;
+        __try
+        {
+            *scale = 100; // DEVICE_SCALE_FACTOR::SCALE_100_PERCENT.
+            return S_OK;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return E_INVALIDARG;
+        }
+    }
+
     UINT_PTR WINAPI BridgeSetCoalescableTimer(
         HWND window, UINT_PTR timerId, UINT elapseMilliseconds,
         GuestAbi::TimerProc timerProcedure, ULONG)
@@ -2202,6 +2327,68 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeShowWindow(HWND window, int command)
     const BOOL result = manager->ShowGuestWindow(window, command, &error);
     BridgeSetLastError(error);
     return result;
+}
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeExitWindowsEx(UINT flags, DWORD reason)
+{
+    constexpr UINT ExitWindowsShutdown = 0x00000001;
+    constexpr UINT ExitWindowsReboot = 0x00000002;
+    constexpr UINT ExitWindowsForce = 0x00000004;
+    constexpr UINT ExitWindowsPowerOff = 0x00000008;
+    constexpr UINT ExitWindowsForceIfHung = 0x00000010;
+    constexpr UINT ExitWindowsRestartApps = 0x00000040;
+    constexpr LPARAM EndSessionCloseApp = 0x00000001;
+    constexpr LPARAM EndSessionLogoff = static_cast<LPARAM>(0x80000000u);
+
+    const UINT action = flags &
+        (ExitWindowsShutdown | ExitWindowsReboot | ExitWindowsPowerOff);
+    if (action != 0 && (action & (action - 1)) != 0)
+    {
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager)
+    {
+        return FALSE;
+    }
+
+    LPARAM endSessionFlags = action == 0 ? EndSessionLogoff : 0;
+    if ((flags & ExitWindowsRestartApps) != 0)
+    {
+        endSessionFlags |= EndSessionCloseApp;
+    }
+
+    const bool forced = (flags & (ExitWindowsForce | ExitWindowsForceIfHung)) != 0;
+    const std::vector<HWND> windows = manager->SnapshotGuestWindows(nullptr, false);
+    if (!forced)
+    {
+        for (HWND window : windows)
+        {
+            DWORD error = ERROR_SUCCESS;
+            if (manager->SendGuestMessage(window, GuestAbi::WmQueryEndSession,
+                0, endSessionFlags, &error) == FALSE)
+            {
+                BridgeSetLastError(error == ERROR_SUCCESS ? ERROR_CANCELLED : error);
+                return FALSE;
+            }
+        }
+    }
+
+    for (HWND window : windows)
+    {
+        DWORD ignored = ERROR_SUCCESS;
+        manager->SendGuestMessage(window, GuestAbi::WmEndSession,
+            TRUE, endSessionFlags, &ignored);
+    }
+
+    RuntimeDiagnostics::Record(
+        L"USER32: ExitWindowsEx completed a virtual guest session transition "
+        L"(flags=" + std::to_wstring(flags) + L", reason=" +
+        std::to_wstring(reason) + L"); the UWP host session was not affected.");
+    BridgeSetLastError(ERROR_SUCCESS);
+    return TRUE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetClientRect(HWND window, LPRECT rect)
@@ -2714,6 +2901,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetMessageW(
     switch (manager->GetGuestMessage(message, window, minimumMessage, maximumMessage))
     {
     case GuestGetMessageResult::Message:
+        DispatchGuestHook(WH_GETMESSAGE, HC_ACTION, PM_REMOVE,
+            reinterpret_cast<LPARAM>(message), BridgeGetCurrentThreadId());
         BridgeSetLastError(ERROR_SUCCESS);
         return TRUE;
     case GuestGetMessageResult::Quit:
@@ -2746,6 +2935,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgePeekMessageW(
     const BOOL result = manager->PeekGuestMessage(message, window, minimumMessage, maximumMessage, removeMessage);
     if (result)
     {
+        DispatchGuestHook(WH_GETMESSAGE, HC_ACTION,
+            (removeMessage & GuestAbi::PeekRemove) != 0 ? PM_REMOVE : PM_NOREMOVE,
+            reinterpret_cast<LPARAM>(message), BridgeGetCurrentThreadId());
         BridgeSetLastError(ERROR_SUCCESS);
     }
     return result;
@@ -4414,6 +4606,12 @@ INT_PTR WINAPI Win32Bridge::Bridge::BridgeDialogBoxParamW(HINSTANCE instance, LP
 
 #include "Bridge/User32CompatibilityShims.inl"
 
+LRESULT Win32Bridge::Bridge::DispatchGuestHook(
+    int hookType, int code, WPARAM wParam, LPARAM lParam, DWORD targetThreadId)
+{
+    return InvokeGuestHookChain(hookType, code, wParam, lParam, targetThreadId);
+}
+
 BOOL WINAPI Win32Bridge::Bridge::BridgeIsDialogMessageW(
     HWND dialog,
     const GuestAbi::Message* message)
@@ -4432,6 +4630,24 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeIsDialogMessageW(
 ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& symbol)
 {
     ImportResolution resolution = CompatibilityCatalog::Resolve(symbol);
+    if (!symbol.importedByOrdinal &&
+        _wcsicmp(symbol.library.c_str(), L"shcore.dll") == 0)
+    {
+        if (_wcsicmp(symbol.name.c_str(), L"setprocessdpiawareness") == 0)
+            resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetProcessDpiAwareness);
+        else if (_wcsicmp(symbol.name.c_str(), L"getprocessdpiawareness") == 0)
+            resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetProcessDpiAwareness);
+        else if (_wcsicmp(symbol.name.c_str(), L"getdpiformonitor") == 0)
+            resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDpiForMonitor);
+        else if (_wcsicmp(symbol.name.c_str(), L"getscalefactorformonitor") == 0)
+            resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetScaleFactorForMonitor);
+        if (resolution.targetAddress)
+        {
+            resolution.disposition = ImportDisposition::NeedsBridge;
+            resolution.note = L"SHCORE DPI adapter backed by the guest monitor metrics.";
+        }
+        return resolution;
+    }
     if (symbol.importedByOrdinal || !IsUserLibrary(symbol.library))
     {
         return resolution;
@@ -4509,6 +4725,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDestroyWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"showwindow") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeShowWindow);
+    else if (_wcsicmp(symbol.name.c_str(), L"exitwindowsex") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExitWindowsEx);
     else if (_wcsicmp(symbol.name.c_str(), L"getclientrect") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClientRect);
     else if (_wcsicmp(symbol.name.c_str(), L"getwindowrect") == 0)
@@ -4826,7 +5044,10 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"setparent") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetParent);
     else if (_wcsicmp(symbol.name.c_str(), L"getwindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"enumchildwindows") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumChildWindows);
+    else if (_wcsicmp(symbol.name.c_str(), L"enumwindows") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumWindows);
     else if (_wcsicmp(symbol.name.c_str(), L"enumthreadwindows") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEnumThreadWindows);
+    else if (_wcsicmp(symbol.name.c_str(), L"gettopwindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetTopWindow);
+    else if (_wcsicmp(symbol.name.c_str(), L"getwindowinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetWindowInfo);
     else if (_wcsicmp(symbol.name.c_str(), L"getactivewindow") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetActiveWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"getlastactivepopup") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLastActivePopup);
     else if (_wcsicmp(symbol.name.c_str(), L"bringwindowtotop") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBringWindowToTop);
@@ -4870,7 +5091,9 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     else if (_wcsicmp(symbol.name.c_str(), L"begindeferwindowpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeBeginDeferWindowPos);
     else if (_wcsicmp(symbol.name.c_str(), L"deferwindowpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDeferWindowPos);
     else if (_wcsicmp(symbol.name.c_str(), L"enddeferwindowpos") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEndDeferWindowPos);
-    else if (_wcsicmp(symbol.name.c_str(), L"setwindowshookexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowsHookExW);
+    else if (_wcsicmp(symbol.name.c_str(), L"setwindowshookexw") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"setwindowshookexa") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetWindowsHookExW);
     else if (_wcsicmp(symbol.name.c_str(), L"unhookwindowshookex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnhookWindowsHookEx);
     else if (_wcsicmp(symbol.name.c_str(), L"callnexthookex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCallNextHookEx);
     else if (_wcsicmp(symbol.name.c_str(), L"setscrollinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetScrollInfo);

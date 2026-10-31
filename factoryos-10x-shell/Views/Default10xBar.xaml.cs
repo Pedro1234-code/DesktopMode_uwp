@@ -26,11 +26,13 @@ using Windows.UI.Input.Preview.Injection;
 using Windows.UI.ViewManagement;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Data;
 using Windows.UI.Xaml.Media;
 using Windows.UI.Xaml.Media.Imaging;
 using factoryos_10x_shell.Library.Services.WebApps;
 using factoryos_10x_shell.Services.Win32;
 using factoryos_10x_shell.Services.Windowing;
+using factoryos_10x_shell.Services.Files;
 
 
 namespace factoryos_10x_shell.Views
@@ -42,6 +44,11 @@ namespace factoryos_10x_shell.Views
         private readonly IWebAppService _webAppService;
         private readonly Win32WindowManagerService _nativeWindowManager;
         private readonly ShellWindowCoordinator _shellWindowCoordinator;
+        private readonly BitmapImage _filesIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Files/files.png"));
+        private readonly BitmapImage _notepadIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
+        private readonly BitmapImage _settingsIconSource = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
+        private readonly BitmapImage _calculatorIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
+        private readonly BitmapImage _firefoxIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
 
 
         public Default10xBar()
@@ -62,7 +69,14 @@ namespace factoryos_10x_shell.Views
         {
             await _appHelper.LoadPinnedTaskbarAppsAsync();
             RefreshPinnedApps();
-            _appHelper.TaskbarIcons.CollectionChanged += (s, args) => RefreshInternalTaskbar();
+            // Pin/unpin really changes the pinned collection, so rebuild that
+            // panel only for this event. Internal window state changes below
+            // must not pay this cost.
+            _appHelper.TaskbarIcons.CollectionChanged += (s, args) =>
+            {
+                RefreshPinnedApps();
+                RefreshFilesTaskbar();
+            };
             _windowManager.Windows.CollectionChanged += (s, args) =>
             {
                 RefreshOpenWebApps();
@@ -70,27 +84,27 @@ namespace factoryos_10x_shell.Views
             };
             _windowManager.WindowsChanged += (s, args) =>
             {
-                RefreshOpenWebApps();
-                RefreshPinnedWebApps();
+                UpdateWebAppTaskbarVisualState();
             };
             _webAppService.InstalledApps.CollectionChanged += (s, args) =>
-            {
-                RefreshOpenWebApps();
                 RefreshPinnedWebApps();
-            };
             _webAppService.AppsChanged += (s, args) =>
             {
                 RefreshOpenWebApps();
                 RefreshPinnedWebApps();
             };
             _nativeWindowManager.Windows.CollectionChanged += (s, args) => RefreshOpenWin32Apps();
-            _nativeWindowManager.WindowsChanged += (s, args) => RefreshOpenWin32Apps();
+            _nativeWindowManager.WindowsChanged += (s, args) => UpdateWin32TaskbarVisualState();
+            FileOperationService.Instance.Windows.CollectionChanged += (s, args) => RefreshFilesTaskbar();
+            FileOperationService.Instance.WindowsChanged += (s, args) => RefreshFilesTaskbar();
             AppState.Instance.OnFilesStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnNotepadStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnSettingsStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnCalculatorStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnFirefoxStateChanged += RefreshInternalTaskbar;
-            _shellWindowCoordinator.StateChanged += (s, args) => RefreshInternalTaskbar();
+            // Activation only changes the highlight. Recreating every Button
+            // here made all taskbar icons disappear/reappear on each click.
+            _shellWindowCoordinator.StateChanged += (s, args) => UpdateInternalTaskbarVisualState();
             RefreshOpenWebApps();
             RefreshPinnedWebApps();
             RefreshOpenWin32Apps();
@@ -158,7 +172,14 @@ namespace factoryos_10x_shell.Views
                 }
                 else
                 {
-                    stack.Children.Add(new Image { Width = 32, Height = 32, Source = app.IconSource });
+                    var image = new Image { Width = 32, Height = 32 };
+                    image.SetBinding(Image.SourceProperty, new Binding
+                    {
+                        Source = app,
+                        Path = new PropertyPath(nameof(StartIconModel.IconSource)),
+                        Mode = BindingMode.OneWay
+                    });
+                    stack.Children.Add(image);
                 }
                 button.Content = stack;
 
@@ -297,6 +318,38 @@ namespace factoryos_10x_shell.Views
             }
         }
 
+        private void UpdateWebAppTaskbarVisualState()
+        {
+            UpdateWebAppButtons(OpenWebAppsPanel);
+            UpdateWebAppButtons(PinnedWebAppsPanel);
+        }
+
+        private void UpdateWebAppButtons(Panel panel)
+        {
+            foreach (Button button in panel.Children.OfType<Button>())
+            {
+                if (!(button.Tag is WebAppDefinition app)) continue;
+                bool isOpen = _windowManager.Windows.Any(window => window.App.Id == app.Id);
+                bool isActive = _windowManager.Windows.Any(window =>
+                    window.App.Id == app.Id && window.IsActive &&
+                    window.Visibility == Visibility.Visible);
+                button.Background = isOpen
+                    ? new SolidColorBrush(Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180))
+                    : new SolidColorBrush(Colors.Transparent);
+            }
+        }
+
+        private void UpdateWin32TaskbarVisualState()
+        {
+            foreach (Button button in OpenWin32AppsPanel.Children.OfType<Button>())
+            {
+                if (!(button.Tag is Win32WindowModel window)) continue;
+                bool isActive = window.IsActive && window.Visibility == Visibility.Visible;
+                button.Background = new SolidColorBrush(
+                    Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180));
+            }
+        }
+
         private static UIElement CreateWin32AppIcon(Win32WindowModel window)
         {
             if (window.IconSource != null)
@@ -327,7 +380,7 @@ namespace factoryos_10x_shell.Views
             button.RightTapped += (sender, args) =>
             {
                 var flyout = new MenuFlyout();
-                var newWindowItem = new MenuFlyoutItem { Text = "New window" };
+                var newWindowItem = new MenuFlyoutItem { Text = app.NewInstanceText };
                 newWindowItem.Click += (itemSender, itemArgs) => _windowManager.OpenNewWindow(app);
                 flyout.Items.Add(newWindowItem);
 
@@ -348,22 +401,22 @@ namespace factoryos_10x_shell.Views
             return new TextBlock { Text = "\uE774", FontFamily = new FontFamily("Segoe MDL2 Assets"), FontSize = 20, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
         }
 
-        private static Image CreateFilesIcon(double size)
+        private Image CreateFilesIcon(double size)
         {
             return new Image
             {
                 Width = size,
                 Height = size,
-                Source = new BitmapImage(new Uri("ms-appx:///Assets/Files/files.png")),
+                Source = _filesIconSource,
                 Stretch = Stretch.Uniform
             };
         }
 
-        private static Image CreateNotepadIcon(double size)
+        private Image CreateNotepadIcon(double size)
         {
             return new Image
             {
-                Source = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png")),
+                Source = _notepadIconSource,
                 Width = size,
                 Height = size,
                 HorizontalAlignment = HorizontalAlignment.Center,
@@ -372,16 +425,48 @@ namespace factoryos_10x_shell.Views
             };
         }
 
-        private static Image CreateSettingsIcon(double size) => new Image { Source = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png")), Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
+        private Image CreateSettingsIcon(double size) => new Image { Source = _settingsIconSource, Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
 
-        private static Image CreateCalculatorIcon(double size) => new Image { Source = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png")), Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
+        private Image CreateCalculatorIcon(double size) => new Image { Source = _calculatorIconSource, Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
 
-        private static Image CreateFirefoxIcon(double size) => new Image { Source = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png")), Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
+        private Image CreateFirefoxIcon(double size) => new Image { Source = _firefoxIconSource, Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
 
         private void RefreshInternalTaskbar()
         {
+            Stopwatch clock = Stopwatch.StartNew();
             RefreshFilesTaskbar();
-            RefreshPinnedApps();
+            // Opening/minimizing an internal window changes only its running
+            // button and active highlight. Rebuilding every pinned button here
+            // forced XAML to recreate styles, flyouts and image decoders on the
+            // UI thread, producing 80-500 ms stalls when an app was opened.
+            UpdateInternalTaskbarVisualState();
+            clock.Stop();
+            MainPage.RecordUiOperation("Taskbar.RefreshInternal", clock.ElapsedMilliseconds);
+        }
+
+        private void UpdateInternalTaskbarVisualState()
+        {
+            UpdateInternalButtons(PinnedAppsPanel);
+            UpdateInternalButtons(OpenFilesPanel);
+        }
+
+        private void UpdateInternalButtons(Panel panel)
+        {
+            foreach (Button button in panel.Children.OfType<Button>())
+            {
+                if (button.Tag is FileOperationModel operation)
+                {
+                    button.Background = new SolidColorBrush(Color.FromArgb(
+                        _shellWindowCoordinator.IsActive(ShellWindowKind.FileOperation, operation) ? (byte)80 : (byte)48, 70, 130, 180));
+                    continue;
+                }
+                string appId = (button.Tag as StartIconModel)?.AppId ?? button.Tag as string;
+                if (!string.IsNullOrEmpty(appId) &&
+                    appId.StartsWith("CoreShell.", StringComparison.OrdinalIgnoreCase))
+                {
+                    button.Background = GetPinnedAppBackground(appId);
+                }
+            }
         }
 
         private Brush GetPinnedAppBackground(string appId)
@@ -411,41 +496,54 @@ namespace factoryos_10x_shell.Views
         private void RefreshNotepadTaskbar()
         {
             OpenFilesPanel.Children.Clear();
+            foreach (FileOperationModel operation in FileOperationService.Instance.Windows)
+            {
+                var operationButton = new Button
+                {
+                    Width = 48, Height = 48, Margin = new Thickness(2), Tag = operation,
+                    Style = (Style)Application.Current.Resources["TaskbarButtonStyle"],
+                    Content = new FontIcon { FontFamily = new FontFamily("Segoe MDL2 Assets"), Glyph = "\uE895", FontSize = 22 }
+                };
+                ToolTipService.SetToolTip(operationButton, operation.Title);
+                operationButton.Click += (s, e) => FileOperationService.Instance.Activate(operation);
+                OpenFilesPanel.Children.Add(operationButton);
+            }
             if (AppState.Instance.IsFilesOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Files"))
             {
-                var filesButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Files"), Content = CreateFilesIcon(28) };
+                var filesButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Files", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Files"), Content = CreateFilesIcon(28) };
                 ToolTipService.SetToolTip(filesButton, "Files");
                 filesButton.Click += (sender, args) => AppState.Instance.RequestFilesOpen();
                 OpenFilesPanel.Children.Add(filesButton);
             }
             if (AppState.Instance.IsNotepadOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Notepad"))
             {
-                var button = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Notepad"), Content = CreateNotepadIcon(27) };
+                var button = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Notepad", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Notepad"), Content = CreateNotepadIcon(27) };
                 ToolTipService.SetToolTip(button, "Notepad");
                 button.Click += (sender, args) => AppState.Instance.RequestNotepadOpen();
                 OpenFilesPanel.Children.Add(button);
             }
             if (AppState.Instance.IsSettingsOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Settings"))
             {
-                var settingsButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Settings"), Content = CreateSettingsIcon(25) };
+                var settingsButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Settings", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Settings"), Content = CreateSettingsIcon(25) };
                 ToolTipService.SetToolTip(settingsButton, "Settings");
                 settingsButton.Click += (sender, args) => AppState.Instance.RequestSettingsOpen();
                 OpenFilesPanel.Children.Add(settingsButton);
             }
             if (AppState.Instance.IsCalculatorOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Calculator"))
             {
-                var calculatorButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Calculator"), Content = CreateCalculatorIcon(24) };
+                var calculatorButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Calculator", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Calculator"), Content = CreateCalculatorIcon(24) };
                 ToolTipService.SetToolTip(calculatorButton, "Calculator");
                 calculatorButton.Click += (sender, args) => AppState.Instance.RequestCalculatorOpen();
                 OpenFilesPanel.Children.Add(calculatorButton);
             }
             if (AppState.Instance.IsFirefoxOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Firefox"))
             {
-                var firefoxButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Firefox"), Content = CreateFirefoxIcon(26) };
+                var firefoxButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Firefox", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Firefox"), Content = CreateFirefoxIcon(26) };
                 ToolTipService.SetToolTip(firefoxButton, "Strawfox");
                 firefoxButton.Click += (sender, args) => AppState.Instance.RequestFirefoxOpen();
                 OpenFilesPanel.Children.Add(firefoxButton);
             }
+            UpdateInternalTaskbarVisualState();
         }
     }
 }

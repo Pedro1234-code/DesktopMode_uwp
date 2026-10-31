@@ -96,6 +96,13 @@ void WINAPI BridgeInitializeSListHead(PSLIST_HEADER head)
     if (head) ::InitializeSListHead(head);
 }
 
+PSLIST_ENTRY WINAPI BridgeInterlockedFlushSList(PSLIST_HEADER head)
+{
+    // The guest uses the same aligned x64 SLIST ABI. Preserve the native
+    // atomic exchange and returned chain, including for CRT cleanup lists.
+    return ::InterlockedFlushSList(head);
+}
+
 DWORD WINAPI BridgeTlsAlloc()
 {
     const DWORD index = ::TlsAlloc();
@@ -328,17 +335,49 @@ PVOID WINAPI BridgeDecodePointer(PVOID pointer)
 DWORD WINAPI BridgeWaitForSingleObjectEx(
     HANDLE object, DWORD milliseconds, BOOL alertable)
 {
-    // APC delivery is not yet modeled, but timeout and object acquisition use
-    // the same guest handle table as WaitForSingleObject.
-    UNREFERENCED_PARAMETER(alertable);
-    return BridgeWaitForSingleObject(object, milliseconds);
+    if (!alertable) return BridgeWaitForSingleObject(object, milliseconds);
+
+    const DWORD threadId = BridgeGetCurrentThreadId();
+    if (DispatchGuestApcs(threadId)) return WAIT_IO_COMPLETION;
+
+    const auto started = std::chrono::steady_clock::now();
+    for (;;)
+    {
+        DWORD slice = 10;
+        if (milliseconds != INFINITE)
+        {
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - started).count();
+            if (elapsed >= milliseconds)
+                return BridgeWaitForSingleObject(object, 0);
+            slice = (std::min)(slice, milliseconds - static_cast<DWORD>(elapsed));
+        }
+
+        const DWORD result = BridgeWaitForSingleObject(object, slice);
+        if (result != WAIT_TIMEOUT) return result;
+        if (DispatchGuestApcs(threadId)) return WAIT_IO_COMPLETION;
+    }
 }
 
 DWORD WINAPI BridgeSleepEx(DWORD milliseconds, BOOL alertable)
 {
-    UNREFERENCED_PARAMETER(alertable);
-    BridgeSleep(milliseconds);
-    return 0;
+    if (!alertable)
+    {
+        BridgeSleep(milliseconds);
+        return 0;
+    }
+
+    const DWORD threadId = BridgeGetCurrentThreadId();
+    if (DispatchGuestApcs(threadId)) return WAIT_IO_COMPLETION;
+    std::unique_lock<std::mutex> guard(g_guestApcLock);
+    const auto ready = [threadId]() { return HasGuestApcLocked(threadId); };
+    if (milliseconds == INFINITE)
+        g_guestApcChanged.wait(guard, ready);
+    else if (!g_guestApcChanged.wait_for(
+        guard, std::chrono::milliseconds(milliseconds), ready))
+        return 0;
+    guard.unlock();
+    return DispatchGuestApcs(threadId) ? WAIT_IO_COMPLETION : 0;
 }
 
 BOOL WINAPI BridgeAreFileApisANSI()
@@ -692,10 +731,36 @@ HRESULT WINAPI BridgeGetApplicationRestartSettings(
 }
 
 DWORD WINAPI BridgeQueueUserAPC(
-    PAPCFUNC, HANDLE, ULONG_PTR)
+    PAPCFUNC procedure, HANDLE thread, ULONG_PTR parameter)
 {
-    SetGuestLastError(ERROR_NOT_SUPPORTED);
-    return 0;
+    if (!procedure)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return 0;
+    }
+    GuestKernelContext* kernel = CurrentGuestKernelContext();
+    DWORD threadId = 0;
+    DWORD error = ERROR_INVALID_HANDLE;
+    if (!kernel || !kernel->GetThreadId(thread, &threadId, &error))
+    {
+        SetGuestLastError(error);
+        return 0;
+    }
+    try
+    {
+        {
+            std::lock_guard<std::mutex> guard(g_guestApcLock);
+            g_guestApcs[threadId].push_back({ procedure, parameter });
+        }
+        g_guestApcChanged.notify_all();
+        SetGuestLastError(ERROR_SUCCESS);
+        return 1;
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return 0;
+    }
 }
 
 BOOL WINAPI BridgeTerminateThread(HANDLE, DWORD)
@@ -711,10 +776,12 @@ BOOL WINAPI BridgeSetStdHandle(DWORD, HANDLE)
     return TRUE;
 }
 
-BOOL WINAPI BridgeCancelIo(HANDLE)
+BOOL WINAPI BridgeCancelIo(HANDLE file)
 {
-    SetGuestLastError(ERROR_NOT_FOUND);
-    return FALSE;
+    const bool cancelled = CancelGuestDirectoryWatches(
+        file, BridgeGetCurrentThreadId());
+    SetGuestLastError(cancelled ? ERROR_SUCCESS : ERROR_NOT_FOUND);
+    return cancelled ? TRUE : FALSE;
 }
 
 BOOL WINAPI BridgeLockFileEx(HANDLE file, DWORD flags, DWORD, DWORD lengthLow,
@@ -758,12 +825,89 @@ BOOL WINAPI BridgeUnlockFile(HANDLE file, DWORD offsetLow, DWORD offsetHigh,
 }
 
 BOOL WINAPI BridgeReadDirectoryChangesW(
-    HANDLE, LPVOID, DWORD, BOOL, DWORD, LPDWORD bytesReturned,
-    LPOVERLAPPED, LPOVERLAPPED_COMPLETION_ROUTINE)
+    HANDLE directory, LPVOID buffer, DWORD bufferSize, BOOL watchSubtree,
+    DWORD notifyFilter, LPDWORD bytesReturned, LPOVERLAPPED overlapped,
+    LPOVERLAPPED_COMPLETION_ROUTINE completionRoutine)
 {
     if (bytesReturned) *bytesReturned = 0;
-    SetGuestLastError(ERROR_NOT_SUPPORTED);
-    return FALSE;
+    constexpr DWORD SupportedFilters =
+        FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
+        FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE |
+        FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_LAST_ACCESS |
+        FILE_NOTIFY_CHANGE_CREATION | FILE_NOTIFY_CHANGE_SECURITY;
+    if (!buffer || bufferSize < FIELD_OFFSET(FILE_NOTIFY_INFORMATION, FileName) ||
+        notifyFilter == 0 || (notifyFilter & ~SupportedFilters) != 0 ||
+        (completionRoutine && !overlapped))
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+
+    GuestStorageContext* storage = CurrentGuestStorageContext();
+    DWORD error = ERROR_INVALID_HANDLE;
+    std::wstring path;
+    if (!storage || !storage->IsDirectoryHandle(directory, &error) ||
+        !storage->GetFilePath(directory, &path, &error))
+    {
+        SetGuestLastError(error);
+        return FALSE;
+    }
+
+    std::shared_ptr<GuestDirectoryChangeWatch> watch;
+    try
+    {
+        watch = std::make_shared<GuestDirectoryChangeWatch>();
+        watch->directory = directory;
+        watch->path = std::move(path);
+        watch->subtree = watchSubtree != FALSE;
+        watch->filter = notifyFilter;
+        watch->buffer = static_cast<BYTE*>(buffer);
+        watch->bufferSize = bufferSize;
+        watch->bytesReturned = bytesReturned;
+        watch->overlapped = overlapped;
+        watch->completionRoutine = completionRoutine;
+        watch->threadId = BridgeGetCurrentThreadId();
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    if (overlapped)
+    {
+        if (!InitializeDirectoryOverlappedLeaf(overlapped))
+        {
+            SetGuestLastError(ERROR_NOACCESS);
+            return FALSE;
+        }
+    }
+    try
+    {
+        std::lock_guard<std::mutex> guard(g_directoryWatchesLock);
+        g_directoryWatches.push_back(watch);
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
+
+    if (overlapped)
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return TRUE;
+    }
+
+    std::unique_lock<std::mutex> guard(watch->lock);
+    watch->changed.wait(guard, [&watch]() { return watch->completed; });
+    if (watch->completionError != ERROR_SUCCESS)
+    {
+        SetGuestLastError(watch->completionError);
+        return FALSE;
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return TRUE;
 }
 
 BOOL WINAPI BridgeReadConsoleW(
@@ -830,6 +974,14 @@ BOOL WINAPI BridgeGetFileAttributesExW(
 
 DWORD WINAPI BridgeGetFileType(HANDLE file)
 {
+    GuestStorageContext* storage = CurrentGuestStorageContext();
+    std::wstring ignored;
+    DWORD error = ERROR_INVALID_HANDLE;
+    if (storage && storage->GetFilePath(file, &ignored, &error))
+    {
+        SetGuestLastError(ERROR_SUCCESS);
+        return FILE_TYPE_DISK;
+    }
     LARGE_INTEGER size{};
     if (BridgeGetFileSizeEx(file, &size))
     {
@@ -961,25 +1113,84 @@ BOOL WINAPI BridgeGetModuleHandleExW(
     constexpr DWORD FromAddress = 0x00000004;
     constexpr DWORD UnchangedRefcount = 0x00000002;
     constexpr DWORD Pin = 0x00000001;
-    if (!module || (flags & ~(FromAddress | UnchangedRefcount | Pin)) != 0)
+    if (!module || (flags & ~(FromAddress | UnchangedRefcount | Pin)) != 0 ||
+        ((flags & Pin) != 0 && (flags & UnchangedRefcount) != 0))
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     if ((flags & FromAddress) != 0)
     {
-        MEMORY_BASIC_INFORMATION memory{};
-        if (!moduleName || !::VirtualQuery(moduleName, &memory, sizeof(memory)))
+        if (!moduleName)
         {
             SetGuestLastError(ERROR_MOD_NOT_FOUND);
             return FALSE;
         }
-        *module = reinterpret_cast<HMODULE>(memory.AllocationBase);
-        SetGuestLastError(ERROR_SUCCESS);
-        return TRUE;
+        const ULONG_PTR address = reinterpret_cast<ULONG_PTR>(moduleName);
+        const BYTE* mainBase = CurrentGuestImageBase();
+        const size_t mainSize = CurrentGuestImageSize();
+        if (mainBase && address >= reinterpret_cast<ULONG_PTR>(mainBase) &&
+            address - reinterpret_cast<ULONG_PTR>(mainBase) < mainSize)
+        {
+            *module = GuestMainModuleHandle();
+        }
+        else
+        {
+            GuestModuleLoader* loader = CurrentGuestModuleLoader();
+            DWORD error = ERROR_SUCCESS;
+            if (!loader || !loader->GetModuleHandleFromAddress(address, module, &error))
+            {
+                *module = nullptr;
+                SetGuestLastError(error == ERROR_SUCCESS ? ERROR_MOD_NOT_FOUND : error);
+                return FALSE;
+            }
+        }
     }
-    *module = BridgeGetModuleHandleW(moduleName);
-    return *module != nullptr;
+    else
+    {
+        *module = BridgeGetModuleHandleW(moduleName);
+        if (!*module) return FALSE;
+    }
+
+    if ((flags & UnchangedRefcount) == 0 && !IsGuestMainModule(*module) &&
+        !FindBridgeSystemModule(*module))
+    {
+        GuestModuleLoader* loader = CurrentGuestModuleLoader();
+        DWORD error = ERROR_SUCCESS;
+        if (!loader || !loader->AddReference(*module, (flags & Pin) != 0, &error))
+        {
+            *module = nullptr;
+            SetGuestLastError(error == ERROR_SUCCESS ? ERROR_MOD_NOT_FOUND : error);
+            return FALSE;
+        }
+    }
+    SetGuestLastError(ERROR_SUCCESS);
+    return TRUE;
+}
+
+BOOL WINAPI BridgeGetModuleHandleExA(
+    DWORD flags, LPCSTR moduleName, HMODULE* module)
+{
+    constexpr DWORD FromAddress = 0x00000004;
+    if ((flags & FromAddress) != 0)
+        return BridgeGetModuleHandleExW(flags, reinterpret_cast<LPCWSTR>(moduleName), module);
+    if (!moduleName) return BridgeGetModuleHandleExW(flags, nullptr, module);
+
+    const int required = ::MultiByteToWideChar(
+        CP_ACP, MB_ERR_INVALID_CHARS, moduleName, -1, nullptr, 0);
+    if (required <= 0)
+    {
+        SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return FALSE;
+    }
+    std::wstring wide(static_cast<size_t>(required), L'\0');
+    if (::MultiByteToWideChar(CP_ACP, MB_ERR_INVALID_CHARS, moduleName, -1,
+            &wide[0], required) != required)
+    {
+        SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
+        return FALSE;
+    }
+    return BridgeGetModuleHandleExW(flags, wide.c_str(), module);
 }
 
 int WINAPI BridgeGetLocaleInfoA(

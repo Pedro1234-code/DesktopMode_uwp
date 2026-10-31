@@ -9,7 +9,9 @@
 #include <atomic>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 #include <limits>
+#include <mutex>
 #include <string>
 
 #include "client/DrmBridge.h"
@@ -34,9 +36,177 @@ using namespace winrt::Windows::UI::Xaml::Media::Imaging;
 namespace gecko_w10m::client {
 
 namespace {
+void LogModuleIdentity(const wchar_t* name, HMODULE module) {
+  if (!module) return;
+  const auto* base = reinterpret_cast<const unsigned char*>(module);
+  const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+  if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0) return;
+  const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+  if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+  const DWORD imageSize = nt->OptionalHeader.SizeOfImage;
+  wchar_t note[320];
+  swprintf_s(note, _countof(note),
+             L"diag: module %ls base=%p PE_timestamp=0x%08lx image_bytes=%lu",
+             name, reinterpret_cast<void*>(module),
+             nt->FileHeader.TimeDateStamp, imageSize);
+  Log::Write(note);
+  const auto& debug = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+  if (!debug.VirtualAddress || debug.VirtualAddress >= imageSize ||
+      debug.Size > imageSize - debug.VirtualAddress) return;
+  const auto* entries = reinterpret_cast<const IMAGE_DEBUG_DIRECTORY*>(base + debug.VirtualAddress);
+  struct CodeViewHeader { DWORD signature; GUID id; DWORD age; };
+  for (DWORD i = 0; i < debug.Size / sizeof(IMAGE_DEBUG_DIRECTORY); ++i) {
+    const auto& entry = entries[i];
+    if (entry.Type != IMAGE_DEBUG_TYPE_CODEVIEW ||
+        entry.SizeOfData < sizeof(CodeViewHeader) ||
+        entry.AddressOfRawData >= imageSize ||
+        sizeof(CodeViewHeader) > imageSize - entry.AddressOfRawData) continue;
+    CodeViewHeader cv;
+    memcpy(&cv, base + entry.AddressOfRawData, sizeof(cv));
+    if (cv.signature != 0x53445352) continue;
+    swprintf_s(note, _countof(note),
+               L"diag: module %ls PDB=%08lx-%04x-%04x-%02x%02x-%02x%02x%02x%02x%02x%02x age=%lu",
+               name, cv.id.Data1, cv.id.Data2, cv.id.Data3,
+               cv.id.Data4[0], cv.id.Data4[1], cv.id.Data4[2], cv.id.Data4[3],
+               cv.id.Data4[4], cv.id.Data4[5], cv.id.Data4[6], cv.id.Data4[7], cv.age);
+    Log::Write(note);
+    break;
+  }
+}
+
 // The UI thread's dispatcher, kept for the launcher callback, which is called
 // from Gecko's threads and has no way to ask for one.
 winrt::Windows::UI::Core::CoreDispatcher gUiDispatcher{nullptr};
+
+std::mutex gClipboardMutex;
+std::wstring gClipboardText;
+std::atomic<uint32_t> gClipboardSequence{1};
+std::once_flag gClipboardWatchOnce;
+std::once_flag gGamepadWatchOnce;
+std::atomic<bool> gGamepadListChanged{true};
+std::atomic<bool> gGamepadEventsAvailable{false};
+
+struct ClipboardBroker {
+  int32_t (*writeText)(const uint16_t*, int32_t);
+  int32_t (*readText)(uint16_t*, int32_t);
+  void (*clear)();
+  uint32_t (*sequence)();
+};
+
+void StoreClipboardText(std::wstring text) {
+  std::lock_guard<std::mutex> lock(gClipboardMutex);
+  if (gClipboardText == text) {
+    return;
+  }
+  gClipboardText = std::move(text);
+  ++gClipboardSequence;
+}
+
+void RefreshClipboardText() noexcept {
+  if (!gUiDispatcher) {
+    return;
+  }
+  try {
+    gUiDispatcher.RunAsync(
+        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [] {
+          try {
+            using winrt::Windows::ApplicationModel::DataTransfer::Clipboard;
+            using winrt::Windows::ApplicationModel::DataTransfer::
+                StandardDataFormats;
+            auto content = Clipboard::GetContent();
+            if (!content || !content.Contains(StandardDataFormats::Text())) {
+              StoreClipboardText({});
+              return;
+            }
+            auto operation = content.GetTextAsync();
+            operation.Completed([](auto const& completed,
+                                   winrt::Windows::Foundation::AsyncStatus status) {
+              if (status != winrt::Windows::Foundation::AsyncStatus::Completed) {
+                return;
+              }
+              try {
+                StoreClipboardText(completed.GetResults().c_str());
+              } catch (...) {
+              }
+            });
+          } catch (...) {
+          }
+        });
+  } catch (...) {
+  }
+}
+
+int32_t WriteClipboardText(const uint16_t* text, int32_t length) noexcept {
+  if (!text || length < 0 || !gUiDispatcher) {
+    return 0;
+  }
+  try {
+    std::wstring value(reinterpret_cast<const wchar_t*>(text),
+                       static_cast<size_t>(length));
+    StoreClipboardText(value);
+    gUiDispatcher.RunAsync(
+        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+        [value = std::move(value)] {
+          try {
+            using winrt::Windows::ApplicationModel::DataTransfer::Clipboard;
+            using winrt::Windows::ApplicationModel::DataTransfer::DataPackage;
+            DataPackage package;
+            package.SetText(winrt::hstring(value));
+            Clipboard::SetContent(package);
+            Clipboard::Flush();
+          } catch (winrt::hresult_error const& error) {
+            Log::Write(L"clipboard: system write failed",
+                       std::wstring(error.message()));
+          }
+        });
+    return 1;
+  } catch (...) {
+    return 0;
+  }
+}
+
+int32_t ReadClipboardText(uint16_t* destination, int32_t capacity) noexcept {
+  try {
+    std::lock_guard<std::mutex> lock(gClipboardMutex);
+    const int32_t length = static_cast<int32_t>(gClipboardText.size());
+    if (!destination || capacity == 0) {
+      return length;
+    }
+    if (capacity < length) {
+      return -1;
+    }
+    if (length) {
+      memcpy(destination, gClipboardText.data(),
+             static_cast<size_t>(length) * sizeof(uint16_t));
+    }
+    return length;
+  } catch (...) {
+    return -1;
+  }
+}
+
+void ClearClipboard() noexcept {
+  StoreClipboardText({});
+  if (!gUiDispatcher) {
+    return;
+  }
+  try {
+    gUiDispatcher.RunAsync(
+        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [] {
+          try {
+            winrt::Windows::ApplicationModel::DataTransfer::Clipboard::Clear();
+          } catch (...) {
+          }
+        });
+  } catch (...) {
+  }
+}
+
+uint32_t ClipboardSequence() noexcept { return gClipboardSequence.load(); }
+
+const ClipboardBroker gClipboardBroker{&WriteClipboardText, &ReadClipboardText,
+                                       &ClearClipboard, &ClipboardSequence};
+bool gClipboardBrokerInstalled = false;
 }  // namespace
 
 namespace {
@@ -296,6 +466,35 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
   } catch (winrt::hresult_error const&) {
   }
 
+  std::call_once(gClipboardWatchOnce, [] {
+    try {
+      winrt::Windows::ApplicationModel::DataTransfer::Clipboard::ContentChanged(
+          [](auto const&, auto const&) { RefreshClipboardText(); });
+      RefreshClipboardText();
+    } catch (winrt::hresult_error const& error) {
+      Log::Write(L"clipboard: system clipboard unavailable",
+                 std::wstring(error.message()));
+    }
+  });
+
+  // Do not query the device broker periodically from CompositionTarget's
+  // render callback. On Xbox that WinRT enumeration can briefly block the UI
+  // thread and appears as a small pause in both animation and mouse movement.
+  std::call_once(gGamepadWatchOnce, [] {
+    try {
+      using winrt::Windows::Gaming::Input::Gamepad;
+      Gamepad::GamepadAdded([](auto const&, auto const&) {
+        gGamepadListChanged.store(true, std::memory_order_relaxed);
+      });
+      Gamepad::GamepadRemoved([](auto const&, auto const&) {
+        gGamepadListChanged.store(true, std::memory_order_relaxed);
+      });
+      gGamepadEventsAvailable.store(true, std::memory_order_relaxed);
+    } catch (winrt::hresult_error const&) {
+      // Keep a slow polling fallback for targets that reject registration.
+    }
+  });
+
   image_ = Image();
   // The engine paints a whole window; show all of it, keeping its shape. The
   // headless screen it was given has the window's aspect, so this costs at
@@ -303,6 +502,11 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
   image_.Stretch(Stretch::Uniform);
   image_.HorizontalAlignment(HorizontalAlignment::Stretch);
   image_.VerticalAlignment(VerticalAlignment::Stretch);
+
+  externalImage_ = Image();
+  externalImage_.Stretch(Stretch::Uniform);
+  externalImage_.HorizontalAlignment(HorizontalAlignment::Stretch);
+  externalImage_.VerticalAlignment(VerticalAlignment::Stretch);
 
   image_.PointerPressed([this](winrt::Windows::Foundation::IInspectable const&,
                                Input::PointerRoutedEventArgs const& args) {
@@ -419,8 +623,9 @@ void EngineView::WireKeyboard() {
   //
   // So whatever lands here is passed on and the sink is emptied again, which
   // keeps it from growing and keeps the next change a pure delta.
-  sink_.TextChanged([this](winrt::Windows::Foundation::IInspectable const&,
-                           Controls::TextChangedEventArgs const&) {
+  // TextChanged is deferred and can run after CharacterReceived sent the text.
+  sink_.TextChanging([this](Controls::TextBox const&,
+                            Controls::TextBoxTextChangingEventArgs const&) {
     if (clearing_) {
       return;
     }
@@ -429,6 +634,7 @@ void EngineView::WireKeyboard() {
       return;
     }
     if (inputEnabled_ && text_ && typing_) {
+      ++textRevision_;
       text_(reinterpret_cast<const uint16_t*>(typed.c_str()),
             static_cast<int32_t>(typed.size()));
     }
@@ -437,13 +643,8 @@ void EngineView::WireKeyboard() {
     clearing_ = false;
   });
 
-  // There is no second way in. Characters were also being taken from the
-  // window, kept on the grounds that a hardware keyboard would need it and
-  // that it cost nothing -- both wrong. It cost every letter twice, because
-  // the on-screen keyboard raises CharacterReceived as well as editing the
-  // control, and a hardware keyboard needs nothing special either: it types
-  // into whatever holds focus, which is this same sink, and arrives as the
-  // same change.
+  // Physical characters missed by the sink retain the Windows keyboard layout.
+  // TextChanging wins synchronously if XAML already delivered the keystroke.
   auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
 
   // Bridge-local flags.  They intentionally are not Gecko's enum values: the
@@ -502,9 +703,10 @@ void EngineView::WireKeyboard() {
     }
     const int32_t code = static_cast<int32_t>(args.VirtualKey());
     const uint32_t mods = currentModifiers();
+    hardwareCharacterPending_ = false;
 
     // When a Gecko edit field is focused, printable text comes through the
-    // TextBox's TextChanged event (including IME input).  Everything else is
+    // TextBox's TextChanging event (including IME input).  Everything else is
     // physical keyboard input.  Outside an edit field all keys must go to
     // Gecko so games and pages receive WASD, Escape, etc.  Modified keys are
     // sent physically even in an edit field so Ctrl+A/C/V and browser
@@ -513,6 +715,8 @@ void EngineView::WireKeyboard() {
     const bool send = !typing_ || modified || isModifier(code) ||
                       isNonText(code);
     if (!send) {
+      hardwareCharacterPending_ = args.KeyStatus().ScanCode != 0;
+      hardwareTextRevision_ = textRevision_;
       return;
     }
 
@@ -530,11 +734,44 @@ void EngineView::WireKeyboard() {
     args.Handled(true);
   });
 
+  window.CharacterReceived(
+      [this, currentModifiers, kControl, kAlt, kMeta](
+          winrt::Windows::UI::Core::CoreWindow const&,
+          winrt::Windows::UI::Core::CharacterReceivedEventArgs const& args) {
+        if (!hardwareCharacterPending_ || args.KeyStatus().ScanCode == 0) {
+          return;
+        }
+        hardwareCharacterPending_ = false;
+        if (!inputEnabled_ || !typing_ || !text_ ||
+            (currentModifiers() & (kControl | kAlt | kMeta)) != 0) {
+          return;
+        }
+        const uint32_t character = args.KeyCode();
+        if (character < 0x20 || character == 0x7f || character > 0x10ffff) {
+          return;
+        }
+        if (textRevision_ == hardwareTextRevision_) {
+          uint16_t text[2] = {static_cast<uint16_t>(character), 0};
+          int32_t length = 1;
+          if (character > 0xffff) {
+            const uint32_t pair = character - 0x10000;
+            text[0] = static_cast<uint16_t>(0xd800 + (pair >> 10));
+            text[1] = static_cast<uint16_t>(0xdc00 + (pair & 0x3ff));
+            length = 2;
+          }
+          ++textRevision_;
+          text_(text, length);
+        }
+        args.Handled(true);
+      });
+  Log::Write(L"keyboard: physical Unicode fallback enabled; synchronous TextChanging deduplication v2");
+
   window.KeyUp([this, currentModifiers](winrt::Windows::UI::Core::CoreWindow const&,
                                          winrt::Windows::UI::Core::KeyEventArgs const& args) {
     if (!inputEnabled_ || !key2_) {
       return;
     }
+    hardwareCharacterPending_ = false;
     const int32_t code = static_cast<int32_t>(args.VirtualKey());
     if (code < 0 || code >= static_cast<int32_t>(forwardedKeys_.size()) ||
         !forwardedKeys_[code]) {
@@ -619,12 +856,40 @@ bool EngineView::Resolve() {
     return false;
   }
   copy_ = reinterpret_cast<CopyFn>(::GetProcAddress(xul, "gecko_w10m_frame_copy"));
+  externalCopy_ = reinterpret_cast<CopyFn>(
+      ::GetProcAddress(xul, "gecko_w10m_external_frame_copy"));
+  externalOpen_ = reinterpret_cast<WantedFn>(
+      ::GetProcAddress(xul, "gecko_w10m_external_window_open"));
+  externalMouse_ = reinterpret_cast<MouseButtonFn>(
+      ::GetProcAddress(xul, "gecko_w10m_external_input_mouse2"));
+  externalWheel_ = reinterpret_cast<WheelFn>(
+      ::GetProcAddress(xul, "gecko_w10m_external_input_wheel"));
+  externalResize_ = reinterpret_cast<ResizeFn>(
+      ::GetProcAddress(xul, "gecko_w10m_external_window_resize"));
+  externalActive_ = reinterpret_cast<ExternalActiveFn>(
+      ::GetProcAddress(xul, "gecko_w10m_external_window_activate"));
+  externalClose_ = reinterpret_cast<ExternalCloseFn>(
+      ::GetProcAddress(xul, "gecko_w10m_external_window_close"));
+  if (!gClipboardBrokerInstalled) {
+    using SetClipboardBrokerFn = void (*)(const ClipboardBroker*);
+    auto setClipboardBroker = reinterpret_cast<SetClipboardBrokerFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_clipboard_broker"));
+    if (setClipboardBroker) {
+      setClipboardBroker(&gClipboardBroker);
+      gClipboardBrokerInstalled = true;
+      Log::Write(L"clipboard: Gecko headless clipboard connected to the system");
+    } else {
+      Log::Write(L"clipboard: engine has no system clipboard bridge");
+    }
+  }
   mouse_ =
       reinterpret_cast<MouseFn>(::GetProcAddress(xul, "gecko_w10m_input_mouse"));
   mouseButton_ = reinterpret_cast<MouseButtonFn>(
       ::GetProcAddress(xul, "gecko_w10m_input_mouse2"));
   wheel_ =
       reinterpret_cast<WheelFn>(::GetProcAddress(xul, "gecko_w10m_input_wheel"));
+  dragFiles_ = reinterpret_cast<DragFilesFn>(
+      ::GetProcAddress(xul, "gecko_w10m_drag_files"));
   wanted_ = reinterpret_cast<WantedFn>(
       ::GetProcAddress(xul, "gecko_w10m_text_input_wanted"));
   text_state_ = reinterpret_cast<TextStateFn>(
@@ -643,6 +908,8 @@ bool EngineView::Resolve() {
   dpi_fn_ = reinterpret_cast<DpiFn>(::GetProcAddress(xul, "gecko_w10m_set_dpi"));
   open_url_ =
       reinterpret_cast<OpenUrlFn>(::GetProcAddress(xul, "gecko_w10m_open_url"));
+  close_session_ = reinterpret_cast<CloseSessionFn>(
+      ::GetProcAddress(xul, "gecko_w10m_close_browser_session"));
   if (!set_launcher_) {
     set_launcher_ = reinterpret_cast<SetLauncherFn>(
         ::GetProcAddress(xul, "gecko_w10m_set_uri_launcher"));
@@ -689,6 +956,14 @@ bool EngineView::Resolve() {
     if (set_download_directory_) {
       DownloadBroker::SetDirectoryChangedSink(set_download_directory_);
       Log::Write(L"download: direct authorized folder connected to Gecko");
+    }
+  }
+  if (!set_wallpaper_sink_) {
+    set_wallpaper_sink_ = reinterpret_cast<SetWallpaperSinkFn>(
+        ::GetProcAddress(xul, "gecko_w10m_set_wallpaper_sink"));
+    if (set_wallpaper_sink_) {
+      set_wallpaper_sink_(&DrmBridge::DispatchWallpaper);
+      Log::Write(L"wallpaper: Gecko connected to the DesktopMode shell");
     }
   }
   if (!set_file_broker_) {
@@ -752,16 +1027,21 @@ bool EngineView::Resolve() {
   // panel from xul rather than from ANGLE -- so ANGLE's note never comes.
   panel_presenting_fn_ = reinterpret_cast<PanelPresentingFn>(
       ::GetProcAddress(xul, "gecko_w10m_panel_presenting"));
+  software_main_presenting_fn_ = reinterpret_cast<SoftwareMainPresentingFn>(
+      ::GetProcAddress(xul, "gecko_w10m_software_main_presenting"));
   // The size goes to ANGLE rather than to the engine: ANGLE needs it on its
   // render thread, where XAML cannot be asked for anything, and xul cannot
   // pass it on because xul does not link against ANGLE -- EGL loads it at run
   // time. It may not be loaded yet, so this is retried like the rest.
   if (!panel_size_fn_) {
     if (HMODULE gles = ::LoadPackagedLibrary(L"libGLESv2.dll", 0)) {
+      LogModuleIdentity(L"libGLESv2.dll", gles);
       panel_size_fn_ = reinterpret_cast<PanelSizeFn>(
           ::GetProcAddress(gles, "angle_uwp_set_panel_size"));
       panel_scale_fn_ = reinterpret_cast<PanelScaleFn>(
           ::GetProcAddress(gles, "angle_uwp_set_panel_scale"));
+      panel_capacity_fn_ = reinterpret_cast<PanelCapacityFn>(
+          ::GetProcAddress(gles, "angle_uwp_set_panel_capacity"));
       // And somewhere for it to say what it did. Its notes cannot go where
       // Gecko's do -- those live in xul, which ANGLE is not linked against --
       // so they come here, which is also where the crash trace lands, so the
@@ -770,6 +1050,8 @@ bool EngineView::Resolve() {
           ::GetProcAddress(gles, "angle_uwp_set_logger"));
       Log::Write(std::wstring(L"view: ANGLE size entry point ") +
                  (panel_size_fn_ ? L"found" : L"MISSING") +
+                 L", source-size capacity entry point " +
+                 (panel_capacity_fn_ ? L"found (mode 2)" : L"MISSING") +
                  L", logging entry point " + (install ? L"found" : L"MISSING"));
       // The mode goes in before the logger, so that ANGLE's own note about it
       // is the first thing it says once it can be heard.
@@ -792,9 +1074,16 @@ bool EngineView::Resolve() {
           // have covered a working GPU path for ever.
           if (strstr(text, "took the swap chain")) {
             g_panelPresenting.store(true);
-          } else if (!Log::Verbose() && !strstr(text, "fail") &&
+          } else if (!Log::Verbose() &&
+                      !strstr(text, "diag:") &&
+                      !strstr(text, "alpha mode") &&
+                      !strstr(text, "first present") &&
+                      !strstr(text, "present returned") &&
+                     !strstr(text, "composition scale") &&
+                     !strstr(text, "fail") &&
                      !strstr(text, "FAIL") && !strstr(text, "error") &&
-                     !strstr(text, "lost") && !strstr(text, "reset") &&
+                     !strstr(text, "lost") && !strstr(text, "device reset") &&
+                     !strstr(text, "context reset") &&
                      !strstr(text, "resized")) {
             // Quiet logs: ANGLE reports every texture and program it makes,
             // dozens a second while a page draws. Only trouble gets through.
@@ -812,6 +1101,8 @@ bool EngineView::Resolve() {
   }
   if (copy_ && !reported_) {
     reported_ = true;
+    Log::Write(L"diag: graphics tracing v6; source-size capacity mode 2 requested; native resize diagnostics retained");
+    LogModuleIdentity(L"xul.dll", xul);
     Log::Write(L"view: engine frame buffer found");
   }
   return copy_ != nullptr;
@@ -829,6 +1120,60 @@ void EngineView::EnsureBitmap(int32_t width, int32_t height) {
              std::to_wstring(height));
 }
 
+void EngineView::EnsureExternalBitmap(int32_t width, int32_t height) {
+  if (externalBitmap_ && externalWidth_ == width && externalHeight_ == height) {
+    return;
+  }
+  externalWidth_ = width;
+  externalHeight_ = height;
+  externalSeen_ = 0;
+  externalBitmap_ = WriteableBitmap(width, height);
+  externalImage_.Source(externalBitmap_);
+  Log::Write(L"external window: frame size " + std::to_wstring(width) + L"x" +
+             std::to_wstring(height));
+}
+
+bool EngineView::HasExternalWindow() {
+  const bool open = Resolve() && externalOpen_ && externalOpen_() == 1;
+  if (!open) {
+    // Do not carry the deduplication state into the next Gecko top-level
+    // window: it may happen to open with the same shell dimensions.
+    externalViewportWidth_ = 0;
+    externalViewportHeight_ = 0;
+  }
+  return open;
+}
+
+void EngineView::SetExternalViewport(double viewWidth, double viewHeight) {
+  if (!Resolve() || !externalResize_ || viewWidth <= 0 || viewHeight <= 0) {
+    return;
+  }
+  const int32_t width =
+      static_cast<int32_t>(viewWidth * rawPerView_ + 0.5);
+  const int32_t height =
+      static_cast<int32_t>(viewHeight * rawPerView_ + 0.5);
+  if (width == externalViewportWidth_ && height == externalViewportHeight_) {
+    return;
+  }
+  externalViewportWidth_ = width;
+  externalViewportHeight_ = height;
+  externalResize_(width, height);
+}
+
+void EngineView::SetExternalActive(bool active) {
+  if (Resolve() && externalActive_) {
+    externalActive_(active ? 1 : 0);
+  }
+}
+
+void EngineView::CloseExternalWindow() {
+  externalViewportWidth_ = 0;
+  externalViewportHeight_ = 0;
+  if (Resolve() && externalClose_) {
+    externalClose_();
+  }
+}
+
 void EngineView::WatchRoom(
     winrt::Windows::UI::Xaml::FrameworkElement const& host) {
   // The room has to be measured on whatever holds the picture, never on the
@@ -839,8 +1184,10 @@ void EngineView::WatchRoom(
   // "room is now" each time. The container's size is a fact about the screen
   // and does not move when the frame does.
   host_ = host;
-  host_.SizeChanged([this](winrt::Windows::Foundation::IInspectable const&,
-                           SizeChangedEventArgs const&) { PushSize(); });
+  // GeckoHost's managed owner publishes the settled viewport explicitly.
+  // Listening here as well used to publish each intermediate XAML layout size
+  // before that coalescing step (notably border removal followed by taskbar
+  // removal during fullscreen), starting overlapping swap-chain changes.
   PushSize();
 }
 
@@ -861,6 +1208,23 @@ void EngineView::GivePanelToEngine() {
   if (!panel_ || fullWidth_ <= 0) {
     return;
   }
+  // GeckoHost creates the panel from Start(), after its managed owner has
+  // already called UpdateLayout on BrowserSurface. Consequently this new
+  // child has no arranged bounds during the first call here. Attaching a swap
+  // chain at 0x0 leaves the native panel visual with startup geometry which is
+  // independent from the XAML tree; on Xbox that shows up as a cropped frame
+  // and pointer coordinates displaced by the same factor. CompositionTarget's
+  // next tick retries this method, after XAML has arranged the child.
+  const double panelWidth = panel_.ActualWidth();
+  const double panelHeight = panel_.ActualHeight();
+  if (panelWidth <= 0 || panelHeight <= 0) {
+    if (!panelLayoutWaitReported_) {
+      panelLayoutWaitReported_ = true;
+      Log::Write(L"view: waiting for a non-zero panel layout before attaching "
+                 L"the swap chain");
+    }
+    return;
+  }
   if (panelWithheld_) {
     if (!panelGiven_) {
       panelGiven_ = true;
@@ -870,17 +1234,35 @@ void EngineView::GivePanelToEngine() {
     return;
   }
   if (panel_size_fn_) {
+    PublishPanelCapacity();
     panel_size_fn_(fullWidth_, fullHeight_);
   }
   if (panel_scale_fn_) {
-    // This must describe the coordinate system used to size the chain, not
-    // necessarily the monitor's CompositionScale. The standalone host passes
-    // the physical scale here. DesktopMode deliberately constructs this view
-    // with 1.0 because the panel is nested below the Shell's own transform.
-    // Using CompositionScale here would reintroduce the Xbox 2x mismatch after
-    // viewport and input had already been converted to logical coordinates.
-    const float frameScale = static_cast<float>(rawPerView_);
-    panel_scale_fn_(frameScale, frameScale);
+    // Fit the exact framebuffer to the panel which XAML actually arranged.
+    // Usually this equals CompositionScale (1.4 on the Xbox shell), but using
+    // the measured ratio is also correct during the first/maximized layout and
+    // prevents a stale startup size from cropping the image.
+    float frameScaleX = static_cast<float>(fullWidth_ / panelWidth);
+    float frameScaleY = static_cast<float>(fullHeight_ / panelHeight);
+    if (!(frameScaleX > 0.01f)) {
+      frameScaleX = panel_.CompositionScaleX();
+    }
+    if (!(frameScaleY > 0.01f)) {
+      frameScaleY = panel_.CompositionScaleY();
+    }
+    panel_scale_fn_(frameScaleX, frameScaleY);
+    if (!panelGiven_) {
+      Log::Write(L"view: panel layout " +
+                 std::to_wstring(static_cast<int>(panelWidth + 0.5)) +
+                 L"x" +
+                 std::to_wstring(static_cast<int>(panelHeight + 0.5)) +
+                 L", XAML composition scale " +
+                 std::to_wstring(panel_.CompositionScaleX()) + L"x" +
+                 std::to_wstring(panel_.CompositionScaleY()) +
+                 L", requested framebuffer transform " +
+                 std::to_wstring(frameScaleX) + L"x" +
+                 std::to_wstring(frameScaleY));
+    }
   }
   if (!panel_fn_) {
     return;
@@ -923,8 +1305,27 @@ void EngineView::PushSizePixels(int32_t width, int32_t height) {
     return;
   }
 
+  if (sizeSent_ && !firstFrameReady_ &&
+      (width != fullWidth_ || height != fullHeight_)) {
+    pendingStartupWidth_ = width;
+    pendingStartupHeight_ = height;
+    Log::Write(L"view: deferring startup resize to " +
+               std::to_wstring(width) + L"x" + std::to_wstring(height) +
+               L" until the first frame");
+    return;
+  }
+
   const bool changed = !sizeSent_ || width != fullWidth_ || height != fullHeight_;
   if (changed) {
+    wchar_t note[320];
+    swprintf_s(note, _countof(note),
+               L"diag: viewport %dx%d->%dx%d panel=%.2fx%.2f composition=%.3fx%.3f framebuffer_scale=%.3f first_frame=%d",
+               fullWidth_, fullHeight_, width, height,
+               panel_ ? panel_.ActualWidth() : 0.0, panel_ ? panel_.ActualHeight() : 0.0,
+               panel_ ? static_cast<double>(panel_.CompositionScaleX()) : 0.0,
+               panel_ ? static_cast<double>(panel_.CompositionScaleY()) : 0.0,
+               rawPerView_, firstFrameReady_ ? 1 : 0);
+    Log::Write(note);
     // GivePanelToEngine also publishes the swap-chain size. Update these first,
     // otherwise ANGLE receives the previous window dimensions and leaves stale
     // pixels around the newly sized panel.
@@ -952,6 +1353,32 @@ void EngineView::PushSizePixels(int32_t width, int32_t height) {
              std::to_wstring(height) + L", telling the engine");
   resize_(width, height);
   sizeSent_ = true;
+}
+
+void EngineView::CompleteFirstFrame() {
+  if (firstFrameReady_) {
+    return;
+  }
+  firstFrameReady_ = true;
+
+  if (firstFrame_) {
+    auto handler = std::move(firstFrame_);
+    firstFrame_ = nullptr;
+    handler();
+  }
+
+  if (pendingStartupWidth_ > 0 && pendingStartupHeight_ > 0) {
+    const int32_t width = pendingStartupWidth_;
+    const int32_t height = pendingStartupHeight_;
+    pendingStartupWidth_ = 0;
+    pendingStartupHeight_ = 0;
+    Log::Write(L"view: applying deferred startup resize " +
+               std::to_wstring(width) + L"x" + std::to_wstring(height));
+    PushSizePixels(width, height);
+  } else {
+    // The engine may have resolved after XAML's initial layout notification.
+    PushSize();
+  }
 }
 
 void EngineView::ApplyInputKind(int32_t kind) {
@@ -1234,12 +1661,67 @@ void EngineView::OpenUrl(std::wstring_view url) {
     ::WideCharToMultiByte(CP_UTF8, 0, url.data(), static_cast<int>(url.size()),
                           utf8.data(), size, nullptr, nullptr);
   }
-  pendingUrl_ = std::move(utf8);
+  pendingUrls_.push_back(std::move(utf8));
   lastOpenAttempt_ = 0;
 }
 
+bool EngineView::DragFiles(int32_t state, double x, double y, const wchar_t* paths) {
+  if (!dragFiles_) {
+    if (state == 0) {
+      Log::Write(L"drag: runtime has no gecko_w10m_drag_files export; rebuild and package the updated engine");
+    }
+    return false;
+  }
+  int32_t frameX = 0, frameY = 0;
+  if (state != 2 && !ToFrame(
+          winrt::Windows::Foundation::Point{static_cast<float>(x), static_cast<float>(y)},
+          &frameX, &frameY)) return false;
+  dragFiles_(state, frameX, frameY, paths);
+  return true;
+}
+
+void EngineView::CloseSession() {
+  pendingUrls_.clear();
+  if (!Resolve() || !close_session_) {
+    Log::Write(L"window: engine has no browser-session close entry point");
+    return;
+  }
+  close_session_();
+  Log::Write(L"window: browser session close requested");
+}
+
 void EngineView::Tick() {
-  if (!g_panelPresenting.load() && panel_presenting_fn_ &&
+  if (!Resolve()) {
+    return;
+  }
+
+  // ANGLE normally owns the panel, but on some Xbox drivers rebuilding its
+  // surface for a maximize can fail and WebRender deliberately falls back to
+  // the headless software buffer. The ANGLE callback is a one-way signal, so
+  // a sticky `true` here used to leave the now-empty panel above a perfectly
+  // good software frame (the grey/purple window). Ask the headless compositor
+  // explicitly which path owns the *main* window instead of guessing from the
+  // existence of any copied frame -- menu and popup buffers are not a fallback.
+  const bool softwareMain =
+      software_main_presenting_fn_ && software_main_presenting_fn_() == 1;
+  if (softwareMain && !softwareMainVisible_) {
+    softwareMainVisible_ = true;
+    g_panelPresenting.store(false);
+    seen_ = 0;
+    Log::Write(L"view: main compositor fell back to the software surface");
+  } else if (!softwareMain && softwareMainVisible_ &&
+             g_panelPresenting.load()) {
+    softwareMainVisible_ = false;
+    // Do not leave the last opaque software frame above a recovered GPU panel.
+    bitmap_ = nullptr;
+    image_.Source(winrt::Windows::UI::Xaml::Media::ImageSource{nullptr});
+    width_ = 0;
+    height_ = 0;
+    seen_ = 0;
+    Log::Write(L"view: main compositor returned to the GPU panel");
+  }
+
+  if (!softwareMain && !g_panelPresenting.load() && panel_presenting_fn_ &&
       panel_presenting_fn_()) {
     Log::Write(L"view: the D3D11 compositor has the panel");
     g_panelPresenting.store(true);
@@ -1248,15 +1730,11 @@ void EngineView::Tick() {
   // The hardware path presents on its own and never fills the buffer the
   // splash is waiting for, so the splash has to be told separately.
   if (g_panelPresenting.load() && firstFrame_) {
-    auto handler = std::move(firstFrame_);
-    firstFrame_ = nullptr;
     Log::Write(L"view: the GPU is presenting through the panel, splash down");
-    handler();
+    CompleteFirstFrame();
   }
 
-  if (!Resolve()) {
-    return;
-  }
+  TickExternalWindow();
 
   PollGamepadScroll();
 
@@ -1276,13 +1754,13 @@ void EngineView::Tick() {
 
   // A URL from outside waits here for a browser window to exist. The engine
   // answers 0 while it has none, so this simply keeps asking.
-  if (!pendingUrl_.empty() && open_url_) {
+  if (!pendingUrls_.empty() && open_url_ && firstFrameReady_) {
     const unsigned long long now = ::GetTickCount64();
     if (!lastOpenAttempt_ || now - lastOpenAttempt_ >= 1000) {
       lastOpenAttempt_ = now;
-      if (open_url_(pendingUrl_.c_str()) == 1) {
+      if (open_url_(pendingUrls_.front().c_str()) == 1) {
         Log::Write(L"open: the engine took the URL");
-        pendingUrl_.clear();
+        pendingUrls_.pop_front();
       }
     }
   }
@@ -1300,10 +1778,8 @@ void EngineView::Tick() {
   }
 
   // Once ANGLE presents directly into the SwapChainPanel there is no software
-  // bitmap to update. Calling frame_copy anyway takes Gecko's compositor lock
-  // from the Shell UI thread on every XAML frame. Pages that invalidate many
-  // chrome items, such as about:downloads, can then stall the entire Shell
-  // while Gecko rebuilds and paints them.
+  // bitmap to update. Calling frame_copy anyway can copy a residual headless
+  // frame and incorrectly put the browser on the expensive software path.
   // Popup/menu widgets are separate headless windows and are composited into
   // the software frame exposed by frame_copy. Keep that path alive while an
   // overlay is visible and for one final frame after it closes. That last
@@ -1361,13 +1837,7 @@ void EngineView::Tick() {
     seen_ = serial;
     bitmap_.Invalidate();
     if (firstFrame_) {
-      auto handler = std::move(firstFrame_);
-      firstFrame_ = nullptr;
-      handler();
-
-      // The engine could not be told a size before it existed, so the first
-      // frame is when the room it actually has is handed over.
-      PushSize();
+      CompleteFirstFrame();
     }
     return;
   }
@@ -1378,13 +1848,62 @@ void EngineView::Tick() {
   }
 }
 
+void EngineView::TickExternalWindow() {
+  if (!externalOpen_ || externalOpen_() != 1 || !externalCopy_) {
+    return;
+  }
+  // A large secondary Firefox window is copied through a WriteableBitmap on
+  // the XAML thread. At display rate that can move hundreds of MB/s and starve
+  // every other Shell control. Thirty frames per second is sufficient for a
+  // dialog/Library window, while its first frame and resize remain immediate.
+  const unsigned long long now = ::GetTickCount64();
+  if (externalBitmap_ && lastExternalFrameCopy_ &&
+      now - lastExternalFrameCopy_ < 33) {
+    return;
+  }
+  int32_t width = externalWidth_;
+  int32_t height = externalHeight_;
+  if (!externalBitmap_) {
+    width = 0;
+    height = 0;
+    externalCopy_(nullptr, 0, &width, &height, nullptr);
+    if (width > 0 && height > 0) {
+      EnsureExternalBitmap(width, height);
+    }
+    return;
+  }
+  uint8_t* pixels = nullptr;
+  auto access = externalBitmap_.PixelBuffer()
+                    .as<::Windows::Storage::Streams::IBufferByteAccess>();
+  if (FAILED(access->Buffer(&pixels)) || !pixels) {
+    return;
+  }
+  uint64_t serial = externalSeen_;
+  const int32_t capacity = externalWidth_ * externalHeight_ * 4;
+  if (externalCopy_(pixels, capacity, &width, &height, &serial) == 1) {
+    externalSeen_ = serial;
+    lastExternalFrameCopy_ = now;
+    externalBitmap_.Invalidate();
+  } else if (width > 0 && height > 0 &&
+             (width != externalWidth_ || height != externalHeight_)) {
+    lastExternalFrameCopy_ = 0;
+    EnsureExternalBitmap(width, height);
+  }
+}
+
 bool EngineView::ToFrame(winrt::Windows::Foundation::Point const& point,
                          int32_t* x, int32_t* y) const {
   if (g_panelPresenting.load() && panel_) {
-    // The panel shows the frame at one physical pixel per frame pixel, and
-    // its points arrive in view pixels.
-    const double fx = point.X * rawPerView_;
-    const double fy = point.Y * rawPerView_;
+    // Use the same measured panel-to-frame mapping used by the swap-chain
+    // matrix. This keeps hit testing aligned even while the Shell is moving
+    // from its startup bounds to maximized bounds.
+    const double panelWidth = panel_.ActualWidth();
+    const double panelHeight = panel_.ActualHeight();
+    if (panelWidth <= 0 || panelHeight <= 0) {
+      return false;
+    }
+    const double fx = point.X * fullWidth_ / panelWidth;
+    const double fy = point.Y * fullHeight_ / panelHeight;
     // A finger that slides off the edge is still a finger; APZ wants to hear
     // where it went, so the point is clamped rather than refused.
     *x = static_cast<int32_t>(std::clamp(fx, 0.0, double(fullWidth_ - 1)));
@@ -1416,6 +1935,68 @@ bool EngineView::ToFrame(winrt::Windows::Foundation::Point const& point,
   *x = static_cast<int32_t>(fx);
   *y = static_cast<int32_t>(fy);
   return true;
+}
+
+bool EngineView::ToExternalFrameFromWindow(
+    winrt::Windows::Foundation::Point const& point, int32_t* x,
+    int32_t* y) const {
+  if (!externalImage_ || externalWidth_ <= 0 || externalHeight_ <= 0) {
+    return false;
+  }
+  try {
+    auto toWindow = externalImage_.TransformToVisual(nullptr);
+    const auto inverse = toWindow.Inverse();
+    if (!inverse) {
+      return false;
+    }
+    const auto local = inverse.TransformPoint(point);
+    const double actualW = externalImage_.ActualWidth();
+    const double actualH = externalImage_.ActualHeight();
+    if (actualW <= 0 || actualH <= 0) {
+      return false;
+    }
+    const double scale = (std::min)(actualW / externalWidth_,
+                                    actualH / externalHeight_);
+    if (scale <= 0) {
+      return false;
+    }
+    const double offsetX = (actualW - externalWidth_ * scale) / 2;
+    const double offsetY = (actualH - externalHeight_ * scale) / 2;
+    const double fx = (local.X - offsetX) / scale;
+    const double fy = (local.Y - offsetY) / scale;
+    if (fx < 0 || fy < 0 || fx >= externalWidth_ || fy >= externalHeight_) {
+      return false;
+    }
+    *x = static_cast<int32_t>(fx);
+    *y = static_cast<int32_t>(fy);
+    return true;
+  } catch (...) {
+    return false;
+  }
+}
+
+bool EngineView::IsPointInExternalWindow(
+    winrt::Windows::Foundation::Point const& point) const {
+  if (!externalImage_) return false;
+  try {
+    // ExternalSurface -> content Grid -> framed window Grid. The last one also
+    // includes DesktopMode's title bar and resize handles. CoreWindow pointer
+    // events are global, so clicks in that chrome must not leak through to the
+    // main browser surface behind it.
+    auto content = externalImage_.Parent().try_as<FrameworkElement>();
+    auto frame = content ? content.Parent().try_as<FrameworkElement>()
+                         : FrameworkElement{nullptr};
+    if (!frame || frame.ActualWidth() <= 0 || frame.ActualHeight() <= 0) {
+      return false;
+    }
+    auto inverse = frame.TransformToVisual(nullptr).Inverse();
+    if (!inverse) return false;
+    const auto local = inverse.TransformPoint(point);
+    return local.X >= 0 && local.Y >= 0 &&
+           local.X < frame.ActualWidth() && local.Y < frame.ActualHeight();
+  } catch (...) {
+    return false;
+  }
 }
 
 EngineView::Finger* EngineView::FindFinger(uint32_t id) {
@@ -1475,6 +2056,16 @@ void EngineView::WireCoreMouse() {
           if (!inputEnabled_) return;
           auto point = args.CurrentPoint();
           if (!isMouse(point)) return;
+          int32_t externalX = 0;
+          int32_t externalY = 0;
+          if (externalMouse_ && ToExternalFrameFromWindow(
+                                    point.Position(), &externalX, &externalY)) {
+            lastExternalInputX_ = externalX;
+            lastExternalInputY_ = externalY;
+            externalMouse_(0, 0, externalX, externalY);
+            return;
+          }
+          if (IsPointInExternalWindow(point.Position())) return;
           OnMoved(point.PointerId(), CoreMousePoint(point.Position()), true);
         });
 
@@ -1486,24 +2077,41 @@ void EngineView::WireCoreMouse() {
           if (!isMouse(point)) return;
           const auto properties = point.Properties();
           const auto position = CoreMousePoint(point.Position());
+          int32_t externalX = 0;
+          int32_t externalY = 0;
+          const bool external = externalMouse_ &&
+              ToExternalFrameFromWindow(point.Position(), &externalX, &externalY);
+          if (!external && IsPointInExternalWindow(point.Position())) return;
+          if (external) {
+            corePointerExternal_ = true;
+            lastExternalInputX_ = externalX;
+            lastExternalInputY_ = externalY;
+            externalMouse_(0, 0, externalX, externalY);
+          } else {
+            corePointerExternal_ = false;
+            if (externalActive_) externalActive_(0);
+          }
           const auto update = properties.PointerUpdateKind();
           if ((update == PointerUpdateKind::LeftButtonPressed ||
                properties.IsLeftButtonPressed()) &&
               !coreLeftDown_) {
             coreLeftDown_ = true;
-            OnMouseButton(position, 0, true);
+            if (external) externalMouse_(1, 0, externalX, externalY);
+            else OnMouseButton(position, 0, true);
           }
           if ((update == PointerUpdateKind::MiddleButtonPressed ||
                properties.IsMiddleButtonPressed()) &&
               !coreMiddleDown_) {
             coreMiddleDown_ = true;
-            OnMouseButton(position, 1, true);
+            if (external) externalMouse_(1, 1, externalX, externalY);
+            else OnMouseButton(position, 1, true);
           }
           if ((update == PointerUpdateKind::RightButtonPressed ||
                properties.IsRightButtonPressed()) &&
               !coreRightDown_) {
             coreRightDown_ = true;
-            OnMouseButton(position, 2, true);
+            if (external) externalMouse_(1, 2, externalX, externalY);
+            else OnMouseButton(position, 2, true);
           }
         });
 
@@ -1515,24 +2123,39 @@ void EngineView::WireCoreMouse() {
           if (!isMouse(point)) return;
           const auto properties = point.Properties();
           const auto position = CoreMousePoint(point.Position());
+          int32_t externalX = lastExternalInputX_;
+          int32_t externalY = lastExternalInputY_;
+          ToExternalFrameFromWindow(point.Position(), &externalX, &externalY);
           const auto update = properties.PointerUpdateKind();
           if (coreLeftDown_ &&
               (update == PointerUpdateKind::LeftButtonReleased ||
                !properties.IsLeftButtonPressed())) {
             coreLeftDown_ = false;
-            OnMouseButton(position, 0, false);
+            if (corePointerExternal_ && externalMouse_)
+              externalMouse_(2, 0, externalX, externalY);
+            else
+              OnMouseButton(position, 0, false);
           }
           if (coreMiddleDown_ &&
               (update == PointerUpdateKind::MiddleButtonReleased ||
                !properties.IsMiddleButtonPressed())) {
             coreMiddleDown_ = false;
-            OnMouseButton(position, 1, false);
+            if (corePointerExternal_ && externalMouse_)
+              externalMouse_(2, 1, externalX, externalY);
+            else
+              OnMouseButton(position, 1, false);
           }
           if (coreRightDown_ &&
               (update == PointerUpdateKind::RightButtonReleased ||
                !properties.IsRightButtonPressed())) {
             coreRightDown_ = false;
-            OnMouseButton(position, 2, false);
+            if (corePointerExternal_ && externalMouse_)
+              externalMouse_(2, 2, externalX, externalY);
+            else
+              OnMouseButton(position, 2, false);
+          }
+          if (!coreLeftDown_ && !coreMiddleDown_ && !coreRightDown_) {
+            corePointerExternal_ = false;
           }
         });
 
@@ -1541,8 +2164,16 @@ void EngineView::WireCoreMouse() {
           if (!inputEnabled_) return;
           auto point = args.CurrentPoint();
           if (!isMouse(point)) return;
-          OnWheel(CoreMousePoint(point.Position()),
-                  point.Properties().MouseWheelDelta());
+          int32_t externalX = 0;
+          int32_t externalY = 0;
+          if (externalWheel_ && ToExternalFrameFromWindow(
+                                    point.Position(), &externalX, &externalY)) {
+            externalWheel_(externalX, externalY, 0.0,
+                           point.Properties().MouseWheelDelta());
+          } else if (!IsPointInExternalWindow(point.Position())) {
+            OnWheel(CoreMousePoint(point.Position()),
+                    point.Properties().MouseWheelDelta());
+          }
         });
     Log::Write(L"mouse: CoreWindow stream attached");
   } catch (winrt::hresult_error const& error) {
@@ -1571,6 +2202,7 @@ void EngineView::SetInputEnabled(bool enabled) {
   // Re-query Gecko's edit focus when the window becomes active again; the
   // disabled sink necessarily lost focus while another Shell surface owned it.
   typing_ = false;
+  hardwareCharacterPending_ = false;
   pressed_ = false;
   coreLeftDown_ = false;
   coreMiddleDown_ = false;
@@ -1840,14 +2472,34 @@ void EngineView::PollGamepadScroll() {
   const auto elapsed = (std::min)(now - lastGamepadPoll_, 100ull);
   lastGamepadPoll_ = now;
 
-  try {
-    using winrt::Windows::Gaming::Input::Gamepad;
-    const auto pads = Gamepad::Gamepads();
-    if (pads.Size() == 0) {
+  if (!gamepad_) {
+    bool shouldDiscover =
+        gGamepadListChanged.exchange(false, std::memory_order_relaxed);
+    if (!shouldDiscover &&
+        !gGamepadEventsAvailable.load(std::memory_order_relaxed)) {
+      shouldDiscover = !lastGamepadDiscovery_ ||
+                       now - lastGamepadDiscovery_ >= 5000;
+    }
+    if (!shouldDiscover) {
       return;
     }
+    lastGamepadDiscovery_ = now;
+    try {
+      using winrt::Windows::Gaming::Input::Gamepad;
+      const auto pads = Gamepad::Gamepads();
+      if (pads.Size() == 0) {
+        return;
+      }
+      gamepad_ = pads.GetAt(0);
+    } catch (winrt::hresult_error const& error) {
+      gamepadApiUnavailable_ = true;
+      Log::Write(L"gamepad: input API unavailable", std::wstring(error.message()));
+      return;
+    }
+  }
 
-    const double value = pads.GetAt(0).GetCurrentReading().RightThumbstickY;
+  try {
+    const double value = gamepad_.GetCurrentReading().RightThumbstickY;
     constexpr double kDeadZone = 0.18;
     const double magnitude = std::abs(value);
     if (magnitude <= kDeadZone) {
@@ -1873,10 +2525,30 @@ void EngineView::PollGamepadScroll() {
     if (x >= 0 && y >= 0 && fullWidth_ > 0 && fullHeight_ > 0) {
       wheel_(x, y, 0.0, delta);
     }
-  } catch (winrt::hresult_error const& error) {
-    // An unavailable Gamepad API must not make every rendered frame throw.
-    gamepadApiUnavailable_ = true;
-    Log::Write(L"gamepad: input API unavailable", std::wstring(error.message()));
+  } catch (winrt::hresult_error const&) {
+    // A disconnected cached controller is rediscovered on a later tick. Do
+    // not permanently disable the API merely because one device disappeared.
+    gamepad_ = nullptr;
+    lastGamepadDiscovery_ = now;
+    gGamepadListChanged.store(true, std::memory_order_relaxed);
+  }
+}
+
+void EngineView::PublishPanelCapacity() {
+  if (!panel_capacity_fn_) {
+    return;
+  }
+  const int32_t width = (std::max)(screenWidth_, fullWidth_);
+  const int32_t height = (std::max)(screenHeight_, fullHeight_);
+  if (width <= 0 || height <= 0) {
+    return;
+  }
+  panel_capacity_fn_(width, height, 2);
+  if (width != capacityWidthSent_ || height != capacityHeightSent_) {
+    capacityWidthSent_ = width;
+    capacityHeightSent_ = height;
+    Log::Write(L"diag: swap-chain capacity " + std::to_wstring(width) + L"x" +
+               std::to_wstring(height) + L", source-size mode 2 (v6)");
   }
 }
 
@@ -1889,6 +2561,7 @@ void EngineView::SetScreen(double viewWidth, double viewHeight) {
   }
   screenWidth_ = width;
   screenHeight_ = height;
+  PublishPanelCapacity();
   if (screen_fn_) {
     screen_fn_(width, height);
   }

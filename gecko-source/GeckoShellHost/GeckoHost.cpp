@@ -3,6 +3,7 @@
 #include "GeckoHost.g.cpp"
 
 #include <atomic>
+#include <deque>
 #include <mutex>
 #include <thread>
 
@@ -32,11 +33,26 @@ namespace
     // The DesktopMode integration intentionally owns one runtime and lets
     // Firefox provide its own tabs inside that one internal window.
     std::atomic<bool> g_runtimeStarted{ false };
-    std::atomic<int32_t> g_windowCommand{ 0 };
+    std::mutex g_windowCommandMutex;
+    std::deque<int32_t> g_windowCommands;
     std::mutex g_revealMutex;
     std::wstring g_revealPath;
+    std::mutex g_wallpaperMutex;
+    std::wstring g_wallpaperPath;
     std::once_flag g_memoryHooks;
     std::atomic<unsigned long long> g_lastMemoryPressure{ 0 };
+
+    void QueueWindowCommand(int32_t command) noexcept
+    {
+        try
+        {
+            std::lock_guard<std::mutex> lock(g_windowCommandMutex);
+            g_windowCommands.push_back(command);
+        }
+        catch (...)
+        {
+        }
+    }
 
     SolidColorBrush MakeSolidColorBrush(Color color)
     {
@@ -137,13 +153,19 @@ namespace winrt::DesktopMode::Gecko::implementation
     {
         gecko_w10m::client::DrmBridge::SetWindowCommandSink([](int32_t command)
         {
-            g_windowCommand.store(command);
+            QueueWindowCommand(command);
         });
         gecko_w10m::client::DrmBridge::SetRevealFileSink([](const wchar_t* path)
         {
             std::lock_guard<std::mutex> lock(g_revealMutex);
             g_revealPath = path ? path : L"";
-            g_windowCommand.store(9);
+            QueueWindowCommand(9);
+        });
+        gecko_w10m::client::DrmBridge::SetWallpaperSink([](const wchar_t* path)
+        {
+            std::lock_guard<std::mutex> lock(g_wallpaperMutex);
+            g_wallpaperPath = path ? path : L"";
+            QueueWindowCommand(10);
         });
         root_ = Grid();
         root_.Background(MakeSolidColorBrush(ColorHelper::FromArgb(255, 28, 27, 34)));
@@ -154,9 +176,30 @@ namespace winrt::DesktopMode::Gecko::implementation
         return root_.as<Windows::Foundation::IInspectable>();
     }
 
+    Windows::Foundation::IInspectable GeckoHost::ExternalContent() const
+    {
+        if (!engineView_ || !engineView_->ExternalSurface())
+        {
+            return nullptr;
+        }
+        return engineView_->ExternalSurface().as<Windows::Foundation::IInspectable>();
+    }
+
     bool GeckoHost::IsStarted() const noexcept
     {
         return started_;
+    }
+
+    bool GeckoHost::IsExternalWindowOpen() const noexcept
+    {
+        try
+        {
+            return engineView_ && engineView_->HasExternalWindow();
+        }
+        catch (...)
+        {
+            return false;
+        }
     }
 
     void GeckoHost::Start(double width, double height)
@@ -208,14 +251,10 @@ namespace winrt::DesktopMode::Gecko::implementation
                 displayPixelsPerViewPixel = 1.0;
             }
 
-            // Render at the display's physical density so Firefox remains
-            // sharp on Xbox. The original embedded host used the panel's
-            // CompositionScale when presenting this buffer; a panel nested
-            // below DesktopMode's transform reports a scale that does not
-            // describe the framebuffer, which made a 2x chain appear clipped.
-            // EngineView now passes this exact value to ANGLE, whose inverse
-            // transform fits the physical buffer into the logical XAML panel.
-            // Input uses the same value after undoing the Shell transform.
+            // Gecko's framebuffer and CSS device scale stay in the display's
+            // physical coordinate system. DesktopMode's 70% transform belongs
+            // to the outer XAML desktop and is undone by the swap-chain matrix;
+            // folding it into Gecko changes the browser's native resolution.
             rawPerView_ = displayPixelsPerViewPixel;
             gecko_w10m::client::Log::Write(
                 L"view: embedded framebuffer scale " +
@@ -230,13 +269,10 @@ namespace winrt::DesktopMode::Gecko::implementation
             {
                 cssScale = pixelWidth / kNarrowestChromeCss;
             }
-            // MainPage's 70% Xbox transform is a separate, outer desktop
-            // transform. It must not be folded into Gecko's device/CSS scale.
-
             engineView_ = std::make_unique<gecko_w10m::client::EngineView>(
                 pixelWidth, pixelHeight, rawPerView_, true, false);
-            BuildVisualTree();
             engineView_->SetScreen(width, height);
+            BuildVisualTree();
             PushDpi();
             engineView_->OnFirstFrame([this]
             {
@@ -244,6 +280,18 @@ namespace winrt::DesktopMode::Gecko::implementation
                 {
                     splash_.Visibility(Visibility::Collapsed);
                 }
+                auto panel = engineView_->Panel();
+                gecko_w10m::client::Log::Write(
+                    L"view: first frame XAML panel " +
+                    std::to_wstring(panel.ActualWidth()) + L"x" +
+                    std::to_wstring(panel.ActualHeight()) +
+                    L", visible=" +
+                    std::to_wstring(panel.Visibility() == Visibility::Visible ? 1 : 0) +
+                    L", opacity=" + std::to_wstring(panel.Opacity()) +
+                    L", overlay image=" +
+                    std::to_wstring(engineView_->Surface().Source() ? 1 : 0) +
+                    L", splash=" +
+                    std::to_wstring(splash_.Visibility() == Visibility::Visible ? 1 : 0));
             });
             engineView_->Start();
             engineView_->SetInputEnabled(true);
@@ -300,6 +348,10 @@ namespace winrt::DesktopMode::Gecko::implementation
         splash_.Children().Append(logo);
         root_.Children().Append(splash_);
 
+        // BrowserSurface was arranged before Start() created these children.
+        // Arrange the newly-added SwapChainPanel now; EngineView deliberately
+        // refuses to attach a native swap chain while the panel is still 0x0.
+        root_.UpdateLayout();
         engineView_->WatchRoom(root_);
     }
 
@@ -334,9 +386,37 @@ namespace winrt::DesktopMode::Gecko::implementation
         engineView_->SetViewport(width, height);
     }
 
+    void GeckoHost::SetExternalViewport(double width, double height)
+    {
+        if (engineView_ && width > 0 && height > 0)
+        {
+            engineView_->SetExternalViewport(width, height);
+        }
+    }
+
+    void GeckoHost::SetExternalActive(bool active)
+    {
+        if (engineView_)
+        {
+            engineView_->SetExternalActive(active);
+        }
+    }
+
+    void GeckoHost::CloseExternalWindow()
+    {
+        if (engineView_)
+        {
+            engineView_->CloseExternalWindow();
+        }
+    }
+
     void GeckoHost::SetScreen(double width, double height)
     {
-        if (!engineView_ || width <= 0 || height <= 0)
+        if (width <= 0 || height <= 0)
+        {
+            return;
+        }
+        if (!engineView_)
         {
             return;
         }
@@ -370,7 +450,25 @@ namespace winrt::DesktopMode::Gecko::implementation
 
     int32_t GeckoHost::TakeWindowCommand() noexcept
     {
-        return g_windowCommand.exchange(0);
+        int32_t command = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_windowCommandMutex);
+            if (g_windowCommands.empty())
+            {
+                return 0;
+            }
+            command = g_windowCommands.front();
+            g_windowCommands.pop_front();
+        }
+        try
+        {
+            gecko_w10m::client::Log::Write(
+                L"window: shell dequeued command " + std::to_wstring(command));
+        }
+        catch (...)
+        {
+        }
+        return command;
     }
 
     hstring GeckoHost::TakeRevealPath()
@@ -381,12 +479,26 @@ namespace winrt::DesktopMode::Gecko::implementation
         return path;
     }
 
+    hstring GeckoHost::TakeWallpaperPath()
+    {
+        std::lock_guard<std::mutex> lock(g_wallpaperMutex);
+        hstring path(g_wallpaperPath);
+        g_wallpaperPath.clear();
+        return path;
+    }
+
     void GeckoHost::OpenUrl(hstring const& url)
     {
         if (engineView_)
         {
             engineView_->OpenUrl(std::wstring_view(url.c_str(), url.size()));
         }
+    }
+
+    bool GeckoHost::DragFiles(int32_t state, double x, double y, hstring const& paths)
+    {
+        return started_ && !closed_ && engineView_ &&
+            engineView_->DragFiles(state, x, y, paths.c_str());
     }
 
     void GeckoHost::Suspend()
@@ -417,6 +529,7 @@ namespace winrt::DesktopMode::Gecko::implementation
         if (engineView_)
         {
             engineView_->SetInputEnabled(false);
+            engineView_->CloseSession();
             engineView_->Stop();
         }
         NotifyGeckoAppState(0);

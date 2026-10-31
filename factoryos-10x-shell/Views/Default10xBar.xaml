@@ -114,8 +114,13 @@
                 Padding="13"
                 HorizontalAlignment="Center"
                 Background="Transparent"
+                BorderBrush="Transparent"
+                BorderThickness="0"
                 Command="{x:Bind Mode=OneWay, Path=ViewModel.StartButtonClickedCommand}"
                 CornerRadius="0"
+                FocusVisualPrimaryThickness="0"
+                FocusVisualSecondaryThickness="0"
+                UseSystemFocusVisuals="False"
                 ToolTipService.ToolTip="Start">
                 <Viewbox>
                     <Canvas

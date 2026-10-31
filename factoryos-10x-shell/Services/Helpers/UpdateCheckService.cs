@@ -26,7 +26,7 @@ namespace factoryos_10x_shell.Services.Helpers
 
     public static class UpdateCheckService
     {
-        public const int CurrentVersion = 20279;
+        public const int CurrentVersion = 21286;
         public const string VersionUrl =
             "https://github.com/Pedro1234-code/DesktopMode_uwp/releases/download/updt/version.txt";
 
@@ -104,7 +104,28 @@ namespace factoryos_10x_shell.Services.Helpers
             var dialog = new ContentDialog
             {
                 Title = "Update available",
-                Content = "Update available. Check Xbox Desktop Mode GitHub to download.",
+                Content = new StackPanel
+                {
+                    Spacing = 16,
+                    Children =
+                    {
+                        new Image
+                        {
+                            Source = new Windows.UI.Xaml.Media.Imaging.BitmapImage(
+                                new Uri("ms-appx:///Assets/UpdateReleasesQr.png")),
+                            Width = 240,
+                            Height = 240,
+                            Stretch = Windows.UI.Xaml.Media.Stretch.Uniform,
+                            HorizontalAlignment = Windows.UI.Xaml.HorizontalAlignment.Center
+                        },
+                        new TextBlock
+                        {
+                            Text = "Scan this QR from your phone or PC or open Desktop Mode releases page on your browser to download the update",
+                            TextWrapping = Windows.UI.Xaml.TextWrapping.Wrap,
+                            MaxWidth = 360
+                        }
+                    }
+                },
                 CloseButtonText = "OK"
             };
 

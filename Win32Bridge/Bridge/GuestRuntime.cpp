@@ -1,12 +1,16 @@
 #include "Bridge\\GuestRuntime.h"
 #include "Bridge/ActivationContext.h"
+#include "Bridge/CommonControlsShims.h"
+#include "Bridge/DialogResources.h"
 #include "Bridge\\GuestKernel.h"
 #include "Bridge\\GuestModule.h"
 #include "Bridge/GuestRegistry.h"
 #include "Bridge/GuestResources.h"
 #include "Bridge\\GuestWindow.h"
 #include "Bridge/Kernel32Shims.h"
+#include "Bridge/OleShims.h"
 #include "Bridge/RuntimeDiagnostics.h"
+#include "Bridge/User32Shims.h"
 #include "Bridge/Win32Shims.h"
 
 #include <atomic>
@@ -59,22 +63,45 @@ namespace
         }
         ULONG_PTR instruction = reinterpret_cast<ULONG_PTR>(record->ExceptionAddress);
         ULONG_PTR stack = 0;
+        ULONG_PTR argument1 = 0;
+        ULONG_PTR argument2 = 0;
+        ULONG_PTR argument3 = 0;
+        ULONG_PTR argument4 = 0;
+        ULONG_PTR allocationBase = 0;
 #if defined(_M_X64)
         if (information->ContextRecord)
         {
             instruction = static_cast<ULONG_PTR>(information->ContextRecord->Rip);
             stack = static_cast<ULONG_PTR>(information->ContextRecord->Rsp);
+            argument1 = static_cast<ULONG_PTR>(information->ContextRecord->Rcx);
+            argument2 = static_cast<ULONG_PTR>(information->ContextRecord->Rdx);
+            argument3 = static_cast<ULONG_PTR>(information->ContextRecord->R8);
+            argument4 = static_cast<ULONG_PTR>(information->ContextRecord->R9);
         }
 #endif
-        wchar_t message[320]{};
+        MEMORY_BASIC_INFORMATION memory{};
+        if (::VirtualQuery(reinterpret_cast<const void*>(instruction),
+            &memory, sizeof(memory)) == sizeof(memory))
+        {
+            allocationBase = reinterpret_cast<ULONG_PTR>(memory.AllocationBase);
+        }
+        wchar_t message[640]{};
         swprintf_s(message,
-            L"WIN32BRIDGE NATIVE EXCEPTION: code=0x%08lX thread=%lu RIP=0x%llX RSP=0x%llX operation=%llu target=0x%llX\r\n",
+            L"WIN32BRIDGE NATIVE EXCEPTION: code=0x%08lX thread=%lu RIP=0x%llX moduleBase=0x%llX moduleOffset=0x%llX RSP=0x%llX operation=%llu target=0x%llX RCX=0x%llX RDX=0x%llX R8=0x%llX R9=0x%llX\r\n",
             static_cast<unsigned long>(record->ExceptionCode),
             static_cast<unsigned long>(::GetCurrentThreadId()),
             static_cast<unsigned long long>(instruction),
+            static_cast<unsigned long long>(allocationBase),
+            static_cast<unsigned long long>(
+                allocationBase && instruction >= allocationBase
+                    ? instruction - allocationBase : 0),
             static_cast<unsigned long long>(stack),
             static_cast<unsigned long long>(operation),
-            static_cast<unsigned long long>(target));
+            static_cast<unsigned long long>(target),
+            static_cast<unsigned long long>(argument1),
+            static_cast<unsigned long long>(argument2),
+            static_cast<unsigned long long>(argument3),
+            static_cast<unsigned long long>(argument4));
         ::OutputDebugStringW(message);
         const HANDLE log = g_nativeExceptionLog.load();
         if (log != INVALID_HANDLE_VALUE && log != nullptr)
@@ -110,14 +137,49 @@ namespace
             }
             using AddHandler = PVOID (WINAPI*)(ULONG, PVECTORED_EXCEPTION_HANDLER);
             using RemoveHandler = ULONG (WINAPI*)(PVOID);
-            HMODULE kernel = ::GetModuleHandleW(L"kernel32.dll");
-            if (!kernel) return;
-            add = reinterpret_cast<AddHandler>(::GetProcAddress(
-                kernel, "AddVectoredExceptionHandler"));
-            remove = reinterpret_cast<RemoveHandler>(::GetProcAddress(
-                kernel, "RemoveVectoredExceptionHandler"));
+            // The UWP import surface varies by SDK/runtime generation.  Some
+            // packages expose the public APIs from KernelBase rather than the
+            // kernel32 forwarding facade; ntdll provides the underlying Rtl
+            // pair.  Resolve all three without a static desktop-only import so
+            // first-chance guest faults are still captured on Xbox/UWP.
+            const struct Candidate
+            {
+                LPCWSTR module;
+                const char* addName;
+                const char* removeName;
+            } candidates[] =
+            {
+                { L"kernel32.dll", "AddVectoredExceptionHandler", "RemoveVectoredExceptionHandler" },
+                { L"KernelBase.dll", "AddVectoredExceptionHandler", "RemoveVectoredExceptionHandler" },
+                { L"ntdll.dll", "RtlAddVectoredExceptionHandler", "RtlRemoveVectoredExceptionHandler" }
+            };
+            for (const Candidate& candidate : candidates)
+            {
+                HMODULE module = ::GetModuleHandleW(candidate.module);
+                if (!module) continue;
+                AddHandler candidateAdd = reinterpret_cast<AddHandler>(
+                    ::GetProcAddress(module, candidate.addName));
+                RemoveHandler candidateRemove = reinterpret_cast<RemoveHandler>(
+                    ::GetProcAddress(module, candidate.removeName));
+                if (candidateAdd && candidateRemove)
+                {
+                    add = candidateAdd;
+                    remove = candidateRemove;
+                    break;
+                }
+            }
             if (add && remove)
                 handle = add(1, &TraceEscapedNativeException);
+            if (!handle && log != INVALID_HANDLE_VALUE)
+            {
+                static const wchar_t unavailable[] =
+                    L"WIN32BRIDGE NATIVE EXCEPTION TRACE UNAVAILABLE\r\n";
+                DWORD written = 0;
+                ::WriteFile(log, unavailable,
+                    static_cast<DWORD>((_countof(unavailable) - 1) * sizeof(wchar_t)),
+                    &written, nullptr);
+                ::FlushFileBuffers(log);
+            }
         }
         ~NativeExceptionTraceScope()
         {
@@ -162,12 +224,24 @@ namespace
         GuestResourceHandleScope()
         {
             if (g_activeGuestRuntimeScopes.fetch_add(1) == 0)
+            {
                 ResetGuestResourceHandles();
+                ResetGuestUser32State();
+                ResetGuestCommonControlState();
+                ResetGuestDialogState();
+                ResetGuestOleState();
+            }
         }
         ~GuestResourceHandleScope()
         {
             if (g_activeGuestRuntimeScopes.fetch_sub(1) == 1)
+            {
+                ResetGuestOleState();
+                ResetGuestDialogState();
+                ResetGuestCommonControlState();
+                ResetGuestUser32State();
                 ResetGuestResourceHandles();
+            }
         }
     };
 

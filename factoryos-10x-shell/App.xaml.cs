@@ -140,10 +140,13 @@ namespace factoryos_10x_shell
         {
             try
             {
+                // Built-in web apps are shell state and do not depend on the
+                // optional Win32 drive. Initialize them first so a runtime
+                // preparation failure cannot hide Xbox Device Portal.
+                await ServiceProvider.GetRequiredService<IWebAppService>().InitializeAsync();
                 await new RuntimeHost().EnsureDriveRootAsync();
                 IAppHelper appHelper = ServiceProvider.GetRequiredService<IAppHelper>();
                 await appHelper.LoadAppsAsync();
-                await ServiceProvider.GetRequiredService<IWebAppService>().InitializeAsync();
             }
             catch (Exception exception)
             {

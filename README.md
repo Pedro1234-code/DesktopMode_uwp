@@ -26,7 +26,7 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 - Notepad: open, edit, save, and save-as support for `.txt` files.
 - Settings: a built-in app with personalization, taskbar, device information, and a visual Windows Update page.
 - A custom Action Center with volume, network status, and system settings shortcuts.
-- Strawfox: a built-in Firefox port running with its own window, with Download, Upload and Add-on support.
+- Strawfox: a built-in Firefox port running in its own window, which the Shell keeps maximized and non-draggable, with Download, Upload and Add-on support.
 - Experimental PE loader for Win32 binaries
 
 ## Project structure

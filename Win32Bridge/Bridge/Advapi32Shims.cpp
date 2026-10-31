@@ -577,6 +577,14 @@ ImportResolution Win32Bridge::Bridge::ResolveAdvapi32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"closeservicehandle") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCloseServiceHandle);
     else if (_wcsicmp(symbol.name.c_str(), L"queryserviceconfigw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueryServiceConfigW);
 
-    if (resolution.targetAddress) resolution.disposition = ImportDisposition::NeedsBridge;
+    if (resolution.targetAddress)
+    {
+        resolution.disposition = ImportDisposition::NeedsBridge;
+        if (symbol.name.size() >= 3 &&
+            _wcsnicmp(symbol.name.c_str(), L"reg", 3) == 0)
+            resolution.note = L"Persistent guest registry adapter; host registry is not exposed.";
+        else
+            resolution.note = L"Sandboxed ADVAPI security/token compatibility adapter.";
+    }
     return resolution;
 }

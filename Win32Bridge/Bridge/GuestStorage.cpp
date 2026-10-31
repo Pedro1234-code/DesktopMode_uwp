@@ -1,5 +1,6 @@
 #include "pch.h"
 #include "Bridge\\GuestStorage.h"
+#include "Bridge\\Kernel32Shims.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <windows.storage.fileproperties.h>
@@ -387,13 +388,21 @@ struct GuestStorageContext::FileRecord final
     {
     }
 
+    FileRecord(StorageFolder^ value, std::wstring path, DWORD access, DWORD sharing)
+        : folder(value), readable(true), writable(false), canonicalPath(std::move(path)),
+          desiredAccess(access), shareMode(sharing), directory(true)
+    {
+    }
+
     Platform::Agile<IRandomAccessStream^> stream;
+    Platform::Agile<StorageFolder^> folder;
     bool readable;
     bool writable;
     std::wstring canonicalPath;
     DWORD desiredAccess = 0;
     DWORD shareMode = 0;
     bool deleteOnClose = false;
+    bool directory = false;
     // Protected by lock.  Closing first removes the handle from the shared
     // table, then marks this record closed before releasing its stream.  An
     // I/O operation that already retained the record therefore cannot race a
@@ -563,6 +572,7 @@ bool GuestStorageContext::GetAuthorizedFolder(const GuestPath& path, StorageFold
 {
     if (!folder) return false;
     *folder = nullptr;
+    if (IsLowerLayerTombstoned(path.canonical)) return false;
     StorageFolder^ current = m_moduleSourceFolder.Get();
     const bool sameDirectory = !m_moduleDirectory.empty() &&
         _wcsicmp(path.canonical.c_str(), m_moduleDirectory.c_str()) == 0;
@@ -588,6 +598,7 @@ bool GuestStorageContext::GetAuthorizedFolder(const GuestPath& path, StorageFold
 bool GuestStorageContext::OpenAuthorizedFile(const GuestPath& path, DWORD desiredAccess,
     DWORD shareMode, HANDLE* guestHandle, DWORD* win32Error)
 {
+    if (IsLowerLayerTombstoned(path.canonical)) return false;
     if (HasWriteAccess(desiredAccess) || path.components.size() <= m_moduleDirectoryComponentCount)
         return false;
     GuestPath parentPath = path;
@@ -612,15 +623,45 @@ bool GuestStorageContext::EnsureLayout(std::wstring* error)
     {
         { L"drive_c" },
         { L"drive_c", L"Program Files" },
+        { L"drive_c", L"Program Files", L"Common Files" },
         { L"drive_c", L"Program Files", L"Win32Bridge" },
+        { L"drive_c", L"ProgramData" },
+        { L"drive_c", L"ProgramData", L"Microsoft" },
+        { L"drive_c", L"ProgramData", L"Microsoft", L"Windows" },
+        { L"drive_c", L"ProgramData", L"Microsoft", L"Windows", L"Start Menu" },
+        { L"drive_c", L"ProgramData", L"Microsoft", L"Windows", L"Start Menu", L"Programs" },
+        { L"drive_c", L"ProgramData", L"Microsoft", L"Windows", L"Start Menu", L"Programs", L"Startup" },
         { L"drive_c", L"Users" },
         { L"drive_c", L"Users", L"Default" },
+        { L"drive_c", L"Users", L"Default", L"Desktop" },
         { L"drive_c", L"Users", L"Default", L"Documents" },
+        { L"drive_c", L"Users", L"Default", L"Favorites" },
+        { L"drive_c", L"Users", L"Default", L"Music" },
+        { L"drive_c", L"Users", L"Default", L"Pictures" },
+        { L"drive_c", L"Users", L"Default", L"Videos" },
         { L"drive_c", L"Users", L"Default", L"AppData" },
         { L"drive_c", L"Users", L"Default", L"AppData", L"Local" },
         { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming" },
         { L"drive_c", L"Users", L"Default", L"AppData", L"Local", L"Temp" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Local", L"Microsoft" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Local", L"Microsoft", L"Windows" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Local", L"Microsoft", L"Windows", L"History" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Local", L"Microsoft", L"Windows", L"INetCache" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming", L"Microsoft" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming", L"Microsoft", L"Windows" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming", L"Microsoft", L"Windows", L"Recent" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming", L"Microsoft", L"Windows", L"SendTo" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming", L"Microsoft", L"Windows", L"Start Menu" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming", L"Microsoft", L"Windows", L"Start Menu", L"Programs" },
+        { L"drive_c", L"Users", L"Default", L"AppData", L"Roaming", L"Microsoft", L"Windows", L"Start Menu", L"Programs", L"Startup" },
+        { L"drive_c", L"Users", L"Public" },
+        { L"drive_c", L"Users", L"Public", L"Desktop" },
+        { L"drive_c", L"Users", L"Public", L"Documents" },
+        { L"drive_c", L"Users", L"Public", L"Music" },
+        { L"drive_c", L"Users", L"Public", L"Pictures" },
+        { L"drive_c", L"Users", L"Public", L"Videos" },
         { L"drive_c", L"Windows" },
+        { L"drive_c", L"Windows", L"Fonts" },
         { L"drive_c", L"Windows", L"System32" },
         { L"drive_c", L"Windows", L"System32", L"config" }
     };
@@ -665,6 +706,34 @@ bool GuestStorageContext::AddFile(
         return false;
     }
 
+    m_files.emplace(token, record);
+    *guestHandle = reinterpret_cast<HANDLE>(token);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestStorageContext::AddDirectory(
+    StorageFolder^ folder,
+    const std::wstring& canonicalPath,
+    DWORD desiredAccess,
+    DWORD shareMode,
+    HANDLE* guestHandle,
+    DWORD* win32Error)
+{
+    if (!folder || !guestHandle)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    auto record = std::make_shared<FileRecord>(
+        folder, canonicalPath, desiredAccess, shareMode);
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    ULONG_PTR token = 0;
+    if (!AllocateHandleLocked(&token))
+    {
+        SetWin32Error(win32Error, ERROR_TOO_MANY_OPEN_FILES);
+        return false;
+    }
     m_files.emplace(token, record);
     *guestHandle = reinterpret_cast<HANDLE>(token);
     SetWin32Error(win32Error, ERROR_SUCCESS);
@@ -781,6 +850,25 @@ bool GuestStorageContext::GetFilePath(
     *path = record->canonicalPath;
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return true;
+}
+
+bool GuestStorageContext::IsDirectoryHandle(
+    HANDLE guestHandle, DWORD* win32Error) const
+{
+    const auto record = LookupFile(guestHandle);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(record->lock);
+    if (record->closed)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    SetWin32Error(win32Error, record->directory ? ERROR_SUCCESS : ERROR_DIRECTORY);
+    return record->directory;
 }
 
 bool GuestStorageContext::LockFileRange(HANDLE guestHandle, ULONGLONG offset,
@@ -919,6 +1007,30 @@ void GuestStorageContext::MoveAttributeOverrides(
     for (const auto& entry : moved) m_attributeOverrides[entry.first] = entry.second;
 }
 
+bool GuestStorageContext::IsLowerLayerTombstoned(
+    const std::wstring& canonicalPath) const
+{
+    const std::wstring key = MetadataKey(canonicalPath);
+    std::lock_guard<std::mutex> guard(m_metadataLock);
+    for (const std::wstring& tombstone : m_lowerLayerTombstones)
+    {
+        if (key == tombstone || (key.size() > tombstone.size() &&
+            key[tombstone.size()] == L'\\' &&
+            key.compare(0, tombstone.size(), tombstone) == 0))
+            return true;
+    }
+    return false;
+}
+
+void GuestStorageContext::SetLowerLayerTombstone(
+    const std::wstring& canonicalPath, bool present)
+{
+    const std::wstring key = MetadataKey(canonicalPath);
+    std::lock_guard<std::mutex> guard(m_metadataLock);
+    if (present) m_lowerLayerTombstones.insert(key);
+    else m_lowerLayerTombstones.erase(key);
+}
+
 bool GuestStorageContext::CreateFile(
     LPCWSTR fileName,
     DWORD desiredAccess,
@@ -991,14 +1103,122 @@ bool GuestStorageContext::CreateFile(
         }
     }
 
-    StorageFolder^ parent = nullptr;
-    std::wstring leaf;
-    if (!GetParentFolder(path, &parent, &leaf, win32Error))
+    DWORD attributeError = ERROR_SUCCESS;
+    const DWORD existingAttributes = GetGuestFileAttributes(fileName, &attributeError);
+    const bool pathExisted = existingAttributes != INVALID_FILE_ATTRIBUTES;
+    if (existingAttributes != INVALID_FILE_ATTRIBUTES &&
+        (existingAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
     {
-        if (creationDisposition == OPEN_EXISTING &&
+        if (creationDisposition != OPEN_EXISTING ||
+            (flagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) == 0)
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
+        StorageFolder^ folder = nullptr;
+        if (!GetDirectoryFolder(path, &folder, win32Error) &&
+            !GetAuthorizedFolder(path, &folder))
+            return false;
+        return AddDirectory(folder, path.canonical, desiredAccess, shareMode,
+            guestHandle, win32Error);
+    }
+
+    GuestPath parentPath = path;
+    const std::wstring leaf = parentPath.components.back();
+    parentPath.components.pop_back();
+    parentPath.canonical = parentPath.canonical.substr(
+        0, parentPath.canonical.find_last_of(L'\\'));
+
+    // The folder selected by the user is the lower, read-only layer of the
+    // guest filesystem.  LocalStorage is its writable upper layer.  Discover
+    // the lower item before creating the upper parent so CreateFile can obey
+    // Win32 existence rules across the combined namespace.
+    StorageFolder^ authorizedParent = nullptr;
+    StorageFile^ authorizedFile = nullptr;
+    if (!IsLowerLayerTombstoned(path.canonical) &&
+        GetAuthorizedFolder(parentPath, &authorizedParent) && authorizedParent)
+    {
+        try
+        {
+            authorizedFile = create_task(authorizedParent->GetFileAsync(
+                ref new String(leaf.c_str()))).get();
+        }
+        catch (...) { authorizedFile = nullptr; }
+    }
+
+    StorageFolder^ parent = nullptr;
+    std::wstring ignoredLeaf;
+    bool haveLocalParent = GetParentFolder(path, &parent, &ignoredLeaf, win32Error);
+    const bool mayCreateUpperLayer = writable ||
+        creationDisposition == CREATE_NEW || creationDisposition == CREATE_ALWAYS ||
+        creationDisposition == OPEN_ALWAYS || creationDisposition == TRUNCATE_EXISTING;
+    if (!haveLocalParent && mayCreateUpperLayer)
+    {
+        std::vector<std::wstring> physical = PhysicalComponents(path);
+        physical.pop_back();
+        haveLocalParent = GetFolder(physical, true, &parent, win32Error);
+    }
+
+    if (!haveLocalParent)
+    {
+        if (creationDisposition == OPEN_EXISTING && !writable && authorizedFile &&
             OpenAuthorizedFile(path, desiredAccess, shareMode, guestHandle, win32Error))
             return true;
         return false;
+    }
+
+    if (creationDisposition == CREATE_NEW && authorizedFile)
+    {
+        SetWin32Error(win32Error, ERROR_FILE_EXISTS);
+        return false;
+    }
+
+    if (authorizedFile && !writable && creationDisposition == OPEN_ALWAYS &&
+        OpenAuthorizedFile(path, desiredAccess, shareMode, guestHandle, win32Error))
+        return true;
+
+    // A writable open of a lower-layer file must not modify the authorised
+    // host file.  Materialise it in LocalStorage first and then open that copy.
+    // This also makes a later read observe the bytes written by the guest.
+    if (authorizedFile && writable &&
+        (creationDisposition == OPEN_EXISTING || creationDisposition == OPEN_ALWAYS))
+    {
+        try
+        {
+            create_task(authorizedFile->CopyAsync(parent,
+                ref new String(leaf.c_str()), NameCollisionOption::FailIfExists)).get();
+        }
+        catch (Exception^ exception)
+        {
+            if (ErrorFromException(exception) != ERROR_FILE_EXISTS)
+            {
+                // The WinRT projection may report E_FAIL rather than
+                // ERROR_FILE_EXISTS for a collision.  If the upper file is
+                // present, the intended copy-on-write state already exists.
+                try
+                {
+                    create_task(parent->GetFileAsync(ref new String(leaf.c_str()))).get();
+                }
+                catch (...)
+                {
+                    SetWin32Error(win32Error, ErrorFromException(exception));
+                    return false;
+                }
+            }
+        }
+    }
+    else if (authorizedFile && creationDisposition == TRUNCATE_EXISTING)
+    {
+        try
+        {
+            create_task(parent->CreateFileAsync(ref new String(leaf.c_str()),
+                CreationCollisionOption::ReplaceExisting)).get();
+        }
+        catch (Exception^ exception)
+        {
+            SetWin32Error(win32Error, ErrorFromException(exception));
+            return false;
+        }
     }
 
     try
@@ -1039,6 +1259,7 @@ bool GuestStorageContext::CreateFile(
         {
             return false;
         }
+        SetLowerLayerTombstone(path.canonical, false);
         if (creationDisposition == CREATE_NEW || creationDisposition == CREATE_ALWAYS)
         {
             DWORD requestedAttributes = flagsAndAttributes & VirtualMutableFileAttributes;
@@ -1047,6 +1268,18 @@ bool GuestStorageContext::CreateFile(
                 requestedAttributes &= ~FILE_ATTRIBUTE_NORMAL;
             if (requestedAttributes == 0) requestedAttributes = FILE_ATTRIBUTE_NORMAL;
             StoreAttributeOverride(path.canonical, requestedAttributes);
+        }
+        if (!pathExisted && (creationDisposition == CREATE_NEW ||
+            creationDisposition == CREATE_ALWAYS || creationDisposition == OPEN_ALWAYS))
+        {
+            NotifyGuestDirectoryChange(path.canonical, FILE_ACTION_ADDED,
+                FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_CREATION);
+        }
+        else if (creationDisposition == CREATE_ALWAYS ||
+            creationDisposition == TRUNCATE_EXISTING)
+        {
+            NotifyGuestDirectoryChange(path.canonical, FILE_ACTION_MODIFIED,
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
         }
         return true;
     }
@@ -1201,6 +1434,8 @@ bool GuestStorageContext::WriteFileAt(HANDLE guestHandle, const void* buffer,
             return false;
         }
         SetWin32Error(win32Error, ERROR_SUCCESS);
+        NotifyGuestDirectoryChange(record->canonicalPath, FILE_ACTION_MODIFIED,
+            FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
         return true;
     }
     catch (Exception^ exception)
@@ -1262,14 +1497,16 @@ bool GuestStorageContext::CloseFile(HANDLE guestHandle, DWORD* win32Error)
         }
 
         IRandomAccessStream^ stream = record->stream.Get();
+        StorageFolder^ folder = record->folder.Get();
         record->closed = true;
         record->stream = nullptr;
-        if (!stream)
+        record->folder = nullptr;
+        if (!stream && !folder)
         {
             SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
             return false;
         }
-        delete stream;
+        if (stream) delete stream;
         if (removeFile)
         {
             DWORD deleteError = ERROR_SUCCESS;
@@ -1420,6 +1657,8 @@ bool GuestStorageContext::SetEndOfFile(HANDLE guestHandle, DWORD* win32Error)
         }
         stream->Size = stream->Position;
         SetWin32Error(win32Error, ERROR_SUCCESS);
+        NotifyGuestDirectoryChange(record->canonicalPath, FILE_ACTION_MODIFIED,
+            FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
         return true;
     }
     catch (Exception^ exception)
@@ -1542,18 +1781,27 @@ bool GuestStorageContext::CreateDirectory(LPCWSTR path, DWORD* win32Error)
         return false;
     }
 
-    StorageFolder^ parent = nullptr;
-    std::wstring leaf;
-    if (!GetParentFolder(resolved, &parent, &leaf, win32Error))
+    DWORD existingError = ERROR_SUCCESS;
+    if (GetGuestFileAttributes(path, &existingError) != INVALID_FILE_ATTRIBUTES)
     {
+        SetWin32Error(win32Error, ERROR_ALREADY_EXISTS);
         return false;
     }
+
+    std::vector<std::wstring> physical = PhysicalComponents(resolved);
+    const std::wstring leaf = physical.back();
+    physical.pop_back();
+    StorageFolder^ parent = nullptr;
+    if (!GetFolder(physical, true, &parent, win32Error)) return false;
 
     try
     {
         create_task(parent->CreateFolderAsync(ref new String(leaf.c_str()), CreationCollisionOption::FailIfExists)).get();
+        SetLowerLayerTombstone(resolved.canonical, false);
         StoreAttributeOverride(resolved.canonical, FILE_ATTRIBUTE_DIRECTORY);
         SetWin32Error(win32Error, ERROR_SUCCESS);
+        NotifyGuestDirectoryChange(resolved.canonical, FILE_ACTION_ADDED,
+            FILE_NOTIFY_CHANGE_DIR_NAME | FILE_NOTIFY_CHANGE_CREATION);
         return true;
     }
     catch (Exception^ exception)
@@ -1604,11 +1852,50 @@ bool GuestStorageContext::DeleteGuestFile(LPCWSTR path, DWORD* win32Error)
         m_deletePending.erase(MetadataKey(resolved.canonical));
     }
 
+    GuestPath authorizedParentPath = resolved;
+    const std::wstring authorizedLeaf = authorizedParentPath.components.back();
+    authorizedParentPath.components.pop_back();
+    authorizedParentPath.canonical = authorizedParentPath.canonical.substr(
+        0, authorizedParentPath.canonical.find_last_of(L'\\'));
+    StorageFolder^ authorizedParent = nullptr;
+    bool lowerLayerFileExists = false;
+    if (GetAuthorizedFolder(authorizedParentPath, &authorizedParent))
+    {
+        try
+        {
+            IStorageItem^ lower = create_task(authorizedParent->GetItemAsync(
+                ref new String(authorizedLeaf.c_str()))).get();
+            lowerLayerFileExists = lower->IsOfType(StorageItemTypes::File);
+        }
+        catch (...) { }
+    }
+
     StorageFolder^ parent = nullptr;
     std::wstring leaf;
     if (!GetParentFolder(resolved, &parent, &leaf, win32Error))
     {
-        return false;
+        if (!lowerLayerFileExists) return false;
+        try
+        {
+            IStorageItem^ item = create_task(authorizedParent->GetItemAsync(
+                ref new String(authorizedLeaf.c_str()))).get();
+            if (!item->IsOfType(StorageItemTypes::File))
+            {
+                SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+                return false;
+            }
+            SetLowerLayerTombstone(resolved.canonical, true);
+            RemoveAttributeOverrides(resolved.canonical, false);
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            NotifyGuestDirectoryChange(resolved.canonical, FILE_ACTION_REMOVED,
+                FILE_NOTIFY_CHANGE_FILE_NAME);
+            return true;
+        }
+        catch (Exception^ exception)
+        {
+            SetWin32Error(win32Error, ErrorFromException(exception));
+            return false;
+        }
     }
 
     try
@@ -1620,13 +1907,28 @@ bool GuestStorageContext::DeleteGuestFile(LPCWSTR path, DWORD* win32Error)
             return false;
         }
         create_task(item->DeleteAsync()).get();
+        if (lowerLayerFileExists)
+            SetLowerLayerTombstone(resolved.canonical, true);
         RemoveAttributeOverrides(resolved.canonical, false);
         SetWin32Error(win32Error, ERROR_SUCCESS);
+        NotifyGuestDirectoryChange(resolved.canonical, FILE_ACTION_REMOVED,
+            FILE_NOTIFY_CHANGE_FILE_NAME);
         return true;
     }
     catch (Exception^ exception)
     {
-        SetWin32Error(win32Error, ErrorFromException(exception));
+        const DWORD error = ErrorFromException(exception);
+        if (lowerLayerFileExists &&
+            (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND))
+        {
+            SetLowerLayerTombstone(resolved.canonical, true);
+            RemoveAttributeOverrides(resolved.canonical, false);
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            NotifyGuestDirectoryChange(resolved.canonical, FILE_ACTION_REMOVED,
+                FILE_NOTIFY_CHANGE_FILE_NAME);
+            return true;
+        }
+        SetWin32Error(win32Error, error);
         return false;
     }
 }
@@ -1667,6 +1969,41 @@ bool GuestStorageContext::MoveGuestPath(
         return false;
     }
 
+    bool sourceWasLowerLayerFile = false;
+    {
+        StorageFolder^ localSourceParent = nullptr;
+        std::wstring localSourceName;
+        DWORD probeError = ERROR_SUCCESS;
+        bool localSourceExists = false;
+        if (GetParentFolder(source, &localSourceParent, &localSourceName, &probeError))
+        {
+            try
+            {
+                IStorageItem^ local = create_task(localSourceParent->GetItemAsync(
+                    ref new String(localSourceName.c_str()))).get();
+                localSourceExists = local != nullptr;
+            }
+            catch (...) { }
+        }
+        if (!localSourceExists)
+        {
+            const DWORD sourceAttributes = GetGuestFileAttributes(existingPath, &probeError);
+            sourceWasLowerLayerFile = sourceAttributes != INVALID_FILE_ATTRIBUTES &&
+                (sourceAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+            if (sourceWasLowerLayerFile)
+            {
+                HANDLE materialized = INVALID_HANDLE_VALUE;
+                if (!CreateFile(existingPath, GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr,
+                    &materialized, win32Error))
+                    return false;
+                DWORD closeError = ERROR_SUCCESS;
+                CloseFile(materialized, &closeError);
+            }
+        }
+    }
+
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
         for (const auto& entry : m_files)
@@ -1693,10 +2030,16 @@ bool GuestStorageContext::MoveGuestPath(
     StorageFolder^ destinationParent = nullptr;
     std::wstring sourceName;
     std::wstring destinationName;
-    if (!GetParentFolder(source, &sourceParent, &sourceName, win32Error) ||
-        !GetParentFolder(destination, &destinationParent, &destinationName, win32Error))
+    if (!GetParentFolder(source, &sourceParent, &sourceName, win32Error))
     {
         return false;
+    }
+    if (!GetParentFolder(destination, &destinationParent, &destinationName, win32Error))
+    {
+        std::vector<std::wstring> physical = PhysicalComponents(destination);
+        destinationName = physical.back();
+        physical.pop_back();
+        if (!GetFolder(physical, true, &destinationParent, win32Error)) return false;
     }
 
     try
@@ -1711,7 +2054,12 @@ bool GuestStorageContext::MoveGuestPath(
             StorageFile^ file = safe_cast<StorageFile^>(item);
             create_task(file->MoveAsync(destinationParent, ref new String(destinationName.c_str()), collision)).get();
             MoveAttributeOverrides(source.canonical, destination.canonical);
+            if (sourceWasLowerLayerFile)
+                SetLowerLayerTombstone(source.canonical, true);
+            SetLowerLayerTombstone(destination.canonical, false);
             SetWin32Error(win32Error, ERROR_SUCCESS);
+            NotifyGuestDirectoryRename(source.canonical, destination.canonical,
+                FILE_NOTIFY_CHANGE_FILE_NAME);
             return true;
         }
 
@@ -1747,6 +2095,8 @@ bool GuestStorageContext::MoveGuestPath(
                 MoveAttributeOverrides(source.canonical, destination.canonical);
                 SetWin32Error(win32Error, ERROR_SUCCESS);
                 RuntimeDiagnostics::Record(L"STORAGE: moved a virtual directory tree.");
+                NotifyGuestDirectoryRename(source.canonical, destination.canonical,
+                    FILE_NOTIFY_CHANGE_DIR_NAME);
                 return true;
             }
 
@@ -1754,6 +2104,8 @@ bool GuestStorageContext::MoveGuestPath(
             create_task(folder->RenameAsync(ref new String(destinationName.c_str()), collision)).get();
             MoveAttributeOverrides(source.canonical, destination.canonical);
             SetWin32Error(win32Error, ERROR_SUCCESS);
+            NotifyGuestDirectoryRename(source.canonical, destination.canonical,
+                FILE_NOTIFY_CHANGE_DIR_NAME);
             return true;
         }
 
@@ -1785,22 +2137,48 @@ bool GuestStorageContext::RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error)
     }
 
     StorageFolder^ folder = nullptr;
-    if (!GetDirectoryFolder(resolved, &folder, win32Error))
+    DWORD localError = ERROR_SUCCESS;
+    const bool haveLocalFolder = GetDirectoryFolder(resolved, &folder, &localError);
+    StorageFolder^ lowerFolder = nullptr;
+    const bool haveLowerFolder = GetAuthorizedFolder(resolved, &lowerFolder);
+    if (!haveLocalFolder && !haveLowerFolder)
     {
+        SetWin32Error(win32Error, localError == ERROR_SUCCESS
+            ? ERROR_PATH_NOT_FOUND : localError);
         return false;
     }
 
     try
     {
-        auto items = create_task(folder->GetItemsAsync()).get();
-        if (items->Size != 0)
+        if (haveLocalFolder)
         {
-            SetWin32Error(win32Error, ERROR_DIR_NOT_EMPTY);
-            return false;
+            auto items = create_task(folder->GetItemsAsync()).get();
+            if (items->Size != 0)
+            {
+                SetWin32Error(win32Error, ERROR_DIR_NOT_EMPTY);
+                return false;
+            }
         }
-        create_task(folder->DeleteAsync()).get();
+        if (haveLowerFolder)
+        {
+            auto items = create_task(lowerFolder->GetItemsAsync()).get();
+            for (IStorageItem^ item : items)
+            {
+                const std::wstring child = resolved.canonical + L"\\" +
+                    std::wstring(item->Name->Data());
+                if (!IsLowerLayerTombstoned(child))
+                {
+                    SetWin32Error(win32Error, ERROR_DIR_NOT_EMPTY);
+                    return false;
+                }
+            }
+        }
+        if (haveLocalFolder) create_task(folder->DeleteAsync()).get();
+        if (haveLowerFolder) SetLowerLayerTombstone(resolved.canonical, true);
         RemoveAttributeOverrides(resolved.canonical, true);
         SetWin32Error(win32Error, ERROR_SUCCESS);
+        NotifyGuestDirectoryChange(resolved.canonical, FILE_ACTION_REMOVED,
+            FILE_NOTIFY_CHANGE_DIR_NAME);
         return true;
     }
     catch (Exception^ exception)
@@ -1815,6 +2193,11 @@ DWORD GuestStorageContext::GetGuestFileAttributes(LPCWSTR path, DWORD* win32Erro
     GuestPath resolved;
     if (!Resolve(path, &resolved, win32Error))
     {
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    if (IsLowerLayerTombstoned(resolved.canonical))
+    {
+        SetWin32Error(win32Error, ERROR_FILE_NOT_FOUND);
         return INVALID_FILE_ATTRIBUTES;
     }
 
@@ -1917,6 +2300,8 @@ bool GuestStorageContext::SetGuestFileAttributes(
         if (normalized == 0) normalized = FILE_ATTRIBUTE_NORMAL;
         StoreAttributeOverride(resolved.canonical, normalized);
         SetWin32Error(win32Error, ERROR_SUCCESS);
+        NotifyGuestDirectoryChange(resolved.canonical, FILE_ACTION_MODIFIED,
+            FILE_NOTIFY_CHANGE_ATTRIBUTES);
         return true;
     }
     catch (Exception^ exception)
@@ -1971,6 +2356,8 @@ bool GuestStorageContext::FindFirstGuestFile(
                 IStorageItem^ item = items->GetAt(index);
                 const std::wstring name(item->Name->Data());
                 if (!WildcardMatch(pattern, name)) continue;
+                if (IsLowerLayerTombstoned(
+                    ChildCanonicalPath(resolvedDirectory.canonical, name))) continue;
                 const bool duplicate = std::any_of(matches.begin(), matches.end(),
                     [&name](const WIN32_FIND_DATAW& entry)
                     { return _wcsicmp(entry.cFileName, name.c_str()) == 0; });
@@ -2165,6 +2552,7 @@ void GuestStorageContext::CloseAll()
             IRandomAccessStream^ stream = pair.second->stream.Get();
             pair.second->closed = true;
             pair.second->stream = nullptr;
+            pair.second->folder = nullptr;
             if (stream)
             {
                 delete stream;

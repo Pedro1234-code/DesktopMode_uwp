@@ -14,6 +14,7 @@ using Windows.UI.Xaml.Media.Imaging;
 using Windows.UI.ViewManagement;
 using factoryos_10x_shell.Services.Helpers;
 using factoryos_10x_shell.Services.Win32;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace factoryos_10x_shell.Controls
 {
@@ -22,6 +23,7 @@ namespace factoryos_10x_shell.Controls
         private bool m_dragging, m_resizing, m_maximized;
         private WindowResizeCorner m_resizeCorner;
         private bool m_initializing = true;
+        private bool m_updatingNavigation;
         private Point m_startPoint;
         private double m_startLeft, m_startTop, m_startWidth, m_startHeight;
         private double m_restoreLeft, m_restoreTop, m_restoreWidth, m_restoreHeight;
@@ -32,6 +34,9 @@ namespace factoryos_10x_shell.Controls
             BackgroundToggle.IsOn = AppState.Instance.IsBgChangeButtonVisible;
             Win32SupportToggle.IsOn = Win32WindowManagerService.Instance.IsAppSupportEnabled;
             AutomaticUpdateCheckToggle.IsOn = UpdateCheckService.IsAutomaticCheckEnabled;
+            CustomCursorToggle.IsOn = MainPage.IsCustomCursorEnabled;
+            DisableLivePackageTrackingToggle.IsOn = !App.ServiceProvider
+                .GetRequiredService<AppHelper>().IsLivePackageTrackingEnabled;
             CurrentVersionText.Text = UpdateCheckService.CurrentVersion.ToString();
             m_initializing = false;
             PopulateDeviceInformation();
@@ -69,10 +74,7 @@ namespace factoryos_10x_shell.Controls
             HomePage.Visibility = Visibility.Visible;
             DetailPage.Visibility = Visibility.Collapsed;
             TitleText.Text = "Settings";
-            HomeNavigation.SelectedIndex = 0;
-            PersonalizationNavigation.SelectedItem = null;
-            SystemNavigation.SelectedItem = null;
-            UpdateSecurityNavigation.SelectedItem = null;
+            SelectNavigationItem("Home");
         }
         private void OpenDetail(string section, string page)
         {
@@ -85,16 +87,28 @@ namespace factoryos_10x_shell.Controls
             SystemNavigation.Visibility = system ? Visibility.Visible : Visibility.Collapsed;
             UpdateSecurityNavigation.Visibility = updateSecurity ? Visibility.Visible : Visibility.Collapsed;
             PersonalizationNavigation.Visibility = !system && !updateSecurity ? Visibility.Visible : Visibility.Collapsed;
-            HomeNavigation.SelectedItem = null;
             SelectDetail(page);
             SelectNavigationItem(page);
             DismissOnScreenKeyboard();
         }
         private void SettingsNavigation_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
-            var item = (sender as ListView)?.SelectedItem as ListViewItem;
+            if (m_updatingNavigation) return;
+
+            var navigation = sender as ListView;
+            var item = navigation?.SelectedItem as ListViewItem;
             string page = item?.Tag as string;
             if (string.IsNullOrEmpty(page)) return;
+
+            m_updatingNavigation = true;
+            try
+            {
+                ClearOtherNavigationSelections(navigation);
+            }
+            finally
+            {
+                m_updatingNavigation = false;
+            }
 
             if (page == "Home")
             {
@@ -103,34 +117,55 @@ namespace factoryos_10x_shell.Controls
                 return;
             }
 
-            HomeNavigation.SelectedItem = null;
             SelectDetail(page);
             DismissOnScreenKeyboard();
         }
         private void SelectNavigationItem(string page)
         {
-            ListView navigation = page == "About"
-                ? SystemNavigation
-                : page == "Windows Update" || page == "For developers"
-                    ? UpdateSecurityNavigation
-                    : PersonalizationNavigation;
-            foreach (object entry in navigation.Items)
+            ListView navigation = page == "Home"
+                ? HomeNavigation
+                : page == "About" || page == "Debug"
+                    ? SystemNavigation
+                    : page == "Windows Update" || page == "For developers"
+                        ? UpdateSecurityNavigation
+                        : PersonalizationNavigation;
+
+            m_updatingNavigation = true;
+            try
             {
-                var item = entry as ListViewItem;
-                if (item?.Tag as string == page)
+                ClearOtherNavigationSelections(navigation);
+                navigation.SelectedItem = null;
+                foreach (object entry in navigation.Items)
                 {
-                    navigation.SelectedItem = item;
-                    break;
+                    var item = entry as ListViewItem;
+                    if (item?.Tag as string == page)
+                    {
+                        navigation.SelectedItem = item;
+                        break;
+                    }
                 }
             }
+            finally
+            {
+                m_updatingNavigation = false;
+            }
+        }
+        private void ClearOtherNavigationSelections(ListView activeNavigation)
+        {
+            if (HomeNavigation != activeNavigation) HomeNavigation.SelectedItem = null;
+            if (PersonalizationNavigation != activeNavigation) PersonalizationNavigation.SelectedItem = null;
+            if (SystemNavigation != activeNavigation) SystemNavigation.SelectedItem = null;
+            if (UpdateSecurityNavigation != activeNavigation) UpdateSecurityNavigation.SelectedItem = null;
         }
         private void SelectDetail(string page)
         {
             BackgroundPanel.Visibility = page == "Background" ? Visibility.Visible : Visibility.Collapsed;
             ColorsPanel.Visibility = page == "Colors" ? Visibility.Visible : Visibility.Collapsed;
             LauncherPanel.Visibility = page == "Launcher" ? Visibility.Visible : Visibility.Collapsed;
+            MousePanel.Visibility = page == "Mouse" ? Visibility.Visible : Visibility.Collapsed;
             TaskbarPanel.Visibility = page == "Taskbar" ? Visibility.Visible : Visibility.Collapsed;
             AboutPanel.Visibility = page == "About" ? Visibility.Visible : Visibility.Collapsed;
+            DebugPanel.Visibility = page == "Debug" ? Visibility.Visible : Visibility.Collapsed;
             WindowsUpdatePanel.Visibility = page == "Windows Update" ? Visibility.Visible : Visibility.Collapsed;
             ForDevelopersPanel.Visibility = page == "For developers" ? Visibility.Visible : Visibility.Collapsed;
             DetailTitle.Text = page;
@@ -253,6 +288,13 @@ namespace factoryos_10x_shell.Controls
         }
         private void LauncherSize_Click(object sender, RoutedEventArgs e) => ApplicationData.Current.LocalSettings.Values["CoreShell.LauncherSize"] = (sender as FrameworkElement)?.Tag as string;
         private void BackgroundToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) { AppState.Instance.IsBgChangeButtonVisible = BackgroundToggle.IsOn; ApplicationData.Current.LocalSettings.Values["IsBgChangeButtonVisible"] = BackgroundToggle.IsOn; } }
+        private void CustomCursorToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) MainPage.SetCustomCursorEnabled(CustomCursorToggle.IsOn); }
+        private void DisableLivePackageTrackingToggle_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!m_initializing)
+                App.ServiceProvider.GetRequiredService<AppHelper>().IsLivePackageTrackingEnabled =
+                    !DisableLivePackageTrackingToggle.IsOn;
+        }
         private void Win32SupportToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) Win32WindowManagerService.Instance.IsAppSupportEnabled = Win32SupportToggle.IsOn; }
     }
 }

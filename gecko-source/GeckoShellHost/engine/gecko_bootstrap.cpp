@@ -111,9 +111,10 @@ void SetEngineEnvironment(const wchar_t* name, const wchar_t* value) {
 // Two files the profile has to carry before Gecko reads it.
 //
 // Seed the embedded Firefox window with the room assigned by DesktopMode.
-// It starts restored; its native maximize/restore buttons then mirror the
-// internal Shell window instead of inheriting the standalone phone host's
-// permanently-maximized state.
+// DesktopMode opens the browser maximized by default, so the initial Gecko
+// size mode must match the Shell window. The native chrome can still restore,
+// move and maximize it afterwards. The width/height below remain the geometry
+// a restore falls back to.
 //
 // devPixelsPerPx is the other half. Left alone, Gecko draws one CSS pixel per
 // device pixel, which on a 1440-wide phone is a browser rendered for ants. The
@@ -225,7 +226,7 @@ void PrepareProfile(const std::wstring& profile,
       "\"screenX\":\"0\",\"screenY\":\"0\","
       "\"width\":\"" + std::to_string(cssWidth) + "\","
       "\"height\":\"" + std::to_string(cssHeight) + "\","
-      "\"sizemode\":\"normal\"}}}\n";
+      "\"sizemode\":\"maximized\"}}}\n";
   WriteProfileFile(profile + L"\\xulstore.json", store);
 
   std::string scaleText = std::to_string(scale);
@@ -246,10 +247,30 @@ void PrepareProfile(const std::wstring& profile,
       "// Written by the shell every start; see gecko_bootstrap.cpp.\n"
        "user_pref(\"layout.css.devPixelsPerPx\", \"" + scaleText + "\");\n"
        "user_pref(\"widget.gecko-w10m.desktop-mode\", true);\n"
+       "// DesktopMode owns the outer window and honors Firefox's minimize,\n"
+       "// maximize, restore and close commands.\n"
+       "// DesktopMode hosts one Firefox chrome window. Divert every content\n"
+       "// request for another browser window (including window.open with\n"
+       "// popup/size features) to a regular foreground tab instead of making\n"
+       "// a second headless top-level window. Chrome menus and panels are XUL\n"
+       "// popups and do not use these content-window preferences.\n"
+       "user_pref(\"browser.link.open_newwindow\", 3);\n"
+       "user_pref(\"browser.link.open_newwindow.restriction\", 0);\n"
+       "user_pref(\"browser.link.open_newwindow.override.external\", 3);\n"
+       "user_pref(\"browser.tabs.loadDivertedInBackground\", false);\n"
+       "user_pref(\"toolkit.legacyUserProfileCustomizations.stylesheets\", true);\n"
        "// Overlay scrollbars depend on native Win32 pointer-hover messages "
        "that the headless UWP input bridge does not produce. Use the regular "
        "Windows scrollbar so sites keep a visible, usable scroll indicator.\n"
        "user_pref(\"ui.useOverlayScrollbars\", 0);\n"
+       "// Enable real WebRTC capture. Package capabilities still gate OS "
+       "access and Firefox still asks each site for permission.\n"
+       "user_pref(\"media.peerconnection.enabled\", true);\n"
+       "user_pref(\"media.navigator.video.enabled\", true);\n"
+       "user_pref(\"media.navigator.streams.fake\", false);\n"
+       "user_pref(\"media.navigator.permission.disabled\", false);\n"
+       "user_pref(\"permissions.default.camera\", 0);\n"
+       "user_pref(\"permissions.default.microphone\", 0);\n"
        "// Gecko downloads into LocalState. DownloadBroker exports completed "
        "files through the FolderPicker-authorized StorageFolder.\n"
       "user_pref(\"browser.download.folderList\", 2);\n"
@@ -263,6 +284,16 @@ void PrepareProfile(const std::wstring& profile,
       "user_pref(\"sanity-test.running\", false);\n"
       "user_pref(\"media.hardware-video-decoding.failed\", false);\n";
   WriteProfileFile(profile + L"\\user.js", prefs);
+
+  // Keep the profile stylesheet under DesktopMode's control, but do not hide
+  // Firefox's native caption controls. The Shell now honors maximize/restore
+  // and title-bar dragging while still opening the window maximized initially.
+  const std::wstring chromeDir = profile + L"\\chrome";
+  ::CreateDirectoryW(chromeDir.c_str(), nullptr);
+  WriteProfileFile(
+      chromeDir + L"\\userChrome.css",
+      "/* Written by DesktopMode on every start; see gecko_bootstrap.cpp. */\n"
+      "/* Native minimize, maximize/restore and close controls remain visible. */\n");
   Log("bootstrap: profile window " + std::to_string(cssWidth) + "x" +
       std::to_string(cssHeight) + " at " + scaleText + " device pixels per CSS pixel");
 }

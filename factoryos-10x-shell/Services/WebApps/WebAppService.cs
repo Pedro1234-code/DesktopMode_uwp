@@ -14,6 +14,11 @@ namespace factoryos_10x_shell.Services.WebApps
     public sealed class WebAppService : IWebAppService
     {
         private const string KeyPrefix = "CoreShellWebApp_";
+        // Deliberately does not use KeyPrefix: Save() replaces every persisted
+        // app entry carrying that prefix.
+        private const string DefaultsSeededKey = "CoreShellDefaults_WebAppsSeeded_v1";
+        private const string XboxDevicePortalId = "builtin-xbox-device-portal";
+        private const string XboxDevicePortalUri = "https://localhost:11443/";
         private bool m_initialized;
 
         public ObservableCollection<WebAppDefinition> InstalledApps { get; } = new ObservableCollection<WebAppDefinition>();
@@ -28,19 +33,48 @@ namespace factoryos_10x_shell.Services.WebApps
             {
                 var saved = pair.Value as ApplicationDataCompositeValue;
                 if (saved == null) continue;
+                string id = saved["Id"] as string;
+                string startUri = saved["StartUri"] as string;
                 InstalledApps.Add(new WebAppDefinition
                 {
-                    Id = saved["Id"] as string,
+                    Id = id,
                     Name = saved["Name"] as string,
-                    StartUri = saved["StartUri"] as string,
+                    StartUri = startUri,
+                    UseStrawfox = saved.TryGetValue("UseStrawfox", out object browser) && browser is bool strawfox && strawfox,
                     IconUri = saved["IconUri"] as string,
                     IsPinned = saved["IsPinned"] is bool isPinned && isPinned
                 });
             }
+
+            // Seed built-in web apps once per local profile. This keeps the app
+            // installed by default while still respecting a later uninstall.
+            if (!(values[DefaultsSeededKey] is bool defaultsSeeded && defaultsSeeded))
+            {
+                WebAppDefinition portal = InstalledApps.FirstOrDefault(app =>
+                    string.Equals(app.Id, XboxDevicePortalId, StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(app.StartUri, XboxDevicePortalUri, StringComparison.OrdinalIgnoreCase));
+                if (portal == null)
+                {
+                    portal = new WebAppDefinition
+                    {
+                        Id = XboxDevicePortalId,
+                        Name = "Xbox Device Portal",
+                        StartUri = XboxDevicePortalUri
+                    };
+                    InstalledApps.Add(portal);
+                }
+                else
+                {
+                    portal.Name = "Xbox Device Portal";
+                    portal.StartUri = XboxDevicePortalUri;
+                }
+                values[DefaultsSeededKey] = true;
+                Save();
+            }
             return Task.CompletedTask;
         }
 
-        public async Task<WebAppDefinition> InstallAsync(string name, string startUri)
+        public async Task<WebAppDefinition> InstallAsync(string name, string startUri, bool useStrawfox = false)
         {
             await InitializeAsync();
             if (!Uri.TryCreate(startUri, UriKind.Absolute, out Uri uri) ||
@@ -48,10 +82,12 @@ namespace factoryos_10x_shell.Services.WebApps
                 throw new ArgumentException("Informe uma URL http ou https válida.", nameof(startUri));
 
             string displayName = string.IsNullOrWhiteSpace(name) ? uri.Host : name.Trim();
-            var app = new WebAppDefinition { Id = Guid.NewGuid().ToString("N"), Name = displayName, StartUri = uri.AbsoluteUri };
+            var app = new WebAppDefinition { Id = Guid.NewGuid().ToString("N"), Name = displayName, StartUri = uri.AbsoluteUri, UseStrawfox = useStrawfox };
             InstalledApps.Add(app);
             Save();
             AppsChanged?.Invoke(this, EventArgs.Empty);
+            if (useStrawfox)
+                _ = SaveFaviconAsync(app, new Uri(uri, "/favicon.ico").AbsoluteUri);
             return app;
         }
 
@@ -107,6 +143,7 @@ namespace factoryos_10x_shell.Services.WebApps
                     ["Id"] = app.Id,
                     ["Name"] = app.Name,
                     ["StartUri"] = app.StartUri,
+                    ["UseStrawfox"] = app.UseStrawfox,
                     ["IconUri"] = app.IconUri,
                     ["IsPinned"] = app.IsPinned
                 };

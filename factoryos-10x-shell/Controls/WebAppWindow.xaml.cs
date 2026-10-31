@@ -17,6 +17,8 @@ namespace factoryos_10x_shell.Controls
 {
     public sealed partial class WebAppWindow : UserControl
     {
+        private static readonly double s_pointerScale =
+            string.Equals(AnalyticsInfo.VersionInfo.DeviceFamily, "Windows.Xbox", StringComparison.OrdinalIgnoreCase) ? 0.75 : 1.0;
         private IWindowManagerService m_windowManager;
         private IWebAppService m_webAppService;
         private IMouseInputService m_mouseInput;
@@ -32,6 +34,15 @@ namespace factoryos_10x_shell.Controls
         private bool m_resizing;
         private bool m_webViewClosed;
         private bool m_runtimeInitialized;
+        private bool m_isLoaded;
+        private bool m_initializingBrowser;
+        private bool m_mouseSubscribed;
+        private WebAppWindowModel m_navigatedWindow;
+        private Exception m_browserInitializationException;
+        private readonly DispatcherTimer m_browserWatchdog = new DispatcherTimer();
+        private string m_browserStage;
+        private bool m_browserStartupFailed;
+        private bool m_loggedBrowserPlatform;
 
         public WebAppWindow()
         {
@@ -41,6 +52,11 @@ namespace factoryos_10x_shell.Controls
             Unloaded += WebAppWindow_Unloaded;
             Browser.PointerPressed += Browser_PointerPressed;
             Browser.NavigationCompleted += Browser_NavigationCompleted;
+            Browser.NavigationStarting += Browser_NavigationStarting;
+            Browser.Loaded += Browser_Loaded;
+            Browser.CoreWebView2Initialized += Browser_CoreWebView2Initialized;
+            m_browserWatchdog.Interval = TimeSpan.FromSeconds(60);
+            m_browserWatchdog.Tick += BrowserWatchdog_Tick;
             TryInitializeRuntimeServices();
         }
 
@@ -49,6 +65,82 @@ namespace factoryos_10x_shell.Controls
             // The XAML designer creates this control before App.ServiceProvider exists.
             // Resolve runtime-only services after the control has entered the visual tree.
             TryInitializeRuntimeServices();
+            m_isLoaded = true;
+            SubscribeMouse();
+            if (m_window == null && DataContext is WebAppWindowModel window)
+            {
+                m_window = window;
+                Width = window.Width;
+                Height = window.Height;
+                window.PropertyChanged += Window_PropertyChanged;
+            }
+            _ = EnsureBrowserAsync();
+        }
+
+        private void Browser_Loaded(object sender, RoutedEventArgs e)
+        {
+            // The parent's Loaded event can precede WebView2's own Loaded.
+            _ = EnsureBrowserAsync();
+        }
+
+        private void Browser_CoreWebView2Initialized(Microsoft.UI.Xaml.Controls.WebView2 sender,
+            Microsoft.UI.Xaml.Controls.CoreWebView2InitializedEventArgs args)
+        {
+            if (m_webViewClosed) return;
+            m_browserInitializationException = args.Exception;
+            if (args.Exception != null)
+            {
+                m_browserStartupFailed = true;
+                ShowBrowserError(BrowserStartupErrorText(args.Exception));
+                LogBrowserFailure($"core initialization failed: {args.Exception.GetType().Name}; HRESULT=0x{args.Exception.HResult:X8}");
+            }
+            else
+            {
+                m_browserStage = "core initialized; waiting for navigation";
+                LogBrowserFailure("core initialized; coreAvailable=" + (sender.CoreWebView2 != null));
+            }
+        }
+
+        private void ShowBrowserError(string message)
+        {
+            m_browserWatchdog.Stop();
+            BrowserErrorText.Text = message;
+            BrowserError.Visibility = Visibility.Visible;
+        }
+
+        private static string BrowserStartupErrorText(Exception exception)
+        {
+            if (exception.HResult == unchecked((int)0x80080005))
+                return "The WebView2 runtime could not start its browser process (0x80080005). The page has not started loading.";
+            return "The web app could not be started. Try again. Error: 0x" + exception.HResult.ToString("X8");
+        }
+
+        private void LogBrowserPlatform()
+        {
+            if (m_loggedBrowserPlatform) return;
+            m_loggedBrowserPlatform = true;
+            try
+            {
+                var info = AnalyticsInfo.VersionInfo;
+                string version = "unavailable";
+                if (ulong.TryParse(info.DeviceFamilyVersion, out ulong packed))
+                    version = $"{(packed >> 48) & 0xffff}.{(packed >> 32) & 0xffff}.{(packed >> 16) & 0xffff}.{packed & 0xffff}";
+                var packageVersion = Windows.ApplicationModel.Package.Current.Id.Version;
+                LogBrowserFailure($"platform: family={info.DeviceFamily}; OS={version}; " +
+                    $"packageVersion={packageVersion.Major}.{packageVersion.Minor}.{packageVersion.Build}.{packageVersion.Revision}; " +
+                    $"memoryLimitMB={Windows.System.MemoryManager.AppMemoryUsageLimit / (1024 * 1024)}");
+            }
+            catch (Exception exception)
+            {
+                LogBrowserFailure($"platform query failed: HRESULT=0x{exception.HResult:X8}");
+            }
+        }
+
+        private void BrowserWatchdog_Tick(object sender, object e)
+        {
+            if (m_webViewClosed) { m_browserWatchdog.Stop(); return; }
+            ShowBrowserError("The web app is taking too long to load. Check your connection and try again.");
+            LogBrowserFailure($"timeout: stage={m_browserStage}; loaded={Browser.IsLoaded}; coreAvailable={Browser.CoreWebView2 != null}; size={Browser.ActualWidth:F0}x{Browser.ActualHeight:F0}");
         }
 
         private bool TryInitializeRuntimeServices()
@@ -57,22 +149,124 @@ namespace factoryos_10x_shell.Controls
             // Do not invoke App.ServiceProvider until it has been configured: its
             // getter intentionally throws when the application is not running.
             if (!App.HasServiceProvider) return false;
-            m_runtimeInitialized = true;
             m_windowManager = App.ServiceProvider.GetRequiredService<IWindowManagerService>();
             m_webAppService = App.ServiceProvider.GetRequiredService<IWebAppService>();
             m_mouseInput = App.ServiceProvider.GetRequiredService<IMouseInputService>();
-            m_mouseInput.InputChanged += MouseInput_InputChanged;
+            m_windowManager.Windows.CollectionChanged += Windows_CollectionChanged;
+            m_runtimeInitialized = true;
+            SubscribeMouse();
             return true;
+        }
+
+        private void SubscribeMouse()
+        {
+            if (!m_isLoaded || m_mouseSubscribed || m_mouseInput == null || m_webViewClosed) return;
+            m_mouseInput.InputChanged += MouseInput_InputChanged;
+            m_mouseSubscribed = true;
+        }
+
+        private void Windows_CollectionChanged(object sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e)
+        {
+            if (m_window != null && !m_windowManager.Windows.Contains(m_window)) ShutdownWebView();
         }
 
         private void WebAppWindow_DataContextChanged(FrameworkElement sender, DataContextChangedEventArgs args)
         {
+            if (m_window != null) m_window.PropertyChanged -= Window_PropertyChanged;
             m_window = args.NewValue as WebAppWindowModel;
             if (m_window == null) return;
             Width = m_window.Width;
             Height = m_window.Height;
             m_window.PropertyChanged += Window_PropertyChanged;
-            if (Uri.TryCreate(m_window.App.StartUri, UriKind.Absolute, out Uri uri)) Browser.Source = uri;
+            _ = EnsureBrowserAsync();
+        }
+
+        private async Task EnsureBrowserAsync()
+        {
+            if (!m_isLoaded || !Browser.IsLoaded || m_webViewClosed || m_initializingBrowser || m_browserStartupFailed || m_window?.App == null ||
+                m_navigatedWindow == m_window || Windows.ApplicationModel.DesignMode.DesignModeEnabled) return;
+            m_initializingBrowser = true;
+            try
+            {
+                var window = m_window;
+                if (!Uri.TryCreate(window.App.StartUri, UriKind.Absolute, out Uri uri) ||
+                    (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+                    throw new ArgumentException("Invalid web app address.");
+                m_browserInitializationException = null;
+                LogBrowserPlatform();
+                m_browserStage = "initializing core";
+                m_browserWatchdog.Start();
+                Browser.ApplyTemplate();
+                // Queue the destination on the control before initialization.
+                // WebView2 itself delivers Source once its core is ready.
+                Browser.Source = uri;
+                LogBrowserFailure($"initialization requested; loaded={Browser.IsLoaded}; size={Browser.ActualWidth:F0}x{Browser.ActualHeight:F0}");
+                await Browser.EnsureCoreWebView2Async();
+                if (m_webViewClosed || m_window != window) return;
+                if (m_browserInitializationException != null) throw m_browserInitializationException;
+                if (Browser.CoreWebView2 == null)
+                    throw new InvalidOperationException("WebView2 initialization completed without a CoreWebView2 instance.");
+                m_navigatedWindow = window;
+            }
+            catch (Exception exception)
+            {
+                if (!m_webViewClosed)
+                {
+                    m_browserStartupFailed = true;
+                    ShowBrowserError(BrowserStartupErrorText(exception));
+                    LogBrowserFailure($"initialization: {exception.GetType().Name}; HRESULT=0x{exception.HResult:X8}");
+                }
+            }
+            finally { m_initializingBrowser = false; }
+        }
+
+        private void Browser_NavigationStarting(Microsoft.UI.Xaml.Controls.WebView2 sender,
+            Microsoft.Web.WebView2.Core.CoreWebView2NavigationStartingEventArgs args)
+        {
+            m_browserStage = "navigation started";
+            m_browserWatchdog.Start();
+            LogBrowserFailure("navigation started");
+            BrowserError.Visibility = Visibility.Collapsed;
+        }
+
+        private async void RetryBrowser_Click(object sender, RoutedEventArgs e)
+        {
+            if (m_webViewClosed || m_initializingBrowser) return;
+            m_browserStartupFailed = false;
+            BrowserError.Visibility = Visibility.Collapsed;
+            if (m_navigatedWindow == m_window && Browser.CoreWebView2 != null)
+            {
+                try
+                {
+                    m_browserStage = "reload requested";
+                    m_browserWatchdog.Start();
+                    Browser.CoreWebView2.Reload();
+                }
+                catch (Exception exception)
+                {
+                    BrowserErrorText.Text = "The web app could not be reloaded. Close it and open it again.";
+                    BrowserError.Visibility = Visibility.Visible;
+                    LogBrowserFailure($"reload: {exception.GetType().Name}; HRESULT=0x{exception.HResult:X8}");
+                }
+            }
+            else await EnsureBrowserAsync();
+        }
+
+        private static void LogBrowserFailure(string detail)
+        {
+            System.Diagnostics.Debug.WriteLine("[WebApps] " + detail);
+            try
+            {
+                string path = System.IO.Path.Combine(Windows.Storage.ApplicationData.Current.LocalFolder.Path,
+                    "WebApps-runtime.log");
+                string line = $"{DateTimeOffset.UtcNow:O} {detail}{System.Environment.NewLine}";
+                _ = Task.Run(() =>
+                {
+                    try { System.IO.File.AppendAllText(path, line); }
+                    catch (Exception) { }
+                });
+            }
+            catch (Exception) { }
         }
 
         private void Window_PropertyChanged(object sender, System.ComponentModel.PropertyChangedEventArgs e)
@@ -167,7 +361,6 @@ namespace factoryos_10x_shell.Controls
         private void MouseInput_InputChanged(object sender, MouseInputChangedEventArgs e)
         {
             if (m_window == null || m_window.Visibility != Visibility.Visible) return;
-            double scale = string.Equals(AnalyticsInfo.VersionInfo.DeviceFamily, "Windows.Xbox", StringComparison.OrdinalIgnoreCase) ? 0.75 : 1.0;
             if (e.Kind == MouseInputChangeKind.Released)
             {
                 m_dragging = false;
@@ -175,12 +368,24 @@ namespace factoryos_10x_shell.Controls
             }
             if (m_dragging)
             {
-                MoveWindow(new Point(e.Snapshot.X / scale - m_window.Left, e.Snapshot.Y / scale - m_window.Top));
+                MoveWindow(new Point(e.Snapshot.X / s_pointerScale - m_window.Left, e.Snapshot.Y / s_pointerScale - m_window.Top));
             }
         }
 
         private async void Browser_NavigationCompleted(Microsoft.UI.Xaml.Controls.WebView2 sender, Microsoft.Web.WebView2.Core.CoreWebView2NavigationCompletedEventArgs args)
         {
+            if (m_webViewClosed) return;
+            LogBrowserFailure($"navigation completed: success={args.IsSuccess}; status={args.WebErrorStatus}; size={Browser.ActualWidth:F0}x{Browser.ActualHeight:F0}");
+            if (!args.IsSuccess)
+            {
+                if (args.WebErrorStatus == Microsoft.Web.WebView2.Core.CoreWebView2WebErrorStatus.OperationCanceled) return;
+                ShowBrowserError("This page could not be loaded (" + args.WebErrorStatus + "). Check your connection and try again.");
+                LogBrowserFailure("navigation: " + args.WebErrorStatus);
+                return;
+            }
+            m_browserWatchdog.Stop();
+            m_browserStage = "navigation completed";
+            BrowserError.Visibility = Visibility.Collapsed;
             await CaptureFaviconAsync();
         }
 
@@ -241,13 +446,34 @@ namespace factoryos_10x_shell.Controls
         {
             if (m_webViewClosed) return;
             m_webViewClosed = true;
+            m_browserWatchdog.Stop();
             if (m_mouseInput != null)
                 m_mouseInput.InputChanged -= MouseInput_InputChanged;
+            m_mouseSubscribed = false;
+            if (m_windowManager != null) m_windowManager.Windows.CollectionChanged -= Windows_CollectionChanged;
+            if (m_window != null) m_window.PropertyChanged -= Window_PropertyChanged;
             Browser.NavigationCompleted -= Browser_NavigationCompleted;
+            Browser.NavigationStarting -= Browser_NavigationStarting;
+            Browser.PointerPressed -= Browser_PointerPressed;
+            Browser.Loaded -= Browser_Loaded;
+            Browser.CoreWebView2Initialized -= Browser_CoreWebView2Initialized;
             Browser.Close();
         }
 
-        private void WebAppWindow_Unloaded(object sender, RoutedEventArgs e) => ShutdownWebView();
+        private void WebAppWindow_Unloaded(object sender, RoutedEventArgs e)
+        {
+            m_isLoaded = false;
+            m_dragging = m_resizing = false;
+            if (m_mouseSubscribed)
+            {
+                m_mouseInput.InputChanged -= MouseInput_InputChanged;
+                m_mouseSubscribed = false;
+            }
+            // Unloaded also occurs during visual-tree changes. Close() is final;
+            // only call it after the actual window model has been removed.
+            if (m_window == null || m_windowManager?.Windows.Contains(m_window) != true)
+                ShutdownWebView();
+        }
 
         private void UpdateCanvasPosition()
         {

@@ -9,7 +9,7 @@
     <OutputType>AppContainerExe</OutputType>
     <AppDesignerFolder>Properties</AppDesignerFolder>
     <RootNamespace>factoryos_10x_shell</RootNamespace>
-    <AssemblyName>factoryos-10x-shell</AssemblyName>
+    <AssemblyName>DesktopMode</AssemblyName>
     <DefaultLanguage>en-US</DefaultLanguage>
     <TargetPlatformIdentifier>UAP</TargetPlatformIdentifier>
     <TargetPlatformVersion Condition=" '$(TargetPlatformVersion)' == '' ">10.0.26100.0</TargetPlatformVersion>
@@ -22,9 +22,15 @@
     <GenerateAppInstallerFile>False</GenerateAppInstallerFile>
     <AppxPackageSigningTimestampDigestAlgorithm>SHA256</AppxPackageSigningTimestampDigestAlgorithm>
     <AppxAutoIncrementPackageRevision>True</AppxAutoIncrementPackageRevision>
-    <GenerateTestArtifacts>True</GenerateTestArtifacts>
-    <AppxBundle>Always</AppxBundle>
+    <!-- A normal Build/Deploy should not recompress the complete Gecko
+         runtime into test artifacts and a bundle. Create App Packages may
+         still override these properties explicitly. -->
+    <GenerateTestArtifacts Condition="'$(GenerateTestArtifacts)' == ''">False</GenerateTestArtifacts>
+    <AppxBundle Condition="'$(AppxBundle)' == ''">Never</AppxBundle>
     <AppxBundlePlatforms>x64</AppxBundlePlatforms>
+    <!-- Gecko directory names can resemble UWP resource qualifiers. Keep the
+         embedded runtime in the main x64 package instead of resource packs. -->
+    <AppxBundleAutoResourcePackageQualifiers>Scale|DXFeatureLevel</AppxBundleAutoResourcePackageQualifiers>
     <HoursBetweenUpdateChecks>0</HoursBetweenUpdateChecks>
     <PackageCertificateThumbprint>2817415E0DFAC624BDB99EA60E7DE6BDFA1667ED</PackageCertificateThumbprint>
     <AppxSymbolPackageEnabled>False</AppxSymbolPackageEnabled>
@@ -140,6 +146,9 @@
     <Compile Include="Controls\FilesWindow.xaml.cs">
       <DependentUpon>FilesWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Controls\FileOperationWindow.xaml.cs">
+      <DependentUpon>FileOperationWindow.xaml</DependentUpon>
+    </Compile>
     <Compile Include="Controls\NotepadWindow.xaml.cs">
       <DependentUpon>NotepadWindow.xaml</DependentUpon>
     </Compile>
@@ -172,6 +181,9 @@
     <Compile Include="Services\Helpers\AppState.cs" />
     <Compile Include="Services\Helpers\UpdateCheckService.cs" />
     <Compile Include="Services\Files\ArchiveService.cs" />
+    <Compile Include="Services\Files\FileOperationModel.cs" />
+    <Compile Include="Services\Files\FileOperationService.cs" />
+    <Compile Include="Services\Files\FileTransferService.cs" />
     <Compile Include="Services\Input\MouseInputService.cs" />
     <Compile Include="Services\WebApps\WebAppService.cs" />
     <Compile Include="Services\WebApps\WindowManagerService.cs" />
@@ -182,9 +194,6 @@
     <Compile Include="Services\Managers\NotificationManager.cs" />
     <Compile Include="Views\FallbackErrorPage.xaml.cs">
       <DependentUpon>FallbackErrorPage.xaml</DependentUpon>
-    </Compile>
-    <Compile Include="Views\Settings.xaml.cs">
-      <DependentUpon>Settings.xaml</DependentUpon>
     </Compile>
     <Compile Include="Views\Default10xBar.xaml.cs">
       <DependentUpon>Default10xBar.xaml</DependentUpon>
@@ -221,6 +230,7 @@
   <ItemGroup>
     <Content Include="10x.png" />
     <Content Include="Assets\10x.png" />
+    <Content Include="Assets\UpdateReleasesQr.png" />
     <Content Include="Assets\defaultUser.png" />
     <Content Include="Assets\Cursor\aero_arrow_xl_fix.png" />
     <Content Include="Assets\LargeTile.scale-100.png" />
@@ -287,10 +297,10 @@
     <Content Include="Assets\Wide310x150Logo.scale-150.png" />
     <Content Include="Assets\Wide310x150Logo.scale-400.png" />
     <Content Include="powerDark.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="powerLight.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="Properties\Default.rd.xml" />
     <Content Include="Assets\LockScreenLogo.scale-200.png" />
@@ -321,13 +331,13 @@
     <Content Include="Windows10x-js-main\Walls\wall5.jpg" />
     <Content Include="Windows10x-js-main\Icons\WindowsSettings.png" />
     <Content Include="taskview.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="taskviewColorWide.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
     <Content Include="taskviewDark.png">
-      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
     </Content>
   </ItemGroup>
   <ItemGroup>
@@ -348,6 +358,10 @@
       <Generator>MSBuild:Compile</Generator>
     </Page>
     <Page Include="Controls\FilesWindow.xaml">
+      <SubType>Designer</SubType>
+      <Generator>MSBuild:Compile</Generator>
+    </Page>
+    <Page Include="Controls\FileOperationWindow.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
@@ -376,10 +390,6 @@
       <Generator>MSBuild:Compile</Generator>
     </Page>
     <Page Include="Views\FallbackErrorPage.xaml">
-      <SubType>Designer</SubType>
-      <Generator>MSBuild:Compile</Generator>
-    </Page>
-    <Page Include="Views\Settings.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
@@ -450,7 +460,6 @@
     <ProjectReference Include="..\calculator-main\src\Calculator\Calculator.csproj">
       <Project>{3B773403-B0D6-4F9A-948E-512A7A5FB315}</Project>
       <Name>Calculator</Name>
-      <AdditionalProperties>CalculatorHostedBuild=true</AdditionalProperties>
     </ProjectReference>
     <ProjectReference Include="..\calculator-main\src\GraphControl\GraphControl.vcxproj">
       <Project>{e727a92b-f149-492c-8117-c039a298719b}</Project>

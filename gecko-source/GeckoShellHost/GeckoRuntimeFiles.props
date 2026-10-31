@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <!--
+    Deliberately curated Gecko payload. Do not replace this with dist\bin\**\*:
+    that directory is a live Mozilla build tree and also contains developer
+    tools, tests, debugger files and transient build markers.
+  -->
+  <ItemGroup Condition="'$(GeckoW10mBin)' != ''">
+    <GeckoRuntimeFile Include="
+        $(GeckoW10mBin)\AccessibleMarshal.dll;
+        $(GeckoW10mBin)\CoreMessagingXP.dll;
+        $(GeckoW10mBin)\dxcompiler.dll;
+        $(GeckoW10mBin)\freebl3.dll;
+        $(GeckoW10mBin)\gkcodecs.dll;
+        $(GeckoW10mBin)\IA2Marshal.dll;
+        $(GeckoW10mBin)\lgpllibs.dll;
+        $(GeckoW10mBin)\libEGL.dll;
+        $(GeckoW10mBin)\libGLESv2.dll;
+        $(GeckoW10mBin)\marshal.dll;
+        $(GeckoW10mBin)\Microsoft.InputStateManager.dll;
+        $(GeckoW10mBin)\Microsoft.Internal.FrameworkUdk.dll;
+        $(GeckoW10mBin)\Microsoft.UI.Composition.OSSupport.dll;
+        $(GeckoW10mBin)\Microsoft.UI.Input.dll;
+        $(GeckoW10mBin)\Microsoft.UI.Windowing.Core.dll;
+        $(GeckoW10mBin)\Microsoft.UI.Windowing.dll;
+        $(GeckoW10mBin)\mozavcodec.dll;
+        $(GeckoW10mBin)\mozavutil.dll;
+        $(GeckoW10mBin)\mozglue.dll;
+        $(GeckoW10mBin)\mozinference.dll;
+        $(GeckoW10mBin)\notificationserver.dll;
+        $(GeckoW10mBin)\nss3.dll;
+        $(GeckoW10mBin)\softokn3.dll;
+        $(GeckoW10mBin)\xul.dll;
+        $(GeckoW10mBin)\chrome.manifest;
+        $(GeckoW10mBin)\default.locale;
+        $(GeckoW10mBin)\dependentlibs.list;
+        $(GeckoW10mBin)\EventArtifactDefinitions.json;
+        $(GeckoW10mBin)\greprefs.js;
+        $(GeckoW10mBin)\platform.ini;
+        $(GeckoW10mBin)\ScalarArtifactDefinitions.json;
+        $(GeckoW10mBin)\default-browser-agent.exe;
+        $(GeckoW10mBin)\firefox.exe;
+        $(GeckoW10mBin)\nmhproxy.exe;
+        $(GeckoW10mBin)\pingsender.exe;
+        $(GeckoW10mBin)\plugin-container.exe">
+      <TargetPath>%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\actors\**\*">
+      <TargetPath>actors\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\browser\**\*">
+      <TargetPath>browser\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\chrome\**\*">
+      <TargetPath>chrome\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\components\**\*">
+      <TargetPath>components\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\contentaccessible\**\*">
+      <TargetPath>contentaccessible\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\defaults\**\*">
+      <TargetPath>defaults\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\dictionaries\**\*">
+      <TargetPath>dictionaries\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\fonts\**\*">
+      <TargetPath>fonts\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\gmp-clearkey\**\*">
+      <TargetPath>gmp-clearkey\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\hyphenation\**\*">
+      <TargetPath>hyphenation\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\localization\**\*">
+      <TargetPath>localization\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\modules\**\*">
+      <TargetPath>modules\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\moz-src\**\*">
+      <TargetPath>moz-src\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+    <GeckoRuntimeFile Include="$(GeckoW10mBin)\res\**\*">
+      <TargetPath>res\%(RecursiveDir)%(Filename)%(Extension)</TargetPath>
+    </GeckoRuntimeFile>
+
+    <GeckoRuntimeFile Remove="$(GeckoW10mBin)\browser\chrome\.mkdir.done;$(GeckoW10mBin)\chrome\.mkdir.done;$(GeckoW10mBin)\gmp-clearkey\0.1\.mkdir.done" />
+  </ItemGroup>
+</Project>

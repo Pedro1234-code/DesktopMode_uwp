@@ -5,11 +5,14 @@
 #include "Bridge/ActivationContext.h"
 #include "Bridge/PeImage.h"
 #include "Bridge/PeMapper.h"
+#include "Bridge/GuestResources.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <algorithm>
 #include <cwctype>
 #include <cwchar>
+#include <initializer_list>
+#include <limits>
 #include <unordered_map>
 
 using namespace Win32Bridge::Bridge;
@@ -27,6 +30,8 @@ namespace
     constexpr DWORD SupportedSearchFlags = LoadLibrarySearchDllLoadDir |
         LoadLibrarySearchApplicationDir | LoadLibrarySearchUserDirs |
         LoadLibrarySearchSystem32 | LoadLibrarySearchDefaultDirs;
+    constexpr DWORD ActCtxResourceNameValid = 0x00000008u;
+    constexpr DWORD ActCtxModuleValid = 0x00000080u;
 
     thread_local GuestModuleLoader* g_currentModuleLoader = nullptr;
     thread_local unsigned g_forwarderDepth = 0;
@@ -90,6 +95,46 @@ namespace
         }
     }
 
+    class ScopedActivationContext final
+    {
+    public:
+        explicit ScopedActivationContext(HANDLE context)
+        {
+            if (context && context != INVALID_HANDLE_VALUE)
+                m_active = BridgeActivateActCtx(context, &m_cookie) != FALSE;
+        }
+
+        ~ScopedActivationContext()
+        {
+            if (m_active) BridgeDeactivateActCtx(0, m_cookie);
+        }
+
+        ScopedActivationContext(const ScopedActivationContext&) = delete;
+        ScopedActivationContext& operator=(const ScopedActivationContext&) = delete;
+
+    private:
+        ULONG_PTR m_cookie = 0;
+        bool m_active = false;
+    };
+
+    bool IsAbsoluteGuestPath(LPCWSTR path)
+    {
+        if (!path || !*path) return false;
+        if (path[0] == L'\\' || path[0] == L'/') return true;
+        return path[0] != L'\0' && path[1] == L':' &&
+            (path[2] == L'\\' || path[2] == L'/');
+    }
+
+    const GuestResourceIdentifier* PreferredManifest(
+        const std::vector<GuestResourceIdentifier>& names,
+        std::initializer_list<WORD> preferredIds)
+    {
+        for (const WORD preferred : preferredIds)
+            for (const auto& name : names)
+                if (name.ordinal && name.id == preferred) return &name;
+        return names.empty() ? nullptr : &names.front();
+    }
+
     bool IsWithinDirectory(
         const std::wstring& path,
         const std::wstring& directory,
@@ -136,8 +181,12 @@ struct GuestModuleLoader::Module final
     ULONG references = 1;
     std::uint64_t attachSequence = 0;
     bool loading = true;
+    bool unloading = false;
+    bool pinned = false;
+    bool resourceOnly = false;
     bool processAttached = false;
     bool threadNotifications = true;
+    HANDLE activationContext = nullptr;
     std::unordered_map<std::wstring, HMODULE> dependencyModules;
     std::vector<HMODULE> dependencyReferences;
 };
@@ -296,18 +345,34 @@ bool GuestModuleLoader::BuildCandidates(
             addApplicationSource(normalized, logicalPath);
             if (!addVirtual(logicalPath)) return false;
         }
+        const bool searchUserDirectories =
+            (searchFlags & (LoadLibrarySearchUserDirs | LoadLibrarySearchDefaultDirs)) != 0;
+        if (classicSearch &&
+            m_legacyDllDirectorySpecified && !m_legacyDllDirectory.empty() &&
+            !addVirtual(JoinPath(m_legacyDllDirectory, normalized)))
+        {
+            return false;
+        }
+        if (searchUserDirectories)
+        {
+            for (const auto& directory : m_userDllDirectories)
+            {
+                if (!addVirtual(JoinPath(directory.second, normalized))) return false;
+            }
+        }
         if (searchSystem32 && !addVirtual(JoinPath(L"C:\\Windows\\System32", normalized)))
         {
             return false;
         }
-        if (classicSearch &&
-            (!addVirtual(JoinPath(L"C:\\Windows", normalized)) ||
-             !addVirtual(JoinPath(m_storage->CurrentDirectory(), normalized))))
+        if (classicSearch && !addVirtual(JoinPath(L"C:\\Windows", normalized)))
         {
             return false;
         }
-        // USER_DIRS is retained as policy even though no user-directory API
-        // has populated that list yet.
+        if (classicSearch && !m_legacyDllDirectorySpecified &&
+            !addVirtual(JoinPath(m_storage->CurrentDirectory(), normalized)))
+        {
+            return false;
+        }
     }
 
     SetWin32Error(win32Error, ERROR_SUCCESS);
@@ -422,6 +487,7 @@ bool GuestModuleLoader::ReadExecutableBytes(
     std::wstring* logicalPath,
     DWORD* win32Error) const
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!bytes || !logicalPath)
     {
         SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
@@ -454,12 +520,136 @@ bool GuestModuleLoader::ReadExecutableBytes(
     return false;
 }
 
+bool GuestModuleLoader::AddDllDirectory(
+    LPCWSTR path, PVOID* cookie, DWORD* win32Error)
+{
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    if (!path || !*path || !cookie || !m_storage || !IsAbsoluteGuestPath(path))
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    *cookie = nullptr;
+    std::wstring canonical;
+    DWORD error = ERROR_SUCCESS;
+    if (!m_storage->CanonicalPath(path, &canonical, &error) ||
+        canonical.size() < 3 || canonical[1] != L':')
+    {
+        SetWin32Error(win32Error, error == ERROR_SUCCESS ? ERROR_INVALID_PARAMETER : error);
+        return false;
+    }
+    const DWORD attributes = m_storage->GetGuestFileAttributes(canonical.c_str(), &error);
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+    {
+        SetWin32Error(win32Error, error == ERROR_SUCCESS ? ERROR_PATH_NOT_FOUND : error);
+        return false;
+    }
+    ULONG_PTR token = m_nextDllDirectoryCookie++;
+    while (token == 0 || token == reinterpret_cast<ULONG_PTR>(INVALID_HANDLE_VALUE) ||
+        std::find_if(m_userDllDirectories.begin(), m_userDllDirectories.end(),
+            [token](const std::pair<ULONG_PTR, std::wstring>& item)
+            { return item.first == token; }) != m_userDllDirectories.end())
+    {
+        token = m_nextDllDirectoryCookie++;
+    }
+    m_userDllDirectories.emplace_back(token, std::move(canonical));
+    *cookie = reinterpret_cast<PVOID>(token);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestModuleLoader::RemoveDllDirectory(PVOID cookie, DWORD* win32Error)
+{
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(cookie);
+    const auto found = std::find_if(m_userDllDirectories.begin(), m_userDllDirectories.end(),
+        [token](const std::pair<ULONG_PTR, std::wstring>& item)
+        { return token != 0 && item.first == token; });
+    if (found == m_userDllDirectories.end())
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    m_userDllDirectories.erase(found);
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestModuleLoader::SetDllDirectory(LPCWSTR path, DWORD* win32Error)
+{
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    if (!path)
+    {
+        m_legacyDllDirectory.clear();
+        m_legacyDllDirectorySpecified = false;
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    if (!*path)
+    {
+        m_legacyDllDirectory.clear();
+        m_legacyDllDirectorySpecified = true;
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    if (wcschr(path, L';'))
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    std::wstring canonical;
+    DWORD error = ERROR_SUCCESS;
+    if (!m_storage || !m_storage->CanonicalPath(path, &canonical, &error))
+    {
+        SetWin32Error(win32Error, error == ERROR_SUCCESS ? ERROR_INVALID_PARAMETER : error);
+        return false;
+    }
+    m_legacyDllDirectory = std::move(canonical);
+    m_legacyDllDirectorySpecified = true;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+DWORD GuestModuleLoader::GetDllDirectory(
+    DWORD bufferLength, LPWSTR buffer, DWORD* win32Error) const
+{
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    const std::wstring value = m_legacyDllDirectorySpecified
+        ? m_legacyDllDirectory : std::wstring{};
+    const size_t required = value.size() + 1;
+    if (!buffer || bufferLength < required)
+    {
+        SetWin32Error(win32Error, buffer || bufferLength ? ERROR_INSUFFICIENT_BUFFER : ERROR_SUCCESS);
+        return static_cast<DWORD>((std::min)(required, static_cast<size_t>((std::numeric_limits<DWORD>::max)())));
+    }
+    memcpy(buffer, value.c_str(), required * sizeof(wchar_t));
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return static_cast<DWORD>(value.size());
+}
+
 bool GuestModuleLoader::LoadLibrary(
     LPCWSTR requestedName,
     HMODULE* module,
     DWORD* win32Error,
-    DWORD searchFlags)
+    DWORD searchFlags,
+    DWORD loadBehaviorFlags)
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    constexpr DWORD DontResolveDllReferences = 0x00000001u;
+    constexpr DWORD LoadAsDataFile = 0x00000002u;
+    constexpr DWORD LoadAsImageResource = 0x00000020u;
+    constexpr DWORD LoadAsDataFileExclusive = 0x00000040u;
+    constexpr DWORD ResourceOnlyFlags =
+        LoadAsDataFile | LoadAsImageResource | LoadAsDataFileExclusive;
+    constexpr DWORD SupportedBehaviorFlags = ResourceOnlyFlags | DontResolveDllReferences;
+    if ((loadBehaviorFlags & ~SupportedBehaviorFlags) != 0)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    const bool resourceOnly = (loadBehaviorFlags & ResourceOnlyFlags) != 0;
+    const bool skipInitialization = resourceOnly ||
+        (loadBehaviorFlags & DontResolveDllReferences) != 0;
     RuntimeDiagnostics::Record(L"DLL: LoadLibrary request for " + (requestedName ? std::wstring(requestedName) : L"<null>") + L".");
     if (!module || !m_resolver)
     {
@@ -479,7 +669,15 @@ bool GuestModuleLoader::LoadLibrary(
         return false;
     }
 
-    if (searchByBaseName)
+    if (resourceOnly)
+    {
+        // Data-file mappings are not members of the executable loader list on
+        // Windows. Keep a separate identity so a later normal LoadLibrary can
+        // still map, bind and initialize the same physical image.
+        for (auto& candidate : candidates) candidate.identity += L"|resource";
+    }
+
+    if (searchByBaseName && !resourceOnly)
     {
         std::lock_guard<std::mutex> guard(m_lock);
         const auto loaded = FindModuleByBaseNameLocked(requestedBaseName);
@@ -531,6 +729,7 @@ bool GuestModuleLoader::LoadLibrary(
         RuntimeDiagnostics::Record(
             L"DLL FAILED: no candidate matched " +
             (requestedName ? std::wstring(requestedName) : L"<null>") +
+            L"; Win32 error " + std::to_wstring(static_cast<unsigned long>(ERROR_MOD_NOT_FOUND)) +
             L". Searched: " + searched + L".");
         return false;
     }
@@ -538,6 +737,7 @@ bool GuestModuleLoader::LoadLibrary(
     auto candidate = std::make_shared<Module>();
     candidate->identity = resolved->identity;
     candidate->canonicalName = resolved->displayName;
+    candidate->resourceOnly = resourceOnly;
     const std::wstring& canonicalName = candidate->canonicalName;
     std::wstring preparationError;
     if (!PeImage::Inspect(fileBytes.data(), fileBytes.size(), &candidate->metadata))
@@ -546,15 +746,19 @@ bool GuestModuleLoader::LoadLibrary(
         SetWin32Error(win32Error, ERROR_BAD_EXE_FORMAT);
         RuntimeDiagnostics::Record(
             L"DLL FAILED: invalid PE image for " + canonicalName + L" (" +
-            preparationError + L").");
+            preparationError + L"; machine " +
+            std::to_wstring(static_cast<unsigned int>(candidate->metadata.machine)) +
+            L"; Win32 error " +
+            std::to_wstring(static_cast<unsigned long>(ERROR_BAD_EXE_FORMAT)) + L").");
         return false;
     }
     if (!PeMapper::Materialize(fileBytes.data(), fileBytes.size(), &candidate->mapped, &preparationError) ||
-        !RuntimeImage::Reserve(candidate->mapped.bytes.size(), candidate->mapped.preferredImageBase, &candidate->runtime, &preparationError) ||
-        !PeMapper::ApplyBaseRelocations(
+        !RuntimeImage::Reserve(candidate->mapped.bytes.size(), candidate->mapped.preferredImageBase,
+            &candidate->runtime, &preparationError) ||
+        (!resourceOnly && !PeMapper::ApplyBaseRelocations(
             &candidate->mapped,
             reinterpret_cast<ULONGLONG>(candidate->runtime.Base()),
-            &preparationError))
+            &preparationError)))
     {
         candidate->runtime.Release();
         SetWin32Error(win32Error, ERROR_BAD_EXE_FORMAT);
@@ -580,6 +784,37 @@ bool GuestModuleLoader::LoadLibrary(
             return true;
         }
         m_modules.push_back(candidate);
+    }
+
+    if (skipInitialization)
+    {
+        const bool copied = candidate->runtime.CopyFrom(candidate->mapped, &preparationError);
+        const bool protectedImage = copied && (resourceOnly ||
+            candidate->runtime.FinalizeProtections(candidate->mapped, &preparationError));
+        if (!copied || !protectedImage)
+        {
+            {
+                std::lock_guard<std::mutex> guard(m_lock);
+                m_modules.erase(std::remove(
+                    m_modules.begin(), m_modules.end(), candidate), m_modules.end());
+            }
+            candidate->runtime.Release();
+            SetWin32Error(win32Error, ERROR_BAD_EXE_FORMAT);
+            RuntimeDiagnostics::Record(
+                L"DLL FAILED: non-initializing mapping failed for " + canonicalName +
+                L" (" + preparationError + L").");
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> guard(m_lock);
+            candidate->loading = false;
+        }
+        *module = reinterpret_cast<HMODULE>(candidate->runtime.Base());
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        RuntimeDiagnostics::Record(resourceOnly
+            ? L"DLL RESOURCE: mapped without IAT/TLS/DllMain: " + canonicalName + L"."
+            : L"DLL NORESOLVE: mapped without IAT/TLS/DllMain: " + canonicalName + L".");
+        return true;
     }
 
     const ImportResolver dependencyResolver = [this, candidate, searchFlags](const ImportedSymbol& symbol)
@@ -684,10 +919,55 @@ bool GuestModuleLoader::LoadLibrary(
         SetWin32Error(win32Error, ERROR_PROC_NOT_FOUND);
         RuntimeDiagnostics::Record(
             L"DLL FAILED: import binding for " + canonicalName + L" (" + preparationError +
-            L"; " + std::to_wstring(candidate->bindings.unresolved) + L" unresolved imports).");
+            L"; " + std::to_wstring(candidate->bindings.unresolved) +
+            L" unresolved imports; Win32 error " +
+            std::to_wstring(static_cast<unsigned long>(ERROR_PROC_NOT_FOUND)) + L").");
         return false;
     }
 
+    // ReactOS/NT associates an entry-point activation context with each
+    // loader entry and activates it while TLS callbacks and DllMain run.  The
+    // process-default context remains the fallback for DLLs without a
+    // manifest; an embedded RT_MANIFEST gets its own independently ref-counted
+    // context.
+    std::vector<GuestResourceIdentifier> manifestNames;
+    const HMODULE candidateHandle = reinterpret_cast<HMODULE>(candidate->runtime.Base());
+    const GuestResourceStatus manifestStatus = EnumerateGuestResourceNames(
+        candidateHandle, MAKEINTRESOURCEW(24), &manifestNames);
+    if (manifestStatus == GuestResourceStatus::Success && !manifestNames.empty())
+    {
+        // ID 2 is the standard DLL manifest, ID 3 is its no-static-import
+        // variant. ID 1 remains a fallback for nonconforming images.
+        const GuestResourceIdentifier* manifestName =
+            PreferredManifest(manifestNames, { 2, 3, 1 });
+        const LPCWSTR resourceName = manifestName->ordinal
+            ? MAKEINTRESOURCEW(manifestName->id) : manifestName->text.c_str();
+        GuestActCtxW actctx{};
+        actctx.cbSize = sizeof(actctx);
+        actctx.dwFlags = ActCtxResourceNameValid | ActCtxModuleValid;
+        actctx.lpSource = candidate->canonicalName.c_str();
+        actctx.lpResourceName = resourceName;
+        actctx.hModule = candidateHandle;
+        candidate->activationContext = BridgeCreateActCtxW(&actctx);
+        if (candidate->activationContext == INVALID_HANDLE_VALUE)
+        {
+            candidate->activationContext = nullptr;
+            {
+                std::lock_guard<std::mutex> guard(m_lock);
+                m_modules.erase(std::remove(m_modules.begin(), m_modules.end(), candidate), m_modules.end());
+            }
+            candidate->runtime.Release();
+            ReleaseModuleDependencies(candidate);
+            SetWin32Error(win32Error, ERROR_SXS_CANT_GEN_ACTCTX);
+            RuntimeDiagnostics::Record(
+                L"DLL FAILED: activation context creation failed for " + canonicalName + L".");
+            return false;
+        }
+        RuntimeDiagnostics::Record(
+            L"DLL ACTCTX: associated embedded manifest with " + canonicalName + L".");
+    }
+
+    ScopedActivationContext activation(candidate->activationContext);
     if (!candidate->runtime.NotifyTls(DLL_PROCESS_ATTACH, &preparationError))
     {
         {
@@ -695,6 +975,11 @@ bool GuestModuleLoader::LoadLibrary(
             m_modules.erase(std::remove(m_modules.begin(), m_modules.end(), candidate), m_modules.end());
         }
         candidate->runtime.Release();
+        if (candidate->activationContext)
+        {
+            BridgeReleaseActCtx(candidate->activationContext);
+            candidate->activationContext = nullptr;
+        }
         ReleaseModuleDependencies(candidate);
         SetWin32Error(win32Error, ERROR_DLL_INIT_FAILED);
         RuntimeDiagnostics::Record(
@@ -714,6 +999,11 @@ bool GuestModuleLoader::LoadLibrary(
             m_modules.erase(std::remove(m_modules.begin(), m_modules.end(), candidate), m_modules.end());
         }
         candidate->runtime.Release();
+        if (candidate->activationContext)
+        {
+            BridgeReleaseActCtx(candidate->activationContext);
+            candidate->activationContext = nullptr;
+        }
         ReleaseModuleDependencies(candidate);
         SetWin32Error(win32Error, ERROR_DLL_INIT_FAILED);
         RuntimeDiagnostics::Record(L"DLL FAILED: " + canonicalName + L" rejected DLL_PROCESS_ATTACH.");
@@ -739,6 +1029,7 @@ ImportResolution GuestModuleLoader::ResolveImport(
     const ImportedSymbol& symbol,
     DWORD searchFlags)
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     ImportResolution resolution = m_resolver(symbol);
     if (resolution.targetAddress != 0) return resolution;
 
@@ -793,6 +1084,7 @@ bool GuestModuleLoader::GetModuleHandle(
     HMODULE* module,
     DWORD* win32Error) const
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!module)
     {
         SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
@@ -835,11 +1127,62 @@ bool GuestModuleLoader::GetModuleHandle(
     return true;
 }
 
+bool GuestModuleLoader::GetModuleHandleFromAddress(
+    ULONG_PTR address, HMODULE* module, DWORD* win32Error) const
+{
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    if (!address || !module)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    *module = nullptr;
+    std::lock_guard<std::mutex> guard(m_lock);
+    for (const auto& candidate : m_modules)
+    {
+        if (!candidate || candidate->resourceOnly || !candidate->runtime.Base() ||
+            candidate->runtime.Size() == 0)
+            continue;
+        const ULONG_PTR base = reinterpret_cast<ULONG_PTR>(candidate->runtime.Base());
+        if (address >= base && address - base < candidate->runtime.Size())
+        {
+            *module = reinterpret_cast<HMODULE>(candidate->runtime.Base());
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+    }
+    SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
+    return false;
+}
+
+bool GuestModuleLoader::AddReference(HMODULE module, bool pin, DWORD* win32Error)
+{
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    std::lock_guard<std::mutex> guard(m_lock);
+    const auto candidate = FindModuleLocked(module);
+    if (!candidate || candidate->unloading)
+    {
+        SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
+        return false;
+    }
+    if (pin)
+    {
+        candidate->pinned = true;
+    }
+    else if (!candidate->pinned && candidate->references != (std::numeric_limits<ULONG>::max)())
+    {
+        ++candidate->references;
+    }
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
 bool GuestModuleLoader::GetModulePath(
     HMODULE module,
     std::wstring* path,
     DWORD* win32Error) const
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!path)
     {
         SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
@@ -860,6 +1203,7 @@ bool GuestModuleLoader::GetModulePath(
 
 FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, DWORD* win32Error)
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!module || !nameOrOrdinal)
     {
         SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
@@ -875,9 +1219,10 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
         std::lock_guard<std::mutex> guard(m_lock);
         candidate = FindModuleLocked(module);
     }
-    if (!candidate)
+    if (!candidate || candidate->resourceOnly)
     {
-        SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
+        SetWin32Error(win32Error,
+            candidate ? ERROR_PROC_NOT_FOUND : ERROR_MOD_NOT_FOUND);
         RuntimeDiagnostics::Record(
             L"GetProcAddress FAILED: module handle " +
             std::to_wstring(reinterpret_cast<ULONG_PTR>(module)) + L" is not a loaded guest DLL.");
@@ -1016,13 +1361,15 @@ std::shared_ptr<GuestModuleLoader::Module> GuestModuleLoader::FindModuleByBaseNa
 {
     for (const auto& candidate : m_modules)
     {
-        if (candidate && FileNameOf(candidate->canonicalName) == baseName) return candidate;
+        if (candidate && !candidate->resourceOnly &&
+            FileNameOf(candidate->canonicalName) == baseName) return candidate;
     }
     return nullptr;
 }
 
 bool GuestModuleLoader::GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!imageBase || !imageSize)
     {
         return false;
@@ -1069,43 +1416,67 @@ bool GuestModuleLoader::DescribeAddress(ULONG_PTR address, std::wstring* descrip
 
 bool GuestModuleLoader::FreeLibrary(HMODULE module, DWORD* win32Error)
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    std::shared_ptr<Module> candidate;
     {
-        std::shared_ptr<Module> candidate;
+        std::lock_guard<std::mutex> guard(m_lock);
+        candidate = FindModuleLocked(module);
+        if (!candidate)
         {
-            std::lock_guard<std::mutex> guard(m_lock);
-            candidate = FindModuleLocked(module);
-            if (!candidate)
-            {
-                SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
-                return false;
-            }
-            if (candidate->references > 1)
-            {
-                --candidate->references;
-                SetWin32Error(win32Error, ERROR_SUCCESS);
-                return true;
-            }
-            m_modules.erase(std::remove(m_modules.begin(), m_modules.end(), candidate), m_modules.end());
-            for (auto iterator = m_importModules.begin(); iterator != m_importModules.end();)
-            {
-                if (iterator->second == module) iterator = m_importModules.erase(iterator);
-                else ++iterator;
-            }
+            SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
+            return false;
         }
-
-        std::wstring ignored;
-        if (candidate->processAttached)
+        if (candidate->unloading)
         {
-            candidate->runtime.NotifyTls(DLL_PROCESS_DETACH, &ignored);
-            BOOL unused = TRUE;
-            InvokeDllEntry(candidate->runtime.Base(), candidate->mapped.entryPointRva,
-                DLL_PROCESS_DETACH, nullptr, &unused);
-            candidate->processAttached = false;
+            // A recursive FreeLibrary from this DLL's detach path must not
+            // execute callbacks twice.  The outer unload owns the transition.
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
         }
-        RuntimeDiagnostics::Record(L"DLL: unloaded " + candidate->canonicalName + L".");
-        candidate->runtime.Release();
-        ReleaseModuleDependencies(candidate);
+        if (candidate->pinned)
+        {
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+        if (candidate->references > 1)
+        {
+            --candidate->references;
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+        candidate->unloading = true;
     }
+
+    // Keep the loader entry discoverable until all detach notifications have
+    // returned, matching LdrUnloadDll/ReactOS.  DllMain is allowed to query its
+    // own HMODULE and exported addresses during teardown.
+    std::wstring ignored;
+    if (candidate->processAttached)
+    {
+        ScopedActivationContext activation(candidate->activationContext);
+        candidate->runtime.NotifyTls(DLL_PROCESS_DETACH, &ignored);
+        BOOL unused = TRUE;
+        InvokeDllEntry(candidate->runtime.Base(), candidate->mapped.entryPointRva,
+            DLL_PROCESS_DETACH, nullptr, &unused);
+        candidate->processAttached = false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(m_lock);
+        m_modules.erase(std::remove(m_modules.begin(), m_modules.end(), candidate), m_modules.end());
+        for (auto iterator = m_importModules.begin(); iterator != m_importModules.end();)
+        {
+            if (iterator->second == module) iterator = m_importModules.erase(iterator);
+            else ++iterator;
+        }
+    }
+    RuntimeDiagnostics::Record(L"DLL: unloaded " + candidate->canonicalName + L".");
+    candidate->runtime.Release();
+    if (candidate->activationContext)
+    {
+        BridgeReleaseActCtx(candidate->activationContext);
+        candidate->activationContext = nullptr;
+    }
+    ReleaseModuleDependencies(candidate);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return true;
 }
@@ -1135,6 +1506,7 @@ bool GuestModuleLoader::NotifyModule(
     if (!module || !module->processAttached) return true;
     if ((reason == DLL_THREAD_ATTACH || reason == DLL_THREAD_DETACH) &&
         !module->threadNotifications) return true;
+    ScopedActivationContext activation(module->activationContext);
     if (!module->runtime.NotifyTls(reason, error)) return false;
     BOOL entryResult = TRUE;
     if (!InvokeDllEntry(module->runtime.Base(), module->mapped.entryPointRva,
@@ -1149,9 +1521,10 @@ bool GuestModuleLoader::NotifyModule(
 
 bool GuestModuleLoader::DisableThreadNotifications(HMODULE module, DWORD* win32Error)
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     std::lock_guard<std::mutex> guard(m_lock);
     const auto candidate = FindModuleLocked(module);
-    if (!candidate)
+    if (!candidate || candidate->resourceOnly)
     {
         SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
         return false;
@@ -1168,6 +1541,7 @@ bool GuestModuleLoader::DisableThreadNotifications(HMODULE module, DWORD* win32E
 
 bool GuestModuleLoader::NotifyThread(DWORD reason, std::wstring* error)
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     std::vector<std::shared_ptr<Module>> modules;
     {
         std::lock_guard<std::mutex> guard(m_lock);
@@ -1206,6 +1580,7 @@ bool GuestModuleLoader::NotifyThread(DWORD reason, std::wstring* error)
 
 void GuestModuleLoader::ReleaseAll()
 {
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     std::vector<std::shared_ptr<Module>> modules;
     {
         std::lock_guard<std::mutex> guard(m_lock);
@@ -1227,6 +1602,7 @@ void GuestModuleLoader::ReleaseAll()
         {
             if (module->processAttached)
             {
+                ScopedActivationContext activation(module->activationContext);
                 std::wstring ignored;
                 module->runtime.NotifyTls(DLL_PROCESS_DETACH, &ignored);
                 BOOL unused = TRUE;
@@ -1235,6 +1611,11 @@ void GuestModuleLoader::ReleaseAll()
                 module->processAttached = false;
             }
             module->runtime.Release();
+            if (module->activationContext)
+            {
+                BridgeReleaseActCtx(module->activationContext);
+                module->activationContext = nullptr;
+            }
         }
     }
 }
