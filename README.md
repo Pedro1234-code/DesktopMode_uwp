@@ -51,7 +51,7 @@ Desktop Mode includes an highly experimental bridge for loading Win32 PEs in .ex
 [Win32Bridge Documentation](Win32Bridge/BRIDGE.md)
 
 ## Enable Loopback
-In order to be able to use Xbox Device Portal directly from Strawfox, and use the <planned> Appx Installer feature, you must enable loopback every reboot. Here's how to do it:
+In order to be able to use Xbox Device Portal directly from Strawfox, and use the (planned) Appx Installer feature, you must enable loopback every reboot. Here's how to do it:
 
 - Start an SSH connection using whatever client on your phone or PC (needs to be on the same network as the Xbox)
 - User: DevToolsUser
