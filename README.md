@@ -23,11 +23,12 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 - Installable Web Apps powered by WebView2, with favicons, multiple windows, resizing, minimize, maximize, and close controls.
 - Files: a file browser built around UWP permissions and folder pickers, with tabs and Files-based UI.
 - Calculator: actual Windows Calculator included as an internal app.
-- Notepad: open, edit, save, and save-as support for `.txt` files.
+- Notepad: open, edit, save, and save-as support for `.txt` files, with tab-based UI.
 - Settings: a built-in app with personalization, taskbar, device information, and a visual Windows Update page.
 - A custom Action Center with volume, network status, and system settings shortcuts.
 - Strawfox: a built-in Firefox port running in its own window, which the Shell keeps maximized and non-draggable, with Download, Upload and Add-on support.
-- Experimental PE loader for Win32 binaries
+- Native zip, 7z and RAR extraction from Files app context menu.
+- Experimental PE loader for Win32 binaries.
 
 ## Project structure
 
@@ -35,16 +36,22 @@ DesktopMode is a UWP shell inspired by the Windows 10X design language and adapt
 | --- | --- |
 | `factoryos-10x-shell` | Main UWP application and DesktopMode interface. |
 | `factoryos-10x-shell.Library` | Shared models, services, and view models. |
-| `Win32Bridge` | Auxiliary integration components, where applicable. |
+| `Win32Bridge` | Win32Bridge project files. |
+| `Calculator-main` | Windows Calculator project files |
+| `Icons` | Resource Windows 11 icons |
+
 
 ## Win32 Bridge
 
-<img width="1920" height="1080" alt="Screenshot_2026-09-27_18-21-56" src="https://github.com/user-attachments/assets/8211b974-8c58-4bfc-b5eb-1b995802ff79" />
+<img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/11fe1117-783e-4683-967e-36dc7455e2e7" />
+
 
 Desktop Mode includes an highly experimental bridge for loading Win32 PEs in .exe format. The .exe has no acess to the real Xbox or PC filesystem, registry or OS, it runs on a virtual drive inside the app's LocalStorage (drive_c). For now, it can render most of 7-Zip, can create a window, and a few more things. Most PEs simply won't load by now, compatibility is meant to be expanded with time.
 
+[Win32Bridge Documentation](Win32Bridge/BRIDGE.md)
+
 ## Enable Loopback
-In order to be able to use Xbox Device Portal directly from Strawfox, and use the Appx Installer feature, you must enable loopback every reboot. Here's how to do it:
+In order to be able to use Xbox Device Portal directly from Strawfox, and use the (planned) Appx Installer feature, you must enable loopback every reboot. Here's how to do it:
 
 - Start an SSH connection using whatever client on your phone or PC (needs to be on the same network as the Xbox)
 - User: DevToolsUser
@@ -71,14 +78,17 @@ If Visual Studio reports that the signing certificate is unavailable, create or 
 
 - Access to files outside the application's local storage depends on access granted by the user through UWP file and folder pickers.
 - External applications are launched through URIs when the package supports them. If a UWP app doesn't include an URI, it can't be launched through Desktop Mode on Xbox.
-- The Windows Update button in Settings is currently visual only; real system updates remain managed by the operating system.
-- It has not been tested with a controller.
+- Strawfox is not resizable and crashes on fullscreen.
+- I strongly recommend you to use it with a mouse and a keyboard
+- Some microstutters on Xbox that are being investigated.
 
 ## Credits and license
 
 This project builds on the original Windows 10X shell recreation by [Pdawg-bytes](https://github.com/Pdawg-bytes/factoryos-10x-shell), expanded into DesktopMode with Xbox- and desktop-focused features.
 
 Credits to Wine for concept and code used as reference.
+
+Special thanks to ReactOS devs for their code which was used as reference.
 
 Credits to https://github.com/Futur3Sn0w/Windows10x for inspiration and some Icons from there.
 
