@@ -5,6 +5,6 @@ In order to be able to use Xbox Device Portal directly from Strawfox, and use th
 - User: DevToolsUser
 - Password: the Visual Studio PIN showed on Dev Home
 
-Once connected to the shell, run: CheckNetIsolation.exe LoopbackExempt -a -n="Microsoft.MicrosoftEdge.CoreShell_8wekyb3d8bbwe"
+Once connected to the shell, run: `CheckNetIsolation.exe LoopbackExempt -a -n="Microsoft.MicrosoftEdge.CoreShell_8wekyb3d8bbwe"`
 
 You must do it every time the console boots.
