@@ -114,8 +114,8 @@ Previously observed results include:
 | Application | Experimental observations |
 |---|---|
 | Windows 7 Notepad | Successful graphical rendering reported in earlier tests. |
-| 7-Zip | Graphical rendering achieved in earlier tests; subsequent development introduced a regression. |
-| Notepad++ | Progressed beyond earlier crashes, creating a window and toolbar before terminating. |
+| 7-Zip | Graphical rendering achieved in earlier tests; Renders almost fully, with app functionality such as file extraction working |
+| Notepad++ | Progressed beyond earlier crashes, creating a window and toolbar. Scintilla fails to load and the editor remains a black retangle. |
 
 These observations demonstrate progress toward compatibility but do not establish complete application functionality.
 
