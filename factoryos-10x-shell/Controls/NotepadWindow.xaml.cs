@@ -45,9 +45,26 @@ namespace factoryos_10x_shell.Controls
         private double m_startLeft, m_startTop, m_startWidth, m_startHeight;
         private double m_restoreLeft, m_restoreTop, m_restoreWidth, m_restoreHeight;
 
+        private Canvas m_workspaceHost;
+        private void Workspace_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (!m_maximized || !(sender is Canvas host)) return;
+            Canvas.SetLeft(this, 0); Canvas.SetTop(this, 0);
+            Width = host.ActualWidth; Height = host.ActualHeight;
+        }
+
         public NotepadWindow()
         {
             InitializeComponent();
+            Loaded += (s, e) => {
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
+                m_workspaceHost = VisualTreeHelper.GetParent(this) as Canvas;
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged += Workspace_SizeChanged;
+            };
+            Unloaded += (s, e) => {
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
+                m_workspaceHost = null;
+            };
             AddDocumentTab(new DocumentState());
         }
 

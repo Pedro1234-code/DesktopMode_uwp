@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using System.Threading.Tasks;
 using Windows.Foundation;
 using Windows.Security.ExchangeActiveSyncProvisioning;
@@ -15,6 +16,8 @@ using Windows.UI.ViewManagement;
 using factoryos_10x_shell.Services.Helpers;
 using factoryos_10x_shell.Services.Win32;
 using Microsoft.Extensions.DependencyInjection;
+using factoryos_10x_shell.Library.Models.InternalData;
+using factoryos_10x_shell.Library.Services.WebApps;
 
 namespace factoryos_10x_shell.Controls
 {
@@ -24,13 +27,40 @@ namespace factoryos_10x_shell.Controls
         private WindowResizeCorner m_resizeCorner;
         private bool m_initializing = true;
         private bool m_updatingNavigation;
+        private bool m_changingAppIcon;
+        private readonly IWebAppService m_webApps;
         private Point m_startPoint;
         private double m_startLeft, m_startTop, m_startWidth, m_startHeight;
         private double m_restoreLeft, m_restoreTop, m_restoreWidth, m_restoreHeight;
 
+        private Canvas m_workspaceHost;
+        private void Workspace_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (!m_maximized || !(sender is Canvas host)) return;
+            Canvas.SetLeft(this, 0); Canvas.SetTop(this, 0);
+            Width = host.ActualWidth; Height = host.ActualHeight;
+        }
+
         public SettingsWindow()
         {
             InitializeComponent();
+            m_webApps = App.ServiceProvider.GetRequiredService<IWebAppService>();
+
+            HomeTiles.Loaded += (s, e) => UpdateHomeTileLayout();
+            HomeTiles.SizeChanged += (s, e) => UpdateHomeTileLayout();
+            Loaded += (s, e) => {
+                m_webApps.InstalledApps.CollectionChanged -= InstalledWebApps_CollectionChanged;
+                m_webApps.InstalledApps.CollectionChanged += InstalledWebApps_CollectionChanged;
+                RefreshWebApps();
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
+                m_workspaceHost = VisualTreeHelper.GetParent(this) as Canvas;
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged += Workspace_SizeChanged;
+            };
+            Unloaded += (s, e) => {
+                m_webApps.InstalledApps.CollectionChanged -= InstalledWebApps_CollectionChanged;
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
+                m_workspaceHost = null;
+            };
             BackgroundToggle.IsOn = AppState.Instance.IsBgChangeButtonVisible;
             Win32SupportToggle.IsOn = Win32WindowManagerService.Instance.IsAppSupportEnabled;
             AutomaticUpdateCheckToggle.IsOn = UpdateCheckService.IsAutomaticCheckEnabled;
@@ -38,8 +68,21 @@ namespace factoryos_10x_shell.Controls
             DisableLivePackageTrackingToggle.IsOn = !App.ServiceProvider
                 .GetRequiredService<AppHelper>().IsLivePackageTrackingEnabled;
             CurrentVersionText.Text = UpdateCheckService.CurrentVersion.ToString();
+            TaskbarAutoHideToggle.IsOn = AppState.Instance.TaskbarAutoHide;
+            TaskbarAlignmentCombo.SelectedIndex = AppState.Instance.TaskbarAlignLeft ? 1 : 0;
             m_initializing = false;
             PopulateDeviceInformation();
+        }
+
+        private void UpdateHomeTileLayout()
+        {
+            var panel = HomeTiles.ItemsPanelRoot as ItemsWrapGrid;
+            double availableWidth = HomeTiles.ActualWidth;
+            if (panel == null || availableWidth <= 0) return;
+
+            int columns = Math.Max(1, Math.Min(3, (int)(availableWidth / 280)));
+            panel.MaximumRowsOrColumns = columns;
+            panel.ItemWidth = availableWidth / columns;
         }
 
         public void Open()
@@ -68,9 +111,112 @@ namespace factoryos_10x_shell.Controls
 
         private void System_Click(object sender, RoutedEventArgs e) { OpenDetail("System", "About"); }
         private void Personalization_Click(object sender, RoutedEventArgs e) { OpenDetail("Personalization", "Background"); }
+        private async void Apps_Click(object sender, RoutedEventArgs e)
+        {
+            await m_webApps.InitializeAsync();
+            OpenDetail("Apps", "Apps");
+        }
+
+        private void WebAppsList_SelectionChanged(object sender, SelectionChangedEventArgs e)
+        {
+            foreach (var removed in e.RemovedItems) SetAppRowExpanded(removed, false);
+            foreach (var added in e.AddedItems) SetAppRowExpanded(added, true);
+            WebAppStatus.Text = string.Empty;
+        }
+
+        private void InstalledWebApps_CollectionChanged(object sender, System.Collections.Specialized.NotifyCollectionChangedEventArgs e) => RefreshWebApps();
+        private void WebAppSearch_TextChanged(object sender, TextChangedEventArgs e) => RefreshWebApps();
+        private void WebAppSort_SelectionChanged(object sender, SelectionChangedEventArgs e) => RefreshWebApps();
+
+        private void RefreshWebApps()
+        {
+            if (m_webApps == null || WebAppsList == null || WebAppCount == null) return;
+            var selected = WebAppsList.SelectedItem;
+            string query = WebAppSearch.Text.Trim();
+            var apps = m_webApps.InstalledApps.Where(app => string.IsNullOrEmpty(query)
+                || (app.Name ?? string.Empty).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0
+                || (app.StartUri ?? string.Empty).IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0);
+            var sorted = WebAppSort.SelectedIndex == 1
+                ? apps.OrderByDescending(app => app.Name, StringComparer.CurrentCultureIgnoreCase).ToList()
+                : apps.OrderBy(app => app.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
+            WebAppsList.ItemsSource = sorted;
+            if (selected is WebAppDefinition previous && sorted.Contains(previous)) WebAppsList.SelectedItem = previous;
+            WebAppCount.Text = sorted.Count == 1 ? "1 app found" : $"{sorted.Count} apps found";
+        }
+
+        private static FrameworkElement FindAppActions(DependencyObject root)
+        {
+            if (root is FrameworkElement element && element.Name == "AppRowActions") return element;
+            for (int i = 0; i < VisualTreeHelper.GetChildrenCount(root); i++)
+            {
+                var found = FindAppActions(VisualTreeHelper.GetChild(root, i));
+                if (found != null) return found;
+            }
+            return null;
+        }
+
+        private void SetAppRowExpanded(object item, bool expanded)
+        {
+            var container = WebAppsList.ContainerFromItem(item) as ListViewItem;
+            var actions = container == null ? null : FindAppActions(container);
+            if (actions != null) actions.Visibility = expanded ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void AppRowActions_Loaded(object sender, RoutedEventArgs e)
+        {
+            if (sender is FrameworkElement actions)
+                actions.Visibility = Equals(actions.DataContext, WebAppsList.SelectedItem) ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void UninstallWebApp_Click(object sender, RoutedEventArgs e)
+        {
+            if (!((sender as FrameworkElement)?.DataContext is WebAppDefinition app)) return;
+            var windows = App.ServiceProvider.GetRequiredService<IWindowManagerService>();
+            foreach (var window in windows.Windows.Where(window => window.App.Id == app.Id).ToList())
+                windows.Close(window);
+            m_webApps.Uninstall(app);
+        }
+
+        private async void ChangeWebAppIcon_Click(object sender, RoutedEventArgs e)
+        {
+            if (m_changingAppIcon || !((sender as FrameworkElement)?.DataContext is WebAppDefinition app)) return;
+            var button = (Button)sender;
+            m_changingAppIcon = true;
+            button.IsEnabled = false;
+            WebAppStatus.Text = string.Empty;
+            try
+            {
+                var picker = new FileOpenPicker { SuggestedStartLocation = PickerLocationId.PicturesLibrary };
+                foreach (string extension in new[] { ".ico", ".png", ".jpg", ".jpeg", ".bmp", ".gif", ".tif", ".tiff", ".webp" })
+                    picker.FileTypeFilter.Add(extension);
+                StorageFile file = await picker.PickSingleFileAsync();
+                if (file != null) await m_webApps.ChangeIconAsync(app, file);
+            }
+            catch
+            {
+                if (WebAppsList.SelectedItem == app)
+                    WebAppStatus.Text = "Couldn't use that file as an app icon.";
+            }
+            finally
+            {
+                m_changingAppIcon = false;
+                button.IsEnabled = true;
+            }
+        }
         private void UpdateSecurity_Click(object sender, RoutedEventArgs e) { OpenDetail("Update & Security", "Windows Update"); }
+        private void SettingsBack_Click(object sender, RoutedEventArgs e)
+        {
+            ShowHome();
+            DismissOnScreenKeyboard();
+        }
+        private void TaskbarAutoHide_Toggled(object sender, RoutedEventArgs e)
+        { if (!m_initializing) AppState.Instance.TaskbarAutoHide = TaskbarAutoHideToggle.IsOn; }
+        private void TaskbarAlignment_Changed(object sender, SelectionChangedEventArgs e)
+        { if (!m_initializing) AppState.Instance.TaskbarAlignLeft = TaskbarAlignmentCombo.SelectedIndex == 1; }
+
         private void ShowHome()
         {
+            SettingsBackButton.Visibility = Visibility.Collapsed;
             HomePage.Visibility = Visibility.Visible;
             DetailPage.Visibility = Visibility.Collapsed;
             TitleText.Text = "Settings";
@@ -78,6 +224,7 @@ namespace factoryos_10x_shell.Controls
         }
         private void OpenDetail(string section, string page)
         {
+            SettingsBackButton.Visibility = Visibility.Visible;
             HomePage.Visibility = Visibility.Collapsed;
             DetailPage.Visibility = Visibility.Visible;
             SectionTitle.Text = section;
@@ -86,7 +233,8 @@ namespace factoryos_10x_shell.Controls
             bool updateSecurity = section == "Update & Security";
             SystemNavigation.Visibility = system ? Visibility.Visible : Visibility.Collapsed;
             UpdateSecurityNavigation.Visibility = updateSecurity ? Visibility.Visible : Visibility.Collapsed;
-            PersonalizationNavigation.Visibility = !system && !updateSecurity ? Visibility.Visible : Visibility.Collapsed;
+            AppsNavigation.Visibility = section == "Apps" ? Visibility.Visible : Visibility.Collapsed;
+            PersonalizationNavigation.Visibility = section == "Personalization" ? Visibility.Visible : Visibility.Collapsed;
             SelectDetail(page);
             SelectNavigationItem(page);
             DismissOnScreenKeyboard();
@@ -124,6 +272,7 @@ namespace factoryos_10x_shell.Controls
         {
             ListView navigation = page == "Home"
                 ? HomeNavigation
+                : page == "Apps" ? AppsNavigation
                 : page == "About" || page == "Debug"
                     ? SystemNavigation
                     : page == "Windows Update" || page == "For developers"
@@ -156,6 +305,7 @@ namespace factoryos_10x_shell.Controls
             if (PersonalizationNavigation != activeNavigation) PersonalizationNavigation.SelectedItem = null;
             if (SystemNavigation != activeNavigation) SystemNavigation.SelectedItem = null;
             if (UpdateSecurityNavigation != activeNavigation) UpdateSecurityNavigation.SelectedItem = null;
+            if (AppsNavigation != activeNavigation) AppsNavigation.SelectedItem = null;
         }
         private void SelectDetail(string page)
         {
@@ -168,7 +318,8 @@ namespace factoryos_10x_shell.Controls
             DebugPanel.Visibility = page == "Debug" ? Visibility.Visible : Visibility.Collapsed;
             WindowsUpdatePanel.Visibility = page == "Windows Update" ? Visibility.Visible : Visibility.Collapsed;
             ForDevelopersPanel.Visibility = page == "For developers" ? Visibility.Visible : Visibility.Collapsed;
-            DetailTitle.Text = page;
+            AppsPanel.Visibility = page == "Apps" ? Visibility.Visible : Visibility.Collapsed;
+            DetailTitle.Text = page == "Apps" ? "Apps & features" : page;
         }
         private async void CheckForUpdates_Click(object sender, RoutedEventArgs e)
         {

@@ -207,6 +207,10 @@ class EngineView {
   // Escape to leave pointer lock.
   using Key2Fn = void (*)(int32_t down, int32_t keyCode, uint32_t modifiers,
                           int32_t repeat);
+  using MouseDeltaFn = void (*)(int32_t dx, int32_t dy);
+  MouseDeltaFn mouseDelta_ = nullptr;
+  void (*exitPointerLock_)() = nullptr;
+  bool consumeLockEscape_ = false;
   using ResizeFn = void (*)(int32_t width, int32_t height);
   using TouchFn = void (*)(int32_t pointerId, int32_t state, int32_t x, int32_t y);
   using ScreenFn = void (*)(int32_t width, int32_t height);

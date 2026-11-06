@@ -232,6 +232,14 @@ namespace factoryos_10x_shell.Services.Helpers
             }
         }
 
+        internal void RecordStartMenuProjection(IEnumerable<StartIconModel> filtered, int gridCount, bool searching)
+        {
+            var visible = new HashSet<string>(filtered.Select(app => app.AppId), StringComparer.OrdinalIgnoreCase);
+            LogStartMenuRefresh($"Start projection: source={StartIcons.Count}; filtered={visible.Count}; grid={gridCount}; searchActive={searching}.");
+            foreach (var app in StartIcons)
+                LogStartMenuRefresh($"Start projection item: aumid={app.AppId}; included={visible.Contains(app.AppId)}.");
+        }
+
         private void LogStartMenuRefresh(string message)
         {
             string line = $"{DateTimeOffset.Now:O} [thread={System.Environment.CurrentManagedThreadId}; ui={m_dispatcherQueue?.HasThreadAccess == true}] {message}";
@@ -427,6 +435,17 @@ namespace factoryos_10x_shell.Services.Helpers
                 });
             }
 
+            const string defaultPinsKey = "CoreShellDefaults_TaskbarPins_v1";
+            if (!(localSettings.Values[defaultPinsKey] is bool pinsSeeded && pinsSeeded))
+            {
+                if (!loaded.Any(app => string.Equals(app.AppId, "CoreShell.Files", StringComparison.OrdinalIgnoreCase)))
+                    loaded.Add(new StartIconModel { AppId = "CoreShell.Files", IconName = "Files" });
+                if (!loaded.Any(app => string.Equals(app.AppId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase)))
+                    loaded.Add(new StartIconModel { AppId = "CoreShell.Firefox", IconName = "Strawfox" });
+                SaveTaskbarPinnedApps(loaded);
+                localSettings.Values[defaultPinsKey] = true;
+            }
+
             var dispatcher = Windows.ApplicationModel.Core.CoreApplication.MainView.CoreWindow.Dispatcher;
 
             await dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
@@ -467,20 +486,62 @@ namespace factoryos_10x_shell.Services.Helpers
             {
                 var result = new PackageDiscoveryResult();
                 var packageManager = new PackageManager();
-                IEnumerable<Package> packages = packageManager.FindPackagesForUser("");
+                var packages = new Dictionary<string, Package>(StringComparer.OrdinalIgnoreCase);
+                try
+                {
+                    foreach (var package in packageManager.FindPackagesForUser(string.Empty))
+                        packages[package.Id.FullName] = package;
+                    LogStartMenuRefresh($"Current-user package snapshot: count={packages.Count}.");
+                }
+                catch (Exception error)
+                {
+                    LogStartMenuRefresh($"Current-user enumeration failed: HRESULT=0x{error.HResult:X8}.");
+                    if (!IsXboxDevice()) throw;
+                }
+                if (IsXboxDevice())
+                {
+                    try
+                    {
+                        int additional = 0;
+                        foreach (var package in packageManager.FindPackagesWithPackageTypes(PackageTypes.Main))
+                        {
+                            if (packages.ContainsKey(package.Id.FullName)) continue;
+                            packages.Add(package.Id.FullName, package);
+                            ++additional;
+                            LogStartMenuRefresh($"Device-wide additional package: {package.Id.FullName}.");
+                        }
+                        LogStartMenuRefresh($"Device-wide package query completed: additional={additional}; combined={packages.Count}.");
+                    }
+                    catch (Exception error)
+                    {
+                        LogStartMenuRefresh($"Device-wide package query unavailable: HRESULT=0x{error.HResult:X8}; retaining current-user results.");
+                        if (packages.Count == 0) throw;
+                    }
+                }
 
-                foreach (Package package in packages)
+                foreach (Package package in packages.Values)
                 {
                     result.PackageCount++;
+                    LogStartMenuRefresh($"Package enumerated: {GetPackageLogName(package)}; framework={package.IsFramework}; resource={package.IsResourcePackage}; stub={package.IsStub}.");
                     if (package.IsFramework || package.IsResourcePackage || package.IsStub)
                         continue;
 
                     Stopwatch packageClock = Stopwatch.StartNew();
                     try
                     {
-                        IReadOnlyList<AppListEntry> entries = package.GetAppListEntries();
+                        IReadOnlyList<AppListEntry> entries = await package.GetAppListEntriesAsync();
                         if (entries == null || entries.Count == 0)
+                        {
+                            LogStartMenuRefresh($"No app-list entries: {GetPackageLogName(package)}; checking manifest.");
+                            var fallback = await DiscoverManifestAppsAsync(package);
+                            if (fallback.Apps.Count > 0)
+                            {
+                                result.Packages.Add(fallback);
+                                result.CandidatePackageCount++;
+                                result.AppEntryCount += fallback.Apps.Count;
+                            }
                             continue;
+                        }
 
                         var discoveredPackage = new DiscoveredPackage
                         {
@@ -489,10 +550,14 @@ namespace factoryos_10x_shell.Services.Helpers
                             FullName = package.Id.FullName
                         };
                         result.CandidatePackageCount++;
+                        result.Packages.Add(discoveredPackage);
+                        LogStartMenuRefresh($"Package entries: {GetPackageLogName(package)}; count={entries.Count}.");
 
                         foreach (AppListEntry entry in entries)
                         {
                             result.AppEntryCount++;
+                            try
+                            {
                             AppDisplayInfo displayInfo = entry.DisplayInfo;
                             discoveredPackage.Apps.Add(new DiscoveredApp
                             {
@@ -503,8 +568,18 @@ namespace factoryos_10x_shell.Services.Helpers
                                 AppUri = await GetPackageProtocolUriAsync(
                                     package, entry.AppUserModelId).ConfigureAwait(false)
                             });
+                            LogStartMenuRefresh($"App discovered: package={package.Id.Name}; aumid={entry.AppUserModelId}; name={displayInfo.DisplayName}.");
+                            }
+                            catch (Exception entryError)
+                            {
+                                LogStartMenuRefresh($"App entry metadata failed: {GetPackageLogName(package)}; HRESULT=0x{entryError.HResult:X8}.");
+                                discoveredPackage.Apps.Add(new DiscoveredApp {
+                                    Entry = entry, AppUserModelId = entry.AppUserModelId,
+                                    DisplayName = package.Id.Name,
+                                    AppUri = await GetPackageProtocolUriAsync(package, entry.AppUserModelId)
+                                });
+                            }
                         }
-                        result.Packages.Add(discoveredPackage);
                     }
                     catch (Exception ex)
                     {
@@ -512,6 +587,16 @@ namespace factoryos_10x_shell.Services.Helpers
                         string packageName = GetPackageLogName(package);
                         Debug.WriteLine($"Error enumerating package {packageName}: {ex.Message}");
                         LogStartMenuRefresh($"Package failed: {packageName}; elapsed={packageClock.ElapsedMilliseconds} ms; error={ex.GetType().Name}: {ex.Message}");
+                        if (!result.Packages.Any(item => item.FullName == package.Id.FullName))
+                        {
+                            var fallback = await DiscoverManifestAppsAsync(package);
+                            if (fallback.Apps.Count > 0)
+                            {
+                                result.Packages.Add(fallback);
+                                result.CandidatePackageCount++;
+                                result.AppEntryCount += fallback.Apps.Count;
+                            }
+                        }
                     }
                     finally
                     {
@@ -523,6 +608,40 @@ namespace factoryos_10x_shell.Services.Helpers
 
                 return result;
             });
+        }
+
+        private async Task<DiscoveredPackage> DiscoverManifestAppsAsync(Package package)
+        {
+            var result = new DiscoveredPackage { Package = package, FamilyName = package.Id.FamilyName, FullName = package.Id.FullName };
+            try
+            {
+                var file = await package.InstalledLocation.GetFileAsync("AppxManifest.xml");
+                var manifest = new XmlDocument();
+                manifest.LoadXml(await FileIO.ReadTextAsync(file));
+                var applications = manifest.SelectNodes("/*[local-name()='Package']/*[local-name()='Applications']/*[local-name()='Application']");
+                foreach (IXmlNode application in applications)
+                {
+                    string id = application.Attributes?.GetNamedItem("Id")?.NodeValue as string;
+                    if (string.IsNullOrWhiteSpace(id)) continue;
+                    var visual = application.SelectSingleNode("*[local-name()='VisualElements']");
+                    string visibility = visual?.Attributes?.GetNamedItem("AppListEntry")?.NodeValue as string;
+                    if (string.Equals(visibility, "none", StringComparison.OrdinalIgnoreCase)) continue;
+                    string name = visual?.Attributes?.GetNamedItem("DisplayName")?.NodeValue as string;
+                    if (string.IsNullOrWhiteSpace(name) || name.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        try { name = package.DisplayName; } catch { name = package.Id.Name; }
+                    }
+                    string aumid = package.Id.FamilyName + "!" + id;
+                    result.Apps.Add(new DiscoveredApp { AppUserModelId = aumid, DisplayName = name,
+                        AppUri = await GetPackageProtocolUriAsync(package, aumid) });
+                }
+                LogStartMenuRefresh($"Manifest fallback: {GetPackageLogName(package)}; apps={result.Apps.Count}.");
+            }
+            catch (Exception error)
+            {
+                LogStartMenuRefresh($"Manifest fallback failed: {GetPackageLogName(package)}; HRESULT=0x{error.HResult:X8}.");
+            }
+            return result;
         }
 
         private async Task<byte[]> ReadLogoBytesAsync(AppDisplayInfo displayInfo)

@@ -16,6 +16,7 @@ namespace factoryos_10x_shell.Library.Models.InternalData
         private bool m_isActive;
 
         public WebAppDefinition App { get; set; }
+        public System.Func<bool> RequestNativeClose { get; set; }
         public double RestoreLeft { get; set; }
         public double RestoreTop { get; set; }
         public double RestoreWidth { get; set; }

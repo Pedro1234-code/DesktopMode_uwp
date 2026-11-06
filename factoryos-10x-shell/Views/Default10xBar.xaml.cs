@@ -51,9 +51,15 @@ namespace factoryos_10x_shell.Views
         private readonly BitmapImage _firefoxIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
 
 
+        private void ApplyTaskbarAlignment()
+        { TaskbarButtons.HorizontalAlignment = AppState.Instance.TaskbarAlignLeft ? HorizontalAlignment.Left : HorizontalAlignment.Center; }
+
         public Default10xBar()
         {
             this.InitializeComponent();
+            ApplyTaskbarAlignment();
+            Loaded += (s, e) => { ApplyTaskbarAlignment(); AppState.Instance.TaskbarPreferencesChanged += ApplyTaskbarAlignment; };
+            Unloaded += (s, e) => AppState.Instance.TaskbarPreferencesChanged -= ApplyTaskbarAlignment;
 
             DataContext = App.ServiceProvider.GetRequiredService<Default10xBarViewModel>();
             _appHelper = App.ServiceProvider.GetRequiredService<AppHelper>();
@@ -61,6 +67,7 @@ namespace factoryos_10x_shell.Views
             _webAppService = App.ServiceProvider.GetRequiredService<IWebAppService>();
             _nativeWindowManager = Win32WindowManagerService.Instance;
             _shellWindowCoordinator = App.ServiceProvider.GetRequiredService<ShellWindowCoordinator>();
+            _shellWindowCoordinator.Windows.CollectionChanged += (s, e) => RefreshFilesTaskbar();
 
             Loaded += Default10xBar_Loaded; // Chamada após a view estar carregada
         }
@@ -496,6 +503,20 @@ namespace factoryos_10x_shell.Views
         private void RefreshNotepadTaskbar()
         {
             OpenFilesPanel.Children.Clear();
+            foreach (var item in _shellWindowCoordinator.Windows.Where(item => item.Kind == ShellWindowKind.AppInstaller))
+            {
+                var installer = item.Identity as factoryos_10x_shell.Controls.AppInstallerWindow;
+                if (installer == null) continue;
+                var button = new Button {
+                    Width = 48, Height = 48, Margin = new Thickness(2),
+                    Style = (Style)Application.Current.Resources["TaskbarButtonStyle"],
+                    Content = new Image { Width = 28, Height = 28, Stretch = Stretch.Uniform,
+                        Source = new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png")) }
+                };
+                ToolTipService.SetToolTip(button, "App Installer — " + installer.PackageTitle);
+                button.Click += (s, e) => installer.ActivateFromTaskbar();
+                OpenFilesPanel.Children.Add(button);
+            }
             foreach (FileOperationModel operation in FileOperationService.Instance.Windows)
             {
                 var operationButton = new Button

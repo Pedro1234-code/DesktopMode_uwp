@@ -16,6 +16,8 @@ using System.Reflection;
 using System.Runtime.InteropServices.WindowsRuntime;
 using System.ServiceModel.Channels;
 using System.Threading.Tasks;
+using System.Text.RegularExpressions;
+using System.Threading;
 using Windows.ApplicationModel;
 using Windows.ApplicationModel.AppService;
 using Windows.Foundation.Collections;
@@ -47,6 +49,7 @@ namespace factoryos_10x_shell
     sealed partial class App : Application
     {
         public static MediaPlayer MediaPlayer;
+        private bool m_protocolInstallOpen;
 
 
         [Obsolete]
@@ -138,15 +141,21 @@ namespace factoryos_10x_shell
 
         private async Task InitializeStartupServicesAsync()
         {
+            _ = InitializeStartAppsAsync();
             try
             {
                 // Built-in web apps are shell state and do not depend on the
                 // optional Win32 drive. Initialize them first so a runtime
                 // preparation failure cannot hide Xbox Device Portal.
                 await ServiceProvider.GetRequiredService<IWebAppService>().InitializeAsync();
-                await new RuntimeHost().EnsureDriveRootAsync();
-                IAppHelper appHelper = ServiceProvider.GetRequiredService<IAppHelper>();
-                await appHelper.LoadAppsAsync();
+                try
+                {
+                    await new RuntimeHost().EnsureDriveRootAsync();
+                }
+                catch (Exception runtimeError)
+                {
+                    Debug.WriteLine($"Win32 drive preparation failed: {runtimeError}");
+                }
             }
             catch (Exception exception)
             {
@@ -154,6 +163,18 @@ namespace factoryos_10x_shell
                 // that cannot be inspected must not delay or terminate Shell
                 // startup.
                 Debug.WriteLine($"Deferred startup initialization failed: {exception}");
+            }
+        }
+
+        private async Task InitializeStartAppsAsync()
+        {
+            try
+            {
+                await ServiceProvider.GetRequiredService<IAppHelper>().LoadAppsAsync();
+            }
+            catch (Exception error)
+            {
+                Debug.WriteLine($"Start Menu package discovery failed: {error}");
             }
         }
 
@@ -230,6 +251,15 @@ namespace factoryos_10x_shell
             if (args.Kind == ActivationKind.Protocol)
             {
                 var protocolArgs = args as ProtocolActivatedEventArgs;
+                if (string.Equals(protocolArgs?.Uri?.Scheme, "cros-apps", StringComparison.OrdinalIgnoreCase))
+                {
+                    try { await HandleWebAppProtocolAsync(protocolArgs.Uri); }
+                    catch (Exception exception)
+                    {
+                        Debug.WriteLine($"Web App protocol activation failed: {exception.GetType().Name} (0x{exception.HResult:X8})");
+                    }
+                    return;
+                }
 
                 // Check if the app is already running
                 if (Window.Current.Content == null)
@@ -263,6 +293,151 @@ namespace factoryos_10x_shell
             }
         }
 
+
+        private async Task HandleWebAppProtocolAsync(Uri request)
+        {
+            if (m_protocolInstallOpen ||
+                !string.Equals(request.Host, "install-app", StringComparison.OrdinalIgnoreCase) ||
+                (request.AbsolutePath != "" && request.AbsolutePath != "/") ||
+                string.IsNullOrEmpty(request.Query)) return;
+
+            var packageIds = new WwwFormUrlDecoder(request.Query)
+                .Where(entry => entry.Name == "package_id").Select(entry => entry.Value).ToList();
+            if (packageIds.Count != 1 || !packageIds[0].StartsWith("web:", StringComparison.Ordinal) ||
+                !Uri.TryCreate(packageIds[0].Substring(4), UriKind.Absolute, out Uri site) ||
+                (site.Scheme != Uri.UriSchemeHttps && site.Scheme != Uri.UriSchemeHttp) ||
+                string.IsNullOrEmpty(site.Host) || !string.IsNullOrEmpty(site.UserInfo)) return;
+
+            m_protocolInstallOpen = true;
+            try
+            {
+                if (!HasServiceProvider)
+                {
+                    ConfigureServices();
+                    PreloadServices();
+                }
+                var frame = Window.Current.Content as Frame;
+                if (frame == null)
+                {
+                    frame = new Frame();
+                    frame.NavigationFailed += OnNavigationFailed;
+                    Window.Current.Content = frame;
+                }
+                if (frame.Content == null)
+                {
+                    frame.Navigate(typeof(MainPage));
+                    _ = InitializeStartupServicesAsync();
+                }
+                Window.Current.Activate();
+
+                string name = site.IdnHost;
+                if (name.StartsWith("www.", StringComparison.OrdinalIgnoreCase))
+                    name = name.Substring(4);
+                var metadata = await LoadWebAppMetadataAsync(site, name);
+                name = metadata.Name;
+                var icon = new Grid { Width = 48, Height = 48 };
+                if (metadata.Icon != null)
+                    icon.Children.Add(new Image { Source = metadata.Icon, Stretch = Stretch.Uniform });
+                else
+                    icon.Children.Add(new FontIcon { Glyph = "\uE774" });
+
+                var panel = new StackPanel { Spacing = 8 };
+                panel.Children.Add(icon);
+                panel.Children.Add(new TextBlock { Text = name, FontSize = 20, TextWrapping = TextWrapping.Wrap });
+                panel.Children.Add(new TextBlock { Text = site.GetLeftPart(UriPartial.Authority), TextWrapping = TextWrapping.Wrap });
+                var dialog = new ContentDialog
+                {
+                    Title = "Install Web App",
+                    Content = panel,
+                    PrimaryButtonText = "Install app",
+                    CloseButtonText = "Cancel"
+                };
+
+                MainPage.SetPopupCursorVisibility(true);
+                try
+                {
+                    if (await dialog.ShowAsync() == ContentDialogResult.Primary)
+                    {
+                        var app = await ServiceProvider.GetRequiredService<IWebAppService>()
+                            .InstallAsync(name, site.AbsoluteUri, useStrawfox: true, useStrawfoxWindow: true,
+                                favicon: metadata.IconBytes);
+                        ServiceProvider.GetRequiredService<IWindowManagerService>().Open(app);
+                    }
+                }
+                finally { MainPage.SetPopupCursorVisibility(false); }
+            }
+            finally { m_protocolInstallOpen = false; }
+        }
+
+        private static async Task<(string Name, BitmapImage Icon, byte[] IconBytes)> LoadWebAppMetadataAsync(Uri site, string name)
+        {
+            var candidates = new List<Uri>();
+            using (var client = new System.Net.Http.HttpClient { Timeout = TimeSpan.FromSeconds(4) })
+            {
+                try
+                {
+                    using (var response = await client.GetAsync(site, System.Net.Http.HttpCompletionOption.ResponseHeadersRead))
+                    using (var stream = await response.EnsureSuccessStatusCode().Content.ReadAsStreamAsync())
+                    using (var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4)))
+                    {
+                        var buffer = new byte[65536];
+                        int length = 0;
+                        while (length < buffer.Length)
+                        {
+                            int count = await stream.ReadAsync(buffer, length, buffer.Length - length, timeout.Token);
+                            if (count == 0) break;
+                            length += count;
+                        }
+                        string html = System.Text.Encoding.UTF8.GetString(buffer, 0, length);
+                        var title = Regex.Match(html, @"<title\b[^>]*>(.*?)</title\s*>", RegexOptions.IgnoreCase | RegexOptions.Singleline);
+                        string decodedTitle = Regex.Replace(System.Net.WebUtility.HtmlDecode(title.Groups[1].Value), @"\s+", " ").Trim();
+                        if (decodedTitle.Length > 0)
+                            name = decodedTitle.Substring(0, Math.Min(120, decodedTitle.Length));
+
+                        foreach (Match link in Regex.Matches(html, @"<link\b[^>]*>", RegexOptions.IgnoreCase))
+                        {
+                            string rel = ReadHtmlAttribute(link.Value, "rel");
+                            if (!Regex.IsMatch(rel, @"(^|\s)icon(\s|$)|^apple-touch-icon$", RegexOptions.IgnoreCase)) continue;
+                            if (Uri.TryCreate(response.RequestMessage.RequestUri, ReadHtmlAttribute(link.Value, "href"), out Uri iconUri) &&
+                                (iconUri.Scheme == Uri.UriSchemeHttps || iconUri.Scheme == Uri.UriSchemeHttp))
+                                candidates.Add(iconUri);
+                        }
+                    }
+                }
+                catch (Exception exception) when (exception is System.Net.Http.HttpRequestException ||
+                    exception is OperationCanceledException || exception is IOException) { }
+
+                candidates = candidates.Distinct().Take(3).ToList();
+                candidates.Add(new Uri(site, "/favicon.ico"));
+                candidates.Add(new Uri("https://www.google.com/s2/favicons?sz=64&domain=" + Uri.EscapeDataString(site.IdnHost)));
+                foreach (Uri uri in candidates.Distinct())
+                {
+                    try
+                    {
+                        byte[] bytes = await client.GetByteArrayAsync(uri);
+                        using (var stream = new MemoryStream(bytes))
+                        {
+                            var bitmap = new BitmapImage { DecodePixelWidth = 48 };
+                            await bitmap.SetSourceAsync(stream.AsRandomAccessStream());
+                            return (name, bitmap, bytes);
+                        }
+                    }
+                    catch (Exception exception)
+                    {
+                        Debug.WriteLine($"Web App icon could not be loaded (0x{exception.HResult:X8}).");
+                    }
+                }
+            }
+            return (name, null, null);
+        }
+
+        private static string ReadHtmlAttribute(string tag, string attribute)
+        {
+            var match = Regex.Match(tag, @"\s" + attribute + @"\s*=\s*(?:""([^""]*)""|'([^']*)'|([^\s>]+))",
+                RegexOptions.IgnoreCase);
+            return System.Net.WebUtility.HtmlDecode(match.Groups.Cast<Group>().Skip(1)
+                .FirstOrDefault(group => group.Success)?.Value ?? string.Empty);
+        }
 
         void OnNavigationFailed(object sender, NavigationFailedEventArgs e)
         {

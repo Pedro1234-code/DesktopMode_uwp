@@ -291,8 +291,55 @@ namespace factoryos_10x_shell.Controls
             try { s_current?.Resume(); } catch { }
         }
 
+        private readonly System.Threading.SemaphoreSlim m_sessionCreationLock = new System.Threading.SemaphoreSlim(1, 1);
+        internal async Task<GeckoWindow> CreateAppWindowAsync(string url)
+        {
+            await m_sessionCreationLock.WaitAsync();
+            bool warming = !AppState.Instance.IsFirefoxOpen;
+            double opacity = Opacity;
+            bool hitTest = IsHitTestVisible;
+            try
+            {
+                if (warming) { Opacity = 0; IsHitTestVisible = false; Visibility = Visibility.Visible; }
+                HookHostCanvas();
+                UpdateLayout();
+                EnsureHost();
+                var deadline = DateTimeOffset.UtcNow.AddSeconds(30);
+                while (DateTimeOffset.UtcNow < deadline)
+                {
+                    if (m_hostFailed) throw new InvalidOperationException("The shared Strawfox runtime failed to start.");
+                    if (m_host?.IsStarted == true)
+                    {
+                        try { return m_host.CreateBrowserWindow(url, true); }
+                        catch (Exception error) when (error.HResult == unchecked((int)0x8000000A)) { }
+                    }
+                    else if (!m_hostStarting) EnsureHost();
+                    await Task.Delay(100);
+                }
+                throw new TimeoutException("Timed out starting the shared Strawfox runtime.");
+            }
+            finally
+            {
+                try
+                {
+                    if (warming && !AppState.Instance.IsFirefoxOpen)
+                    {
+                        m_host?.SetActive(false);
+                        Visibility = Visibility.Collapsed;
+                        m_pointerInsideWindow = false;
+                        UpdateNativeCursorRequest();
+                    }
+                    Opacity = opacity;
+                    IsHitTestVisible = hitTest;
+                }
+                finally { m_sessionCreationLock.Release(); }
+            }
+        }
+
         public void Open()
         {
+            Opacity = 1;
+            IsHitTestVisible = true;
             Visibility = Visibility.Visible;
             HookHostCanvas();
             ApplyInitialWindowState();
@@ -452,14 +499,16 @@ namespace factoryos_10x_shell.Controls
 
         private void UpdateHostInput()
         {
-            bool active = m_isWindowActive && !m_inputSuppressed && Visibility == Visibility.Visible;
+            bool active = AppState.Instance.IsFirefoxOpen && !AppState.Instance.IsFirefoxMinimized &&
+                m_isWindowActive && !m_inputSuppressed && IsHitTestVisible && Visibility == Visibility.Visible;
             m_host?.SetActive(active);
             UpdateNativeCursorRequest();
         }
 
         private void UpdateNativeCursorRequest()
         {
-            bool requested = m_pointerInsideWindow && Visibility == Visibility.Visible;
+            bool requested = AppState.Instance.IsFirefoxOpen && !AppState.Instance.IsFirefoxMinimized &&
+                m_pointerInsideWindow && IsHitTestVisible && Visibility == Visibility.Visible;
             if (requested == m_nativeCursorRequested) return;
 
             m_nativeCursorRequested = requested;

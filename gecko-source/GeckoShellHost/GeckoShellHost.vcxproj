@@ -78,6 +78,7 @@
   <ItemGroup>
     <ClInclude Include="pch.h" />
     <ClInclude Include="GeckoHost.h" />
+    <ClInclude Include="GeckoWindow.h" />
     <ClInclude Include="DesktopMode.Gecko.GeckoHost.h" />
     <ClInclude Include="client\DownloadBroker.h" />
     <ClInclude Include="client\DrmBridge.h" />
@@ -93,6 +94,7 @@
     </ClCompile>
     <ClCompile Include="dllmain.cpp" />
     <ClCompile Include="GeckoHost.cpp" />
+    <ClCompile Include="GeckoWindow.cpp" />
     <ClCompile Include="$(GeneratedFilesDir)\module.g.cpp" />
     <ClCompile Include="client\DownloadBroker.cpp" />
     <ClCompile Include="client\DrmBridge.cpp" />

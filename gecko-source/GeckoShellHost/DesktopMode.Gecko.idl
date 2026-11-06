@@ -2,6 +2,27 @@ import "inspectable.idl";
 
 namespace DesktopMode.Gecko
 {
+    runtimeclass GeckoWindow
+    {
+        Object Content{ get; };
+        UInt64 Id{ get; };
+        UInt32 State{ get; };
+        UInt32 Error{ get; };
+        UInt32 TextInputState{ get; };
+        Boolean UpdateFrame();
+        void SetViewport(Double width, Double height);
+        void SetActive(Boolean active);
+        Boolean OpenUrl(String url);
+        void SendMouse(Int32 kind, Int32 button, Double x, Double y);
+        void SendWheel(Double x, Double y, Double dx, Double dy);
+        void SendKey(Boolean down, Int32 key, UInt32 modifiers, Boolean repeat);
+        void SendText(String text);
+        Int32 TakeWindowCommand();
+        Boolean ContextAction(String action);
+        void RequestClose();
+        void Close();
+    }
+
     runtimeclass GeckoHost
     {
         GeckoHost();
@@ -22,6 +43,7 @@ namespace DesktopMode.Gecko
         String TakeRevealPath();
         String TakeWallpaperPath();
         void OpenUrl(String url);
+        GeckoWindow CreateBrowserWindow(String url, Boolean appMode);
         Boolean DragFiles(Int32 state, Double x, Double y, String paths);
         void Suspend();
         void Resume();

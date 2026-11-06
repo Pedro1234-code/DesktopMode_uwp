@@ -27,7 +27,7 @@
                     <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="10" Text="&#xE8BB;" />
                 </Button>
             </Grid>
-            <muxc:WebView2 x:Name="Browser" Grid.Row="1" />
+            <ContentControl x:Name="BrowserContainer" Grid.Row="1" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Stretch" />
             <Border x:Name="BrowserError" Grid.Row="1" Background="#FF202020" Visibility="Collapsed">
                 <StackPanel Margin="24" Spacing="12" HorizontalAlignment="Center" VerticalAlignment="Center" MaxWidth="420">
                     <TextBlock x:Name="BrowserErrorText" TextWrapping="Wrap" Foreground="White" />

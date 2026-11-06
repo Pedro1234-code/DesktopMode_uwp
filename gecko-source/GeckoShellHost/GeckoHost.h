@@ -28,6 +28,7 @@ namespace winrt::DesktopMode::Gecko::implementation
         winrt::hstring TakeRevealPath();
         winrt::hstring TakeWallpaperPath();
         void OpenUrl(hstring const& url);
+        winrt::DesktopMode::Gecko::GeckoWindow CreateBrowserWindow(hstring const& url, bool appMode);
         bool DragFiles(int32_t state, double x, double y, hstring const& paths);
         void Suspend();
         void Resume();

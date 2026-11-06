@@ -19,6 +19,7 @@
     </Page.Resources>
 
     <Grid
+        x:Name="StartSurface"
         MaxHeight="685"
         Background="{ThemeResource TaskbarAcrylicBrush}"
         CornerRadius="4">
@@ -55,22 +56,17 @@
                         Opacity="0.8"
                         Text="&#xE721;" />
                     <TextBox
+                        x:Name="AppSearchBox"
+                        GotFocus="AppSearchBox_GotFocus"
+                        PointerPressed="AppSearchBox_PointerPressed"
                         Grid.RowSpan="2"
                         Grid.Column="1"
                         Margin="10,8,10,0"
                         VerticalAlignment="Top"
                         PlaceholderText="Search the web or your devices"
+                        TextChanged="AppSearchBox_TextChanged"
+                        KeyDown="AppSearchBox_KeyDown"
                         Style="{ThemeResource TextBoxStyleBlack}" />
-                    <Button
-                        x:Name="TextBoxSearchButton"
-                        Grid.RowSpan="2"
-                        Grid.ColumnSpan="2"
-                        Width="620"
-                        Height="28"
-                        Margin="10,10,0,0"
-                        VerticalAlignment="Top"
-                        Command="{x:Bind ViewModel.TextBoxSearchClickedCommand, Mode=OneWay}"
-                        Opacity="0" />
                 </Grid>
             </Border>
         </Grid>
@@ -115,7 +111,7 @@
                         Padding="0"
                         HorizontalAlignment="Center"
                         ItemContainerStyle="{StaticResource AppsListGridItemStyle}"
-                        ItemsSource="{x:Bind ViewModel.StartIcons}"
+                        ItemsSource="{x:Bind FilteredApps}"
                         ReorderMode="Enabled"
                         ScrollViewer.HorizontalScrollMode="Disabled"
                         ScrollViewer.VerticalScrollBarVisibility="Disabled"
@@ -136,6 +132,7 @@
                                         </Button.ContextFlyout>
                                     </Button>
                                     <StackPanel
+                                        IsHitTestVisible="False"
                                         Width="90"
                                         Height="90"
                                         Padding="0"
@@ -158,10 +155,11 @@
                             </DataTemplate>
                         </GridView.ItemTemplate>
                     </GridView>
-                    <Grid MaxWidth="640" Margin="40,0,40,0" HorizontalAlignment="Stretch">
+                    <TextBlock x:Name="NoSearchResults" Visibility="Collapsed" Margin="40,24,40,24" HorizontalAlignment="Center" Text="No apps found." Opacity="0.7" />
+                    <Grid x:Name="WebAppsSection" MaxWidth="640" Margin="40,0,40,0" HorizontalAlignment="Stretch">
                         <StackPanel>
                             <TextBlock Margin="0,12,0,0" FontWeight="SemiBold" Text="Web apps" />
-                            <GridView Margin="0,8,0,12" HorizontalAlignment="Left" ItemsSource="{x:Bind ViewModel.WebApps}">
+                            <GridView Margin="0,8,0,12" HorizontalAlignment="Left" ItemsSource="{x:Bind FilteredWebApps}">
                                 <GridView.ItemTemplate>
                                     <DataTemplate>
                                         <Button Width="90" Height="90" Click="WebAppButton_Click" Style="{StaticResource AppIconBackgroundStyle}">

@@ -54,6 +54,11 @@
             <uap:DisplayName>CoreShell</uap:DisplayName>
           </uap:Protocol>
         </uap:Extension>
+        <uap:Extension Category="windows.protocol">
+          <uap:Protocol Name="cros-apps">
+            <uap:DisplayName>Desktop Mode Web App Installer</uap:DisplayName>
+          </uap:Protocol>
+        </uap:Extension>
         <uap:Extension Category="windows.fileTypeAssociation">
           <uap:FileTypeAssociation Name="desktoppdf">
             <uap:Logo>Assets\Square44x44Logo.png</uap:Logo>

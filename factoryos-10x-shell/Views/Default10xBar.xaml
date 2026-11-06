@@ -106,7 +106,7 @@
         VerticalAlignment="Bottom"
         Background="{ThemeResource TaskbarAcrylicBrush}">
 
-        <StackPanel HorizontalAlignment="Center" Orientation="Horizontal">
+        <StackPanel x:Name="TaskbarButtons" HorizontalAlignment="Center" Orientation="Horizontal">
             <Button
                 x:Name="StartButton"
                 Width="50"

@@ -49,6 +49,7 @@ namespace factoryos_10x_shell.Services.WebApps
                 Top = 56 + (Windows.Count * 28)
             };
             window.PropertyChanged += Window_PropertyChanged;
+            WebAppDiagnostics.Write(window, "created", $"bounds={window.Left},{window.Top},{window.Width},{window.Height}");
             Windows.Add(window);
             Activate(window);
         }
@@ -82,7 +83,7 @@ namespace factoryos_10x_shell.Services.WebApps
 
         private bool OpenInStrawfox(WebAppDefinition app)
         {
-            if (app?.UseStrawfox != true) return false;
+            if (app?.UseStrawfox != true || app.UseStrawfoxWindow) return false;
             CloseTaskView();
             factoryos_10x_shell.Services.Helpers.AppState.Instance.RequestFirefoxUrl(app.StartUri);
             return true;
@@ -123,6 +124,7 @@ namespace factoryos_10x_shell.Services.WebApps
 
         public void Minimize(WebAppWindowModel window)
         {
+            WebAppDiagnostics.Write(window, "minimize");
             if (window == null || !Windows.Contains(window)) return;
             m_changingWindowState = true;
             window.IsActive = false;
@@ -140,9 +142,12 @@ namespace factoryos_10x_shell.Services.WebApps
         public void Close(WebAppWindowModel window)
         {
             if (window == null || !Windows.Contains(window)) return;
+            WebAppDiagnostics.Write(window, "close-requested");
+            if (window.RequestNativeClose?.Invoke() == true) { WebAppDiagnostics.Write(window, "close-await-native"); return; }
             m_changingWindowState = true;
             window.PropertyChanged -= Window_PropertyChanged;
             Windows.Remove(window);
+            WebAppDiagnostics.Write(window, "removed");
             if (!Windows.Any(window => window.IsActive))
             {
                 WebAppWindowModel next = Windows.Where(window => window.Visibility == Visibility.Visible)
@@ -156,6 +161,7 @@ namespace factoryos_10x_shell.Services.WebApps
 
         public void ToggleMaximize(WebAppWindowModel window)
         {
+            WebAppDiagnostics.Write(window, window.IsMaximized ? "restore" : "maximize");
             if (!window.IsMaximized)
             {
                 if (m_workspaceWidth <= 0 || m_workspaceHeight <= 0)

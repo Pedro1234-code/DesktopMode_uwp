@@ -4086,6 +4086,9 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
             bool paintStillPending = false;
             int surfaceWidth = 0;
             int surfaceHeight = 0;
+            HWND paintParent = nullptr;
+            std::uint64_t paintZOrder = 0;
+            bool paintVisible = false;
             MiniGdi::Color topLeft = MiniGdi::Transparent;
             MiniGdi::Color center = MiniGdi::Transparent;
             MiniGdi::Color bottomRight = MiniGdi::Transparent;
@@ -4096,6 +4099,9 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
                     window->internalPaintPending;
                 surfaceWidth = window->surface.Width();
                 surfaceHeight = window->surface.Height();
+                paintParent = window->parent;
+                paintZOrder = window->zOrder;
+                paintVisible = window->visible;
                 if (surfaceWidth > 0 && surfaceHeight > 0 &&
                     window->surface.Pixels().size() ==
                         static_cast<size_t>(surfaceWidth) * static_cast<size_t>(surfaceHeight))
@@ -4107,11 +4113,14 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
                     bottomRight = pixels.back();
                 }
             }
-            RuntimeDiagnostics::Record(
+            RuntimeDiagnostics::RecordChanged(L"paint:" + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)),
                 L"PAINT CALLBACK: handle " + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)) +
                 L", class '" + className + L"', proc " +
                 std::to_wstring(reinterpret_cast<ULONG_PTR>(procedure)) +
                 L", builtin " + std::to_wstring(static_cast<unsigned int>(builtinKind)) +
+                L", parent " + std::to_wstring(reinterpret_cast<ULONG_PTR>(paintParent)) +
+                L", z " + std::to_wstring(paintZOrder) +
+                L", visible " + (paintVisible ? L"yes" : L"no") +
                 L", surface " + std::to_wstring(surfaceWidth) + L"x" +
                 std::to_wstring(surfaceHeight) + L", samples " +
                 std::to_wstring(static_cast<unsigned long>(topLeft)) + L"/" +
@@ -6319,7 +6328,8 @@ void GuestWindowManager::ReorderGuestWindow(HWND window, HWND insertAfter)
     {
         std::lock_guard<std::mutex> guard(moving->lock);
         if (requested == static_cast<ULONG_PTR>(-1)) moving->zTopMost = true;
-        else if (requested == static_cast<ULONG_PTR>(-2)) moving->zTopMost = false;
+        else if (requested == static_cast<ULONG_PTR>(-2) || requested == 1)
+            moving->zTopMost = false;
     }
 
     std::vector<std::shared_ptr<WindowRecord>> siblings;
@@ -6359,7 +6369,9 @@ void GuestWindowManager::ReorderGuestWindow(HWND window, HWND insertAfter)
         {
             return item->handle == insertAfter;
         });
-        if (after != siblings.end()) position = std::next(after);
+        // HWND insertAfter is immediately ABOVE the moved window in Win32.
+        // Our vector runs bottom-to-top, so insertion belongs before it.
+        if (after != siblings.end()) position = after;
     }
     siblings.insert(position, moving);
     for (const auto& sibling : siblings)
@@ -16829,6 +16841,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             bool zTopMost = false;
             bool nonClientActive = false;
             std::wstring title;
+            std::wstring className;
             DWORD style = 0;
             DWORD extendedStyle = 0;
             GuestMetrics::NonClientMetrics nonClient;
@@ -16865,6 +16878,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                 snapshot.visible = candidate->visible;
                 snapshot.compositionHeight = candidate->surface.Height();
                 snapshot.title = candidate->title;
+                if (candidate->windowClass) snapshot.className = candidate->windowClass->name;
                 snapshot.style = candidate->style;
                 snapshot.extendedStyle = candidate->extendedStyle;
                 snapshot.nonClient = GuestMetrics::NonClientForEmbeddedWindow(
@@ -17087,6 +17101,8 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     SaturatingAdd(parentY, parentSnapshot.clientTop),
                     child.bounds.top);
                 bool copied = false;
+                MiniGdi::Color sourceCenter = MiniGdi::Transparent;
+                unsigned long long visiblePixels = 0;
                 const MiniGdi::Region visibleRegion =
                     VisibleRegionForWindow(child.handle, true);
                 {
@@ -17097,6 +17113,9 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     if (!child.record->destroyed && child.record->visible &&
                         child.record->parent == parent)
                     {
+                        const auto centerPixel = child.record->surface.PixelAt(
+                            child.record->surface.Width() / 2, child.record->surface.Height() / 2);
+                        if (centerPixel) sourceCenter = *centerPixel;
                         for (const MiniGdi::Rect& visible : visibleRegion.rectangles)
                         {
                             const MiniGdi::Rect source = MiniGdi::IntersectRect(visible,
@@ -17104,6 +17123,8 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                                     (std::min)(child.compositionHeight,
                                         child.record->surface.Height()) });
                             if (source.Empty()) continue;
+                            visiblePixels += static_cast<unsigned long long>(source.right - source.left) *
+                                static_cast<unsigned long long>(source.bottom - source.top);
                             copied = MiniGdi::CopyRect(composite,
                                 MiniGdi::Point{ SaturatingAdd(childX, source.left),
                                     SaturatingAdd(childY, source.top) },
@@ -17111,6 +17132,19 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                         }
                     }
                 }
+                RuntimeDiagnostics::RecordChanged(
+                    L"layer:" + std::to_wstring(reinterpret_cast<ULONG_PTR>(child.handle)),
+                    L"COMPOSITION LAYER: hwnd=" + std::to_wstring(reinterpret_cast<ULONG_PTR>(child.handle)) +
+                    L" class='" + child.className + L"' parent=" +
+                    std::to_wstring(reinterpret_cast<ULONG_PTR>(parent)) +
+                    L" z=" + std::to_wstring(child.zOrder) +
+                    L" desktop=" + std::to_wstring(childX) + L"," + std::to_wstring(childY) +
+                    L" size=" + std::to_wstring(child.bounds.right - child.bounds.left) + L"x" +
+                    std::to_wstring(child.bounds.bottom - child.bounds.top) +
+                    L" region_rects=" + std::to_wstring(visibleRegion.rectangles.size()) +
+                    L" visible_pixels=" + std::to_wstring(visiblePixels) +
+                    L" center_argb=" + std::to_wstring(static_cast<unsigned long>(sourceCenter)) +
+                    L" copied=" + (copied ? L"yes" : L"no"));
                 if (copied)
                 {
                     if (child.nonClient.left > 0 || child.nonClient.top > 0)

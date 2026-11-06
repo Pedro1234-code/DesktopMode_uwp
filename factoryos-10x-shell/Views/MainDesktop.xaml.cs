@@ -1,4 +1,4 @@
-﻿using factoryos_10x_shell.Library.Services.Managers;
+using factoryos_10x_shell.Library.Services.Managers;
 using factoryos_10x_shell.Library.ViewModels;
 using Microsoft.Extensions.DependencyInjection;
 using System;
@@ -55,6 +55,8 @@ namespace factoryos_10x_shell.Views
         private readonly IWebAppService m_webAppService;
         private readonly Win32WindowManagerService m_nativeWindowManager;
         private readonly ShellWindowCoordinator m_shellWindowCoordinator;
+        private readonly List<factoryos_10x_shell.Controls.AppInstallerWindow> m_installers = new List<factoryos_10x_shell.Controls.AppInstallerWindow>();
+        private int m_installerZIndex;
         private readonly FileOperationService m_fileOperations = FileOperationService.Instance;
         private readonly Dictionary<FileOperationModel, factoryos_10x_shell.Controls.FileOperationWindow> m_operationWindows =
             new Dictionary<FileOperationModel, factoryos_10x_shell.Controls.FileOperationWindow>();
@@ -91,6 +93,19 @@ namespace factoryos_10x_shell.Views
         public MainDesktop()
         {
             this.InitializeComponent();
+            m_taskbarHideTimer.Tick += AutoHideTimerTick;
+            Loaded += (s, e) => {
+                AppState.Instance.TaskbarPreferencesChanged += TaskbarPreferencesChanged;
+                Window.Current.CoreWindow.PointerMoved += AutoHidePointerMoved;
+                Window.Current.CoreWindow.PointerExited += AutoHidePointerExited;
+                TaskbarPreferencesChanged();
+            };
+            Unloaded += (s, e) => {
+                AppState.Instance.TaskbarPreferencesChanged -= TaskbarPreferencesChanged;
+                Window.Current.CoreWindow.PointerMoved -= AutoHidePointerMoved;
+                Window.Current.CoreWindow.PointerExited -= AutoHidePointerExited;
+                m_taskbarHideTimer.Stop();
+            };
             DataContext = App.ServiceProvider.GetRequiredService<MainDesktopViewModel>();
 
             m_startManager = App.ServiceProvider.GetRequiredService<IStartManagerService>();
@@ -114,6 +129,7 @@ namespace factoryos_10x_shell.Views
             m_fileOperations.Windows.CollectionChanged += (s, args) => FileOperationWindowsChanged();
             m_fileOperations.WindowsChanged += (s, args) => FileOperationWindowsChanged();
             m_fileOperations.ActivationRequested += ActivateFileOperation;
+            factoryos_10x_shell.Controls.AppInstallerWindow.OpenRequested += OpenAppInstaller;
             Loaded += MainDesktop_Loaded;
             SizeChanged += MainDesktop_SizeChanged;
 
@@ -233,6 +249,11 @@ namespace factoryos_10x_shell.Views
             MainPage.RecordUiOperation("Window.Create.Calculator", clock.ElapsedMilliseconds);
             return CalculatorWindow;
         }
+
+        internal bool IsStrawfoxInputBlocked => m_startManager.IsStartOpen || m_actionManager.IsActionCenterOpen || m_windowManager.IsTaskViewOpen;
+
+        internal System.Threading.Tasks.Task<DesktopMode.Gecko.GeckoWindow> CreateStrawfoxAppWindowAsync(string url)
+            => EnsureFirefoxWindow().CreateAppWindowAsync(url);
 
         private factoryos_10x_shell.Controls.FirefoxWindow EnsureFirefoxWindow()
         {
@@ -683,6 +704,37 @@ namespace factoryos_10x_shell.Views
             ActivateShellWindow(ShellWindowKind.FileOperation, operation);
         }
 
+        private void OpenAppInstaller(StorageFile package)
+        {
+            var existing = m_installers.FirstOrDefault(item => item.OpensPackage(package));
+            if (existing != null) { ActivateInstaller(existing); return; }
+            var window = new factoryos_10x_shell.Controls.AppInstallerWindow(package);
+            m_installers.Add(window);
+            window.MaxWidth = Math.Max(320, AppInstallerWindowHost.ActualWidth);
+            window.MaxHeight = Math.Max(180, AppInstallerWindowHost.ActualHeight);
+            Canvas.SetLeft(window, Math.Max(0, (AppInstallerWindowHost.ActualWidth - window.Width) / 2));
+            Canvas.SetTop(window, Math.Max(0, (AppInstallerWindowHost.ActualHeight - window.Height) / 2));
+            window.ActivationRequested += () => ActivateInstaller(window);
+            window.Changed += () => { RestoreMostRecentWindow(); SynchronizeShellWindows(); };
+            window.CloseRequested += () => {
+                m_installers.Remove(window);
+                AppInstallerWindowHost.Children.Remove(window);
+                m_shellWindowCoordinator.Remove(ShellWindowKind.AppInstaller, window);
+                RestoreMostRecentWindow();
+                SynchronizeShellWindows();
+            };
+            AppInstallerWindowHost.Children.Add(window);
+            ActivateInstaller(window);
+        }
+
+        private void ActivateInstaller(factoryos_10x_shell.Controls.AppInstallerWindow window)
+        {
+            if (!m_installers.Contains(window)) return;
+            window.Visibility = Visibility.Visible;
+            Canvas.SetZIndex(window, ++m_installerZIndex);
+            ActivateShellWindow(ShellWindowKind.AppInstaller, window);
+        }
+
         private void ActivateShellWindow(ShellWindowKind kind, object identity)
         {
             if (identity == null) return;
@@ -743,6 +795,8 @@ namespace factoryos_10x_shell.Views
         {
             switch (window.Kind)
             {
+                case ShellWindowKind.AppInstaller:
+                    return window.Identity is factoryos_10x_shell.Controls.AppInstallerWindow installer && m_installers.Contains(installer);
                 case ShellWindowKind.FileOperation:
                     return window.Identity is FileOperationModel operation && m_fileOperations.Windows.Contains(operation);
                 case ShellWindowKind.WebApp:
@@ -770,6 +824,8 @@ namespace factoryos_10x_shell.Views
 
             switch (window.Kind)
             {
+                case ShellWindowKind.AppInstaller:
+                    return ((factoryos_10x_shell.Controls.AppInstallerWindow)window.Identity).Visibility == Visibility.Visible;
                 case ShellWindowKind.FileOperation:
                     return ((FileOperationModel)window.Identity).Visibility == Visibility.Visible;
                 case ShellWindowKind.WebApp:
@@ -795,6 +851,9 @@ namespace factoryos_10x_shell.Views
         {
             switch (window.Kind)
             {
+                case ShellWindowKind.AppInstaller:
+                    ActivateInstaller((factoryos_10x_shell.Controls.AppInstallerWindow)window.Identity);
+                    break;
                 case ShellWindowKind.FileOperation:
                     m_fileOperations.Activate((FileOperationModel)window.Identity);
                     break;
@@ -827,6 +886,7 @@ namespace factoryos_10x_shell.Views
             Canvas.SetZIndex(WindowHost, activeKind == ShellWindowKind.WebApp ? 2 : 1);
             Canvas.SetZIndex(NativeWindowHost, activeKind == ShellWindowKind.Win32App ? 2 : 1);
             Canvas.SetZIndex(FilesWindowHost, activeKind == ShellWindowKind.Files ? 2 : 1);
+            Canvas.SetZIndex(AppInstallerWindowHost, activeKind == ShellWindowKind.AppInstaller ? 2 : 1);
             Canvas.SetZIndex(FileOperationWindowHost, activeKind == ShellWindowKind.FileOperation ? 2 : 1);
             Canvas.SetZIndex(NotepadWindowHost, activeKind == ShellWindowKind.Notepad ? 2 : 1);
             Canvas.SetZIndex(SettingsWindowHost, activeKind == ShellWindowKind.Settings ? 2 : 1);
@@ -935,6 +995,14 @@ namespace factoryos_10x_shell.Views
                     IsMinimized = operation.Visibility != Visibility.Visible
                 });
             }
+            foreach (var installer in m_installers)
+                descriptors.Add(new ShellWindowDescriptor {
+                    Kind = ShellWindowKind.AppInstaller, Identity = installer,
+                    Title = "App Installer", Subtitle = installer.PackageTitle, FallbackGlyph = "\uE7B8",
+                    IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png")),
+                    IsActive = m_shellWindowCoordinator.IsActive(ShellWindowKind.AppInstaller, installer),
+                    IsMinimized = installer.Visibility != Visibility.Visible
+                });
             m_shellWindowCoordinator.Synchronize(descriptors);
             TaskViewEmptyState.Visibility = descriptors.Count == 0
                 ? Visibility.Visible
@@ -1086,6 +1154,7 @@ namespace factoryos_10x_shell.Views
 
         private void MainDesktop_SizeChanged(object sender, SizeChangedEventArgs e)
         {
+            UpdateStartMenuAlignment();
             UpdateWorkspaceBounds();
         }
 
@@ -1124,6 +1193,9 @@ namespace factoryos_10x_shell.Views
         {
             switch (window.Kind)
             {
+                case ShellWindowKind.AppInstaller:
+                    ActivateInstaller((factoryos_10x_shell.Controls.AppInstallerWindow)window.Identity);
+                    break;
                 case ShellWindowKind.FileOperation:
                     m_fileOperations.Activate((FileOperationModel)window.Identity);
                     break;
@@ -1157,6 +1229,9 @@ namespace factoryos_10x_shell.Views
 
             switch (window.Kind)
             {
+                case ShellWindowKind.AppInstaller:
+                    ((factoryos_10x_shell.Controls.AppInstallerWindow)window.Identity).CloseWindow();
+                    break;
                 case ShellWindowKind.FileOperation:
                     m_fileOperations.Close((FileOperationModel)window.Identity);
                     break;
@@ -1190,17 +1265,79 @@ namespace factoryos_10x_shell.Views
                 m_windowManager.CloseTaskView();
         }
 
+        private readonly DispatcherTimer m_taskbarHideTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(600) };
+        private bool m_pointerOverTaskbar;
+        private void TaskbarPreferencesChanged()
+        {
+            UpdateStartMenuAlignment();
+            double bottom = AppState.Instance.TaskbarAutoHide ? 0 : 50;
+            foreach (var host in new[] { AppInstallerWindowHost, FilesWindowHost, FileOperationWindowHost, NotepadWindowHost, SettingsWindowHost, CalculatorWindowHost, FirefoxWindowHost })
+                host.Margin = new Thickness(0, 0, 0, bottom);
+            m_taskbarHideTimer.Stop();
+            SetTaskbarRevealed(!AppState.Instance.TaskbarAutoHide);
+            UpdateWorkspaceBounds();
+        }
+        private void UpdateStartMenuAlignment()
+        {
+            bool alignLeft = AppState.Instance.TaskbarAlignLeft;
+            StartMenuFrame.HorizontalAlignment = alignLeft
+                ? HorizontalAlignment.Left : HorizontalAlignment.Stretch;
+            // Preserve the stretched menu's width when anchoring it to the
+            // left, including on desktops narrower than its maximum width.
+            StartMenuFrame.Width = alignLeft
+                ? Math.Max(0, Math.Min(StartMenuFrame.MaxWidth,
+                    MainGrid.ActualWidth - StartMenuFrame.Margin.Left - StartMenuFrame.Margin.Right))
+                : double.NaN;
+        }
+        private void SetTaskbarRevealed(bool visible)
+        {
+            TaskbarFrame.Opacity = visible ? 1 : 0;
+            TaskbarFrame.IsHitTestVisible = visible;
+        }
+        private void AutoHidePointerMoved(CoreWindow sender, Windows.UI.Core.PointerEventArgs args)
+        {
+            if (!AppState.Instance.TaskbarAutoHide || FirefoxWindow?.IsFullscreen == true) return;
+            var transform = MainGrid.TransformToVisual(null).Inverse;
+            if (transform == null) return;
+            var p = transform.TransformPoint(args.CurrentPoint.Position);
+            bool inWidth = p.X >= 0 && p.X <= MainGrid.ActualWidth;
+            bool atEdge = inWidth && p.Y >= MainGrid.ActualHeight - 3 && p.Y <= MainGrid.ActualHeight;
+            m_pointerOverTaskbar = inWidth && p.Y >= MainGrid.ActualHeight - 50 && p.Y <= MainGrid.ActualHeight;
+            if (atEdge) SetTaskbarRevealed(true);
+            if (m_pointerOverTaskbar) m_taskbarHideTimer.Stop();
+            else if (TaskbarFrame.Opacity > 0 && !m_taskbarHideTimer.IsEnabled) m_taskbarHideTimer.Start();
+        }
+        private void AutoHidePointerExited(CoreWindow sender, Windows.UI.Core.PointerEventArgs args)
+        {
+            m_pointerOverTaskbar = false;
+            if (AppState.Instance.TaskbarAutoHide && TaskbarFrame.Opacity > 0) m_taskbarHideTimer.Start();
+        }
+        private void AutoHideTimerTick(object sender, object args)
+        {
+            if (m_startManager.IsStartOpen || m_actionManager.IsActionCenterOpen || m_windowManager.IsTaskViewOpen ||
+                VisualTreeHelper.GetOpenPopups(Window.Current).Count > 0) return;
+            m_taskbarHideTimer.Stop();
+            if (AppState.Instance.TaskbarAutoHide && !m_pointerOverTaskbar) SetTaskbarRevealed(false);
+        }
+
         private void UpdateWorkspaceBounds()
         {
             SynchronizeFileOperationWindows();
+            foreach (var installer in m_installers)
+            {
+                installer.MaxWidth = Math.Max(320, AppInstallerWindowHost.ActualWidth);
+                installer.MaxHeight = Math.Max(180, AppInstallerWindowHost.ActualHeight);
+                Canvas.SetLeft(installer, Math.Max(0, Math.Min(Canvas.GetLeft(installer), AppInstallerWindowHost.ActualWidth - Math.Min(installer.Width, installer.MaxWidth))));
+                Canvas.SetTop(installer, Math.Max(0, Math.Min(Canvas.GetTop(installer), AppInstallerWindowHost.ActualHeight - 36)));
+            }
             // WindowHost shares the desktop's logical coordinate space, including the
             // Xbox desktop scale. Use its measured size rather than physical bounds.
             m_windowManager.SetWorkspaceBounds(
                 WindowHost.ActualWidth,
-                Math.Max(0, WindowHost.ActualHeight - 50));
+                Math.Max(0, WindowHost.ActualHeight - (AppState.Instance.TaskbarAutoHide ? 0 : 50)));
             m_nativeWindowManager.SetWorkspaceBounds(
                 NativeWindowHost.ActualWidth,
-                Math.Max(0, NativeWindowHost.ActualHeight - 50));
+                Math.Max(0, NativeWindowHost.ActualHeight - (AppState.Instance.TaskbarAutoHide ? 0 : 50)));
         }
 
         private void OnPointerPressed(object sender, PointerRoutedEventArgs args)

@@ -9,7 +9,8 @@ namespace factoryos_10x_shell.Library.Models.InternalData
         public string Name { get; set; }
         public string StartUri { get; set; }
         public bool UseStrawfox { get; set; }
-        public string NewInstanceText => UseStrawfox ? "New tab" : "New window";
+        public bool UseStrawfoxWindow { get; set; }
+        public string NewInstanceText => UseStrawfox && !UseStrawfoxWindow ? "New tab" : "New window";
         private string m_iconUri;
         private bool m_isPinned;
 

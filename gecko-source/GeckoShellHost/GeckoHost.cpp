@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "GeckoHost.h"
 #include "GeckoHost.g.cpp"
+#include "GeckoWindow.h"
 
 #include <atomic>
 #include <deque>
@@ -501,6 +502,28 @@ namespace winrt::DesktopMode::Gecko::implementation
             engineView_->DragFiles(state, x, y, paths.c_str());
     }
 
+    winrt::DesktopMode::Gecko::GeckoWindow GeckoHost::CreateBrowserWindow(hstring const& url, bool appMode)
+    {
+        if (!started_ || !engineView_)
+        {
+            throw hresult_error(E_PENDING, L"Start the shared Gecko runtime before opening a window.");
+        }
+        Uri target(url);
+        if (target.SchemeName() != L"https" && target.SchemeName() != L"http" &&
+            url != L"about:home" && url != L"about:blank")
+        {
+            throw hresult_invalid_argument(L"Unsupported browser-window URL scheme.");
+        }
+        if (!active_)
+        {
+            // Let the primary view finish publishing the shared renderer's
+            // panel/exports during background startup without accepting input.
+            engineView_->SetInputEnabled(false);
+            engineView_->Start();
+        }
+        return winrt::make<implementation::GeckoWindow>(url, appMode);
+    }
+
     void GeckoHost::Suspend()
     {
         if (engineView_)
@@ -532,9 +555,16 @@ namespace winrt::DesktopMode::Gecko::implementation
             engineView_->CloseSession();
             engineView_->Stop();
         }
-        NotifyGeckoAppState(0);
         // The Gecko worker may still be unwinding callbacks when the Shell
         // window is hidden. Keep the view alive until the host itself is
         // destroyed; releasing it synchronously here races that thread.
+        bool otherWindows = false;
+        if (auto xul = ::GetModuleHandleW(L"xul.dll"))
+        {
+            using CountFn = uint32_t (*)();
+            if (auto count = reinterpret_cast<CountFn>(::GetProcAddress(xul, "gecko_w10m_managed_window_count")))
+                otherWindows = count() != 0;
+        }
+        if (!otherWindows) NotifyGeckoAppState(0);
     }
 }

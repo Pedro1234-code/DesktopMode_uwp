@@ -84,6 +84,7 @@ std::atomic<uint32_t> gClipboardSequence{1};
 std::once_flag gClipboardWatchOnce;
 std::once_flag gGamepadWatchOnce;
 std::atomic<bool> gGamepadListChanged{true};
+std::atomic<bool> gPointerLocked{false};
 std::atomic<bool> gGamepadEventsAvailable{false};
 
 struct ClipboardBroker {
@@ -702,6 +703,12 @@ void EngineView::WireKeyboard() {
       return;
     }
     const int32_t code = static_cast<int32_t>(args.VirtualKey());
+    if (code == 27 && (consumeLockEscape_ || gPointerLocked.load())) {
+      consumeLockEscape_ = true;
+      if (exitPointerLock_) exitPointerLock_();
+      args.Handled(true);
+      return;
+    }
     const uint32_t mods = currentModifiers();
     hardwareCharacterPending_ = false;
 
@@ -773,6 +780,11 @@ void EngineView::WireKeyboard() {
     }
     hardwareCharacterPending_ = false;
     const int32_t code = static_cast<int32_t>(args.VirtualKey());
+    if (code == 27 && consumeLockEscape_) {
+      consumeLockEscape_ = false;
+      args.Handled(true);
+      return;
+    }
     if (code < 0 || code >= static_cast<int32_t>(forwardedKeys_.size()) ||
         !forwardedKeys_[code]) {
       return;
@@ -937,6 +949,27 @@ bool EngineView::Resolve() {
   if (!set_cursor_) {
     set_cursor_ = reinterpret_cast<SetCursorSinkFn>(
         ::GetProcAddress(xul, "gecko_w10m_set_cursor_sink"));
+    mouseDelta_ = reinterpret_cast<MouseDeltaFn>(
+        ::GetProcAddress(xul, "gecko_w10m_input_mouse_delta"));
+    exitPointerLock_ = reinterpret_cast<void (*)()>(
+        ::GetProcAddress(xul, "gecko_w10m_exit_pointer_lock"));
+    const auto setPointerLock = reinterpret_cast<void (*)(void (*)(int32_t))>(
+        ::GetProcAddress(xul, "gecko_w10m_set_pointer_lock_sink"));
+    if (setPointerLock && mouseDelta_ && exitPointerLock_) {
+      setPointerLock([](int32_t locked) {
+        gPointerLocked.store(locked != 0);
+        if (gUiDispatcher) gUiDispatcher.RunAsync(
+            winrt::Windows::UI::Core::CoreDispatcherPriority::Normal, [] {
+          const auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+          if (window) window.PointerCursor(gPointerLocked.load()
+              ? winrt::Windows::UI::Core::CoreCursor{nullptr}
+              : winrt::Windows::UI::Core::CoreCursor(
+                  winrt::Windows::UI::Core::CoreCursorType::Arrow, 0));
+        });
+        Log::Write(locked ? L"pointer-lock: host enabled relative mouse"
+                          : L"pointer-lock: host released relative mouse");
+      });
+    }
     if (set_cursor_) {
       set_cursor_(&CursorChanged);
       Log::Write(L"cursor: Gecko CSS cursor connected to the UWP pointer");
@@ -1075,6 +1108,8 @@ bool EngineView::Resolve() {
           if (strstr(text, "took the swap chain")) {
             g_panelPresenting.store(true);
           } else if (!Log::Verbose() &&
+                      !strstr(text, "angle: commands-v1 ") &&
+                      !strstr(text, "angle: breadcrumb ") &&
                       !strstr(text, "diag:") &&
                       !strstr(text, "alpha mode") &&
                       !strstr(text, "first present") &&
@@ -1429,8 +1464,23 @@ void EngineView::FollowTextInput() {
 
   if (wants) {
     ApplyInputKind(static_cast<int32_t>(state & 0xff));
+    bool showKeyboard = false;
+    try {
+      showKeyboard =
+          winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size() != 0 &&
+          winrt::Windows::Devices::Input::KeyboardCapabilities().KeyboardPresent() == 0;
+    } catch (winrt::hresult_error const& error) {
+      Log::Write(L"keyboard: device detection failed", std::wstring(error.message()));
+    }
+    sink_.PreventKeyboardDisplayOnProgrammaticFocus(!showKeyboard);
     const bool focused = sink_.Focus(FocusState::Programmatic);
-    (void)focused;
+    if (focused && showKeyboard) {
+      try {
+        winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView().TryShow();
+      } catch (winrt::hresult_error const& error) {
+        Log::Write(L"keyboard: virtual keyboard request failed", std::wstring(error.message()));
+      }
+    }
   } else {
     Log::Write(L"view: engine no longer wants text input");
   }
@@ -2044,6 +2094,12 @@ void EngineView::WireCoreMouse() {
     if (coreWindow_) return;
     coreWindow_ = CoreWindow::GetForCurrentThread();
     if (!coreWindow_) return;
+    winrt::Windows::Devices::Input::MouseDevice::GetForCurrentView().MouseMoved(
+        [this](auto const&, auto const& args) {
+          if (!inputEnabled_ || !gPointerLocked.load() || !mouseDelta_) return;
+          const auto delta = args.MouseDelta();
+          mouseDelta_(delta.X, delta.Y);
+        });
 
     const auto isMouse = [](auto const& point) {
       return point && point.PointerDevice() &&
@@ -2056,6 +2112,7 @@ void EngineView::WireCoreMouse() {
           if (!inputEnabled_) return;
           auto point = args.CurrentPoint();
           if (!isMouse(point)) return;
+          if (gPointerLocked.load()) return;
           int32_t externalX = 0;
           int32_t externalY = 0;
           if (externalMouse_ && ToExternalFrameFromWindow(
@@ -2190,6 +2247,9 @@ void EngineView::SetInputEnabled(bool enabled) {
   }
 
   inputEnabled_ = enabled;
+  if (!enabled && gPointerLocked.load() && exitPointerLock_) {
+    exitPointerLock_();
+  }
   if (sink_) {
     // The hidden text transport must not retain CoreWindow focus while a
     // different internal Shell window (or a Shell overlay) owns the input.

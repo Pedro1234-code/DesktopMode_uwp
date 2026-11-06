@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <Import Project="$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props" Condition="Exists('$(MSBuildExtensionsPath)\$(MSBuildToolsVersion)\Microsoft.Common.props')" />
   <PropertyGroup>
@@ -131,7 +131,7 @@
     <UseVSHostingProcess>false</UseVSHostingProcess>
     <ErrorReport>prompt</ErrorReport>
     <Prefer32Bit>true</Prefer32Bit>
-    <UseDotNetNativeToolchain>true</UseDotNetNativeToolchain>
+    <UseDotNetNativeToolchain>false</UseDotNetNativeToolchain>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
   <PropertyGroup>
@@ -161,6 +161,8 @@
     <Compile Include="Controls\FirefoxWindow.xaml.cs">
       <DependentUpon>FirefoxWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Controls\StrawfoxAppView.cs" />
+    <Compile Include="Services\WebApps\WebAppDiagnostics.cs" />
     <Compile Include="Controls\WebAppWindow.xaml.cs">
       <DependentUpon>WebAppWindow.xaml</DependentUpon>
     </Compile>
@@ -181,6 +183,8 @@
     <Compile Include="Services\Helpers\AppState.cs" />
     <Compile Include="Services\Helpers\UpdateCheckService.cs" />
     <Compile Include="Services\Files\ArchiveService.cs" />
+    <Compile Include="Services\Files\AppPackageService.cs" />
+    <Compile Include="Controls\AppInstallerWindow.xaml.cs"><DependentUpon>AppInstallerWindow.xaml</DependentUpon></Compile>
     <Compile Include="Services\Files\FileOperationModel.cs" />
     <Compile Include="Services\Files\FileOperationService.cs" />
     <Compile Include="Services\Files\FileTransferService.cs" />
@@ -231,6 +235,7 @@
     <Content Include="10x.png" />
     <Content Include="Assets\10x.png" />
     <Content Include="Assets\UpdateReleasesQr.png" />
+    <Content Include="Assets\LOOPBACK_inst-1024.jpeg" />
     <Content Include="Assets\defaultUser.png" />
     <Content Include="Assets\Cursor\aero_arrow_xl_fix.png" />
     <Content Include="Assets\LargeTile.scale-100.png" />
@@ -311,11 +316,13 @@
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
     <Content Include="Assets\Files\files.png" />
     <Content Include="Assets\Files\FluentIcons\SidebarSections\*.png" />
+    <Content Include="Assets\Files\FluentIcons\Package.png" />
     <Content Include="Assets\Files\FluentIcons\*.txt" />
     <Content Include="..\Icons\**\*.ico">
       <Link>Assets\Files\Windows11Icons\%(RecursiveDir)%(Filename)%(Extension)</Link>
     </Content>
     <Content Include="Assets\Firefox\firefox.png" />
+    <Content Include="Assets\Firefox\app_mall_512.png" />
     <Content Include="Assets\Notepad\notepad.png" />
     <Content Include="..\Win32Bridge\GuestApps\notepad.exe">
       <Link>GuestRuntimeDefaults\Windows\notepad.exe</Link>
@@ -324,6 +331,7 @@
       <Link>GuestRuntimeDefaults\Windows\pt-BR\notepad.exe.mui</Link>
     </Content>
     <Content Include="Assets\TaskView\taskview-hover.png" />
+    <Content Include="Windows10x-js-main\font\fluent_regular.ttf" />
     <Content Include="Windows10x-js-main\Walls\wall1.jpg" />
     <Content Include="Windows10x-js-main\Walls\wall2.jpg" />
     <Content Include="Windows10x-js-main\Walls\wall3.jpg" />
@@ -361,6 +369,7 @@
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
+    <Page Include="Controls\AppInstallerWindow.xaml"><Generator>MSBuild:Compile</Generator><SubType>Designer</SubType></Page>
     <Page Include="Controls\FileOperationWindow.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>

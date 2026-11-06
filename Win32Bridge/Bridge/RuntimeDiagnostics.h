@@ -1,6 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
+#include <unordered_map>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -22,7 +24,34 @@ namespace Bridge
             State& state = Instance();
             std::lock_guard<std::mutex> guard(state.lock);
             state.lines.clear();
+            state.lastValues.clear();
+            state.suppressed = 0;
+            state.sequence = 0;
+            state.started = std::chrono::steady_clock::now();
             state.lines.push_back({ L"Win32Bridge runtime report: " + title, false });
+            state.lines.push_back({ L"DIAGNOSTICS: schema=3; session UTC epoch ms=" +
+                std::to_wstring(std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::system_clock::now().time_since_epoch()).count()), false });
+        }
+
+        // Retain state transitions instead of thousands of identical paints.
+        // Keys are bridge identifiers, never guest document contents.
+        static void RecordChanged(const std::wstring& key, const std::wstring& line)
+        {
+            State& state = Instance();
+            {
+                std::lock_guard<std::mutex> guard(state.lock);
+                const auto found = state.lastValues.find(key);
+                if (found != state.lastValues.end() && found->second == line)
+                {
+                    ++state.suppressed;
+                    return;
+                }
+                if (state.lastValues.size() >= 2048 && found == state.lastValues.end())
+                    state.lastValues.erase(state.lastValues.begin());
+                state.lastValues[key] = line;
+            }
+            Record(line);
         }
 
         static void Record(const std::wstring& line)
@@ -41,7 +70,10 @@ namespace Bridge
             constexpr size_t maximumLines = 4096;
             constexpr size_t maximumTraceLines = 512;
             const bool trace = IsHighFrequencyTrace(line);
-            state.lines.push_back({ line, trace });
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - state.started).count();
+            state.lines.push_back({ line + L" [event=" + std::to_wstring(++state.sequence) +
+                L" elapsed_ms=" + std::to_wstring(elapsed) + L"]", trace });
 
             if (trace)
             {
@@ -79,6 +111,8 @@ namespace Bridge
                 report += entry.text;
                 report += L"\r\n";
             }
+            report += L"DIAGNOSTICS: unchanged events suppressed=" +
+                std::to_wstring(state.suppressed) + L"\r\n";
             return report;
         }
 
@@ -93,6 +127,10 @@ namespace Bridge
         {
             std::mutex lock;
             std::vector<Entry> lines;
+            std::unordered_map<std::wstring, std::wstring> lastValues;
+            unsigned long long suppressed = 0;
+            unsigned long long sequence = 0;
+            std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
         };
 
         static bool IsHighFrequencyTrace(const std::wstring& line)

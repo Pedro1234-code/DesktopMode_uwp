@@ -154,9 +154,26 @@ namespace factoryos_10x_shell.Controls
         private double m_startLeft, m_startTop, m_startWidth, m_startHeight;
         private double m_restoreLeft, m_restoreTop, m_restoreWidth, m_restoreHeight;
 
+        private Canvas m_workspaceHost;
+        private void Workspace_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (!m_maximized || !(sender is Canvas host)) return;
+            Canvas.SetLeft(this, 0); Canvas.SetTop(this, 0);
+            Width = host.ActualWidth; Height = host.ActualHeight;
+        }
+
         public FilesWindow()
         {
             InitializeComponent();
+            Loaded += (s, e) => {
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
+                m_workspaceHost = VisualTreeHelper.GetParent(this) as Canvas;
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged += Workspace_SizeChanged;
+            };
+            Unloaded += (s, e) => {
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
+                m_workspaceHost = null;
+            };
             // ListView handles row pointer events internally. Observe handled
             // events too so its selection/capture does not hide the mouse gesture.
             ItemsList.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler(ItemsList_FilePointerPressed), true);
@@ -661,7 +678,9 @@ namespace factoryos_10x_shell.Controls
                         Kind = string.IsNullOrWhiteSpace(child.DisplayType) ? child.FileType : child.DisplayType,
                         SizeText = FormatSize(properties.Size),
                         DateModifiedText = FormatDate(properties.DateModified),
-                        FallbackIcon = CreatePackagedIcon(GetFileIconPath(child)),
+                        FallbackIcon = AppPackageService.IsPackage(child)
+                            ? new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png"))
+                            : CreatePackagedIcon(GetFileIconPath(child)),
                         File = child
                     };
                     loadedItems.Add(entry);
@@ -690,6 +709,7 @@ namespace factoryos_10x_shell.Controls
 
         private async void ItemsList_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
         {
+            e.Handled = true;
             await OpenEntryAsync(ItemsList.SelectedItem as FileEntry);
         }
 
@@ -704,6 +724,8 @@ namespace factoryos_10x_shell.Controls
         {
             if (entry == null) return;
             if (entry.Folder != null) await OpenFolderAsync(entry.Folder, entry.Folder.Name, true);
+            else if (AppPackageService.IsPackage(entry.File))
+                await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => AppInstallerWindow.RequestOpen(entry.File));
             else if (entry.File != null && string.Equals(entry.File.FileType, ".exe", StringComparison.OrdinalIgnoreCase))
             {
                 // Executables always use the packaged Windows icon. Do not ask
@@ -743,7 +765,7 @@ namespace factoryos_10x_shell.Controls
 
         private static async Task LoadItemThumbnailAsync(FileEntry entry)
         {
-            if (entry?.File == null || entry.Thumbnail != null) return;
+            if (entry?.File == null || entry.Thumbnail != null || AppPackageService.IsPackage(entry.File)) return;
 
             try
             {

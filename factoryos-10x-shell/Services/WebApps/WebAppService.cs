@@ -7,6 +7,7 @@ using System.Linq;
 using System.Threading.Tasks;
 using Windows.Storage;
 using Windows.Storage.Streams;
+using Windows.UI.Xaml.Media.Imaging;
 using Windows.Web.Http;
 
 namespace factoryos_10x_shell.Services.WebApps
@@ -19,6 +20,7 @@ namespace factoryos_10x_shell.Services.WebApps
         private const string DefaultsSeededKey = "CoreShellDefaults_WebAppsSeeded_v1";
         private const string XboxDevicePortalId = "builtin-xbox-device-portal";
         private const string XboxDevicePortalUri = "https://localhost:11443/";
+        private const string AppStoreSeededKey = "CoreShellDefaults_AppStoreSeeded_v1";
         private bool m_initialized;
 
         public ObservableCollection<WebAppDefinition> InstalledApps { get; } = new ObservableCollection<WebAppDefinition>();
@@ -41,6 +43,7 @@ namespace factoryos_10x_shell.Services.WebApps
                     Name = saved["Name"] as string,
                     StartUri = startUri,
                     UseStrawfox = saved.TryGetValue("UseStrawfox", out object browser) && browser is bool strawfox && strawfox,
+                    UseStrawfoxWindow = saved.TryGetValue("UseStrawfoxWindow", out object windowMode) && windowMode is bool separate && separate,
                     IconUri = saved["IconUri"] as string,
                     IsPinned = saved["IsPinned"] is bool isPinned && isPinned
                 });
@@ -71,10 +74,29 @@ namespace factoryos_10x_shell.Services.WebApps
                 values[DefaultsSeededKey] = true;
                 Save();
             }
+            if (!(values[AppStoreSeededKey] is bool storeSeeded && storeSeeded))
+            {
+                const string storeUri = "https://discover.apps.chrome/";
+                var store = InstalledApps.FirstOrDefault(app => app.Id == "builtin-app-store" ||
+                    string.Equals(app.StartUri?.TrimEnd('/'), storeUri.TrimEnd('/'), StringComparison.OrdinalIgnoreCase));
+                if (store == null)
+                {
+                    store = new WebAppDefinition { Id = "builtin-app-store" };
+                    InstalledApps.Add(store);
+                }
+                store.Name = "App Store";
+                store.StartUri = storeUri;
+                store.IconUri = "ms-appx:///Assets/Firefox/app_mall_512.png";
+                store.UseStrawfox = true;
+                store.UseStrawfoxWindow = true;
+                store.IsPinned = true;
+                Save();
+                values[AppStoreSeededKey] = true;
+            }
             return Task.CompletedTask;
         }
 
-        public async Task<WebAppDefinition> InstallAsync(string name, string startUri, bool useStrawfox = false)
+        public async Task<WebAppDefinition> InstallAsync(string name, string startUri, bool useStrawfox = false, bool useStrawfoxWindow = false, byte[] favicon = null)
         {
             await InitializeAsync();
             if (!Uri.TryCreate(startUri, UriKind.Absolute, out Uri uri) ||
@@ -82,11 +104,18 @@ namespace factoryos_10x_shell.Services.WebApps
                 throw new ArgumentException("Informe uma URL http ou https válida.", nameof(startUri));
 
             string displayName = string.IsNullOrWhiteSpace(name) ? uri.Host : name.Trim();
-            var app = new WebAppDefinition { Id = Guid.NewGuid().ToString("N"), Name = displayName, StartUri = uri.AbsoluteUri, UseStrawfox = useStrawfox };
+            var app = new WebAppDefinition { Id = Guid.NewGuid().ToString("N"), Name = displayName, StartUri = uri.AbsoluteUri, UseStrawfox = useStrawfox || useStrawfoxWindow, UseStrawfoxWindow = useStrawfoxWindow };
+            if (favicon != null)
+            {
+                StorageFolder folder = await ApplicationData.Current.LocalFolder.CreateFolderAsync("WebAppIcons", CreationCollisionOption.OpenIfExists);
+                StorageFile file = await folder.CreateFileAsync(app.Id + ".favicon");
+                await FileIO.WriteBytesAsync(file, favicon);
+                app.IconUri = "ms-appdata:///local/WebAppIcons/" + file.Name;
+            }
             InstalledApps.Add(app);
             Save();
             AppsChanged?.Invoke(this, EventArgs.Empty);
-            if (useStrawfox)
+            if (favicon == null && (useStrawfox || useStrawfoxWindow))
                 _ = SaveFaviconAsync(app, new Uri(uri, "/favicon.ico").AbsoluteUri);
             return app;
         }
@@ -107,9 +136,45 @@ namespace factoryos_10x_shell.Services.WebApps
             AppsChanged?.Invoke(this, EventArgs.Empty);
         }
 
+        public async Task ChangeIconAsync(WebAppDefinition app, StorageFile file)
+        {
+            if (!InstalledApps.Contains(app)) return;
+
+            using (var stream = await file.OpenReadAsync())
+            {
+                var preview = new BitmapImage { DecodePixelWidth = 48 };
+                await preview.SetSourceAsync(stream);
+            }
+
+            StorageFolder folder = await ApplicationData.Current.LocalFolder.CreateFolderAsync(
+                "WebAppIcons", CreationCollisionOption.OpenIfExists);
+            StorageFile icon = await file.CopyAsync(folder, app.Id + "-" + Guid.NewGuid().ToString("N") + file.FileType);
+            if (!InstalledApps.Contains(app))
+            {
+                await icon.DeleteAsync();
+                return;
+            }
+
+            string previousIcon = app.IconUri;
+            app.IconUri = "ms-appdata:///local/WebAppIcons/" + Uri.EscapeDataString(icon.Name);
+            Save();
+            AppsChanged?.Invoke(this, EventArgs.Empty);
+
+            if (previousIcon?.StartsWith("ms-appdata:///local/WebAppIcons/" + app.Id + "-", StringComparison.Ordinal) == true)
+            {
+                try
+                {
+                    var previousFile = await StorageFile.GetFileFromApplicationUriAsync(new Uri(previousIcon));
+                    await previousFile.DeleteAsync();
+                }
+                catch { }
+            }
+        }
+
         public async Task SaveFaviconAsync(WebAppDefinition app, string faviconUri)
         {
-            if (app == null || !Uri.TryCreate(faviconUri, UriKind.Absolute, out Uri uri) ||
+            if (!InstalledApps.Contains(app) || !string.IsNullOrEmpty(app.IconUri) ||
+                !Uri.TryCreate(faviconUri, UriKind.Absolute, out Uri uri) ||
                 (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps)) return;
 
             try
@@ -120,6 +185,7 @@ namespace factoryos_10x_shell.Services.WebApps
                     StorageFolder iconFolder = await ApplicationData.Current.LocalFolder.CreateFolderAsync("WebAppIcons", CreationCollisionOption.OpenIfExists);
                     StorageFile iconFile = await iconFolder.CreateFileAsync(app.Id + ".favicon", CreationCollisionOption.ReplaceExisting);
                     await FileIO.WriteBufferAsync(iconFile, buffer);
+                    if (!InstalledApps.Contains(app) || !string.IsNullOrEmpty(app.IconUri)) return;
                     app.IconUri = "ms-appdata:///local/WebAppIcons/" + app.Id + ".favicon";
                     Save();
                     AppsChanged?.Invoke(this, EventArgs.Empty);
@@ -144,6 +210,7 @@ namespace factoryos_10x_shell.Services.WebApps
                     ["Name"] = app.Name,
                     ["StartUri"] = app.StartUri,
                     ["UseStrawfox"] = app.UseStrawfox,
+                    ["UseStrawfoxWindow"] = app.UseStrawfoxWindow,
                     ["IconUri"] = app.IconUri,
                     ["IsPinned"] = app.IsPinned
                 };

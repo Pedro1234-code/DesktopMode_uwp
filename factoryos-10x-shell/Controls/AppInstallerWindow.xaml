@@ -1,0 +1,59 @@
+<UserControl x:Class="factoryos_10x_shell.Controls.AppInstallerWindow" xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" Width="652" Height="427" FontFamily="Segoe UI" FontSize="13">
+ <UserControl.Resources><ResourceDictionary>
+  <ResourceDictionary.ThemeDictionaries>
+   <ResourceDictionary x:Key="Light"><SolidColorBrush x:Key="InstallerSurface" Color="#FFF3F3F3"/><SolidColorBrush x:Key="InstallerSecondary" Color="#FF666666"/></ResourceDictionary>
+   <ResourceDictionary x:Key="Default"><SolidColorBrush x:Key="InstallerSurface" Color="#FF202020"/><SolidColorBrush x:Key="InstallerSecondary" Color="#FFB0B0B0"/></ResourceDictionary>
+  </ResourceDictionary.ThemeDictionaries>
+  <Style x:Key="InstallerAction" TargetType="Button"><Setter Property="Width" Value="120"/><Setter Property="Height" Value="32"/><Setter Property="Padding" Value="12,0"/><Setter Property="CornerRadius" Value="4"/><Setter Property="FontSize" Value="13"/><Setter Property="HorizontalContentAlignment" Value="Center"/></Style>
+ </ResourceDictionary></UserControl.Resources>
+ <Border Background="{ThemeResource InstallerSurface}" BorderBrush="{ThemeResource SystemControlForegroundBaseMediumLowBrush}" BorderThickness="1" CornerRadius="8">
+  <Grid PointerPressed="Root_PointerPressed">
+   <Grid.RowDefinitions><RowDefinition Height="32"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
+   <Grid>
+    <Border Background="Transparent" Margin="0,0,138,0" PointerPressed="Title_PointerPressed" PointerMoved="Title_PointerMoved" PointerReleased="Title_PointerReleased" PointerCaptureLost="Title_PointerReleased"><TextBlock Text="App Installer" Margin="12,0" FontSize="12" VerticalAlignment="Center"/></Border>
+    <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+     <Button Style="{StaticResource ShellCaptionButtonStyle}" Width="46" Height="32" Click="Minimize_Click" ToolTipService.ToolTip="Minimize"><FontIcon Glyph="&#xE921;" FontSize="10"/></Button>
+     <Button Style="{StaticResource ShellCaptionButtonStyle}" Width="46" Height="32" Click="Maximize_Click" ToolTipService.ToolTip="Maximize / Restore"><FontIcon Glyph="&#xE922;" FontSize="10"/></Button>
+     <Button Style="{StaticResource ShellCloseButtonStyle}" Width="46" Height="32" Click="Close_Click" ToolTipService.ToolTip="Close"><FontIcon Glyph="&#xE8BB;" FontSize="10"/></Button>
+    </StackPanel>
+   </Grid>
+   <ScrollViewer x:Name="PackageDetailsScroll" Grid.Row="1" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+    <StackPanel Margin="24,16,24,12">
+     <Grid MinHeight="100"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="24"/><ColumnDefinition Width="90"/></Grid.ColumnDefinitions>
+      <StackPanel>
+       <TextBlock x:Name="Heading" Text="Reading app package…" FontSize="28" FontWeight="SemiBold" TextWrapping="Wrap" Margin="-2,2,0,6"/>
+       <TextBlock Text="App package" Foreground="{ThemeResource SystemControlHighlightAccentBrush}" Margin="0,0,0,2"/>
+       <TextBlock x:Name="Publisher" TextWrapping="Wrap"/><TextBlock x:Name="VersionText" Margin="0,2,0,0"/>
+      </StackPanel>
+      <Grid Grid.Column="2" Width="90" Height="90" VerticalAlignment="Top"><FontIcon x:Name="LogoFallback" Glyph="&#xE7B8;" FontSize="48"/><Image x:Name="PackageLogo" Stretch="Uniform"/></Grid>
+     </Grid>
+     <TextBlock x:Name="Description" TextWrapping="Wrap" Margin="0,12,0,0" Visibility="Collapsed"/>
+     <TextBlock Text="Capabilities:" Margin="0,24,0,3"/><TextBlock x:Name="Capabilities" TextWrapping="Wrap" Foreground="{ThemeResource InstallerSecondary}"/>
+     <HyperlinkButton Content="More options" Click="MoreOptions_Click" Padding="0" Margin="0,10,0,0" HorizontalAlignment="Left" FontSize="13"/>
+     <StackPanel x:Name="InstallOptions" Spacing="8" Margin="0,8,0,0" Visibility="Collapsed">
+      <TextBlock x:Name="ResourceNotice" Visibility="Collapsed" FontSize="12" TextWrapping="Wrap" Foreground="{ThemeResource InstallerSecondary}" Text="Localized package details could not be resolved. The package identity is shown instead."/>
+      <Button Content="Add dependencies…" Click="Dependencies_Click" HorizontalAlignment="Left"/><TextBlock x:Name="DependencyText" Text="No dependency packages selected" FontSize="12" TextWrapping="Wrap"/>
+      <ToggleSwitch x:Name="ConnectionOptions" Header="Device Portal connection settings" Toggled="ConnectionOptions_Toggled"/>
+      <StackPanel x:Name="ConnectionPanel" Visibility="Collapsed" Spacing="8"><TextBlock Text="https://localhost:11443"/><TextBox x:Name="Username" Header="Username (leave blank if authentication is disabled)"/><PasswordBox x:Name="Password" Header="Password"/><CheckBox x:Name="TrustLocalCertificate" IsChecked="True" Content="Allow the local Device Portal self-signed certificate"/></StackPanel>
+     </StackPanel>
+    </StackPanel>
+   </ScrollViewer>
+   <ScrollViewer x:Name="ConnectionHelp" Grid.Row="1" Visibility="Collapsed" HorizontalScrollBarVisibility="Disabled">
+    <StackPanel Margin="24,12,24,12" Spacing="12" HorizontalAlignment="Center">
+     <TextBlock Text="Could not connect to localhost" FontSize="24" FontWeight="SemiBold" TextWrapping="Wrap" TextAlignment="Center"/>
+     <Image Source="ms-appx:///Assets/LOOPBACK_inst-1024.jpeg" Width="160" Height="160" Stretch="Uniform" AutomationProperties.Name="Instructions to fix the localhost connection"/>
+     <TextBlock Text="Open this on your phone or PC and follow the instructions to fix" TextWrapping="Wrap" TextAlignment="Center" MaxWidth="480"/>
+    </StackPanel>
+   </ScrollViewer>
+   <StackPanel Grid.Row="2" Margin="24,8,24,18" Spacing="10">
+    <ProgressBar x:Name="InstallProgress" Height="4" IsIndeterminate="True"/><TextBlock x:Name="Status" TextWrapping="Wrap" MaxHeight="70" IsTextSelectionEnabled="True" AutomationProperties.LiveSetting="Polite"/>
+    <Grid Margin="0,0,0,24"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="120"/><ColumnDefinition Width="12"/><ColumnDefinition Width="120"/></Grid.ColumnDefinitions>
+     <CheckBox x:Name="LaunchWhenReady" Content="Launch when ready" IsChecked="True" FontSize="13" VerticalAlignment="Center"/>
+     <Button x:Name="InstallButton" Grid.Column="1" Content="Install" IsEnabled="False" Click="Install_Click" Style="{StaticResource InstallerAction}" Background="{ThemeResource SystemControlHighlightAccentBrush}" Foreground="White"/>
+     <Button x:Name="CancelButton" Grid.Column="3" Content="Cancel" Click="Close_Click" Style="{StaticResource InstallerAction}" Background="{ThemeResource SystemControlHighlightAccentBrush}" Foreground="White"/>
+    </Grid>
+    <StackPanel Orientation="Horizontal" Spacing="12" MinHeight="42"><FontIcon Glyph="&#xE946;" FontSize="18" VerticalAlignment="Top"/><TextBlock x:Name="SourceText" Text="Source: local app package" TextTrimming="CharacterEllipsis" VerticalAlignment="Center"/></StackPanel>
+   </StackPanel>
+  </Grid>
+ </Border>
+</UserControl>

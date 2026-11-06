@@ -821,6 +821,14 @@ bool GuestModuleLoader::LoadLibrary(
     {
         ImportResolution resolution = m_resolver(symbol);
         if (resolution.targetAddress != 0) return resolution;
+        const auto recordMissing = [&]()
+        {
+            RuntimeDiagnostics::Record(
+                L"DLL IMPORT MISSING: importer='" + candidate->canonicalName +
+                L"' symbol=" + symbol.library + L"!" +
+                (symbol.importedByOrdinal ? L"#" + std::to_wstring(symbol.ordinal) : symbol.name) +
+                L" reason='" + resolution.note + L"'.");
+        };
 
         const std::wstring dependencyName = ApiSetHostLibrary(symbol.library);
         const std::wstring dependencyKey = Lowercase(FileNameOf(dependencyName));
@@ -867,7 +875,11 @@ bool GuestModuleLoader::LoadLibrary(
             {
                 LoadLibrary(dependencyName.c_str(), &dependency, &error, inheritedFlags);
             }
-            if (!dependency) return resolution;
+            if (!dependency)
+            {
+                recordMissing();
+                return resolution;
+            }
 
             std::lock_guard<std::mutex> guard(m_lock);
             const auto inserted = candidate->dependencyModules.emplace(
@@ -897,6 +909,7 @@ bool GuestModuleLoader::LoadLibrary(
             resolution.targetAddress = reinterpret_cast<ULONGLONG>(procedure);
             resolution.note = L"Resolved from guest dependency " + dependencyName + L".";
         }
+        else recordMissing();
         return resolution;
     };
 

@@ -12,6 +12,18 @@ namespace factoryos_10x_shell.Services.Helpers
         private static AppState _instance;
         public static AppState Instance => _instance ?? (_instance = new AppState());
 
+        public event Action TaskbarPreferencesChanged;
+        public bool TaskbarAutoHide
+        {
+            get => ApplicationData.Current.LocalSettings.Values["TaskbarAutoHide"] as bool? ?? false;
+            set { ApplicationData.Current.LocalSettings.Values["TaskbarAutoHide"] = value; TaskbarPreferencesChanged?.Invoke(); }
+        }
+        public bool TaskbarAlignLeft
+        {
+            get => ApplicationData.Current.LocalSettings.Values["TaskbarAlignLeft"] as bool? ?? false;
+            set { ApplicationData.Current.LocalSettings.Values["TaskbarAlignLeft"] = value; TaskbarPreferencesChanged?.Invoke(); }
+        }
+
         private bool _isBgChangeButtonVisible;
         public bool IsBgChangeButtonVisible
         {

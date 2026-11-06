@@ -39,11 +39,36 @@ namespace
     BOOL WINAPI BridgeIsAppThemed() { return BridgeIsThemeActive(); }
     HRESULT WINAPI BridgeSetWindowTheme(HWND, LPCWSTR, LPCWSTR) { return S_OK; }
 
-    HRESULT WINAPI BridgeDrawThemeBackground(HANDLE theme, HDC, int, int, const RECT*, const RECT*)
+    HRESULT WINAPI BridgeDrawThemeBackground(
+        HANDLE theme, HDC dc, int part, int state, const RECT* bounds, const RECT* clip)
     {
-        // GuestWindow already paints built-in controls according to the
-        // active context. Do not let callers overlay a classic fallback.
-        return theme && CurrentGuestUsesVisualStyles() ? S_OK : E_HANDLE;
+        if (!theme || !CurrentGuestUsesVisualStyles()) return E_HANDLE;
+        if (!dc || !bounds) return E_INVALIDARG;
+        // Custom/subclassed controls also call this API on memory DCs. Their
+        // buffer is later blitted into the HWND, so the retained control
+        // renderer cannot supply this background on their behalf. Use the
+        // solid background exposed by GetThemeColor until theme-part artwork
+        // is available; never claim success with an untouched black bitmap.
+        RECT output = *bounds;
+        if (clip)
+        {
+            output.left = (std::max)(output.left, clip->left);
+            output.top = (std::max)(output.top, clip->top);
+            output.right = (std::min)(output.right, clip->right);
+            output.bottom = (std::min)(output.bottom, clip->bottom);
+        }
+        if (output.right <= output.left || output.bottom <= output.top) return S_OK;
+        const HRESULT result = BridgeFillRect(dc, &output, BridgeGetSysColorBrush(15))
+            ? S_OK : E_FAIL;
+        RuntimeDiagnostics::RecordChanged(
+            L"theme-background:" + std::to_wstring(reinterpret_cast<ULONG_PTR>(dc)),
+            L"THEME BACKGROUND: theme=" + std::to_wstring(reinterpret_cast<ULONG_PTR>(theme)) +
+            L" dc=" + std::to_wstring(reinterpret_cast<ULONG_PTR>(dc)) +
+            L" part=" + std::to_wstring(part) + L" state=" + std::to_wstring(state) +
+            L" rect=" + std::to_wstring(output.left) + L"," + std::to_wstring(output.top) +
+            L"," + std::to_wstring(output.right) + L"," + std::to_wstring(output.bottom) +
+            L" HRESULT=" + std::to_wstring(static_cast<unsigned long>(result)));
+        return result;
     }
 
     HRESULT WINAPI BridgeGetThemeColor(HANDLE theme, int, int, int property, COLORREF* color)

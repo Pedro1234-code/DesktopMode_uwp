@@ -27,9 +27,26 @@ namespace factoryos_10x_shell.Controls
         private bool m_calculatorLoaded;
         private ResourceDictionary m_calculatorResources;
 
+        private Canvas m_workspaceHost;
+        private void Workspace_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (!m_maximized || !(sender is Canvas host)) return;
+            Canvas.SetLeft(this, 0); Canvas.SetTop(this, 0);
+            Width = host.ActualWidth; Height = host.ActualHeight;
+        }
+
         public CalculatorWindow()
         {
             InitializeComponent();
+            Loaded += (s, e) => {
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
+                m_workspaceHost = VisualTreeHelper.GetParent(this) as Canvas;
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged += Workspace_SizeChanged;
+            };
+            Unloaded += (s, e) => {
+                if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
+                m_workspaceHost = null;
+            };
             CalculatorFrame.NavigationFailed += CalculatorFrame_NavigationFailed;
         }
 

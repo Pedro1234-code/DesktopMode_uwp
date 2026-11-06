@@ -17,7 +17,8 @@ namespace factoryos_10x_shell.Services.Windowing
         Settings,
         Calculator,
         Firefox,
-        FileOperation
+        FileOperation,
+        AppInstaller
     }
 
     internal sealed class ShellWindowReference
