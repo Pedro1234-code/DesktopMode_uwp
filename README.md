@@ -67,12 +67,26 @@ Join our server: https://discord.gg/dEKYCqFXt
 
 ## Building
 
-1. Install Visual Studio 2022 with the **Universal Windows Platform development** and the latest C++ workload.
-2. Install Windows 10 SDK `10.0.19041` or a compatible version.
-3. Open [`factoryos-10x-shell.sln`](factoryos-10x-shell.sln).
-4. Build and launch the application from Visual Studio.
+1. Install Visual Studio with C# and C++ UWP development tools, the **MSVC v143 x64/x86** build tools, **C++ (v143) Universal Windows Platform tools**, and Windows SDK `10.0.26100.0`. The shell also references the **Microsoft.VCLibs.Desktop 14.0** Extension SDK.
+2. Build Gecko and configure its paths as described below.
+3. Open [`factoryos-10x-shell.sln`](factoryos-10x-shell.sln), restore the NuGet packages, and select **Release | x64** (or **Debug | x64** for debugging).
+4. Build the solution with `factoryos-10x-shell` as the startup project. To deploy to an Xbox in Developer Mode, select **Remote Machine** and enter the console's IP address, or use **Publish > Create App Packages** to create an x64 sideload package.
 
 If Visual Studio reports that the signing certificate is unavailable, create or associate a development certificate with the package before deployment. Note that, in order for the Mouse APIs to work on Xbox, Microsoft's CN must be used on the cert.
+
+### Build Gecko for integrated Strawfox
+
+Follow the prerequisites and **Clone the source and build Gecko** section of the [Strawfox x64 build guide](https://github.com/Pedro1234-code/Strawfox-UWP#build-for-xbox-x64). The integrated host uses the same engine build. Continue here after the engine build succeeds and produces `dist\bin`, `dist\include`, and `dist\lib`. The standalone Strawfox app package is unnecessary for this build.
+
+In this repository, copy [`gecko-source/GeckoShellHost/GeckoBuild.local.props.example`](gecko-source/GeckoShellHost/GeckoBuild.local.props.example) to `GeckoBuild.local.props` in the same directory and set these properties to match your machine:
+
+| MSBuild property | Example | What it points to |
+| --- | --- | --- |
+| `GeckoW10mSource` | `C:\strawfox\engine\firefox` | Gecko submodule checkout used to build the engine |
+| `GeckoW10mObj` | `C:\rw-obj` | Object directory set by `GECKO_W10M_OBJ`, containing `dist` |
+| `GeckoW10mClangCl` | `C:\Program Files\LLVM\bin\clang-cl.exe` | Full path to the LLVM compiler |
+
+The local props file is ignored by Git. On a checkout without that file, you can also set `GECKO_W10M_SOURCE`, `GECKO_W10M_OBJ`, and `GECKO_W10M_CLANG_CL` before launching Visual Studio. The Desktop Mode solution builds the embedded host and packages the required runtime files from Gecko's `dist\bin`. After changing Gecko, rebuild the engine and regenerate the Desktop Mode package to include the new runtime.
 
 ## Known limitations
 
