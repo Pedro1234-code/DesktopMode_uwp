@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -44,6 +45,7 @@ namespace Bridge
         void Activate();
         void Deactivate();
         void SetInputEnabled(bool enabled) { m_inputEnabled.store(enabled); }
+        void SetInitialWindowSizeHandler(std::function<void(int, int)> handler);
 
         ATOM RegisterGuestClass(const GuestAbi::WndClassExW* windowClass, DWORD* win32Error);
         ATOM RegisterGuestClass(const GuestAbi::WndClassW* windowClass, DWORD* win32Error);
@@ -258,6 +260,8 @@ namespace Bridge
         void HandleKey(Windows::UI::Core::KeyEventArgs^ args, UINT message);
         void HandleCharacter(Windows::UI::Core::CharacterReceivedEventArgs^ args);
         void HandleHostSizeChanged(int width, int height);
+        POINT ViewportOrigin() const;
+        void ResizeGuestWindowToViewport(HWND window);
         void DetachHostEvents();
 
         Platform::Agile<Windows::UI::Core::CoreWindow^> m_coreWindow;
@@ -292,7 +296,8 @@ namespace Bridge
         mutable std::mutex m_windowsLock;
         std::unordered_map<ULONG_PTR, std::shared_ptr<WindowRecord>> m_windows;
         ULONG_PTR m_nextWindow = 0x20000;
-        std::uint64_t m_nextZOrder = 1;
+        std::atomic<std::int64_t> m_nextZOrder{ 1 };
+        std::int64_t m_nextChildBottomZOrder = -1;
         std::atomic<ULONG_PTR> m_foregroundWindow{ 0 };
         std::atomic<ULONG_PTR> m_focusWindow{ 0 };
         std::atomic<ULONG_PTR> m_captureWindow{ 0 };
@@ -312,7 +317,8 @@ namespace Bridge
         void DispatchSentCallbackToken(ULONG_PTR token);
         BOOL QueueAsynchronousSentMessage(HWND window, UINT message, WPARAM wParam,
             LPARAM lParam, void (CALLBACK* callback)(HWND, UINT, ULONG_PTR, LRESULT),
-            ULONG_PTR callbackData, DWORD sendState, DWORD* win32Error);
+            ULONG_PTR callbackData, DWORD sendState, DWORD* win32Error,
+            bool hostResize = false);
         mutable std::mutex m_sentMessagesLock;
         std::unordered_map<ULONG_PTR, std::shared_ptr<SentMessageRecord>> m_sentMessages;
         ULONG_PTR m_nextSentMessage = 1;

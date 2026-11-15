@@ -1,5 +1,9 @@
 using System;
 using Windows.Foundation;
+using Windows.UI.Xaml;
+using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Input;
+using Windows.UI.Xaml.Media;
 
 namespace factoryos_10x_shell.Controls
 {
@@ -8,11 +12,30 @@ namespace factoryos_10x_shell.Controls
         TopLeft,
         TopRight,
         BottomLeft,
-        BottomRight
+        BottomRight,
+        Left,
+        Top,
+        Right,
+        Bottom
     }
 
     internal static class WindowResize
     {
+        internal static UIElement CoordinateSpace(DependencyObject window)
+        {
+            for (var parent = VisualTreeHelper.GetParent(window); parent != null;
+                 parent = VisualTreeHelper.GetParent(parent))
+            {
+                if (parent is Canvas canvas) return canvas;
+            }
+            return null;
+        }
+
+        internal static bool TryCapture(object sender, PointerRoutedEventArgs e) =>
+            sender is UIElement grip &&
+            e.GetCurrentPoint(grip).Properties.IsLeftButtonPressed &&
+            grip.CapturePointer(e.Pointer);
+
         internal static WindowResizeCorner CornerFromTag(object tag)
         {
             return Enum.TryParse(tag as string, out WindowResizeCorner corner)
@@ -30,31 +53,24 @@ namespace factoryos_10x_shell.Controls
         {
             double dx = currentPointer.X - startPointer.X;
             double dy = currentPointer.Y - startPointer.Y;
-            bool fromLeft = corner == WindowResizeCorner.TopLeft || corner == WindowResizeCorner.BottomLeft;
-            bool fromTop = corner == WindowResizeCorner.TopLeft || corner == WindowResizeCorner.TopRight;
+            bool fromLeft = corner == WindowResizeCorner.Left ||
+                corner == WindowResizeCorner.TopLeft || corner == WindowResizeCorner.BottomLeft;
+            bool fromTop = corner == WindowResizeCorner.Top ||
+                corner == WindowResizeCorner.TopLeft || corner == WindowResizeCorner.TopRight;
+            bool changesWidth = corner != WindowResizeCorner.Top && corner != WindowResizeCorner.Bottom;
+            bool changesHeight = corner != WindowResizeCorner.Left && corner != WindowResizeCorner.Right;
 
-            double width = fromLeft ? startBounds.Width - dx : startBounds.Width + dx;
-            double height = fromTop ? startBounds.Height - dy : startBounds.Height + dy;
-            width = Math.Max(minimumWidth, width);
-            height = Math.Max(minimumHeight, height);
+            double width = changesWidth
+                ? Math.Max(minimumWidth, startBounds.Width + (fromLeft ? -dx : dx))
+                : startBounds.Width;
+            double height = changesHeight
+                ? Math.Max(minimumHeight, startBounds.Height + (fromTop ? -dy : dy))
+                : startBounds.Height;
 
             double left = fromLeft ? startBounds.Right - width : startBounds.X;
             double top = fromTop ? startBounds.Bottom - height : startBounds.Y;
 
-            // A corner dragged beyond the desktop edge stops at that edge while
-            // retaining the opposite side of the window.
-            if (fromLeft && left < 0)
-            {
-                width += left;
-                left = 0;
-            }
-            if (fromTop && top < 0)
-            {
-                height += top;
-                top = 0;
-            }
-
-            return new Rect(left, top, Math.Max(minimumWidth, width), Math.Max(minimumHeight, height));
+            return new Rect(left, top, width, height);
         }
     }
 }

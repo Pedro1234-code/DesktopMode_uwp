@@ -164,7 +164,7 @@ namespace factoryos_10x_shell.Services.Windowing
             if (identity == null) return;
 
             ShellWindowReference existing = m_mru.FirstOrDefault(item => Matches(item, kind, identity));
-            if (ReferenceEquals(ActiveWindow, existing)) return;
+            if (existing != null && ReferenceEquals(ActiveWindow, existing)) return;
 
             if (existing != null) m_mru.Remove(existing);
             else existing = new ShellWindowReference(kind, identity);
@@ -202,6 +202,9 @@ namespace factoryos_10x_shell.Services.Windowing
             if (isAvailable == null) throw new ArgumentNullException(nameof(isAvailable));
             return m_mru.FirstOrDefault(isAvailable);
         }
+
+        public IEnumerable<ShellWindowKind> GetWindowLayers(Func<ShellWindowReference, bool> isAvailable) =>
+            m_mru.Where(isAvailable).Select(window => window.Kind).Distinct().Reverse();
 
         public void ClearActive()
         {

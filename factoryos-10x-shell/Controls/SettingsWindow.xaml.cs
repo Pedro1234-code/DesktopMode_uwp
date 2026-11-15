@@ -57,6 +57,7 @@ namespace factoryos_10x_shell.Controls
                 if (m_workspaceHost != null) m_workspaceHost.SizeChanged += Workspace_SizeChanged;
             };
             Unloaded += (s, e) => {
+                CancelPortalLoad();
                 m_webApps.InstalledApps.CollectionChanged -= InstalledWebApps_CollectionChanged;
                 if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
                 m_workspaceHost = null;
@@ -68,6 +69,7 @@ namespace factoryos_10x_shell.Controls
             DisableLivePackageTrackingToggle.IsOn = !App.ServiceProvider
                 .GetRequiredService<AppHelper>().IsLivePackageTrackingEnabled;
             CurrentVersionText.Text = UpdateCheckService.CurrentVersion.ToString();
+            ShellSkinCombo.SelectedIndex = AppState.Instance.UseWindows11Skin ? 1 : 0;
             TaskbarAutoHideToggle.IsOn = AppState.Instance.TaskbarAutoHide;
             TaskbarAlignmentCombo.SelectedIndex = AppState.Instance.TaskbarAlignLeft ? 1 : 0;
             m_initializing = false;
@@ -87,14 +89,16 @@ namespace factoryos_10x_shell.Controls
 
         public void Open()
         {
+            bool opening = Visibility != Visibility.Visible;
             Visibility = Visibility.Visible;
             AppState.Instance.SetSettingsWindowState(true, false);
             AppState.Instance.ActivateSettings();
+            if (opening) BeginPortalLoad();
         }
         public void CloseFromTaskView() => Close();
-        private void Close() { Visibility = Visibility.Collapsed; AppState.Instance.SetSettingsWindowState(false, false); ShowHome(); }
+        private void Close() { CancelPortalLoad(); Visibility = Visibility.Collapsed; AppState.Instance.SetSettingsWindowState(false, false); ShowHome(); }
         private void Close_Click(object sender, RoutedEventArgs e) => Close();
-        private void Minimize_Click(object sender, RoutedEventArgs e) { Visibility = Visibility.Collapsed; AppState.Instance.SetSettingsWindowState(true, true); }
+        private void Minimize_Click(object sender, RoutedEventArgs e) { CancelPortalLoad(); Visibility = Visibility.Collapsed; AppState.Instance.SetSettingsWindowState(true, true); }
         private void Root_PointerPressed(object sender, PointerRoutedEventArgs e) => AppState.Instance.ActivateSettings();
         private void Maximize_Click(object sender, RoutedEventArgs e)
         {
@@ -105,11 +109,25 @@ namespace factoryos_10x_shell.Controls
         private void TitleBar_PointerPressed(object sender, PointerRoutedEventArgs e) { if (m_maximized) return; m_dragging = true; m_startPoint = e.GetCurrentPoint(VisualTreeHelper.GetParent(this) as UIElement).Position; m_startLeft = Canvas.GetLeft(this); m_startTop = Canvas.GetTop(this); TitleBar.CapturePointer(e.Pointer); }
         private void TitleBar_PointerMoved(object sender, PointerRoutedEventArgs e) { if (!m_dragging) return; Point p = e.GetCurrentPoint(VisualTreeHelper.GetParent(this) as UIElement).Position; Canvas.SetLeft(this, Math.Max(0, m_startLeft + p.X - m_startPoint.X)); Canvas.SetTop(this, Math.Max(0, m_startTop + p.Y - m_startPoint.Y)); }
         private void TitleBar_PointerReleased(object sender, PointerRoutedEventArgs e) { m_dragging = false; TitleBar.ReleasePointerCaptures(); }
-        private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e) { if (!m_maximized) { m_resizing = true; m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag); m_startPoint = e.GetCurrentPoint(null).Position; m_startLeft = Canvas.GetLeft(this); m_startTop = Canvas.GetTop(this); m_startWidth = Width; m_startHeight = Height; (sender as UIElement)?.CapturePointer(e.Pointer); } }
-        private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e) { if (m_resizing) { Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint, e.GetCurrentPoint(null).Position, new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 720, 480); Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y); Width = bounds.Width; Height = bounds.Height; } }
+        private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
+        {
+            if (m_maximized) return;
+            if (m_resizing || !WindowResize.TryCapture(sender, e)) return;
+            AppState.Instance.ActivateSettings();
+            m_resizing = true;
+            m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
+            m_startPoint = e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position;
+            m_startLeft = Canvas.GetLeft(this);
+            m_startTop = Canvas.GetTop(this);
+            m_startWidth = Width;
+            m_startHeight = Height;
+            e.Handled = true;
+        }
+        private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e) { if (m_resizing) { Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint, e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position, new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 720, 480); Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y); Width = bounds.Width; Height = bounds.Height; } }
         private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; (sender as UIElement)?.ReleasePointerCaptures(); }
 
-        private void System_Click(object sender, RoutedEventArgs e) { OpenDetail("System", "About"); }
+        private void System_Click(object sender, RoutedEventArgs e) { OpenDetail("System", DisplayNav.IsEnabled ? "Display" : "About"); }
+        private void Network_Click(object sender, RoutedEventArgs e) { OpenDetail("Network & Internet", "Status"); }
         private void Personalization_Click(object sender, RoutedEventArgs e) { OpenDetail("Personalization", "Background"); }
         private async void Apps_Click(object sender, RoutedEventArgs e)
         {
@@ -209,6 +227,12 @@ namespace factoryos_10x_shell.Controls
             ShowHome();
             DismissOnScreenKeyboard();
         }
+        private void ShellSkin_Changed(object sender, SelectionChangedEventArgs e)
+        {
+            if (!m_initializing && sender is ComboBox combo && combo.SelectedIndex >= 0)
+                AppState.Instance.UseWindows11Skin = combo.SelectedIndex == 1;
+        }
+
         private void TaskbarAutoHide_Toggled(object sender, RoutedEventArgs e)
         { if (!m_initializing) AppState.Instance.TaskbarAutoHide = TaskbarAutoHideToggle.IsOn; }
         private void TaskbarAlignment_Changed(object sender, SelectionChangedEventArgs e)
@@ -232,6 +256,7 @@ namespace factoryos_10x_shell.Controls
             bool system = section == "System";
             bool updateSecurity = section == "Update & Security";
             SystemNavigation.Visibility = system ? Visibility.Visible : Visibility.Collapsed;
+            NetworkNavigation.Visibility = section == "Network & Internet" ? Visibility.Visible : Visibility.Collapsed;
             UpdateSecurityNavigation.Visibility = updateSecurity ? Visibility.Visible : Visibility.Collapsed;
             AppsNavigation.Visibility = section == "Apps" ? Visibility.Visible : Visibility.Collapsed;
             PersonalizationNavigation.Visibility = section == "Personalization" ? Visibility.Visible : Visibility.Collapsed;
@@ -273,7 +298,8 @@ namespace factoryos_10x_shell.Controls
             ListView navigation = page == "Home"
                 ? HomeNavigation
                 : page == "Apps" ? AppsNavigation
-                : page == "About" || page == "Debug"
+                : page == "Status" ? NetworkNavigation
+                : page == "About" || page == "Debug" || IsPortalSystemPage(page)
                     ? SystemNavigation
                     : page == "Windows Update" || page == "For developers"
                         ? UpdateSecurityNavigation
@@ -306,6 +332,7 @@ namespace factoryos_10x_shell.Controls
             if (SystemNavigation != activeNavigation) SystemNavigation.SelectedItem = null;
             if (UpdateSecurityNavigation != activeNavigation) UpdateSecurityNavigation.SelectedItem = null;
             if (AppsNavigation != activeNavigation) AppsNavigation.SelectedItem = null;
+            if (NetworkNavigation != activeNavigation) NetworkNavigation.SelectedItem = null;
         }
         private void SelectDetail(string page)
         {
@@ -313,6 +340,7 @@ namespace factoryos_10x_shell.Controls
             ColorsPanel.Visibility = page == "Colors" ? Visibility.Visible : Visibility.Collapsed;
             LauncherPanel.Visibility = page == "Launcher" ? Visibility.Visible : Visibility.Collapsed;
             MousePanel.Visibility = page == "Mouse" ? Visibility.Visible : Visibility.Collapsed;
+            ThemesPanel.Visibility = page == "Themes" ? Visibility.Visible : Visibility.Collapsed;
             TaskbarPanel.Visibility = page == "Taskbar" ? Visibility.Visible : Visibility.Collapsed;
             AboutPanel.Visibility = page == "About" ? Visibility.Visible : Visibility.Collapsed;
             DebugPanel.Visibility = page == "Debug" ? Visibility.Visible : Visibility.Collapsed;
@@ -320,6 +348,7 @@ namespace factoryos_10x_shell.Controls
             ForDevelopersPanel.Visibility = page == "For developers" ? Visibility.Visible : Visibility.Collapsed;
             AppsPanel.Visibility = page == "Apps" ? Visibility.Visible : Visibility.Collapsed;
             DetailTitle.Text = page == "Apps" ? "Apps & features" : page;
+            UpdatePortalPage(page);
         }
         private async void CheckForUpdates_Click(object sender, RoutedEventArgs e)
         {

@@ -7,7 +7,7 @@
   <Style x:Key="InstallerAction" TargetType="Button"><Setter Property="Width" Value="120"/><Setter Property="Height" Value="32"/><Setter Property="Padding" Value="12,0"/><Setter Property="CornerRadius" Value="4"/><Setter Property="FontSize" Value="13"/><Setter Property="HorizontalContentAlignment" Value="Center"/></Style>
  </ResourceDictionary></UserControl.Resources>
  <Border Background="{ThemeResource InstallerSurface}" BorderBrush="{ThemeResource SystemControlForegroundBaseMediumLowBrush}" BorderThickness="1" CornerRadius="8">
-  <Grid PointerPressed="Root_PointerPressed">
+  <Grid>
    <Grid.RowDefinitions><RowDefinition Height="32"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
    <Grid>
     <Border Background="Transparent" Margin="0,0,138,0" PointerPressed="Title_PointerPressed" PointerMoved="Title_PointerMoved" PointerReleased="Title_PointerReleased" PointerCaptureLost="Title_PointerReleased"><TextBlock Text="App Installer" Margin="12,0" FontSize="12" VerticalAlignment="Center"/></Border>

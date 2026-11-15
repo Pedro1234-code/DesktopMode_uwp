@@ -147,6 +147,7 @@
     <ClInclude Include="Bridge\ActivationContext.h" />
     <ClInclude Include="Bridge\CommonControlsShims.h" />
     <ClInclude Include="Bridge\Comdlg32Shims.h" />
+    <ClInclude Include="Bridge\FileDialogCom.inl" />
     <ClInclude Include="Bridge\DialogResources.h" />
     <ClInclude Include="Bridge\DirectWriteText.h" />
     <ClInclude Include="Bridge\GuestRegistry.h" />
@@ -155,6 +156,7 @@
     <ClInclude Include="Bridge\MprShims.h" />
     <ClInclude Include="Bridge\OleShims.h" />
     <ClInclude Include="Bridge\Shell32Shims.h" />
+    <ClInclude Include="Bridge\ShellLinkReader.h" />
     <ClInclude Include="Bridge\Gdi32Shims.h" />
     <ClInclude Include="Bridge\GuestKernel.h" />
     <ClInclude Include="Bridge\GuestModule.h" />

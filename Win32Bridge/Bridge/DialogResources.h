@@ -3,12 +3,36 @@
 #include <windows.h>
 
 #include <string>
+#include <vector>
 
 namespace Win32Bridge
 {
 namespace Bridge
 {
     void ResetGuestDialogState();
+
+    constexpr UINT GuestFileDialogNameId = 0x5204;
+    constexpr UINT GuestFileDialogFilterId = 0x5205;
+    constexpr UINT GuestFileDialogNameLabelId = 0x5206;
+    constexpr UINT GuestFileDialogSetFilterMessage = WM_APP + 0x205;
+    constexpr UINT GuestFileDialogSetFolderMessage = WM_APP + 0x206;
+
+    struct GuestFileDialogCheckBox
+    {
+        DWORD id = 0;
+        std::wstring label;
+        BOOL checked = FALSE;
+        DWORD state = 3; // CDCS_ENABLED | CDCS_VISIBLE
+        HWND window = nullptr;
+    };
+
+    constexpr UINT MaximumGuestFileDialogFilters = 128;
+
+    enum class GuestFileDialogEvent
+    {
+        Initialized, FolderChanging, FolderChanged, SelectionChanged,
+        TypeChanged, FileOk, CheckButtonToggled, Destroyed
+    };
 
     struct GuestFileDialogDescriptor
     {
@@ -23,6 +47,13 @@ namespace Bridge
         DWORD flags = 0;
         BOOL saveDialog = FALSE;
         BOOL folderDialog = FALSE;
+        BOOL allowMultiple = FALSE;
+        LPCWSTR okButtonLabel = nullptr;
+        LPCWSTR fileNameLabel = nullptr;
+        std::vector<GuestFileDialogCheckBox>* checkBoxes = nullptr;
+        HRESULT (*onEvent)(void*, GuestFileDialogEvent, HWND,
+            const std::wstring&, const std::vector<std::wstring>&, DWORD) = nullptr;
+        void* eventContext = nullptr;
     };
 
     struct GuestPropertyFieldDescriptor
@@ -91,7 +122,8 @@ namespace Bridge
         bool modal = true, HWND* createdWindow = nullptr);
     INT_PTR ShowGuestPropertySheet(const GuestPropertySheetDescriptor& descriptor);
     bool ShowGuestFileDialog(const GuestFileDialogDescriptor& descriptor,
-        std::wstring* selectedPath, DWORD* selectedFilterIndex);
+        std::wstring* selectedPath, DWORD* selectedFilterIndex,
+        std::vector<std::wstring>* selectedPaths = nullptr);
     bool ShowGuestColorDialog(HWND owner, HINSTANCE instance,
         COLORREF initialColor, COLORREF* selectedColor,
         DLGPROC hookProcedure = nullptr, LPARAM hookParameter = 0);

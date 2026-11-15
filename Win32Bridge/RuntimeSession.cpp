@@ -2,6 +2,10 @@
 #include "RuntimeSession.h"
 
 #include "Bridge\GuestRuntime.h"
+#include "Bridge/GuestResources.h"
+#include "Bridge/ShellLinkReader.h"
+#include "Bridge/VirtualPath.h"
+#include "Bridge/User32Shims.h"
 #include "Bridge\GuestStorage.h"
 #include "Bridge\GuestWindow.h"
 #include "Bridge\MouseInput.h"
@@ -10,6 +14,9 @@
 
 #include <windows.globalization.h>
 #include <windows.storage.accesscache.h>
+#include <fileapifromapp.h>
+#include <robuffer.h>
+#include <wrl/client.h>
 
 #include <atomic>
 #include <algorithm>
@@ -35,6 +42,7 @@ namespace
     constexpr wchar_t RuntimeLogFileName[] = L"Win32Bridge-runtime.log";
     constexpr wchar_t ImportLogFileName[] = L"Win32Bridge-imports.log";
     constexpr wchar_t ExternalFolderToken[] = L"CoreShell.Files.Mount.Removable media";
+    constexpr unsigned int IconPreviewLimit = 64 * 1024 * 1024;
     std::atomic<bool> g_diagnosticsSnapshotPending{ false };
 
     std::wstring ToWide(String^ value)
@@ -174,10 +182,22 @@ namespace
         });
     }
 
-    task<std::vector<BYTE>> ReadOptionalFileBytesAsync(StorageFile^ file)
+    task<std::vector<BYTE>> ReadOptionalFileBytesAsync(StorageFile^ file,
+        unsigned int maximumSize = MAXDWORD)
     {
         if (!file) return task_from_result(std::vector<BYTE>{});
-        return create_task(FileIO::ReadBufferAsync(file)).then([](task<IBuffer^> previous)
+        auto read = maximumSize == MAXDWORD ? create_task(FileIO::ReadBufferAsync(file))
+            : create_task(file->OpenAsync(FileAccessMode::Read)).then(
+            [maximumSize](IRandomAccessStream^ stream) -> task<IBuffer^>
+        {
+            if (!stream || stream->Size == 0 || stream->Size > maximumSize)
+                return task_from_result<IBuffer^>(nullptr);
+            const auto size = static_cast<unsigned int>(stream->Size);
+            return create_task(stream->ReadAsync(
+                ref new Windows::Storage::Streams::Buffer(size), size, InputStreamOptions::None))
+                .then([stream](IBuffer^ buffer) { return buffer; });
+        });
+        return read.then([](task<IBuffer^> previous)
         {
             std::vector<BYTE> bytes;
             try
@@ -328,6 +348,12 @@ struct Win32Bridge::RuntimeSessionState final
 };
 
 Win32Bridge::RuntimeSession::RuntimeSession(Panel^ surfaceHost)
+    : RuntimeSession(surfaceHost, nullptr)
+{
+}
+
+Win32Bridge::RuntimeSession::RuntimeSession(Panel^ surfaceHost,
+    InitialGuestWindowSizeHandler^ initialSizeHandler)
     : m_state()
 {
     if (!surfaceHost)
@@ -337,6 +363,14 @@ Win32Bridge::RuntimeSession::RuntimeSession(Panel^ surfaceHost)
 
     auto state = std::make_shared<RuntimeSessionState>();
     state->windows = std::make_shared<GuestWindowManager>(Window::Current->CoreWindow, surfaceHost);
+    if (initialSizeHandler)
+    {
+        Platform::Agile<InitialGuestWindowSizeHandler^> handler(initialSizeHandler);
+        state->windows->SetInitialWindowSizeHandler([handler](int width, int height)
+        {
+            handler.Get()->Invoke(width, height);
+        });
+    }
     state->windows->Activate();
     state->windows->SetInputEnabled(false);
 
@@ -361,6 +395,13 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
     StorageFile^ executable,
     StorageFolder^ moduleSourceFolder)
 {
+    return PrepareShortcutAsync(executable, moduleSourceFolder, nullptr, nullptr, nullptr);
+}
+
+IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareShortcutAsync(
+    StorageFile^ executable, StorageFolder^ moduleSourceFolder,
+    String^ virtualPath, String^ arguments, String^ workingDirectory)
+{
     if (!m_state || !executable || !moduleSourceFolder)
     {
         throw ref new InvalidArgumentException(L"The executable and its authorized source folder are required.");
@@ -377,10 +418,13 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
     RuntimeDiagnostics::Reset(L"CoreShell: " + state->executableName);
     RuntimeDiagnostics::Record(L"HOST: preparing an executable selected through CoreShell Files.");
 
-    return create_async([state, executable, moduleSourceFolder]()
+    const auto shortcutPath = ToWide(virtualPath);
+    const auto shortcutArguments = ToWide(arguments);
+    const auto shortcutDirectory = ToWide(workingDirectory);
+    return create_async([state, executable, moduleSourceFolder, shortcutPath, shortcutArguments, shortcutDirectory]()
     {
         auto preparation = create_task(FileIO::ReadBufferAsync(executable)).then(
-            [state, moduleSourceFolder](IBuffer^ buffer) -> task<bool>
+            [state, moduleSourceFolder, shortcutPath, shortcutArguments, shortcutDirectory](IBuffer^ buffer) -> task<bool>
         {
             if (!buffer || buffer->Length == 0)
             {
@@ -404,13 +448,13 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
                         ToWide(satellite->Name) + L"'.");
                 }
                 return ReadOptionalFileBytesAsync(satellite);
-            }).then([state, moduleSourceFolder, bytes](std::vector<BYTE> satelliteBytes) -> task<bool>
+            }).then([state, moduleSourceFolder, bytes, shortcutPath, shortcutArguments, shortcutDirectory](std::vector<BYTE> satelliteBytes) -> task<bool>
             {
                 if (satelliteBytes.empty())
                     RuntimeDiagnostics::Record(
                         L"MUI: no companion resource file was found beside the executable.");
                 return GetExternalMountFolderAsync().then(
-                    [state, moduleSourceFolder, bytes, satelliteBytes](StorageFolder^ externalFolder)
+                    [state, moduleSourceFolder, bytes, satelliteBytes, shortcutPath, shortcutArguments, shortcutDirectory](StorageFolder^ externalFolder)
                 {
                     // Give a picked executable a stable guest-visible directory that
                     // represents the folder the user actually selected.  Treating every
@@ -423,9 +467,9 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
                         ? ToWide(moduleSourceFolder->Name)
                         : std::wstring(L"Application");
                     if (sourceDirectoryName.empty()) sourceDirectoryName = L"Application";
-                    const std::wstring virtualModulePath =
+                    const std::wstring virtualModulePath = shortcutPath.empty() ?
                         L"C:\\PortableApps\\" + sourceDirectoryName + L"\\" +
-                        state->executableName;
+                        state->executableName : shortcutPath;
                     state->storage = std::make_shared<GuestStorageContext>(
                         ApplicationData::Current->LocalFolder,
                         virtualModulePath,
@@ -435,6 +479,9 @@ IAsyncOperation<bool>^ Win32Bridge::RuntimeSession::PrepareAsync(
                     state->runtime->SetStorageContext(state->storage);
                     state->runtime->SetWindowManager(state->windows);
                     state->runtime->SetModuleSourceFolder(moduleSourceFolder);
+                    if (!shortcutArguments.empty())
+                        state->runtime->SetCommandLine(L"\"" + virtualModulePath + L"\" " + shortcutArguments);
+                    state->runtime->SetInitialCurrentDirectory(shortcutDirectory);
 
                     std::wstring error;
                     if (!satelliteBytes.empty() && !state->runtime->SetResourceSatellite(
@@ -541,6 +588,188 @@ void Win32Bridge::RuntimeSession::SetInputEnabled(bool enabled)
     {
         m_state->windows->SetInputEnabled(enabled && !m_state->closeRequested.load());
     }
+}
+
+Win32Bridge::ShellShortcut::ShellShortcut(String^ target, String^ relativePath,
+    String^ arguments, String^ workingDirectory)
+    : m_target(target), m_relativePath(relativePath), m_arguments(arguments),
+      m_workingDirectory(workingDirectory)
+{
+}
+
+String^ Win32Bridge::RuntimeSession::ResolveShortcutPath(String^ path, String^ directory)
+{
+    if (!path || !path->Length() || !directory) return nullptr;
+    VirtualPathResolver resolver;
+    GuestPath base;
+    GuestPath target;
+    if (!resolver.Resolve(directory->Data(), &base, nullptr) ||
+        !resolver.SetCurrentDirectoryPath(base, nullptr) ||
+        !resolver.Resolve(path->Data(), &target, nullptr))
+        return nullptr;
+    return ref new String(target.canonical.c_str());
+}
+
+Win32Bridge::ShellShortcutDirectory::ShellShortcutDirectory(
+    Windows::Foundation::Collections::IVectorView<String^>^ folders,
+    Windows::Foundation::Collections::IVectorView<String^>^ shortcuts)
+    : m_folders(folders), m_shortcuts(shortcuts)
+{
+}
+
+Win32Bridge::ShellShortcutDirectory^ Win32Bridge::RuntimeSession::ListShellShortcutDirectory(String^ folderPath)
+{
+    if (!folderPath || !folderPath->Length())
+        throw ref new InvalidArgumentException();
+    auto folders = ref new Platform::Collections::Vector<String^>();
+    auto shortcuts = ref new Platform::Collections::Vector<String^>();
+    const auto pattern = ToWide(folderPath) + L"\\*";
+    WIN32_FIND_DATAW data{};
+    HANDLE search = ::FindFirstFileExFromAppW(pattern.c_str(), FindExInfoBasic,
+        &data, FindExSearchNameMatch, nullptr, 0);
+    if (search != INVALID_HANDLE_VALUE)
+    {
+        const auto closeSearch = [](void* handle) { ::FindClose(handle); };
+        std::unique_ptr<void, decltype(closeSearch)> guard(search, closeSearch);
+        do
+        {
+            const std::wstring name(data.cFileName);
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+            if (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            {
+                if (name != L"." && name != L"..")
+                    folders->Append(ref new String(name.c_str()));
+            }
+            else if (name.size() >= 4 && _wcsicmp(name.c_str() + name.size() - 4, L".lnk") == 0)
+                shortcuts->Append(ref new String(name.c_str()));
+        } while (::FindNextFileW(search, &data));
+        const DWORD error = ::GetLastError();
+        if (error != ERROR_NO_MORE_FILES)
+            throw Exception::CreateException(HRESULT_FROM_WIN32(error));
+    }
+    else
+    {
+        const DWORD error = ::GetLastError();
+        if (error != ERROR_FILE_NOT_FOUND && error != ERROR_NO_MORE_FILES)
+            throw Exception::CreateException(HRESULT_FROM_WIN32(error));
+    }
+    return ref new ShellShortcutDirectory(folders->GetView(), shortcuts->GetView());
+}
+
+namespace
+{
+    Win32Bridge::ShellShortcut^ ReadShellShortcutBytes(const std::vector<BYTE>& bytes)
+    {
+        ShellLinkData link;
+        if (!ParseShellLink(bytes, link)) return nullptr;
+        return ref new Win32Bridge::ShellShortcut(ref new String(link.target.c_str()),
+            ref new String(link.relativePath.c_str()), ref new String(link.arguments.c_str()),
+            ref new String(link.workingDirectory.c_str()));
+    }
+}
+
+Win32Bridge::ShellShortcut^ Win32Bridge::RuntimeSession::ReadShellShortcutFile(
+    String^ folderPath, String^ fileName)
+{
+    const auto name = ToWide(fileName);
+    if (!folderPath || !folderPath->Length() || name.size() < 4 ||
+        name.find_first_of(L"\\/:*?") != std::wstring::npos ||
+        _wcsicmp(name.c_str() + name.size() - 4, L".lnk") != 0)
+        throw ref new InvalidArgumentException();
+
+    const auto path = ToWide(folderPath) + L"\\" + name;
+    HANDLE file = ::CreateFile2FromAppW(path.c_str(), GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, OPEN_EXISTING, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        throw Exception::CreateException(HRESULT_FROM_WIN32(::GetLastError()));
+    const auto closeFile = [](void* handle) { ::CloseHandle(handle); };
+    std::unique_ptr<void, decltype(closeFile)> guard(file, closeFile);
+    LARGE_INTEGER size{};
+    if (!::GetFileSizeEx(file, &size))
+        throw Exception::CreateException(HRESULT_FROM_WIN32(::GetLastError()));
+    if (size.QuadPart <= 0 || size.QuadPart > static_cast<LONGLONG>(MaximumShellLinkSize)) return nullptr;
+    std::vector<BYTE> bytes(static_cast<size_t>(size.QuadPart));
+    DWORD read = 0;
+    if (!::ReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr))
+        throw Exception::CreateException(HRESULT_FROM_WIN32(::GetLastError()));
+    return read == bytes.size() ? ReadShellShortcutBytes(bytes) : nullptr;
+}
+
+Win32Bridge::ShellShortcut^ Win32Bridge::RuntimeSession::ReadShellShortcut(IBuffer^ buffer)
+{
+    if (!buffer || !buffer->Length || buffer->Length > MaximumShellLinkSize) return nullptr;
+    std::vector<BYTE> bytes(buffer->Length);
+    DataReader::FromBuffer(buffer)->ReadBytes(ArrayReference<BYTE>(bytes.data(), buffer->Length));
+    return ReadShellShortcutBytes(bytes);
+}
+
+namespace
+{
+    Windows::UI::Xaml::Media::ImageSource^ CreateExecutableIconBitmap(const MiniGdi::Surface& icon)
+    {
+        if (icon.Empty()) return nullptr;
+        auto bitmap = ref new Windows::UI::Xaml::Media::Imaging::WriteableBitmap(
+            icon.Width(), icon.Height());
+        auto buffer = bitmap->PixelBuffer;
+        Microsoft::WRL::ComPtr<Windows::Storage::Streams::IBufferByteAccess> access;
+        BYTE* pixels = nullptr;
+        if (!buffer || FAILED(reinterpret_cast<IInspectable*>(buffer)->QueryInterface(
+            IID_PPV_ARGS(&access))) || FAILED(access->Buffer(&pixels)) || !pixels ||
+            buffer->Length < icon.Pixels().size() * sizeof(MiniGdi::Color))
+            return nullptr;
+
+        // WriteableBitmap expects premultiplied BGRA.
+        for (const auto color : icon.Pixels())
+        {
+            const unsigned alpha = MiniGdi::Alpha(color);
+            *pixels++ = static_cast<BYTE>((MiniGdi::Blue(color) * alpha + 127) / 255);
+            *pixels++ = static_cast<BYTE>((MiniGdi::Green(color) * alpha + 127) / 255);
+            *pixels++ = static_cast<BYTE>((MiniGdi::Red(color) * alpha + 127) / 255);
+            *pixels++ = static_cast<BYTE>(alpha);
+        }
+        bitmap->Invalidate();
+        return bitmap;
+    }
+}
+
+Windows::UI::Xaml::Media::ImageSource^ Win32Bridge::RuntimeSession::LoadExecutableIcon()
+{
+    if (!m_state || !m_state->prepared.load() || !m_state->runtime) return nullptr;
+    try
+    {
+        MiniGdi::Surface icon;
+        return m_state->runtime->CopyExecutableIcon(32, &icon) ? CreateExecutableIconBitmap(icon) : nullptr;
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+
+IAsyncOperation<Windows::UI::Xaml::Media::ImageSource^>^
+Win32Bridge::RuntimeSession::ReadExecutableIconAsync(StorageFile^ executable)
+{
+    using Windows::UI::Xaml::Media::ImageSource;
+    const auto ui = task_continuation_context::use_current();
+    return create_async([executable, ui]() -> task<ImageSource^>
+    {
+        return ReadOptionalFileBytesAsync(executable, IconPreviewLimit).then([](std::vector<BYTE> bytes)
+        {
+            MiniGdi::Surface icon;
+            MappedPeImage mapped;
+            std::wstring error;
+            if (!bytes.empty() && PeMapper::Materialize(
+                bytes.data(), bytes.size(), &mapped, &error, IconPreviewLimit))
+            {
+                GuestResourceScope resources(mapped.bytes.data(), mapped.bytes.size());
+                CopyGuestExecutableIconPixels(48, &icon);
+            }
+            return icon;
+        }, task_continuation_context::use_arbitrary()).then([](MiniGdi::Surface icon) -> ImageSource^
+        {
+            return CreateExecutableIconBitmap(icon);
+        }, ui);
+    });
 }
 
 void Win32Bridge::RuntimeSession::FlushDiagnostics()

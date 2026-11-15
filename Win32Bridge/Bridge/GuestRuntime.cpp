@@ -447,6 +447,15 @@ bool GuestRuntime::SetResourceSatellite(
     return true;
 }
 
+bool GuestRuntime::CopyExecutableIcon(int size, MiniGdi::Surface* destination) const
+{
+    if (m_mapped.bytes.empty()) return false;
+    GuestResourceScope resources(m_mapped.bytes.data(), m_mapped.bytes.size(),
+        m_resourceSatellite.bytes.empty() ? nullptr : m_resourceSatellite.bytes.data(),
+        m_resourceSatellite.bytes.size());
+    return CopyGuestExecutableIconPixels(size, destination);
+}
+
 bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportResolver& resolver, std::wstring* error)
 {
     RuntimeDiagnostics::Record(L"PREPARE: inspecting main PE (" + std::to_wstring(fileSize) + L" bytes).");

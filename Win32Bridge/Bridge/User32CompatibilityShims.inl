@@ -159,6 +159,62 @@ UINT WINAPI BridgeGetDlgItemTextA(HWND parent, int identifier, LPSTR buffer, int
     return child ? static_cast<UINT>(BridgeGetWindowTextA(child, buffer, count)) : 0;
 }
 
+LRESULT WINAPI BridgeSendDlgItemMessageA(
+    HWND parent, int identifier, UINT message, WPARAM wParam, LPARAM lParam)
+{
+    const HWND child = BridgeGetDlgItem(parent, identifier);
+    if (!child) return 0;
+
+    // The bridge's window procedures consume UTF-16 for standard text
+    // messages. Private messages retain the caller's argument representation.
+    constexpr UINT EditReplaceSelection = 0x00c2; // EM_REPLACESEL
+    switch (message)
+    {
+    case WM_SETTEXT:
+    case EditReplaceSelection:
+    {
+        if (!lParam) return BridgeSendMessageW(child, message, wParam, 0);
+        const std::wstring text = AnsiToWide(reinterpret_cast<LPCSTR>(lParam));
+        return BridgeSendMessageW(child, message, wParam,
+            reinterpret_cast<LPARAM>(text.c_str()));
+    }
+    case WM_GETTEXT:
+    case WM_GETTEXTLENGTH:
+    {
+        constexpr WPARAM MaximumWindowTextBuffer = 32768;
+        WPARAM count = (std::min)(wParam, MaximumWindowTextBuffer);
+        if (message == WM_GETTEXTLENGTH)
+        {
+            const LRESULT length = BridgeSendMessageW(child, WM_GETTEXTLENGTH, 0, 0);
+            if (length <= 0) return length;
+            count = static_cast<WPARAM>((std::min)(length,
+                static_cast<LRESULT>(MaximumWindowTextBuffer - 1))) + 1;
+        }
+        else if (!count || !lParam)
+        {
+            return 0;
+        }
+
+        std::vector<wchar_t> text(count, L'\0');
+        const LRESULT copied = BridgeSendMessageW(child, WM_GETTEXT, count,
+            reinterpret_cast<LPARAM>(text.data()));
+        if (copied <= 0)
+        {
+            if (message == WM_GETTEXT) *reinterpret_cast<LPSTR>(lParam) = '\0';
+            return copied;
+        }
+        text.back() = L'\0';
+        if (message == WM_GETTEXT)
+            return WideToAnsi(text.data(), reinterpret_cast<LPSTR>(lParam), static_cast<int>(count));
+        const int required = BridgeWideCharToMultiByte(CP_ACP, 0, text.data(), -1,
+            nullptr, 0, nullptr, nullptr);
+        return required > 0 ? required - 1 : 0;
+    }
+    default:
+        return BridgeSendMessageW(child, message, wParam, lParam);
+    }
+}
+
 UINT WINAPI BridgeGetDlgItemInt(HWND parent, int identifier, BOOL* translated, BOOL signedValue)
 {
     wchar_t text[64]{};

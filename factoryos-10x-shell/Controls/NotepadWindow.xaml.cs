@@ -202,8 +202,21 @@ namespace factoryos_10x_shell.Controls
             m_dragSurface = null;
         }
 
-        private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e) { if (!m_maximized) { m_resizing = true; m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag); m_startPoint = e.GetCurrentPoint(null).Position; m_startLeft = Canvas.GetLeft(this); m_startTop = Canvas.GetTop(this); m_startWidth = Width; m_startHeight = Height; (sender as UIElement)?.CapturePointer(e.Pointer); } }
-        private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e) { if (m_resizing) { Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint, e.GetCurrentPoint(null).Position, new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 480, 320); Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y); Width = bounds.Width; Height = bounds.Height; } }
+        private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
+        {
+            if (m_maximized) return;
+            if (m_resizing || !WindowResize.TryCapture(sender, e)) return;
+            AppState.Instance.ActivateNotepad();
+            m_resizing = true;
+            m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
+            m_startPoint = e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position;
+            m_startLeft = Canvas.GetLeft(this);
+            m_startTop = Canvas.GetTop(this);
+            m_startWidth = Width;
+            m_startHeight = Height;
+            e.Handled = true;
+        }
+        private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e) { if (m_resizing) { Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint, e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position, new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 480, 320); Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y); Width = bounds.Width; Height = bounds.Height; } }
         private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; (sender as UIElement)?.ReleasePointerCaptures(); }
 
         private void DocumentTabs_AddTabButtonClick(Muxc.TabView sender, object args) => AddDocumentTab(new DocumentState());

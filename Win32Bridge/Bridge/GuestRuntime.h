@@ -12,6 +12,7 @@ namespace Win32Bridge
 {
 namespace Bridge
 {
+    namespace MiniGdi { class Surface; }
     class GuestWindowManager;
     class GuestKernelContext;
     class GuestModuleLoader;
@@ -36,6 +37,7 @@ namespace Bridge
             size_t fileSize,
             std::wstring* error);
         bool Prepare(const BYTE* fileBytes, size_t fileSize, const ImportResolver& resolver, std::wstring* error);
+        bool CopyExecutableIcon(int size, MiniGdi::Surface* destination) const;
         bool Run(int* exitCode, std::wstring* error);
         bool LaunchChildProcess(
             LPCWSTR executableName,

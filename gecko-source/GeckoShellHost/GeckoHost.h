@@ -44,6 +44,7 @@ namespace winrt::DesktopMode::Gecko::implementation
         bool started_ = false;
         bool active_ = false;
         bool closed_ = false;
+        bool suspended_ = false;
         double rawPerView_ = 1.0;
     };
 }

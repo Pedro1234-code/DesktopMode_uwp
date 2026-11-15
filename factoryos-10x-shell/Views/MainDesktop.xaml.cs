@@ -79,6 +79,9 @@ namespace factoryos_10x_shell.Views
         private Rect m_firefoxExternalRestoreBounds;
         private Visibility m_taskbarVisibilityBeforeFirefoxFullscreen = Visibility.Visible;
         private readonly BitmapImage m_filesIcon = new BitmapImage(new Uri("ms-appx:///Assets/Files/files.png"));
+        private ImageSource FilesIcon => AppState.Instance.UseWindows11Skin
+            ? (ImageSource)Application.Current.Resources["Windows11FilesIcon"]
+            : m_filesIcon;
         private readonly BitmapImage m_notepadIcon = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
         private readonly BitmapImage m_settingsIcon = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
         private readonly BitmapImage m_calculatorIcon = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
@@ -96,12 +99,14 @@ namespace factoryos_10x_shell.Views
             m_taskbarHideTimer.Tick += AutoHideTimerTick;
             Loaded += (s, e) => {
                 AppState.Instance.TaskbarPreferencesChanged += TaskbarPreferencesChanged;
+                AppState.Instance.ShellSkinChanged += UpdateDesktopSkin;
                 Window.Current.CoreWindow.PointerMoved += AutoHidePointerMoved;
                 Window.Current.CoreWindow.PointerExited += AutoHidePointerExited;
                 TaskbarPreferencesChanged();
             };
             Unloaded += (s, e) => {
                 AppState.Instance.TaskbarPreferencesChanged -= TaskbarPreferencesChanged;
+                AppState.Instance.ShellSkinChanged -= UpdateDesktopSkin;
                 Window.Current.CoreWindow.PointerMoved -= AutoHidePointerMoved;
                 Window.Current.CoreWindow.PointerExited -= AutoHidePointerExited;
                 m_taskbarHideTimer.Stop();
@@ -203,6 +208,7 @@ namespace factoryos_10x_shell.Views
             if (FilesWindow != null) return FilesWindow;
             Stopwatch clock = Stopwatch.StartNew();
             FilesWindow = new factoryos_10x_shell.Controls.FilesWindow { Visibility = Visibility.Collapsed };
+            FilesWindow.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((s, e) => FilesActivated()), true);
             Canvas.SetLeft(FilesWindow, 160);
             Canvas.SetTop(FilesWindow, 80);
             FilesWindowHost.Children.Add(FilesWindow);
@@ -398,14 +404,15 @@ namespace factoryos_10x_shell.Views
         private void FirefoxExternalResize_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
             if (m_firefoxExternalMaximized) return;
+            if (m_firefoxExternalResizing || !factoryos_10x_shell.Controls.WindowResize.TryCapture(sender, e)) return;
+            FirefoxExternalWindow_PointerPressed(sender, e);
             m_firefoxExternalResizing = true;
             m_firefoxExternalResizeCorner = factoryos_10x_shell.Controls.WindowResize.CornerFromTag(
                 (sender as FrameworkElement)?.Tag);
-            m_firefoxExternalPointerStart = e.GetCurrentPoint(null).Position;
+            m_firefoxExternalPointerStart = e.GetCurrentPoint(FirefoxWindowHost).Position;
             m_firefoxExternalStartBounds = new Rect(
                 Canvas.GetLeft(FirefoxExternalWindow), Canvas.GetTop(FirefoxExternalWindow),
                 FirefoxExternalWindow.Width, FirefoxExternalWindow.Height);
-            (sender as UIElement)?.CapturePointer(e.Pointer);
             e.Handled = true;
         }
 
@@ -414,7 +421,7 @@ namespace factoryos_10x_shell.Views
             if (!m_firefoxExternalResizing) return;
             Rect bounds = factoryos_10x_shell.Controls.WindowResize.Calculate(
                 m_firefoxExternalResizeCorner, m_firefoxExternalPointerStart,
-                e.GetCurrentPoint(null).Position, m_firefoxExternalStartBounds, 480, 320);
+                e.GetCurrentPoint(FirefoxWindowHost).Position, m_firefoxExternalStartBounds, 480, 320);
             Canvas.SetLeft(FirefoxExternalWindow, bounds.X);
             Canvas.SetTop(FirefoxExternalWindow, bounds.Y);
             FirefoxExternalWindow.Width = bounds.Width;
@@ -495,7 +502,11 @@ namespace factoryos_10x_shell.Views
         private void FilesRevealRequested(string path)
         {
             EnsureFilesWindow();
-            FilesWindow.OpenFolderAndSelect(path);
+            const string openDownload = "open-download:";
+            if (path.StartsWith(openDownload, StringComparison.Ordinal))
+                FilesWindow.OpenDownloadedFile(path.Substring(openDownload.Length));
+            else
+                FilesWindow.OpenFolderAndSelect(path);
         }
 
         private void FilesActivated()
@@ -563,7 +574,7 @@ namespace factoryos_10x_shell.Views
             {
                 TaskbarFrame.Visibility = m_taskbarVisibilityBeforeFirefoxFullscreen;
             }
-            Canvas.SetZIndex(FirefoxWindowHost, fullscreen ? 40 : 2);
+            ApplyWindowLayers();
         }
 
         private void WebWindowsChanged(object sender, EventArgs e)
@@ -687,8 +698,9 @@ namespace factoryos_10x_shell.Views
         private void FileOperationWindowsChanged()
         {
             ShellWindowReference active = m_shellWindowCoordinator.ActiveWindow;
-            if (active?.Kind == ShellWindowKind.FileOperation && !IsWindowAvailable(active))
-                ReleaseInternalTextInputFocus();
+            if (active?.Kind == ShellWindowKind.FileOperation && !IsWindowAvailable(active) &&
+                m_operationWindows.TryGetValue((FileOperationModel)active.Identity, out var window))
+                ReleaseFocusFromWindow(window);
             SynchronizeFileOperationWindows();
             RestoreMostRecentWindow();
             SynchronizeShellWindows();
@@ -715,8 +727,15 @@ namespace factoryos_10x_shell.Views
             Canvas.SetLeft(window, Math.Max(0, (AppInstallerWindowHost.ActualWidth - window.Width) / 2));
             Canvas.SetTop(window, Math.Max(0, (AppInstallerWindowHost.ActualHeight - window.Height) / 2));
             window.ActivationRequested += () => ActivateInstaller(window);
-            window.Changed += () => { RestoreMostRecentWindow(); SynchronizeShellWindows(); };
+            window.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler((s, e) => ActivateInstaller(window)), true);
+            window.Changed += () =>
+            {
+                if (window.Visibility != Visibility.Visible) ReleaseFocusFromWindow(window);
+                RestoreMostRecentWindow();
+                SynchronizeShellWindows();
+            };
             window.CloseRequested += () => {
+                ReleaseFocusFromWindow(window);
                 m_installers.Remove(window);
                 AppInstallerWindowHost.Children.Remove(window);
                 m_shellWindowCoordinator.Remove(ShellWindowKind.AppInstaller, window);
@@ -731,6 +750,7 @@ namespace factoryos_10x_shell.Views
         {
             if (!m_installers.Contains(window)) return;
             window.Visibility = Visibility.Visible;
+            if (m_shellWindowCoordinator.IsActive(ShellWindowKind.AppInstaller, window)) return;
             Canvas.SetZIndex(window, ++m_installerZIndex);
             ActivateShellWindow(ShellWindowKind.AppInstaller, window);
         }
@@ -757,7 +777,7 @@ namespace factoryos_10x_shell.Views
                 m_shellWindowCoordinator.Activate(kind, identity);
                 if (kind != ShellWindowKind.WebApp) m_windowManager.DeactivateAll();
                 if (kind != ShellWindowKind.Win32App) m_nativeWindowManager.DeactivateAll();
-                ApplyWindowLayers(kind);
+                ApplyWindowLayers();
                 SynchronizeShellWindows();
             }
             finally
@@ -776,7 +796,7 @@ namespace factoryos_10x_shell.Views
             ShellWindowReference active = m_shellWindowCoordinator.ActiveWindow;
             if (active != null && IsWindowAvailable(active))
             {
-                ApplyWindowLayers(active.Kind);
+                ApplyWindowLayers();
                 return;
             }
 
@@ -784,7 +804,7 @@ namespace factoryos_10x_shell.Views
             ShellWindowReference next = m_shellWindowCoordinator.GetMostRecentAvailable(IsWindowAvailable);
             if (next == null)
             {
-                ApplyWindowLayers(null);
+                ApplyWindowLayers();
                 return;
             }
 
@@ -881,21 +901,36 @@ namespace factoryos_10x_shell.Views
             }
         }
 
-        private void ApplyWindowLayers(ShellWindowKind? activeKind)
+        private void ReleaseFocusFromWindow(UIElement window)
         {
-            Canvas.SetZIndex(WindowHost, activeKind == ShellWindowKind.WebApp ? 2 : 1);
-            Canvas.SetZIndex(NativeWindowHost, activeKind == ShellWindowKind.Win32App ? 2 : 1);
-            Canvas.SetZIndex(FilesWindowHost, activeKind == ShellWindowKind.Files ? 2 : 1);
-            Canvas.SetZIndex(AppInstallerWindowHost, activeKind == ShellWindowKind.AppInstaller ? 2 : 1);
-            Canvas.SetZIndex(FileOperationWindowHost, activeKind == ShellWindowKind.FileOperation ? 2 : 1);
-            Canvas.SetZIndex(NotepadWindowHost, activeKind == ShellWindowKind.Notepad ? 2 : 1);
-            Canvas.SetZIndex(SettingsWindowHost, activeKind == ShellWindowKind.Settings ? 2 : 1);
-            Canvas.SetZIndex(CalculatorWindowHost, activeKind == ShellWindowKind.Calculator ? 2 : 1);
-            Canvas.SetZIndex(
-                FirefoxWindowHost,
-                FirefoxWindow?.IsFullscreen == true ? 40 :
-                activeKind == ShellWindowKind.Firefox ? 2 : 1);
-            FirefoxWindow?.SetWindowActive(activeKind == ShellWindowKind.Firefox);
+            for (var element = FocusManager.GetFocusedElement() as DependencyObject;
+                element != null; element = VisualTreeHelper.GetParent(element))
+            {
+                if (element != window) continue;
+                ReleaseInternalTextInputFocus();
+                return;
+            }
+        }
+
+        private void ApplyWindowLayers()
+        {
+            // Index by ShellWindowKind. Ordinary windows stay below Task View (20).
+            var hosts = new UIElement[]
+            {
+                WindowHost, NativeWindowHost, FilesWindowHost, NotepadWindowHost,
+                SettingsWindowHost, CalculatorWindowHost, FirefoxWindowHost,
+                FileOperationWindowHost, AppInstallerWindowHost
+            };
+            var layers = new int[hosts.Length];
+            int zIndex = 2;
+            foreach (var kind in m_shellWindowCoordinator.GetWindowLayers(IsWindowAvailable))
+                layers[(int)kind] = zIndex++;
+
+            if (FirefoxWindow?.IsFullscreen == true) layers[(int)ShellWindowKind.Firefox] = 40;
+            for (int i = 0; i < hosts.Length; i++)
+                Canvas.SetZIndex(hosts[i], Math.Max(1, layers[i]));
+
+            FirefoxWindow?.SetWindowActive(m_shellWindowCoordinator.ActiveWindow?.Kind == ShellWindowKind.Firefox);
         }
 
         private void SynchronizeShellWindows()
@@ -940,7 +975,7 @@ namespace factoryos_10x_shell.Views
                 "Files",
                 "File manager",
                 "\uE8B7",
-                m_filesIcon,
+                FilesIcon,
                 AppState.Instance.IsFilesOpen,
                 AppState.Instance.IsFilesMinimized);
             AddBuiltInWindowDescriptor(
@@ -990,7 +1025,7 @@ namespace factoryos_10x_shell.Views
                 {
                     Kind = ShellWindowKind.FileOperation, Identity = operation,
                     Title = operation.Title, Subtitle = operation.IsRunning ? "File operation" : operation.Status,
-                    IconSource = m_filesIcon, FallbackGlyph = "\uE8B7",
+                    IconSource = FilesIcon, FallbackGlyph = "\uE8B7",
                     IsActive = m_shellWindowCoordinator.IsActive(ShellWindowKind.FileOperation, operation),
                     IsMinimized = operation.Visibility != Visibility.Visible
                 });
@@ -1277,8 +1312,18 @@ namespace factoryos_10x_shell.Views
             SetTaskbarRevealed(!AppState.Instance.TaskbarAutoHide);
             UpdateWorkspaceBounds();
         }
+        private void UpdateDesktopSkin()
+        {
+            UpdateStartMenuAlignment();
+            SynchronizeShellWindows();
+        }
+
         private void UpdateStartMenuAlignment()
         {
+            bool windows11 = AppState.Instance.UseWindows11Skin;
+            StartMenuFrame.MaxWidth = windows11 ? 640 : 810;
+            double availableHeight = MainGrid.ActualHeight - StartMenuFrame.Margin.Top - StartMenuFrame.Margin.Bottom;
+            StartMenuFrame.Height = windows11 && availableHeight > 0 ? Math.Min(640, availableHeight) : double.NaN;
             bool alignLeft = AppState.Instance.TaskbarAlignLeft;
             StartMenuFrame.HorizontalAlignment = alignLeft
                 ? HorizontalAlignment.Left : HorizontalAlignment.Stretch;
@@ -1473,7 +1518,13 @@ namespace factoryos_10x_shell.Views
 
         private void StartManager_StartVisibilityChanged(object sender, Library.Events.StartVisibilityChangedEventArgs e)
         {
-            if (e.CurrentVisibility) { EnsureStartMenu(); OpenStartStoryboard.Begin(); }
+            if (e.CurrentVisibility)
+            {
+                EnsureStartMenu();
+                OpenStartStoryboard.Begin();
+                if (StartMenuFrame.Content is StartMenu menu)
+                    _ = menu.RefreshWin32ShortcutsAsync();
+            }
             else { CloseStartStoryboard.Begin(); }
             UpdateNativeInputSuppression();
         }

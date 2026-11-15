@@ -325,8 +325,7 @@ namespace winrt::DesktopMode::Gecko::implementation
     {
         root_.Children().Clear();
 
-        // The sink is retained only as the transport for physical keyboard
-        // text. DesktopMode does not use the old phone InputPane workflow.
+        // The sink receives physical and on-screen keyboard text for Gecko.
         root_.Children().Append(engineView_->TextSink());
         if (engineView_->VideoPanel())
         {
@@ -437,15 +436,13 @@ namespace winrt::DesktopMode::Gecko::implementation
             return;
         }
 
-        engineView_->SetInputEnabled(active);
-        if (active)
+        // Focus can change while the compositor is attaching its first frame.
+        // Keep the rendering subscription alive until the host is suspended or closed.
+        engineView_->SetInputEnabled(active && !suspended_);
+        if (active && !suspended_)
         {
             engineView_->Start();
             engineView_->EnableMouse();
-        }
-        else
-        {
-            engineView_->Stop();
         }
     }
 
@@ -514,7 +511,7 @@ namespace winrt::DesktopMode::Gecko::implementation
         {
             throw hresult_invalid_argument(L"Unsupported browser-window URL scheme.");
         }
-        if (!active_)
+        if (!active_ && !suspended_)
         {
             // Let the primary view finish publishing the shared renderer's
             // panel/exports during background startup without accepting input.
@@ -526,6 +523,7 @@ namespace winrt::DesktopMode::Gecko::implementation
 
     void GeckoHost::Suspend()
     {
+        suspended_ = true;
         if (engineView_)
         {
             engineView_->Stop();
@@ -537,11 +535,13 @@ namespace winrt::DesktopMode::Gecko::implementation
 
     void GeckoHost::Resume()
     {
+        suspended_ = false;
         NotifyGeckoAppState(1);
-        if (active_ && engineView_)
+        if (!closed_ && started_ && engineView_)
         {
-            engineView_->SetInputEnabled(true);
+            engineView_->SetInputEnabled(active_);
             engineView_->Start();
+            if (active_) engineView_->EnableMouse();
         }
     }
 

@@ -1,4 +1,4 @@
-﻿using Windows.ApplicationModel.Core;
+using Windows.ApplicationModel.Core;
 using Windows.UI.ViewManagement;
 using Windows.UI;
 using Windows.UI.Xaml.Controls;
@@ -50,6 +50,8 @@ namespace factoryos_10x_shell
         private readonly CoreCursor m_systemArrowCursor;
         private readonly CoreCursor m_resizeNwSeCursor;
         private readonly CoreCursor m_resizeNeSwCursor;
+        private readonly CoreCursor m_resizeHorizontalCursor;
+        private readonly CoreCursor m_resizeVerticalCursor;
         private CoreCursor m_visibleSystemCursor;
         private Controls.WindowResizeCorner? m_hoveredResizeCorner;
         private readonly bool m_useXboxDesktopScale;
@@ -102,6 +104,8 @@ namespace factoryos_10x_shell
             m_systemArrowCursor = new CoreCursor(CoreCursorType.Arrow, 0);
             m_resizeNwSeCursor = new CoreCursor(CoreCursorType.SizeNorthwestSoutheast, 0);
             m_resizeNeSwCursor = new CoreCursor(CoreCursorType.SizeNortheastSouthwest, 0);
+            m_resizeHorizontalCursor = new CoreCursor(CoreCursorType.SizeWestEast, 0);
+            m_resizeVerticalCursor = new CoreCursor(CoreCursorType.SizeNorthSouth, 0);
             ContentRoot.AddHandler(UIElement.PointerMovedEvent,
                 new PointerEventHandler(ContentRoot_PointerMoved), true);
             if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.TryGetValue(
@@ -303,9 +307,12 @@ namespace factoryos_10x_shell
             // measure/arrange on every raw pointer packet.
             MouseCursorTransform.X = e.Snapshot.X / scale;
             MouseCursorTransform.Y = e.Snapshot.Y / scale;
-            double resizeHalfSize = ResizeCursor.Width / 2;
-            ResizeCursorTransform.X = e.Snapshot.X / scale - resizeHalfSize;
-            ResizeCursorTransform.Y = e.Snapshot.Y / scale - resizeHalfSize;
+            if (m_customCursorEnabled && m_hoveredResizeCorner.HasValue)
+            {
+                double halfSize = ResizeCursor.Width / 2;
+                ResizeCursorTransform.X = MouseCursorTransform.X - halfSize;
+                ResizeCursorTransform.Y = MouseCursorTransform.Y - halfSize;
+            }
             m_hasMouseInput = true;
 
             // Popup-tree discovery is a compatibility fallback for controls
@@ -398,19 +405,42 @@ namespace factoryos_10x_shell
                 }
                 if (element == ContentRoot) break;
             }
+            if (m_customCursorEnabled && corner.HasValue && corner != m_hoveredResizeCorner)
+            {
+                var position = e.GetCurrentPoint(ContentRoot).Position;
+                double halfSize = ResizeCursor.Width / 2;
+                ResizeCursorTransform.X = position.X - halfSize;
+                ResizeCursorTransform.Y = position.Y - halfSize;
+            }
             if (corner == m_hoveredResizeCorner) return;
             m_hoveredResizeCorner = corner;
-            ResizeCursorRotation.Angle = corner == Controls.WindowResizeCorner.TopRight ||
-                                         corner == Controls.WindowResizeCorner.BottomLeft ? 90 : 0;
+            switch (corner)
+            {
+                case Controls.WindowResizeCorner.Left:
+                case Controls.WindowResizeCorner.Right:
+                    ResizeCursorRotation.Angle = -45;
+                    break;
+                case Controls.WindowResizeCorner.Top:
+                case Controls.WindowResizeCorner.Bottom:
+                    ResizeCursorRotation.Angle = 45;
+                    break;
+                case Controls.WindowResizeCorner.TopRight:
+                case Controls.WindowResizeCorner.BottomLeft:
+                    ResizeCursorRotation.Angle = 90;
+                    break;
+                default:
+                    ResizeCursorRotation.Angle = 0;
+                    break;
+            }
             UpdateCursorPresentation();
         }
 
         private void UpdateCursorPresentation()
         {
-            bool useSystemCursor = !m_customCursorEnabled || m_popupCursorRequests > 0 ||
-                m_hasOpenXamlPopup || !m_isWindowActive;
-            bool showResize = m_hoveredResizeCorner.HasValue && m_hasMouseInput &&
-                !m_hasOpenXamlPopup && m_isWindowActive;
+            bool allowResize = m_popupCursorRequests == 0 && !m_hasOpenXamlPopup && m_isWindowActive;
+            bool showResize = allowResize && m_hoveredResizeCorner.HasValue;
+            bool drawResize = showResize && m_customCursorEnabled;
+            bool useSystemCursor = !allowResize || !m_customCursorEnabled;
             Stopwatch cursorClock = Stopwatch.StartNew();
             bool cursorChanged = false;
             if (useSystemCursor)
@@ -418,9 +448,7 @@ namespace factoryos_10x_shell
                 MouseCursor.Visibility = Visibility.Collapsed;
                 ResizeCursor.Visibility = Visibility.Collapsed;
                 CoreCursor cursor = showResize
-                    ? (m_hoveredResizeCorner == Controls.WindowResizeCorner.TopRight ||
-                       m_hoveredResizeCorner == Controls.WindowResizeCorner.BottomLeft
-                        ? m_resizeNeSwCursor : m_resizeNwSeCursor)
+                    ? GetSystemResizeCursor(m_hoveredResizeCorner.Value)
                     : m_systemArrowCursor;
                 if (m_isNativeMouseCursorHidden || m_visibleSystemCursor != cursor)
                 {
@@ -443,7 +471,7 @@ namespace factoryos_10x_shell
                 }
 
                 MouseCursor.Visibility = m_hasMouseInput && !showResize ? Visibility.Visible : Visibility.Collapsed;
-                ResizeCursor.Visibility = showResize ? Visibility.Visible : Visibility.Collapsed;
+                ResizeCursor.Visibility = drawResize ? Visibility.Visible : Visibility.Collapsed;
             }
 
             cursorClock.Stop();
@@ -455,6 +483,24 @@ namespace factoryos_10x_shell
                     $"popupCursorRequests={m_popupCursorRequests}; xamlPopup={m_hasOpenXamlPopup}";
                 Debug.WriteLine("[ShellStutter] " + line);
                 _ = AppendUiStutterLogAsync(line);
+            }
+        }
+
+        private CoreCursor GetSystemResizeCursor(Controls.WindowResizeCorner corner)
+        {
+            switch (corner)
+            {
+                case Controls.WindowResizeCorner.Left:
+                case Controls.WindowResizeCorner.Right:
+                    return m_resizeHorizontalCursor;
+                case Controls.WindowResizeCorner.Top:
+                case Controls.WindowResizeCorner.Bottom:
+                    return m_resizeVerticalCursor;
+                case Controls.WindowResizeCorner.TopRight:
+                case Controls.WindowResizeCorner.BottomLeft:
+                    return m_resizeNeSwCursor;
+                default:
+                    return m_resizeNwSeCursor;
             }
         }
 

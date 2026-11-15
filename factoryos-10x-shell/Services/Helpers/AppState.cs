@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
@@ -11,6 +11,18 @@ namespace factoryos_10x_shell.Services.Helpers
     {
         private static AppState _instance;
         public static AppState Instance => _instance ?? (_instance = new AppState());
+
+        public event Action ShellSkinChanged;
+        public bool UseWindows11Skin
+        {
+            get => Equals(ApplicationData.Current.LocalSettings.Values["ShellSkin"], "Windows11");
+            set
+            {
+                if (UseWindows11Skin == value) return;
+                ApplicationData.Current.LocalSettings.Values["ShellSkin"] = value ? "Windows11" : "Windows10X";
+                ShellSkinChanged?.Invoke();
+            }
+        }
 
         public event Action TaskbarPreferencesChanged;
         public bool TaskbarAutoHide

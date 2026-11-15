@@ -183,6 +183,10 @@
     <Compile Include="Services\Helpers\AppState.cs" />
     <Compile Include="Services\Helpers\UpdateCheckService.cs" />
     <Compile Include="Services\Files\ArchiveService.cs" />
+    <Compile Include="Controls\SettingsWindow.DevicePortal.cs">
+      <DependentUpon>SettingsWindow.xaml</DependentUpon>
+    </Compile>
+    <Compile Include="Services\Helpers\DevicePortalSettingsService.cs" />
     <Compile Include="Services\Files\AppPackageService.cs" />
     <Compile Include="Controls\AppInstallerWindow.xaml.cs"><DependentUpon>AppInstallerWindow.xaml</DependentUpon></Compile>
     <Compile Include="Services\Files\FileOperationModel.cs" />
@@ -192,6 +196,7 @@
     <Compile Include="Services\WebApps\WebAppService.cs" />
     <Compile Include="Services\WebApps\WindowManagerService.cs" />
     <Compile Include="Services\GuestRuntime\Win32WindowModel.cs" />
+    <Compile Include="Services\GuestRuntime\Win32StartShortcuts.cs" />
     <Compile Include="Services\GuestRuntime\Win32WindowManagerService.cs" />
     <Compile Include="Services\Windowing\ShellWindowCoordinator.cs" />
     <Compile Include="Services\Managers\ActionCenterManagerService.cs" />
@@ -315,6 +320,7 @@
     <Content Include="Assets\Square44x44Logo.targetsize-24_altform-unplated.png" />
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
     <Content Include="Assets\Files\files.png" />
+    <Content Include="Assets\Windows11\*.ico" />
     <Content Include="Assets\Files\FluentIcons\SidebarSections\*.png" />
     <Content Include="Assets\Files\FluentIcons\Package.png" />
     <Content Include="Assets\Files\FluentIcons\*.txt" />

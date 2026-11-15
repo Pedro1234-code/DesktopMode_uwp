@@ -1,5 +1,7 @@
 #include "pch.h"
 #include "Bridge/OleShims.h"
+#include "Bridge/ShellLinkReader.h"
+#include "Bridge/Comdlg32Shims.h"
 #include "Bridge/Gdi32Shims.h"
 #include "Bridge/Kernel32Shims.h"
 #include "Bridge/RuntimeDiagnostics.h"
@@ -8,6 +10,7 @@
 
 #include <chrono>
 #include <mutex>
+#include <memory>
 #include <atomic>
 #include <new>
 #include <string>
@@ -321,7 +324,80 @@ namespace
         HRESULT STDMETHODCALLTYPE GetClassID(CLSID* value) override
         { if (!value) return E_POINTER; *value = GuestClsidShellLink; return S_OK; }
         HRESULT STDMETHODCALLTYPE IsDirty() override { return m_dirty ? S_OK : S_FALSE; }
-        HRESULT STDMETHODCALLTYPE Load(LPCOLESTR, DWORD) override { return E_NOTIMPL; }
+        HRESULT STDMETHODCALLTYPE Load(LPCOLESTR fileName, DWORD) override
+        {
+            if (!fileName || !*fileName) return E_INVALIDARG;
+            try
+            {
+                HANDLE file = BridgeCreateFileW(fileName, GENERIC_READ, FILE_SHARE_READ,
+                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+                if (file == INVALID_HANDLE_VALUE)
+                    return HRESULT_FROM_WIN32(BridgeGetLastError());
+                const auto closeFile = [](void* handle) { BridgeCloseHandle(handle); };
+                std::unique_ptr<void, decltype(closeFile)> ownedFile(file, closeFile);
+                LARGE_INTEGER size{};
+                if (!BridgeGetFileSizeEx(file, &size))
+                    return HRESULT_FROM_WIN32(BridgeGetLastError());
+                if (size.QuadPart <= 0 || size.QuadPart > MaximumShellLinkSize)
+                    return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+                std::vector<BYTE> bytes(static_cast<size_t>(size.QuadPart));
+                DWORD read = 0;
+                if (!BridgeReadFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &read, nullptr))
+                    return HRESULT_FROM_WIN32(BridgeGetLastError());
+                ShellLinkData link;
+                if (read != bytes.size() || !ParseShellLink(bytes, link))
+                    return HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+
+                std::wstring currentFile(fileName);
+                constexpr DWORD MaxGuestPath = 32768;
+                std::vector<wchar_t> canonical(MaxGuestPath);
+                const DWORD fullLength = BridgeGetFullPathNameW(
+                    fileName, MaxGuestPath, canonical.data(), nullptr);
+                if (fullLength && fullLength < MaxGuestPath)
+                    currentFile.assign(canonical.data(), fullLength);
+                if (link.target.find(L'%') != std::wstring::npos)
+                {
+                    const DWORD expanded = BridgeExpandEnvironmentStringsW(
+                        link.target.c_str(), canonical.data(), MaxGuestPath);
+                    if (expanded && expanded <= MaxGuestPath)
+                        link.target.assign(canonical.data());
+                }
+                if (!link.relativePath.empty() && (link.target.empty() ||
+                    BridgeGetFileAttributesW(link.target.c_str()) == INVALID_FILE_ATTRIBUTES))
+                {
+                    const auto separator = currentFile.find_last_of(L"\\/");
+                    if (separator != std::wstring::npos)
+                    {
+                        std::wstring candidate = link.relativePath;
+                        if (candidate.find(L':') == std::wstring::npos &&
+                            candidate.front() != L'\\' && candidate.front() != L'/')
+                            candidate.insert(0, currentFile.substr(0, separator + 1));
+                        const DWORD length = BridgeGetFullPathNameW(
+                            candidate.c_str(), MaxGuestPath, canonical.data(), nullptr);
+                        if (length && length < MaxGuestPath &&
+                            (link.target.empty() ||
+                             BridgeGetFileAttributesW(canonical.data()) != INVALID_FILE_ATTRIBUTES))
+                            link.target.assign(canonical.data(), length);
+                    }
+                }
+                m_target = std::move(link.target);
+                m_relativePath = std::move(link.relativePath);
+                m_description = std::move(link.description);
+                m_workingDirectory = std::move(link.workingDirectory);
+                m_arguments = std::move(link.arguments);
+                m_iconPath = std::move(link.iconPath);
+                m_iconIndex = link.iconIndex;
+                m_showCommand = link.showCommand;
+                m_hotKey = link.hotKey;
+                m_currentFile = std::move(currentFile);
+                m_dirty = false;
+                return S_OK;
+            }
+            catch (const std::bad_alloc&)
+            {
+                return E_OUTOFMEMORY;
+            }
+        }
         HRESULT STDMETHODCALLTYPE Save(LPCOLESTR fileName, BOOL remember) override
         {
             if (!fileName || !*fileName || m_target.empty()) return E_INVALIDARG;
@@ -506,6 +582,8 @@ HRESULT WINAPI Win32Bridge::Bridge::BridgeCoCreateInstance(REFCLSID clsid, LPUNK
     if (!result) return E_POINTER;
     *result = nullptr;
     if (outer) return CLASS_E_NOAGGREGATION;
+    if (IsGuestFileDialogClass(clsid))
+        return CreateGuestFileDialog(clsid, iid, result);
     if (IsEqualGUID(clsid, GuestClsidShellLink))
     {
         GuestShellLink* link = new (std::nothrow) GuestShellLink();

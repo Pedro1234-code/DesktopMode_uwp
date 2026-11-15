@@ -191,21 +191,23 @@ namespace factoryos_10x_shell.Controls
         private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
             if (m_maximized) return;
+            if (m_resizing || !WindowResize.TryCapture(sender, e)) return;
+            AppState.Instance.ActivateCalculator();
             m_resizing = true;
             m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
-            m_startPoint = e.GetCurrentPoint(null).Position;
+            m_startPoint = e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position;
             m_startLeft = Canvas.GetLeft(this);
             m_startTop = Canvas.GetTop(this);
             m_startWidth = Width;
             m_startHeight = Height;
-            (sender as UIElement)?.CapturePointer(e.Pointer);
+            e.Handled = true;
         }
 
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
             Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint,
-                e.GetCurrentPoint(null).Position,
+                e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position,
                 new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 320, 450);
             Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y);
             Width = bounds.Width; Height = bounds.Height;

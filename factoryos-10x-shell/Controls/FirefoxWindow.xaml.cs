@@ -658,6 +658,11 @@ namespace factoryos_10x_shell.Controls
             Visibility visibility = (m_maximized || m_fullscreen)
                 ? Visibility.Collapsed
                 : Visibility.Visible;
+            ResizeEdgeLeft.Visibility = visibility;
+            ResizeEdgeTop.Visibility = visibility;
+            ResizeEdgeRight.Visibility = visibility;
+            ResizeEdgeBottom.Visibility = visibility;
+
             ResizeGripTopLeft.Visibility = visibility;
             ResizeGripTopRight.Visibility = visibility;
             ResizeGripBottomLeft.Visibility = visibility;
@@ -792,7 +797,7 @@ namespace factoryos_10x_shell.Controls
                 Height = host.ActualHeight;
                 WindowBorder.BorderThickness = new Thickness(0);
                 WindowBorder.CornerRadius = new CornerRadius(0);
-                ResizeGripTopLeft.Visibility = Visibility.Collapsed;
+                UpdateResizeGripVisibility();
                 ResizeGripTopRight.Visibility = Visibility.Collapsed;
                 ResizeGripBottomLeft.Visibility = Visibility.Collapsed;
                 ResizeGrip.Visibility = Visibility.Collapsed;
@@ -906,21 +911,23 @@ namespace factoryos_10x_shell.Controls
         private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
             if (m_maximized || m_fullscreen) return;
+            if (m_resizing || !WindowResize.TryCapture(sender, e)) return;
+            AppState.Instance.ActivateFirefox();
             m_resizing = true;
             m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
-            m_startPoint = e.GetCurrentPoint(null).Position;
+            m_startPoint = e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position;
             m_dragStartLeft = Canvas.GetLeft(this);
             m_dragStartTop = Canvas.GetTop(this);
             m_startWidth = Width;
             m_startHeight = Height;
-            (sender as UIElement)?.CapturePointer(e.Pointer);
+            e.Handled = true;
         }
 
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
             Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint,
-                e.GetCurrentPoint(null).Position,
+                e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position,
                 new Rect(m_dragStartLeft, m_dragStartTop, m_startWidth, m_startHeight), 640, 480);
             Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y);
             Width = bounds.Width; Height = bounds.Height;

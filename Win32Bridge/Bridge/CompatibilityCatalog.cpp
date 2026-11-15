@@ -114,6 +114,7 @@ namespace
             name == L"setdlgitemtextw" ||
             name == L"getdlgitemtextw" ||
             name == L"senddlgitemmessagew" ||
+            name == L"senddlgitemmessagea" ||
             name == L"iswindow" ||
             name == L"iswindowvisible" ||
             name == L"iswindowenabled" ||

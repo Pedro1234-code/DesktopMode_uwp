@@ -146,6 +146,16 @@ LPWSTR WINAPI BridgePathFindExtensionW(LPCWSTR path)
     return const_cast<LPWSTR>(extension);
 }
 
+BOOL WINAPI BridgePathFileExistsW(LPCWSTR path)
+{
+    if (!path || !*path)
+    {
+        BridgeSetLastError(ERROR_FILE_NOT_FOUND);
+        return FALSE;
+    }
+    return BridgeGetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
 LPWSTR WINAPI BridgePathFindFileNameW(LPCWSTR path)
 {
     if (!path) return nullptr;
@@ -562,6 +572,7 @@ ImportResolution ResolveAuxiliaryImport(const ImportedSymbol& symbol)
         else if (_wcsicmp(symbol.name.c_str(), L"pathcompactpathexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePathCompactPathExW);
         else if (_wcsicmp(symbol.name.c_str(), L"pathfindextensionw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePathFindExtensionW);
         else if (_wcsicmp(symbol.name.c_str(), L"pathfindfilenamew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePathFindFileNameW);
+        else if (_wcsicmp(symbol.name.c_str(), L"pathfileexistsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePathFileExistsW);
         else if (_wcsicmp(symbol.name.c_str(), L"pathgetdrivenumberw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePathGetDriveNumberW);
         else if (_wcsicmp(symbol.name.c_str(), L"pathisnetworkpathw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePathIsNetworkPathW);
         else if (_wcsicmp(symbol.name.c_str(), L"pathisrelativew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePathIsRelativeW);

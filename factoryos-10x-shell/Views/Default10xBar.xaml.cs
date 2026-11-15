@@ -1,4 +1,4 @@
-﻿using factoryos_10x_shell.Library.Models.InternalData;
+using factoryos_10x_shell.Library.Models.InternalData;
 using factoryos_10x_shell.Library.Services.Navigation;
 using factoryos_10x_shell.Library.ViewModels;
 using factoryos_10x_shell.Services.Helpers;
@@ -44,12 +44,60 @@ namespace factoryos_10x_shell.Views
         private readonly IWebAppService _webAppService;
         private readonly Win32WindowManagerService _nativeWindowManager;
         private readonly ShellWindowCoordinator _shellWindowCoordinator;
+        private bool? _appliedWindows11Skin;
         private readonly BitmapImage _filesIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Files/files.png"));
         private readonly BitmapImage _notepadIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
         private readonly BitmapImage _settingsIconSource = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
         private readonly BitmapImage _calculatorIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
         private readonly BitmapImage _firefoxIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
 
+
+        private void UpdateTrayDate()
+        {
+            if (Windows11TrayDate.Visibility == Visibility.Visible)
+                Windows11TrayDate.Text = DateTime.Today.ToShortDateString();
+        }
+
+        private void ApplyShellSkin()
+        {
+            bool windows11 = AppState.Instance.UseWindows11Skin;
+            bool dark = ActualTheme == ElementTheme.Dark;
+            var visibility = windows11 ? Visibility.Visible : Visibility.Collapsed;
+            Windows11TaskbarPlate.Visibility = visibility;
+            var legacyVisibility = windows11 ? Visibility.Collapsed : Visibility.Visible;
+            Windows10XTaskbarPlate.Visibility = legacyVisibility;
+            Windows11StartButton.Visibility = visibility;
+            Windows11TaskViewButton.Visibility = visibility;
+            Windows11TrayDate.Visibility = visibility;
+            StartButton.Visibility = legacyVisibility;
+            TaskViewButton.Visibility = legacyVisibility;
+            TrayLayout.Width = ActionCenterButton.Width = windows11 ? 96 : 75;
+            Windows11QuickSettingsButton.Visibility = visibility;
+            TrayStatusIcons.Visibility = windows11 ? Visibility.Collapsed : Visibility.Visible;
+            ApplyTaskbarButtonSkin(ActionCenterButton);
+            ApplyTaskbarButtonSkin(Windows11QuickSettingsButton);
+            TrayStatusIcons.Margin = windows11 ? new Thickness(3, 0, 0, 0) : new Thickness(0);
+            TrayStatusIcons.HorizontalAlignment = windows11 ? HorizontalAlignment.Left : HorizontalAlignment.Right;
+            TrayStatusIcons.VerticalAlignment = windows11 ? VerticalAlignment.Center : VerticalAlignment.Stretch;
+            ClockText2.FontSize = windows11 ? 12 : 14;
+            if (windows11)
+            {
+                Windows11TaskbarPlate.BorderBrush = new SolidColorBrush(dark
+                    ? Color.FromArgb(36, 255, 255, 255)
+                    : Color.FromArgb(32, 0, 0, 0));
+                UpdateTrayDate();
+            }
+            if (_shellWindowCoordinator == null) return;
+            if (_appliedWindows11Skin != windows11)
+            {
+                _appliedWindows11Skin = windows11;
+                RefreshPinnedApps();
+                RefreshFilesTaskbar();
+            }
+            UpdateInternalTaskbarVisualState();
+            UpdateWebAppTaskbarVisualState();
+            UpdateWin32TaskbarVisualState();
+        }
 
         private void ApplyTaskbarAlignment()
         { TaskbarButtons.HorizontalAlignment = AppState.Instance.TaskbarAlignLeft ? HorizontalAlignment.Left : HorizontalAlignment.Center; }
@@ -58,6 +106,14 @@ namespace factoryos_10x_shell.Views
         {
             this.InitializeComponent();
             ApplyTaskbarAlignment();
+            Loaded += (s, e) =>
+            {
+                AppState.Instance.ShellSkinChanged += ApplyShellSkin;
+                ApplyShellSkin();
+            };
+            Unloaded += (s, e) => AppState.Instance.ShellSkinChanged -= ApplyShellSkin;
+            ActualThemeChanged += (s, e) => ApplyShellSkin();
+            ClockText2.RegisterPropertyChangedCallback(TextBlock.TextProperty, (s, p) => UpdateTrayDate());
             Loaded += (s, e) => { ApplyTaskbarAlignment(); AppState.Instance.TaskbarPreferencesChanged += ApplyTaskbarAlignment; };
             Unloaded += (s, e) => AppState.Instance.TaskbarPreferencesChanged -= ApplyTaskbarAlignment;
 
@@ -247,6 +303,7 @@ namespace factoryos_10x_shell.Views
                 };
 
 
+                ApplyTaskbarButtonSkin(button);
                 PinnedAppsPanel.Children.Add(button);
             }
 
@@ -272,6 +329,7 @@ namespace factoryos_10x_shell.Views
                 button.Content = CreateWebAppIcon(app);
                 button.Click += (sender, args) => _windowManager.ToggleFromTaskbar((WebAppDefinition)((Button)sender).Tag);
                 AddWebAppTaskbarMenu(button, app);
+                UpdateRunningIndicator(button, true, isActive);
                 OpenWebAppsPanel.Children.Add(button);
             }
         }
@@ -298,6 +356,7 @@ namespace factoryos_10x_shell.Views
                 button.Content = CreateWebAppIcon(app);
                 button.Click += (sender, args) => _windowManager.ToggleFromTaskbar((WebAppDefinition)((Button)sender).Tag);
                 AddWebAppTaskbarMenu(button, app);
+                UpdateRunningIndicator(button, isOpen, isActive);
                 PinnedWebAppsPanel.Children.Add(button);
             }
         }
@@ -321,8 +380,72 @@ namespace factoryos_10x_shell.Views
                 ToolTipService.SetToolTip(button, window.DisplayName);
                 button.Click += (sender, args) =>
                     _nativeWindowManager.ToggleFromTaskbar((Win32WindowModel)((Button)sender).Tag);
+                UpdateRunningIndicator(button, true, isActive);
                 OpenWin32AppsPanel.Children.Add(button);
             }
+        }
+
+        private void ApplyTaskbarButtonSkin(Button button)
+        {
+            bool windows11 = AppState.Instance.UseWindows11Skin;
+            var style = windows11 ? (Style)Resources["Windows11TaskbarAppStyle"]
+                : (Style)Application.Current.Resources["TaskbarButtonStyle"];
+            if (button.Style == style) return;
+            button.Style = style;
+            button.CornerRadius = new CornerRadius(windows11 ? 6 : 0);
+        }
+
+        private void UpdateRunningIndicator(Button button, bool isOpen, bool isActive, UIElement replacementIcon = null)
+        {
+            ApplyTaskbarButtonSkin(button);
+            var plate = button.Content as Grid;
+            bool wrapped = plate?.Tag as string == "Windows11RunningIndicator";
+            if (!AppState.Instance.UseWindows11Skin)
+            {
+                if (wrapped)
+                {
+                    var icon = plate.Children[0];
+                    plate.Children.RemoveAt(0);
+                    button.Content = replacementIcon ?? icon;
+                }
+                else if (replacementIcon != null) button.Content = replacementIcon;
+                return;
+            }
+
+            if (!wrapped)
+            {
+                var icon = replacementIcon ?? button.Content as UIElement;
+                if (icon == null) return;
+                button.Content = null;
+                plate = new Grid { Tag = "Windows11RunningIndicator", Width = 36, Height = 40 };
+                plate.Children.Add(icon);
+                plate.Children.Add(new Border
+                {
+                    Height = 3, CornerRadius = new CornerRadius(1.5),
+                    HorizontalAlignment = HorizontalAlignment.Center,
+                    VerticalAlignment = VerticalAlignment.Bottom,
+                    IsHitTestVisible = false
+                });
+                button.Content = plate;
+            }
+            else if (replacementIcon != null)
+            {
+                plate.Children.RemoveAt(0);
+                plate.Children.Insert(0, replacementIcon);
+            }
+
+            bool dark = ActualTheme == ElementTheme.Dark;
+            var indicator = (Border)plate.Children[1];
+            indicator.Visibility = isOpen ? Visibility.Visible : Visibility.Collapsed;
+            indicator.Width = isActive ? 16 : 6;
+            Color color = isActive
+                ? (dark ? Color.FromArgb(255, 96, 205, 255) : Color.FromArgb(255, 0, 103, 192))
+                : (dark ? Color.FromArgb(255, 157, 159, 165) : Color.FromArgb(255, 97, 101, 109));
+            if (!(indicator.Background is SolidColorBrush brush) || brush.Color != color)
+                indicator.Background = new SolidColorBrush(color);
+            button.Background = isActive
+                ? new SolidColorBrush(dark ? Color.FromArgb(28, 255, 255, 255) : Color.FromArgb(150, 255, 255, 255))
+                : new SolidColorBrush(Colors.Transparent);
         }
 
         private void UpdateWebAppTaskbarVisualState()
@@ -343,6 +466,7 @@ namespace factoryos_10x_shell.Views
                 button.Background = isOpen
                     ? new SolidColorBrush(Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180))
                     : new SolidColorBrush(Colors.Transparent);
+                UpdateRunningIndicator(button, isOpen, isActive);
             }
         }
 
@@ -354,6 +478,12 @@ namespace factoryos_10x_shell.Views
                 bool isActive = window.IsActive && window.Visibility == Visibility.Visible;
                 button.Background = new SolidColorBrush(
                     Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180));
+                object content = button.Content;
+                if (content is Grid plate && plate.Tag as string == "Windows11RunningIndicator")
+                    content = plate.Children[0];
+                var currentIcon = (content as Image)?.Source;
+                UpdateRunningIndicator(button, true, isActive,
+                    ReferenceEquals(currentIcon, window.IconSource) ? null : CreateWin32AppIcon(window));
             }
         }
 
@@ -414,7 +544,9 @@ namespace factoryos_10x_shell.Views
             {
                 Width = size,
                 Height = size,
-                Source = _filesIconSource,
+                Source = AppState.Instance.UseWindows11Skin
+                    ? (ImageSource)Application.Current.Resources["Windows11FilesIcon"]
+                    : _filesIconSource,
                 Stretch = Stretch.Uniform
             };
         }
@@ -461,10 +593,16 @@ namespace factoryos_10x_shell.Views
         {
             foreach (Button button in panel.Children.OfType<Button>())
             {
+                if (button.Tag is factoryos_10x_shell.Controls.AppInstallerWindow installer)
+                {
+                    UpdateRunningIndicator(button, true, _shellWindowCoordinator.IsActive(ShellWindowKind.AppInstaller, installer));
+                    continue;
+                }
                 if (button.Tag is FileOperationModel operation)
                 {
-                    button.Background = new SolidColorBrush(Color.FromArgb(
-                        _shellWindowCoordinator.IsActive(ShellWindowKind.FileOperation, operation) ? (byte)80 : (byte)48, 70, 130, 180));
+                    bool active = _shellWindowCoordinator.IsActive(ShellWindowKind.FileOperation, operation);
+                    button.Background = new SolidColorBrush(Color.FromArgb(active ? (byte)80 : (byte)48, 70, 130, 180));
+                    UpdateRunningIndicator(button, true, active);
                     continue;
                 }
                 string appId = (button.Tag as StartIconModel)?.AppId ?? button.Tag as string;
@@ -472,6 +610,8 @@ namespace factoryos_10x_shell.Views
                     appId.StartsWith("CoreShell.", StringComparison.OrdinalIgnoreCase))
                 {
                     button.Background = GetPinnedAppBackground(appId);
+                    var item = _shellWindowCoordinator.Windows.FirstOrDefault(window => Equals(window.Identity, appId));
+                    UpdateRunningIndicator(button, item != null, item?.IsActive == true);
                 }
             }
         }
@@ -508,7 +648,7 @@ namespace factoryos_10x_shell.Views
                 var installer = item.Identity as factoryos_10x_shell.Controls.AppInstallerWindow;
                 if (installer == null) continue;
                 var button = new Button {
-                    Width = 48, Height = 48, Margin = new Thickness(2),
+                    Width = 48, Height = 48, Margin = new Thickness(2), Tag = installer,
                     Style = (Style)Application.Current.Resources["TaskbarButtonStyle"],
                     Content = new Image { Width = 28, Height = 28, Stretch = Stretch.Uniform,
                         Source = new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png")) }

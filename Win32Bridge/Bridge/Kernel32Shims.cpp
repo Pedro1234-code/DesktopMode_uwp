@@ -2708,6 +2708,188 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetVersion()
 #include "Bridge/Kernel32LocaleShims.inl"
 #include "Bridge/Kernel32CoreShims.inl"
 
+namespace
+{
+    bool ReadGuestProfile(LPCWSTR fileName, std::wstring& text)
+    {
+        auto* storage = CurrentGuestStorageContext();
+        if (!storage || (fileName && !*fileName))
+        {
+            SetGuestLastError(!storage ? ERROR_INVALID_HANDLE : ERROR_ACCESS_DENIED);
+            return false;
+        }
+
+        std::wstring path = fileName ? fileName : L"win.ini";
+        if (path.find_first_of(L"\\/:") == std::wstring::npos)
+        {
+            wchar_t windowsDirectory[MAX_PATH]{};
+            BridgeGetWindowsDirectoryW(windowsDirectory, _countof(windowsDirectory));
+            path = std::wstring(windowsDirectory) + L"\\" + path;
+        }
+
+        std::vector<BYTE> bytes;
+        DWORD error = ERROR_SUCCESS;
+        if (!storage->ReadAllBytes(path.c_str(), &bytes, &error))
+        {
+            SetGuestLastError(error);
+            return false;
+        }
+        if (bytes.empty()) return true;
+
+        const bool littleEndian = bytes.size() >= 2 && bytes[0] == 0xff && bytes[1] == 0xfe;
+        const bool bigEndian = bytes.size() >= 2 && bytes[0] == 0xfe && bytes[1] == 0xff;
+        if (littleEndian || bigEndian)
+        {
+            for (size_t i = 2; i + 1 < bytes.size(); i += 2)
+            {
+                const BYTE low = bytes[i + (bigEndian ? 1 : 0)];
+                const BYTE high = bytes[i + (bigEndian ? 0 : 1)];
+                text.push_back(static_cast<wchar_t>(low | (high << 8)));
+            }
+            return true;
+        }
+
+        const bool utf8 = bytes.size() >= 3 && bytes[0] == 0xef &&
+            bytes[1] == 0xbb && bytes[2] == 0xbf;
+        const size_t offset = utf8 ? 3 : 0;
+        const int byteCount = static_cast<int>(bytes.size() - offset);
+        if (!byteCount) return true;
+        const auto input = reinterpret_cast<LPCCH>(bytes.data() + offset);
+        const UINT codePage = utf8 ? CP_UTF8 : CP_ACP;
+        const int length = BridgeMultiByteToWideChar(codePage, 0, input, byteCount, nullptr, 0);
+        if (length <= 0) return false;
+        text.resize(length);
+        return BridgeMultiByteToWideChar(codePage, 0, input, byteCount, &text[0], length) == length;
+    }
+
+    std::wstring TrimProfileText(const std::wstring& text)
+    {
+        const wchar_t* whitespace = L" \t\r\n\v\f";
+        const size_t start = text.find_first_not_of(whitespace);
+        if (start == std::wstring::npos) return {};
+        return text.substr(start, text.find_last_not_of(whitespace) - start + 1);
+    }
+
+    template<typename Visitor>
+    void VisitGuestProfile(const std::wstring& text, Visitor visit)
+    {
+        std::wstring section;
+        for (size_t start = 0; start < text.size();)
+        {
+            const size_t end = text.find_first_of(L"\r\n", start);
+            const std::wstring line = TrimProfileText(text.substr(start,
+                end == std::wstring::npos ? end : end - start));
+            start = end == std::wstring::npos ? text.size() : end + 1;
+            if (line.empty() || line.front() == L';') continue;
+
+            if (line.front() == L'[')
+            {
+                const size_t close = line.find(L']', 1);
+                if (close == std::wstring::npos) continue;
+                section = TrimProfileText(line.substr(1, close - 1));
+                if (!visit(section, nullptr, nullptr)) return;
+                continue;
+            }
+            const size_t equals = line.find(L'=');
+            if (equals == std::wstring::npos) continue;
+            const auto key = TrimProfileText(line.substr(0, equals));
+            auto value = TrimProfileText(line.substr(equals + 1));
+            if (value.size() >= 2 && (value.front() == L'"' || value.front() == L'\'') &&
+                value.front() == value.back())
+                value = value.substr(1, value.size() - 2);
+            if (!visit(section, &key, &value)) return;
+        }
+    }
+
+    UINT ParseGuestProfileInteger(const std::wstring& value)
+    {
+        const wchar_t* cursor = value.c_str();
+        while (*cursor && *cursor <= L' ') ++cursor;
+        const bool negative = *cursor == L'-';
+        if (*cursor == L'+' || negative) ++cursor;
+        UINT base = 10;
+        if (*cursor == L'0')
+        {
+            switch (cursor[1])
+            {
+            case L'b': base = 2; break;
+            case L'o': base = 8; break;
+            case L'x': base = 16; break;
+            }
+            if (base != 10) cursor += 2;
+        }
+
+        UINT number = 0;
+        for (; *cursor; ++cursor)
+        {
+            const wchar_t ch = towlower(*cursor);
+            UINT digit = base;
+            if (ch >= L'0' && ch <= L'9') digit = ch - L'0';
+            else if (ch >= L'a' && ch <= L'f') digit = ch - L'a' + 10;
+            if (digit >= base) break;
+            number = number * base + digit;
+        }
+        return negative ? 0u - number : number;
+    }
+
+    UINT WINAPI BridgeGetPrivateProfileIntW(
+        LPCWSTR section, LPCWSTR key, INT defaultValue, LPCWSTR fileName)
+    {
+        UINT result = static_cast<UINT>(defaultValue);
+        std::wstring text;
+        if (!section || !key || !ReadGuestProfile(fileName, text)) return result;
+        VisitGuestProfile(text, [&](const std::wstring& candidate, const std::wstring* name,
+            const std::wstring* value)
+        {
+            if (!name || _wcsicmp(candidate.c_str(), section) || _wcsicmp(name->c_str(), key))
+                return true;
+            if (!value->empty()) result = ParseGuestProfileInteger(*value);
+            return false;
+        });
+        SetGuestLastError(ERROR_SUCCESS);
+        return result;
+    }
+
+    DWORD WINAPI BridgeGetPrivateProfileSectionNamesW(LPWSTR output, DWORD capacity, LPCWSTR fileName)
+    {
+        if (!output || !capacity)
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        output[0] = L'\0';
+        if (capacity == 1) return 0;
+        output[1] = L'\0';
+
+        std::wstring text;
+        if (!ReadGuestProfile(fileName, text)) return 0;
+        DWORD written = 0;
+        bool truncated = false;
+        VisitGuestProfile(text, [&](const std::wstring& section, const std::wstring* key,
+            const std::wstring*)
+        {
+            if (key || section.empty()) return true;
+            const DWORD available = capacity - written - 1;
+            if (section.size() >= available)
+            {
+                const DWORD limit = capacity - 2;
+                if (written < limit)
+                    memcpy(output + written, section.data(), (limit - written) * sizeof(wchar_t));
+                written = limit;
+                truncated = true;
+                return false;
+            }
+            memcpy(output + written, section.c_str(), (section.size() + 1) * sizeof(wchar_t));
+            written += static_cast<DWORD>(section.size() + 1);
+            return true;
+        });
+        output[written] = L'\0';
+        if (truncated) output[written + 1] = L'\0';
+        SetGuestLastError(ERROR_SUCCESS);
+        return truncated ? capacity - 2 : written;
+    }
+}
+
 void WINAPI Win32Bridge::Bridge::BridgeGetStartupInfoA(LPSTARTUPINFOA startupInfo)
 {
     if (!startupInfo) { SetGuestLastError(ERROR_INVALID_PARAMETER); return; }
@@ -4884,6 +5066,10 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"initoncecomplete") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitOnceComplete);
     else if (_wcsicmp(symbol.name.c_str(), L"initializeslisthead") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInitializeSListHead);
     else if (_wcsicmp(symbol.name.c_str(), L"interlockedflushslist") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeInterlockedFlushSList);
+    else if (_wcsicmp(symbol.name.c_str(), L"getprivateprofileintw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPrivateProfileIntW);
+    else if (_wcsicmp(symbol.name.c_str(), L"getprivateprofilesectionnamesw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetPrivateProfileSectionNamesW);
     else if (_wcsicmp(symbol.name.c_str(), L"tlsalloc") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTlsAlloc);
     else if (_wcsicmp(symbol.name.c_str(), L"tlsfree") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTlsFree);
     else if (_wcsicmp(symbol.name.c_str(), L"tlsgetvalue") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeTlsGetValue);

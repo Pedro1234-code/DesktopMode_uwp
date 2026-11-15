@@ -23,6 +23,9 @@ namespace factoryos_10x_shell.Services.Win32
         public Guid Id { get; } = Guid.NewGuid();
         public StorageFile Executable { get; set; }
         public StorageFolder ModuleSourceFolder { get; set; }
+        public string VirtualExecutablePath { get; set; }
+        public string Arguments { get; set; }
+        public string WorkingDirectory { get; set; }
         public string DisplayName => Executable?.DisplayName ?? Executable?.Name ?? "Win32 app";
         public double RestoreLeft { get; set; }
         public double RestoreTop { get; set; }

@@ -321,37 +321,49 @@ namespace factoryos_10x_shell.Controls
             AppState.Instance.ActivateFiles();
         }
 
-        public async void OpenFolderAndSelect(string filePath)
+        public void OpenDownloadedFile(string filePath) => OpenFolderAndSelect(filePath, true);
+
+        public async void OpenFolderAndSelect(string filePath, bool openFile = false)
         {
             if (string.IsNullOrWhiteSpace(filePath)) return;
 
-            Visibility = Visibility.Visible;
-            SettingsPage.Visibility = Visibility.Collapsed;
-            AppState.Instance.SetFilesWindowState(true, false);
-            AppState.Instance.ActivateFiles();
-
-            try
+            if (!openFile)
             {
-                StorageFile file = await StorageFile.GetFileFromPathAsync(filePath);
-                StorageFolder folder = await file.GetParentAsync();
-                await OpenFolderAsync(folder, folder.DisplayName, true);
-                SelectFile(file.Path, file.Name);
-                return;
+                Visibility = Visibility.Visible;
+                SettingsPage.Visibility = Visibility.Collapsed;
+                AppState.Instance.SetFilesWindowState(true, false);
+                AppState.Instance.ActivateFiles();
             }
-            catch { }
 
-            // Downloads on Xbox are normally accessible through the same
-            // FutureAccessList grant used by Gecko's FolderPicker. Resolve the
-            // file from that grant when direct path activation is restricted.
+            StorageFile file;
+            StorageFolder folder;
             try
             {
-                const string downloadToken = "Gecko.Downloads.v1";
-                if (!StorageApplicationPermissions.FutureAccessList.ContainsItem(downloadToken)) return;
-                StorageFolder folder = await StorageApplicationPermissions.FutureAccessList.GetFolderAsync(downloadToken);
-                string name = System.IO.Path.GetFileName(filePath);
-                StorageFile file = await folder.GetFileAsync(name);
-                await OpenFolderAsync(folder, folder.DisplayName, true);
-                SelectFile(file.Path, file.Name);
+                file = await StorageFile.GetFileFromPathAsync(filePath);
+                folder = await file.GetParentAsync();
+            }
+            catch
+            {
+                try
+                {
+                    const string downloadToken = "Gecko.Downloads.v1";
+                    var access = StorageApplicationPermissions.FutureAccessList;
+                    if (!access.ContainsItem(downloadToken)) return;
+                    folder = await access.GetFolderAsync(downloadToken);
+                    if (!string.Equals(System.IO.Path.GetDirectoryName(filePath), folder.Path, StringComparison.OrdinalIgnoreCase)) return;
+                    file = await folder.GetFileAsync(System.IO.Path.GetFileName(filePath));
+                }
+                catch { return; }
+            }
+
+            try
+            {
+                if (openFile) await OpenFileAsync(file, folder);
+                else
+                {
+                    await OpenFolderAsync(folder, folder.DisplayName, true);
+                    SelectFile(file.Path, file.Name);
+                }
             }
             catch { }
         }
@@ -400,7 +412,6 @@ namespace factoryos_10x_shell.Controls
             }
         }
 
-        private void Root_PointerPressed(object sender, PointerRoutedEventArgs e) => AppState.Instance.ActivateFiles();
         private void ContextFlyout_Opened(object sender, object e) => MainPage.SetPopupCursorVisibility(true);
         private void ContextFlyout_Closed(object sender, object e)
         {
@@ -496,18 +507,20 @@ namespace factoryos_10x_shell.Controls
         private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
             if (m_maximized) return;
+            if (m_resizing || !WindowResize.TryCapture(sender, e)) return;
+            AppState.Instance.ActivateFiles();
             m_resizing = true;
             m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
-            m_startPoint = e.GetCurrentPoint(null).Position;
+            m_startPoint = e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position;
             m_startLeft = Canvas.GetLeft(this); m_startTop = Canvas.GetTop(this);
             m_startWidth = Width; m_startHeight = Height;
-            (sender as UIElement)?.CapturePointer(e.Pointer);
+            e.Handled = true;
         }
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
             Rect bounds = WindowResize.Calculate(m_resizeCorner, m_startPoint,
-                e.GetCurrentPoint(null).Position,
+                e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position,
                 new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 480, 320);
             Canvas.SetLeft(this, bounds.X); Canvas.SetTop(this, bounds.Y);
             Width = bounds.Width; Height = bounds.Height;
@@ -724,21 +737,26 @@ namespace factoryos_10x_shell.Controls
         {
             if (entry == null) return;
             if (entry.Folder != null) await OpenFolderAsync(entry.Folder, entry.Folder.Name, true);
-            else if (AppPackageService.IsPackage(entry.File))
-                await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => AppInstallerWindow.RequestOpen(entry.File));
-            else if (entry.File != null && string.Equals(entry.File.FileType, ".exe", StringComparison.OrdinalIgnoreCase))
+            else if (entry.File != null) await OpenFileAsync(entry.File, m_currentFolder);
+        }
+
+        private async Task OpenFileAsync(StorageFile file, StorageFolder folder)
+        {
+            if (AppPackageService.IsPackage(file))
+                await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => AppInstallerWindow.RequestOpen(file));
+            else if (string.Equals(file.FileType, ".exe", StringComparison.OrdinalIgnoreCase))
             {
                 // Executables always use the packaged Windows icon. Do not ask
                 // the storage provider for an executable thumbnail.
-                Win32WindowManagerService.Instance.Open(entry.File, m_currentFolder);
+                Win32WindowManagerService.Instance.Open(file, folder);
             }
-            else if (entry.File != null && string.Equals(entry.File.FileType, ".txt", StringComparison.OrdinalIgnoreCase))
-                AppState.Instance.RequestNotepadOpen(entry.File);
-            else if (entry.File != null && string.Equals(entry.File.FileType, ".pdf", StringComparison.OrdinalIgnoreCase))
-                AppState.Instance.RequestFirefoxOpen(entry.File);
-            else if (entry.File != null && ArchiveService.IsArchive(entry.File))
-                await OpenArchivePreviewAsync(entry.File);
-            else if (entry.File != null) await Launcher.LaunchFileAsync(entry.File);
+            else if (string.Equals(file.FileType, ".txt", StringComparison.OrdinalIgnoreCase))
+                AppState.Instance.RequestNotepadOpen(file);
+            else if (string.Equals(file.FileType, ".pdf", StringComparison.OrdinalIgnoreCase))
+                AppState.Instance.RequestFirefoxOpen(file);
+            else if (ArchiveService.IsArchive(file))
+                await OpenArchivePreviewAsync(file);
+            else await Launcher.LaunchFileAsync(file);
         }
 
         private async void Back_Click(object sender, RoutedEventArgs e)

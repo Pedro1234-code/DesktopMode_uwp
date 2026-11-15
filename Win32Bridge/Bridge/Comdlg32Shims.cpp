@@ -1,6 +1,20 @@
 #include "pch.h"
 #include "Bridge/Comdlg32Shims.h"
 #include "Bridge/DialogResources.h"
+#include "Bridge/GuestStorage.h"
+#include "Bridge/Kernel32Shims.h"
+#include "Bridge/RuntimeDiagnostics.h"
+#include "Bridge/User32Shims.h"
+
+#include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <new>
+#include <type_traits>
+#include <utility>
+#include <wrl/client.h>
+
+#include "Bridge/FileDialogCom.inl"
 
 namespace
 {

@@ -37,11 +37,15 @@ namespace factoryos_10x_shell.Services.Win32
             set => ApplicationData.Current.LocalSettings.Values[AppSupportEnabledSettingKey] = value;
         }
 
-        public Win32WindowModel Open(StorageFile executable, StorageFolder sourceFolder, ImageSource iconSource = null)
+        public Win32WindowModel Open(StorageFile executable, StorageFolder sourceFolder, ImageSource iconSource = null,
+            string virtualPath = null, string arguments = null, string workingDirectory = null)
         {
             if (!IsAppSupportEnabled || executable == null || sourceFolder == null) return null;
             Win32WindowModel existing = Windows.FirstOrDefault(item =>
                 string.Equals(item.Executable?.Path, executable.Path, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(item.VirtualExecutablePath, virtualPath, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(item.Arguments, arguments, StringComparison.Ordinal) &&
+                string.Equals(item.WorkingDirectory, workingDirectory, StringComparison.OrdinalIgnoreCase) &&
                 !string.IsNullOrWhiteSpace(executable.Path));
             if (existing != null)
             {
@@ -53,6 +57,9 @@ namespace factoryos_10x_shell.Services.Win32
             {
                 Executable = executable,
                 ModuleSourceFolder = sourceFolder,
+                VirtualExecutablePath = virtualPath,
+                Arguments = arguments,
+                WorkingDirectory = workingDirectory,
                 IconSource = iconSource,
                 Left = 92 + Windows.Count * 28,
                 Top = 58 + Windows.Count * 28

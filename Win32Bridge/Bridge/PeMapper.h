@@ -30,7 +30,8 @@ namespace Bridge
     class PeMapper final
     {
     public:
-        static bool Materialize(const BYTE* fileBytes, size_t fileSize, MappedPeImage* image, std::wstring* error);
+        static bool Materialize(const BYTE* fileBytes, size_t fileSize, MappedPeImage* image,
+            std::wstring* error, size_t maximumImageSize = static_cast<size_t>(-1));
         static bool ApplyBaseRelocations(MappedPeImage* image, ULONGLONG actualImageBase, std::wstring* error);
     };
 }

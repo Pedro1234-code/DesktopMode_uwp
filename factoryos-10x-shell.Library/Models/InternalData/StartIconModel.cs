@@ -5,7 +5,7 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Threading.Tasks;
-using Windows.UI.Xaml.Media.Imaging;
+using Windows.UI.Xaml.Media;
 
 namespace factoryos_10x_shell.Library.Models.InternalData
 {
@@ -13,7 +13,17 @@ namespace factoryos_10x_shell.Library.Models.InternalData
     {
         private string _iconName;
         public string AppUri { get; set; }
-        public string IconGlyph { get; set; }
+        private string _iconGlyph;
+        public string IconGlyph
+        {
+            get => _iconGlyph;
+            set
+            {
+                if (_iconGlyph == value) return;
+                _iconGlyph = value;
+                OnPropertyChanged();
+            }
+        }
 
         public byte[] IconBytes { get; set; }
 
@@ -34,8 +44,8 @@ namespace factoryos_10x_shell.Library.Models.InternalData
 
         public string Aumid { get; set; }
 
-        private BitmapImage _iconSource;
-        public BitmapImage IconSource
+        private ImageSource _iconSource;
+        public ImageSource IconSource
         {
             get { return _iconSource; }
             set

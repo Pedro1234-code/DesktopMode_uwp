@@ -83,7 +83,6 @@
     <rescap:Capability Name="broadFileSystemAccess" />
     <rescap:Capability Name="packageManagement" />
     <rescap:Capability Name="fullTrust" />
-    <rescap:Capability Name="userProfile" />
     <rescap:Capability Name="runFullTrust"/>
     <rescap:Capability Name="inputInjectionBrokered" />
     <uap4:Capability Name="userDataTasks"/>

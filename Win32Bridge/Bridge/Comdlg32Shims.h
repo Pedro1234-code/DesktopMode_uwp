@@ -38,6 +38,9 @@ namespace Bridge
     BOOL WINAPI BridgeGetOpenFileNameW(GuestOpenFileNameW* openFileName);
     BOOL WINAPI BridgeGetSaveFileNameW(GuestOpenFileNameW* openFileName);
     DWORD WINAPI BridgeCommDlgExtendedError();
+    bool IsGuestFileDialogClass(REFCLSID clsid);
+    HRESULT CreateGuestFileDialog(REFCLSID clsid, REFIID iid, void** result);
+    HRESULT CreateGuestShellItemFromPath(LPCWSTR path, REFIID iid, void** result);
 
     ImportResolution ResolveComdlg32Import(const ImportedSymbol& symbol);
 }

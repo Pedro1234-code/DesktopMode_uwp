@@ -1,4 +1,4 @@
-﻿<Page
+<Page
     x:Class="factoryos_10x_shell.Views.Default10xBar"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
@@ -10,6 +10,107 @@
     mc:Ignorable="d">
 
     <Page.Resources>
+        <Style x:Key="Windows11TaskbarAppStyle" TargetType="Button">
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Grid Background="Transparent">
+                            <VisualStateManager.VisualStateGroups>
+                                <VisualStateGroup x:Name="CommonStates">
+                                    <VisualStateGroup.Transitions>
+                                        <VisualTransition GeneratedDuration="0:0:0.083" />
+                                    </VisualStateGroup.Transitions>
+                                    <VisualState x:Name="Normal" />
+                                    <VisualState x:Name="PointerOver">
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="Hover" Storyboard.TargetProperty="Opacity" To="1" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="Pressed">
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="PressedPlate" Storyboard.TargetProperty="Opacity" To="1" Duration="0" />
+                                            <DoubleAnimation Storyboard.TargetName="ItemContent" Storyboard.TargetProperty="Opacity" To="0.8" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="Disabled">
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="ItemContent" Storyboard.TargetProperty="Opacity" To="0.4" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                </VisualStateGroup>
+                            </VisualStateManager.VisualStateGroups>
+                            <Border Background="{TemplateBinding Background}" CornerRadius="{TemplateBinding CornerRadius}" IsHitTestVisible="False" />
+                            <Border x:Name="Hover" Background="{ThemeResource Windows11TaskbarHoverFill}"
+                                    BorderBrush="{ThemeResource Windows11TaskbarHoverStroke}" BorderThickness="1" CornerRadius="{TemplateBinding CornerRadius}"
+                                    Opacity="0" IsHitTestVisible="False" />
+                            <Border x:Name="PressedPlate" Background="{ThemeResource Windows11ItemPressedFill}"
+                                    CornerRadius="{TemplateBinding CornerRadius}" Opacity="0" IsHitTestVisible="False" />
+                            <ContentPresenter x:Name="ItemContent" Content="{TemplateBinding Content}"
+                                              ContentTemplate="{TemplateBinding ContentTemplate}" Margin="{TemplateBinding Padding}"
+                                              HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="Windows11LaunchButtonStyle" TargetType="Button">
+            <Setter Property="Width" Value="48" />
+            <Setter Property="Height" Value="42" />
+            <Setter Property="CornerRadius" Value="6" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Grid Background="Transparent">
+                            <VisualStateManager.VisualStateGroups>
+                                <VisualStateGroup x:Name="CommonStates">
+                                    <VisualStateGroup.Transitions>
+                                        <VisualTransition To="Pressed" GeneratedDuration="0:0:0.07" />
+                                        <VisualTransition From="Pressed" GeneratedDuration="0:0:0.18">
+                                            <VisualTransition.GeneratedEasingFunction>
+                                                <CubicEase EasingMode="EaseOut" />
+                                            </VisualTransition.GeneratedEasingFunction>
+                                        </VisualTransition>
+                                        <VisualTransition GeneratedDuration="0:0:0.12" />
+                                    </VisualStateGroup.Transitions>
+                                    <VisualState x:Name="Normal" />
+                                    <VisualState x:Name="PointerOver">
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="HoverPlate" Storyboard.TargetProperty="Opacity" To="1" Duration="0" />
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleX" To="1.04" Duration="0" />
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleY" To="1.04" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="Pressed">
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="HoverPlate" Storyboard.TargetProperty="Opacity" To="0.65" Duration="0" />
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleX" To="0.80" Duration="0" />
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleY" To="0.80" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="Disabled">
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="IconPresenter" Storyboard.TargetProperty="Opacity" To="0.4" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                </VisualStateGroup>
+                            </VisualStateManager.VisualStateGroups>
+                            <Border x:Name="HoverPlate" CornerRadius="{TemplateBinding CornerRadius}" Opacity="0"
+                                    Background="{ThemeResource SystemControlHighlightListLowBrush}" />
+                            <ContentPresenter x:Name="IconPresenter" Content="{TemplateBinding Content}"
+                                              HorizontalAlignment="Center" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5">
+                                <ContentPresenter.RenderTransform>
+                                    <ScaleTransform x:Name="IconScale" />
+                                </ContentPresenter.RenderTransform>
+                            </ContentPresenter>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
         <BitmapImage x:Key="TaskViewDefaultIcon" UriSource="ms-appx:///taskview.png" />
         <BitmapImage x:Key="TaskViewHoverIcon" UriSource="ms-appx:///Assets/TaskView/taskview-hover.png" />
         <Style x:Key="TaskViewButtonStyle" TargetType="Button">
@@ -104,8 +205,11 @@
         x:Name="TaskbarGrid"
         Height="50"
         VerticalAlignment="Bottom"
-        Background="{ThemeResource TaskbarAcrylicBrush}">
+        Background="Transparent">
 
+        <Border x:Name="Windows10XTaskbarPlate" Background="{ThemeResource TaskbarAcrylicBrush}" IsHitTestVisible="False" />
+        <Border x:Name="Windows11TaskbarPlate" Background="{ThemeResource Windows11TaskbarAcrylic}"
+                BorderThickness="0,1,0,0" IsHitTestVisible="False" Visibility="Collapsed" />
         <StackPanel x:Name="TaskbarButtons" HorizontalAlignment="Center" Orientation="Horizontal">
             <Button
                 x:Name="StartButton"
@@ -202,12 +306,21 @@
                     </Canvas>
                 </Viewbox>
             </Button>
+            <Button x:Name="Windows11StartButton" Visibility="Collapsed" Style="{StaticResource Windows11LaunchButtonStyle}"
+                    AutomationProperties.Name="Start" ToolTipService.ToolTip="Start"
+                    Command="{x:Bind Mode=OneWay, Path=ViewModel.StartButtonClickedCommand}">
+                <Image Width="24" Height="24" Source="{ThemeResource Windows11StartGlyph}" Stretch="Uniform" />
+            </Button>
 
             <Button
                 x:Name="TaskViewButton"
                 Click="TaskViewButton_Click"
                 Style="{StaticResource TaskViewButtonStyle}"
                 ToolTipService.ToolTip="Task View" />
+            <Button x:Name="Windows11TaskViewButton" Visibility="Collapsed" Style="{StaticResource Windows11LaunchButtonStyle}"
+                    AutomationProperties.Name="Task View" ToolTipService.ToolTip="Task View" Click="TaskViewButton_Click">
+                <Image Width="24" Height="24" Source="{ThemeResource Windows11TaskViewGlyph}" Stretch="Uniform" />
+            </Button>
 
             <StackPanel
                 x:Name="PinnedAppsPanel"
@@ -238,6 +351,22 @@
             HorizontalAlignment="Right"
             Orientation="Horizontal">
 
+            <Button x:Name="Windows11QuickSettingsButton" Visibility="Collapsed" Height="42" MinWidth="58"
+                    CornerRadius="6" Background="Transparent" BorderThickness="0" Padding="7,0"
+                    ToolTipService.ToolTip="Quick settings"
+                    Command="{x:Bind Mode=OneWay, Path=ViewModel.ActionCenterButtonClickedCommand}">
+                <StackPanel Orientation="Horizontal" Spacing="7">
+                    <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="14"
+                               Foreground="{x:Bind Mode=OneWay, Path=ViewModel.ThemedIconBrush}"
+                               Text="{x:Bind Mode=OneWay, Path=ViewModel.NetworkStatusCharacter}" />
+                    <FontIcon Glyph="&#xE767;" FontSize="14"
+                              Foreground="{x:Bind Mode=OneWay, Path=ViewModel.ThemedIconBrush}" />
+                    <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="14"
+                               Foreground="{x:Bind Mode=OneWay, Path=ViewModel.ThemedIconBrush}"
+                               Text="{x:Bind Mode=OneWay, Path=ViewModel.BatteryStatusCharacter}"
+                               Visibility="{x:Bind Mode=OneWay, Path=ViewModel.BattStatusVisibility}" />
+                </StackPanel>
+            </Button>
             <Button
                 x:Name="ActionCenterButton"
                 Width="75"
@@ -247,9 +376,12 @@
                 Style="{StaticResource TaskbarButtonStyle}"
                 ToolTipService.ToolTip="Action Center">
                 <Grid
+                    x:Name="TrayLayout"
                     Width="75"
                     Height="50"
                     Padding="0">
+                    <TextBlock x:Name="Windows11TrayDate" HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                               Margin="0,0,8,5" FontSize="11" Foreground="{x:Bind Mode=OneWay, Path=ViewModel.ThemedIconBrush}" Visibility="Collapsed" />
                     <TextBlock
                         x:Name="ClockText2"
                         Margin="5,5,10,5"
@@ -258,7 +390,7 @@
                         FontWeight="Medium"
                         Foreground="{x:Bind Mode=OneWay, Path=ViewModel.ThemedIconBrush}"
                         Text="{x:Bind Mode=OneWay, Path=ViewModel.TimeText}" />
-                    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                    <StackPanel x:Name="TrayStatusIcons" HorizontalAlignment="Right" Orientation="Horizontal">
                         <TextBlock
                             x:Name="NotifStatus2"
                             Margin="0,0,5,7"

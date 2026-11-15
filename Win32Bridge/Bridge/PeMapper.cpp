@@ -73,7 +73,8 @@ namespace
     }
 }
 
-bool PeMapper::Materialize(const BYTE* fileBytes, size_t fileSize, MappedPeImage* image, std::wstring* error)
+bool PeMapper::Materialize(const BYTE* fileBytes, size_t fileSize, MappedPeImage* image,
+    std::wstring* error, size_t maximumImageSize)
 {
     if (!image)
     {
@@ -90,7 +91,8 @@ bool PeMapper::Materialize(const BYTE* fileBytes, size_t fileSize, MappedPeImage
         return false;
     }
 
-    if (optionalHeader.SizeOfImage == 0 || optionalHeader.SizeOfHeaders > optionalHeader.SizeOfImage ||
+    if (optionalHeader.SizeOfImage == 0 || optionalHeader.SizeOfImage > maximumImageSize ||
+        optionalHeader.SizeOfHeaders > optionalHeader.SizeOfImage ||
         optionalHeader.SizeOfHeaders == 0 ||
         optionalHeader.SectionAlignment == 0 || optionalHeader.FileAlignment == 0 ||
         (optionalHeader.SizeOfImage % 4096u) != 0 ||

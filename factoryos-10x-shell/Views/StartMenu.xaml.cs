@@ -1,9 +1,10 @@
-﻿using factoryos_10x_shell.Library.Models.InternalData;
+using factoryos_10x_shell.Library.Models.InternalData;
 using factoryos_10x_shell.Library.Services.Helpers;
 using factoryos_10x_shell;
 using factoryos_10x_shell.Library.Services.Managers;
 using factoryos_10x_shell.Library.ViewModels;
 using factoryos_10x_shell.Services.Helpers;
+using factoryos_10x_shell.Services.Win32;
 using factoryos_10x_shell.Library.Services.WebApps;
 using Microsoft.Extensions.DependencyInjection;
 using System;
@@ -53,6 +54,8 @@ namespace factoryos_10x_shell.Views
         private readonly IStartManagerService startManager;
         private bool m_searching;
         private bool m_refreshQueued;
+        private bool m_shortcutsLoading;
+        private IReadOnlyList<StartIconModel> m_shortcuts = Array.Empty<StartIconModel>();
         private InputPane m_searchInputPane;
         public ObservableCollection<StartIconModel> FilteredApps { get; } = new ObservableCollection<StartIconModel>();
         public ObservableCollection<WebAppDefinition> FilteredWebApps { get; } = new ObservableCollection<WebAppDefinition>();
@@ -60,6 +63,13 @@ namespace factoryos_10x_shell.Views
         public StartMenu()
         {
             this.InitializeComponent();
+            Loaded += (s, e) =>
+            {
+                AppState.Instance.ShellSkinChanged += ApplyShellSkin;
+                ApplyShellSkin();
+            };
+            Unloaded += (s, e) => AppState.Instance.ShellSkinChanged -= ApplyShellSkin;
+            ActualThemeChanged += (s, e) => ApplyShellSkin();
             appHelper = App.ServiceProvider.GetRequiredService<IAppHelper>();
             webAppService = App.ServiceProvider.GetRequiredService<IWebAppService>();
             windowManager = App.ServiceProvider.GetRequiredService<IWindowManagerService>();
@@ -73,6 +83,7 @@ namespace factoryos_10x_shell.Views
                 ViewModel.StartIcons.CollectionChanged += SearchSource_CollectionChanged;
                 ViewModel.WebApps.CollectionChanged += SearchSource_CollectionChanged;
                 RefreshSearchResults();
+                _ = RefreshWin32ShortcutsAsync();
             };
             Unloaded += (s, e) =>
             {
@@ -85,7 +96,198 @@ namespace factoryos_10x_shell.Views
             RefreshSearchResults();
         }
 
+        public ObservableCollection<StartIconModel> Windows11PinnedApps { get; } = new ObservableCollection<StartIconModel>();
+        public ObservableCollection<StartIconModel> Windows11ListedApps { get; } = new ObservableCollection<StartIconModel>();
+        public ObservableCollection<StartIconModel> Windows11RecentApps { get; } = new ObservableCollection<StartIconModel>();
+        private readonly List<string> m_windows11RecentIds = new List<string>();
+        private bool m_windows11ShowAll;
+        private const string Windows11PinsSetting = "Windows11.StartPins";
+
+        private List<string> GetWindows11PinIds()
+        {
+            if (ApplicationData.Current.LocalSettings.Values[Windows11PinsSetting] is string saved)
+                return saved.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+            return new List<string> { "CoreShell.Files", "CoreShell.Firefox", "CoreShell.Notepad",
+                "CoreShell.Calculator", "CoreShell.Settings" };
+        }
+
+        private void UpdateWindows11Start()
+        {
+            if (!AppState.Instance.UseWindows11Skin) return;
+
+            var apps = FilteredApps.Select(app => app.AppId == "CoreShell.Files" ? new StartIconModel
+            {
+                AppId = app.AppId,
+                IconName = app.IconName,
+                IconSource = (ImageSource)Windows.UI.Xaml.Application.Current.Resources["Windows11FilesIcon"],
+                IconGlyph = string.Empty
+            } : app).Concat(FilteredWebApps.Select(app => new StartIconModel
+            {
+                AppId = "web:" + app.Id,
+                IconName = app.Name,
+                IconSource = Uri.TryCreate(app.IconUri, UriKind.Absolute, out var icon)
+                    ? new BitmapImage(icon) : null,
+                IconGlyph = string.IsNullOrEmpty(app.IconUri) ? "\uE774" : string.Empty,
+                Data = app
+            })).OrderBy(app => app.IconName, StringComparer.CurrentCultureIgnoreCase).ToList();
+
+            bool list = m_searching || m_windows11ShowAll;
+            Windows11Pins.Visibility = list ? Visibility.Collapsed : Visibility.Visible;
+            Windows11Recommended.Visibility = Windows11Pins.Visibility;
+            Windows11AllApps.Visibility = list ? Visibility.Visible : Visibility.Collapsed;
+            Windows11StartHeading.Text = m_searching ? "Search results" : list ? "All apps" : "Pinned";
+            Windows11AppsToggle.Visibility = m_searching ? Visibility.Collapsed : Visibility.Visible;
+            Windows11AppsToggle.Content = list ? "‹  Back" : "All apps  ›";
+            Windows11NoResults.Visibility = list && apps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+
+            if (list)
+            {
+                Windows11ListedApps.Clear();
+                foreach (var app in apps) Windows11ListedApps.Add(app);
+                return;
+            }
+
+            Windows11PinnedApps.Clear();
+            foreach (var id in GetWindows11PinIds())
+            {
+                var app = apps.FirstOrDefault(item => item.AppId == id);
+                if (app != null) Windows11PinnedApps.Add(app);
+            }
+            Windows11RecentApps.Clear();
+            foreach (var id in m_windows11RecentIds)
+            {
+                var app = apps.FirstOrDefault(item => item.AppId == id);
+                if (app != null) Windows11RecentApps.Add(app);
+            }
+            Windows11RecentHint.Visibility = Windows11RecentApps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void Windows11AppsToggle_Click(object sender, RoutedEventArgs e)
+        {
+            m_windows11ShowAll = !m_windows11ShowAll;
+            UpdateWindows11Start();
+        }
+
+        private async Task LaunchWindows11AppAsync(StartIconModel app)
+        {
+            if (app == null) return;
+            if (!string.IsNullOrEmpty(app.AppId))
+            {
+                m_windows11RecentIds.Remove(app.AppId);
+                m_windows11RecentIds.Insert(0, app.AppId);
+                if (m_windows11RecentIds.Count > 6) m_windows11RecentIds.RemoveAt(6);
+            }
+            m_windows11ShowAll = false;
+            if (app.Data is WebAppDefinition webApp)
+            {
+                windowManager.Open(webApp);
+                startManager.RequestStartVisibilityChange(false);
+            }
+            else await LaunchStartAppAsync(app);
+            UpdateWindows11Start();
+        }
+
+        private async void Windows11App_Click(object sender, RoutedEventArgs e) =>
+            await LaunchWindows11AppAsync((sender as FrameworkElement)?.DataContext as StartIconModel);
+
+        private void Windows11App_RightTapped(object sender, RightTappedRoutedEventArgs e)
+        {
+            if (!(sender is FrameworkElement target) || !(target.DataContext is StartIconModel app)) return;
+            var menu = new MenuFlyout();
+            menu.Opened += ContextFlyout_Opened;
+            menu.Closed += ContextFlyout_Closed;
+            var ids = GetWindows11PinIds();
+            if (!string.IsNullOrEmpty(app.AppId))
+            {
+                bool pinned = ids.Contains(app.AppId);
+                var pin = new MenuFlyoutItem { Text = pinned ? "Unpin from Start" : "Pin to Start" };
+                pin.Click += (s, args) =>
+                {
+                    if (pinned) ids.Remove(app.AppId);
+                    else if (!ids.Contains(app.AppId)) ids.Add(app.AppId);
+                    ApplicationData.Current.LocalSettings.Values[Windows11PinsSetting] = string.Join("\n", ids);
+                    UpdateWindows11Start();
+                };
+                menu.Items.Add(pin);
+            }
+            if (app.Data is WebAppDefinition webApp)
+            {
+                var pin = new MenuFlyoutItem { Text = "Pin to taskbar", DataContext = webApp };
+                pin.Click += PinWebApp_Click;
+                menu.Items.Add(pin);
+                var open = new MenuFlyoutItem { Text = webApp.NewInstanceText, DataContext = webApp };
+                open.Click += NewWebAppWindow_Click;
+                menu.Items.Add(open);
+                var uninstall = new MenuFlyoutItem { Text = "Uninstall", DataContext = webApp };
+                uninstall.Click += UninstallWebApp_Click;
+                menu.Items.Add(uninstall);
+            }
+            else if (!(app.Data is Win32StartShortcut))
+            {
+                var pin = new MenuFlyoutItem { Text = "Pin to taskbar", DataContext = app };
+                pin.Click += PinToTaskbar_Click;
+                menu.Items.Add(pin);
+            }
+            if (menu.Items.Count == 0) return;
+            menu.ShowAt(target);
+            e.Handled = true;
+        }
+
+        private void ApplyShellSkin()
+        {
+            bool windows11 = AppState.Instance.UseWindows11Skin;
+            bool dark = ActualTheme == ElementTheme.Dark;
+            var skinVisibility = windows11 ? Visibility.Visible : Visibility.Collapsed;
+            var legacyVisibility = windows11 ? Visibility.Collapsed : Visibility.Visible;
+
+            Windows11StartPlate.Visibility = skinVisibility;
+            Windows10XStartPlate.Visibility = legacyVisibility;
+            Windows11StartBody.Visibility = skinVisibility;
+            Windows10XContent.Visibility = legacyVisibility;
+            Windows10XStartBody.Visibility = legacyVisibility;
+            LegacyFooterSpacer.Visibility = legacyVisibility;
+            AppsHeading.Text = windows11 ? "Apps" : "My apps";
+            StartSurface.CornerRadius = new CornerRadius(windows11 ? 12 : 4);
+            SearchRow.Height = new GridLength(windows11 ? 76 : 120);
+            SearchPlate.CornerRadius = new CornerRadius(windows11 ? 20 : 3);
+            AppSearchBox.PlaceholderText = windows11 ? "Search for apps" : "Search the web or your devices";
+            AppListShow.CornerRadius = new CornerRadius(windows11 ? 5 : 10);
+            PowerButton.Width = SettingsButton.Width = windows11 ? 48 : 75;
+
+            if (windows11)
+            {
+                StartSurface.MinHeight = 0;
+                Windows11StartPlate.BorderBrush = new SolidColorBrush(dark
+                    ? Windows.UI.Color.FromArgb(42, 255, 255, 255)
+                    : Windows.UI.Color.FromArgb(28, 0, 0, 0));
+                Windows11BottomBar.Background = new SolidColorBrush(dark
+                    ? Windows.UI.Color.FromArgb(30, 0, 0, 0)
+                    : Windows.UI.Color.FromArgb(90, 255, 255, 255));
+                UpdateWindows11Start();
+            }
+        }
+
         public StartMenuViewModel ViewModel => (StartMenuViewModel)this.DataContext;
+
+        internal async Task RefreshWin32ShortcutsAsync()
+        {
+            if (m_shortcutsLoading) return;
+            m_shortcutsLoading = true;
+            try
+            {
+                m_shortcuts = await Win32StartShortcuts.ReadAsync();
+                RefreshSearchResults();
+                await Win32StartShortcuts.LoadIconsAsync(m_shortcuts);
+            }
+            catch (Exception exception)
+            {
+                Debug.WriteLine("Start shortcut scan failed: " + exception.Message);
+            }
+            finally
+            {
+                m_shortcutsLoading = false;
+            }
+        }
 
         private bool UpdateSearchKeyboardPolicy()
         {
@@ -147,7 +349,7 @@ namespace factoryos_10x_shell.Views
             bool searching = query.Length != 0;
             // Filtering changes the content's desired height. Keep the menu
             // at its pre-search height, with results scrolling inside it.
-            if (searching && !m_searching)
+            if (searching && !m_searching && !AppState.Instance.UseWindows11Skin)
                 StartSurface.MinHeight = StartSurface.ActualHeight;
             else if (!searching && m_searching)
                 StartSurface.MinHeight = 0;
@@ -156,7 +358,8 @@ namespace factoryos_10x_shell.Views
                 name ?? string.Empty, query, CompareOptions.IgnoreCase | CompareOptions.IgnoreNonSpace) >= 0;
 
             FilteredApps.Clear();
-            foreach (var app in ViewModel.StartIcons.Where(app => Matches(app.IconName))) FilteredApps.Add(app);
+            foreach (var app in ViewModel.StartIcons.Concat(m_shortcuts).Where(app => Matches(app.IconName)))
+                FilteredApps.Add(app);
             FilteredWebApps.Clear();
             foreach (var app in ViewModel.WebApps.Where(app => Matches(app.Name))) FilteredWebApps.Add(app);
 
@@ -164,6 +367,7 @@ namespace factoryos_10x_shell.Views
             AppListShow.Visibility = searching ? Visibility.Collapsed : Visibility.Visible;
             WebAppsSection.Visibility = searching && FilteredWebApps.Count == 0
                 ? Visibility.Collapsed : Visibility.Visible;
+            UpdateWindows11Start();
             NoSearchResults.Visibility = searching && FilteredApps.Count == 0 && FilteredWebApps.Count == 0
                 ? Visibility.Visible : Visibility.Collapsed;
         }
@@ -178,7 +382,9 @@ namespace factoryos_10x_shell.Views
             else if (e.Key == VirtualKey.Enter && !string.IsNullOrWhiteSpace(AppSearchBox.Text))
             {
                 e.Handled = true;
-                if (FilteredApps.Count > 0) await LaunchStartAppAsync(FilteredApps[0]);
+                if (AppState.Instance.UseWindows11Skin && m_searching)
+                    await LaunchWindows11AppAsync(Windows11ListedApps.FirstOrDefault());
+                else if (FilteredApps.Count > 0) await LaunchStartAppAsync(FilteredApps[0]);
                 else if (FilteredWebApps.Count > 0)
                 {
                     windowManager.Open(FilteredWebApps[0]);
@@ -197,6 +403,14 @@ namespace factoryos_10x_shell.Views
         {
             if (model != null)
             {
+                if (model.Data is Win32StartShortcut shortcut)
+                {
+                    var window = Win32WindowManagerService.Instance.Open(shortcut.Executable,
+                        shortcut.Folder, model.IconSource, shortcut.VirtualPath,
+                        shortcut.Arguments, shortcut.WorkingDirectory);
+                    if (window != null) startManager.RequestStartVisibilityChange(false);
+                    return;
+                }
                 if (model.AppId == "CoreShell.Files")
                 {
                     AppState.Instance.RequestFilesOpen(true);
@@ -238,6 +452,7 @@ namespace factoryos_10x_shell.Views
             if (sender is MenuFlyoutItem item &&
                 item.DataContext is StartIconModel app)
             {
+                if (app.Data is Win32StartShortcut) return;
                 if (!appHelper.TaskbarIcons.Any(i => i.AppId == app.AppId))
                 {
                     appHelper.TaskbarIcons.Add(app);
@@ -328,7 +543,16 @@ namespace factoryos_10x_shell.Views
             startManager.RequestStartVisibilityChange(false);
         }
 
-        private void ContextFlyout_Opened(object sender, object e) => MainPage.SetPopupCursorVisibility(true);
+        private void ContextFlyout_Opened(object sender, object e)
+        {
+            if (sender is MenuFlyout menu && menu.Items.FirstOrDefault() is MenuFlyoutItem item &&
+                item.DataContext is StartIconModel app && app.Data is Win32StartShortcut)
+            {
+                menu.Hide();
+                return;
+            }
+            MainPage.SetPopupCursorVisibility(true);
+        }
         private void ContextFlyout_Closed(object sender, object e) => MainPage.SetPopupCursorVisibility(false);
 
     }

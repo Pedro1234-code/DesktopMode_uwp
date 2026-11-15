@@ -36,6 +36,7 @@ namespace Bridge
     std::vector<GuestMenuVisualItem> GetGuestMenuItems(HMENU menu);
     std::vector<GuestMenuVisualItem> GetGuestMenuBarItems(HWND window);
     bool CopyGuestIconPixels(HICON icon, MiniGdi::Surface* destination);
+    bool CopyGuestExecutableIconPixels(int size, MiniGdi::Surface* destination);
     HICON StoreGuestIconPixels(const MiniGdi::Surface& source);
     HICON CreateGuestShellIcon(bool directory, int size);
     ATOM WINAPI BridgeRegisterClassExW(const GuestAbi::WndClassExW* windowClass);

@@ -44,7 +44,6 @@ namespace factoryos_10x_shell.Controls
             if (!e.GetCurrentPoint(sender as UIElement).Properties.IsLeftButtonPressed) return;
             var host = VisualTreeHelper.GetParent(this) as Canvas;
             if (host == null) return;
-            FileOperationService.Instance.Activate(Operation);
             m_start = e.GetCurrentPoint(host).Position;
             m_left = Canvas.GetLeft(this);
             m_top = Canvas.GetTop(this);

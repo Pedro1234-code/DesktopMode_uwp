@@ -263,6 +263,13 @@ void PrepareProfile(const std::wstring& profile,
        "that the headless UWP input bridge does not produce. Use the regular "
        "Windows scrollbar so sites keep a visible, usable scroll indicator.\n"
        "user_pref(\"ui.useOverlayScrollbars\", 0);\n"
+       "user_pref(\"widget.non-native-theme.scrollbar.style\", 4);\n"
+       "// PiP needs a separate player window, which the integrated host "
+       "// does not support. Inline video and fullscreen use other paths.\n"
+       "user_pref(\"media.videocontrols.picture-in-picture.enabled\", false);\n"
+       "user_pref(\"media.videocontrols.picture-in-picture.video-toggle.enabled\", false);\n"
+       "user_pref(\"dom.media-pip.enabled\", false);\n"
+       "user_pref(\"dom.documentpip.enabled\", false);\n"
        "// Enable real WebRTC capture. Package capabilities still gate OS "
        "access and Firefox still asks each site for permission.\n"
        "user_pref(\"media.peerconnection.enabled\", true);\n"
@@ -283,6 +290,15 @@ void PrepareProfile(const std::wstring& profile,
       "user_pref(\"media.sanity-test.disabled\", true);\n"
       "user_pref(\"sanity-test.running\", false);\n"
       "user_pref(\"media.hardware-video-decoding.failed\", false);\n";
+  // Allow shared WebGPU textures when the adapter and compositor support them.
+  prefs +=
+      "user_pref(\"dom.webgpu.allow-in-parent\", true);\n"
+      "user_pref(\"dom.webgpu.allow-present-without-readback\", true);\n";
+  // Avoid Glean metric writes in the UWP browser profile.
+  prefs +=
+      "user_pref(\"datareporting.healthreport.uploadEnabled\", false);\n"
+      "user_pref(\"telemetry.fog.test.localhost_port\", 0);\n"
+      "user_pref(\"telemetry.fog.init_on_shutdown\", false);\n";
   WriteProfileFile(profile + L"\\user.js", prefs);
 
   // Keep the profile stylesheet under DesktopMode's control, but do not hide

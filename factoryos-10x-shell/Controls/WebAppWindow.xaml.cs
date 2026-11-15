@@ -509,21 +509,23 @@ namespace factoryos_10x_shell.Controls
         private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
             if (m_window == null || m_window.IsMaximized) return;
+            if (m_resizing || !WindowResize.TryCapture(sender, e)) return;
+            m_windowManager?.Activate(m_window);
             m_resizing = true;
             m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
-            m_resizeStart = e.GetCurrentPoint(null).Position;
+            m_resizeStart = e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position;
             m_startLeft = m_window.Left;
             m_startTop = m_window.Top;
             m_startWidth = m_window.Width;
             m_startHeight = m_window.Height;
-            (sender as UIElement)?.CapturePointer(e.Pointer);
+            e.Handled = true;
         }
 
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
             Rect bounds = WindowResize.Calculate(m_resizeCorner, m_resizeStart,
-                e.GetCurrentPoint(null).Position,
+                e.GetCurrentPoint(WindowResize.CoordinateSpace(this)).Position,
                 new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 360, 260);
             m_window.Left = bounds.X; m_window.Top = bounds.Y;
             m_window.Width = bounds.Width; m_window.Height = bounds.Height;

@@ -269,10 +269,11 @@ void Handle(std::string json) {
         sink(command);
         Log::Write(L"window: chrome requested " + op);
       }
-    } else if (op == L"file.reveal") {
+    } else if (op == L"file.reveal" || op == L"file.open-download") {
       std::wstring path(msg.GetNamedString(L"path", L""));
       if (!path.empty()) {
         if (auto sink = gRevealFileSink.load()) {
+          if (op == L"file.open-download") path.insert(0, L"open-download:");
           sink(path.c_str());
           Log::Write(L"window: Files reveal requested");
         }

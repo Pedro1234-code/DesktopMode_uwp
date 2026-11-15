@@ -410,3 +410,4 @@ Contexto Win32Bridge.html
 # Machine-local Gecko toolchain/output locations. Copy the adjacent .example
 # file and keep workstation-specific paths out of the project itself.
 /gecko-source/GeckoShellHost/GeckoBuild.local.props
+/XboxAppInstaller

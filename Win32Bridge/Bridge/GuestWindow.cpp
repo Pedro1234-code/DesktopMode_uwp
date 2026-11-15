@@ -52,6 +52,10 @@ namespace
     // message can become visible to guest GetMessage/PeekMessage callers.
     constexpr UINT InternalSentMessage = 0xffffffffu;
     constexpr UINT InternalSentCallbackMessage = 0xfffffffeu;
+    constexpr DWORD GroupBoxButtonStyle = 0x0007u;
+    constexpr DWORD OwnerDrawStaticStyle = 0x000du;
+    constexpr DWORD StaticTypeMask = 0x001fu;
+    constexpr DWORD ButtonHorizontalAlignmentMask = 0x0300u;
     constexpr DWORD GuestIsmexSend = 0x00000001u;
     constexpr DWORD GuestIsmexNotify = 0x00000002u;
     constexpr DWORD GuestIsmexCallback = 0x00000004u;
@@ -470,11 +474,11 @@ namespace
 
     int DefaultExtent(int value, int fallback)
     {
-        if (value == GuestAbi::CwUseDefault || value <= 0)
+        if (value == GuestAbi::CwUseDefault)
         {
             return fallback;
         }
-        return (std::max)(1, (std::min)(value, 2048));
+        return (std::max)(0, (std::min)(value, 2048));
     }
 
     int DefaultCoordinate(int value)
@@ -1919,6 +1923,10 @@ namespace
         if (properties->IsRightButtonPressed) result |= GuestAbi::MkRButton;
         if (properties->IsXButton1Pressed) result |= GuestAbi::MkXButton1;
         if (properties->IsXButton2Pressed) result |= GuestAbi::MkXButton2;
+        if (MouseInput().GetKeyState(static_cast<int>(GuestAbi::VkShift)) & 0x8000)
+            result |= GuestAbi::MkShift;
+        if (MouseInput().GetKeyState(static_cast<int>(GuestAbi::VkControl)) & 0x8000)
+            result |= GuestAbi::MkControl;
         return result;
     }
 
@@ -2031,6 +2039,9 @@ struct GuestPresentationState final
     std::shared_ptr<std::vector<MiniGdi::Color>> pixels;
     int width = 0;
     int height = 0;
+    std::function<void(int, int)> initialSizeHandler;
+    SIZE initialWindowSize{};
+    POINT viewportOrigin{};
     std::uint64_t epoch = 0;
     std::uint64_t frameSerial = 0;
     std::uint64_t queuedTicket = 0;
@@ -2202,6 +2213,8 @@ namespace
         int width = 0;
         int height = 0;
         std::uint64_t serial = 0;
+        std::function<void(int, int)> initialSizeHandler;
+        SIZE initialWindowSize{};
         {
             std::lock_guard<std::mutex> guard(presentation->lock);
             if (!presentation->active || !presentation->presentQueued ||
@@ -2214,6 +2227,11 @@ namespace
             width = presentation->width;
             height = presentation->height;
             serial = presentation->frameSerial;
+            if (presentation->initialWindowSize.cx > 0)
+            {
+                initialSizeHandler = std::move(presentation->initialSizeHandler);
+                initialWindowSize = presentation->initialWindowSize;
+            }
         }
 
         bool frameUploaded = false;
@@ -2222,6 +2240,8 @@ namespace
         {
             try
             {
+                if (initialSizeHandler)
+                    initialSizeHandler(initialWindowSize.cx, initialWindowSize.cy);
                 Image^ image = nullptr;
                 WriteableBitmap^ bitmap = nullptr;
                 bool currentFrame = false;
@@ -2499,7 +2519,7 @@ struct GuestWindowManager::WindowRecord final
     HINSTANCE instance = nullptr;
     HWND parent = nullptr;
     HWND owner = nullptr;
-    std::uint64_t zOrder = 0;
+    std::int64_t zOrder = 0;
     bool zTopMost = false;
     UINT_PTR controlId = 0;
     std::vector<BYTE> extraBytes;
@@ -2632,6 +2652,9 @@ struct GuestWindowManager::WindowRecord final
     bool menuBar = false;
     bool viewportWidthBound = false;
     bool viewportHeightBound = false;
+    bool hostResizeQueued = false;
+    bool clientLayoutFromHost = false;
+    bool clientSizeDispatched = false;
     int openMenuIndex = -1;
     bool visible = false;
     bool enabled = true;
@@ -2665,6 +2688,7 @@ struct GuestWindowManager::SentMessageRecord final
     void (CALLBACK* callback)(HWND, UINT, ULONG_PTR, LRESULT) = nullptr;
     ULONG_PTR callbackData = 0;
     bool autoRelease = false;
+    bool hostResize = false;
     std::mutex lock;
     std::condition_variable completedChanged;
     LRESULT result = 0;
@@ -2883,6 +2907,20 @@ GuestWindowManager::~GuestWindowManager()
 {
     Deactivate();
     DetachHostEvents();
+}
+
+void GuestWindowManager::SetInitialWindowSizeHandler(std::function<void(int, int)> handler)
+{
+    if (!m_presentation) return;
+    std::lock_guard<std::mutex> guard(m_presentation->lock);
+    m_presentation->initialSizeHandler = std::move(handler);
+}
+
+POINT GuestWindowManager::ViewportOrigin() const
+{
+    if (!m_presentation) return {};
+    std::lock_guard<std::mutex> guard(m_presentation->lock);
+    return m_presentation->viewportOrigin;
 }
 
 void GuestWindowManager::Activate()
@@ -3374,31 +3412,15 @@ HWND GuestWindowManager::CreateGuestWindow(
         SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
     }
-    // CW_USEDEFAULT has a different meaning for a stock control than for a
-    // top-level desktop. Use the virtual desktop for top-level defaults and
-    // control metrics for child strips before their parent performs layout.
-    const BuiltinControlKind builtinKind = registered->builtinKind;
-    const int defaultWidth = GuestMetrics::CurrentScreenWidth();
-    int defaultHeight = GuestMetrics::CurrentScreenHeight();
-    if (builtinKind == BuiltinControlKind::Toolbar ||
-        builtinKind == BuiltinControlKind::Rebar)
-        defaultHeight = GuestMetrics::ToolbarHeight;
-    else if (builtinKind == BuiltinControlKind::StatusBar)
-        defaultHeight = GuestMetrics::StatusBarHeight;
-    else if (builtinKind == BuiltinControlKind::Header)
-        defaultHeight = GuestMetrics::ListViewHeaderHeight;
-    else if (builtinKind == BuiltinControlKind::Progress ||
-        builtinKind == BuiltinControlKind::UpDown ||
-        builtinKind == BuiltinControlKind::ToolTip)
-        defaultHeight = GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight);
-    const bool defaultTopLevelX = !parent && x == GuestAbi::CwUseDefault;
-    const bool defaultTopLevelY = !parent && y == GuestAbi::CwUseDefault;
-    window->viewportWidthBound = !parent && width == GuestAbi::CwUseDefault;
-    window->viewportHeightBound = !parent && height == GuestAbi::CwUseDefault;
+    const bool overlapped = !childWindow && (style & 0x80000000u) == 0; // WS_POPUP
+    const bool defaultTopLevelX = overlapped && x == GuestAbi::CwUseDefault;
+    const bool defaultTopLevelY = overlapped && y == GuestAbi::CwUseDefault;
+    window->viewportWidthBound = overlapped && width == GuestAbi::CwUseDefault;
+    window->viewportHeightBound = overlapped && height == GuestAbi::CwUseDefault;
     const int initialWindowWidth = DefaultExtent(width,
-        parent ? defaultWidth : (std::max)(1, m_viewportWidth.load()));
+        overlapped ? (std::max)(1, m_viewportWidth.load()) : 0);
     const int initialWindowHeight = DefaultExtent(height,
-        parent ? defaultHeight : (std::max)(1, m_viewportHeight.load()));
+        overlapped ? (std::max)(1, m_viewportHeight.load()) : 0);
     window->bounds.left = defaultTopLevelX && initialWindowWidth < m_viewportWidth.load()
         ? (m_viewportWidth.load() - initialWindowWidth) / 2
         : DefaultCoordinate(x);
@@ -3423,7 +3445,8 @@ HWND GuestWindowManager::CreateGuestWindow(
         std::lock_guard<std::mutex> guard(m_windowsLock);
         const ULONG_PTR token = m_nextWindow++;
         window->handle = reinterpret_cast<HWND>(token);
-        window->zOrder = m_nextZOrder++;
+        // Win32 inserts a new child below its existing siblings.
+        window->zOrder = parent ? m_nextChildBottomZOrder-- : m_nextZOrder++;
         m_windows.emplace(token, window);
     }
 
@@ -3485,6 +3508,9 @@ HWND GuestWindowManager::CreateGuestWindow(
     if (ncCreated)
     {
         std::lock_guard<std::mutex> guard(window->lock);
+        if (!window->parent && window->menuBar)
+            initialClient.top = (std::min)(initialClient.bottom, (std::max)(initialClient.top,
+                static_cast<LONG>(SaturatingAdd(window->bounds.top, GuestMetrics::MenuHeight))));
         window->clientArea = RECT{
             initialClient.left - window->bounds.left,
             initialClient.top - window->bounds.top,
@@ -4027,6 +4053,8 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
     std::wstring className;
     {
         std::lock_guard<std::mutex> guard(window->lock);
+        if (message == GuestAbi::WmSize && window->clientLayoutFromHost)
+            window->clientSizeDispatched = true;
         procedure = window->procedure;
         handle = window->handle;
         targetThreadId = window->threadId;
@@ -4087,7 +4115,7 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
             int surfaceWidth = 0;
             int surfaceHeight = 0;
             HWND paintParent = nullptr;
-            std::uint64_t paintZOrder = 0;
+            std::int64_t paintZOrder = 0;
             bool paintVisible = false;
             MiniGdi::Color topLeft = MiniGdi::Transparent;
             MiniGdi::Color center = MiniGdi::Transparent;
@@ -4161,6 +4189,22 @@ LRESULT GuestWindowManager::CallWindowProcedure(const std::shared_ptr<WindowReco
                 }
                 else
                     DefaultGuestWindowProcedure(handle, message, wParam, lParam);
+            }
+        }
+        if (message == GuestAbi::WmNcCalcSize)
+        {
+            const bool extended = wParam != FALSE;
+            RECT client{};
+            if (TryReadGuestValue(reinterpret_cast<const RECT*>(lParam), &client))
+            {
+                RuntimeDiagnostics::RecordChanged(
+                    L"nonclient:" + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)),
+                    L"WINDOW CLIENT: handle " + std::to_wstring(reinterpret_cast<ULONG_PTR>(handle)) +
+                    L" '" + className + L"' origin " +
+                    std::to_wstring(client.left) + L"," + std::to_wstring(client.top) +
+                    L" size " + std::to_wstring(client.right - client.left) + L"x" +
+                    std::to_wstring(client.bottom - client.top) +
+                    (extended ? L" (NCCALCSIZE_PARAMS)." : L" (RECT)."));
             }
         }
         return result;
@@ -4496,6 +4540,9 @@ BOOL GuestWindowManager::SetGuestWindowMenuBar(HWND window, BOOL visible, DWORD*
                 reinterpret_cast<LPARAM>(&clientBounds));
             {
                 std::lock_guard<std::mutex> guard(record->lock);
+                if (record->menuBar)
+                    clientBounds.top = (std::min)(clientBounds.bottom, (std::max)(clientBounds.top,
+                        static_cast<LONG>(SaturatingAdd(record->bounds.top, GuestMetrics::MenuHeight))));
                 record->clientArea = RECT{
                     clientBounds.left - record->bounds.left,
                     clientBounds.top - record->bounds.top,
@@ -4949,7 +4996,7 @@ BOOL GuestWindowManager::GetGuestWindowRect(HWND window, LPRECT rect, DWORD* win
 
         HWND parent = nullptr;
         RECT bounds{};
-        bool menuBar = false;
+        RECT clientArea{};
         {
             std::lock_guard<std::mutex> guard(record->lock);
             if (record->destroyed)
@@ -4959,7 +5006,7 @@ BOOL GuestWindowManager::GetGuestWindowRect(HWND window, LPRECT rect, DWORD* win
             }
             parent = record->parent;
             bounds = record->bounds;
-            menuBar = record->menuBar;
+            clientArea = record->clientArea;
         }
 
         if (first)
@@ -4971,12 +5018,11 @@ BOOL GuestWindowManager::GetGuestWindowRect(HWND window, LPRECT rect, DWORD* win
         left = SaturatingAdd(left, bounds.left);
         top = SaturatingAdd(top, bounds.top);
 
-        // Child coordinates are relative to the parent's client origin.  The
-        // bridge models the root menu as non-client chrome, so descendants of
-        // that root begin below it on the composed guest screen.
-        if (!parent && menuBar && current != window)
+        // A child is positioned in its parent's client coordinates.
+        if (current != window)
         {
-            top = SaturatingAdd(top, GuestMetrics::MenuHeight);
+            left = SaturatingAdd(left, clientArea.left);
+            top = SaturatingAdd(top, clientArea.top);
         }
         current = parent;
     }
@@ -5010,7 +5056,7 @@ BOOL GuestWindowManager::GetGuestClientOrigin(HWND window, LPPOINT point, DWORD*
         return FALSE;
     }
 
-    bool rootMenuBar = false;
+    RECT clientArea{};
     {
         std::lock_guard<std::mutex> guard(record->lock);
         if (record->destroyed)
@@ -5018,15 +5064,11 @@ BOOL GuestWindowManager::GetGuestClientOrigin(HWND window, LPPOINT point, DWORD*
             SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
             return FALSE;
         }
-        // Descendant window rectangles already include the root's client
-        // offset while walking their parent chain.  Only the root itself
-        // still needs its non-client menu height applied here.
-        rootMenuBar = !record->parent && record->menuBar;
+        clientArea = record->clientArea;
     }
 
-    point->x = windowRect.left;
-    point->y = SaturatingAdd(
-        windowRect.top, rootMenuBar ? GuestMetrics::MenuHeight : 0);
+    point->x = SaturatingAdd(windowRect.left, clientArea.left);
+    point->y = SaturatingAdd(windowRect.top, clientArea.top);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
@@ -5104,12 +5146,12 @@ std::vector<HWND> GuestWindowManager::SnapshotGuestWindows(HWND parent, bool des
         records.reserve(m_windows.size());
         for (const auto& item : m_windows) records.push_back(item.second);
     }
-    std::vector<std::pair<std::uint64_t, HWND>> ordered;
+    std::vector<std::pair<std::int64_t, HWND>> ordered;
     for (const auto& record : records)
     {
         HWND candidateParent = nullptr;
         bool alive = false;
-        std::uint64_t zOrder = 0;
+        std::int64_t zOrder = 0;
         {
             std::lock_guard<std::mutex> guard(record->lock);
             alive = !record->destroyed;
@@ -5608,7 +5650,6 @@ bool GuestWindowManager::GetGuestSurfaceGeometry(
     bool first = true;
     int accumulatedLeft = 0;
     int accumulatedTop = 0;
-    bool rootMenuBar = false;
     while (current)
     {
         const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(current);
@@ -5686,7 +5727,7 @@ MiniGdi::Region GuestWindowManager::VisibleRegionForWindow(HWND window, bool cli
 
     HWND parent = nullptr;
     DWORD style = 0;
-    std::uint64_t zOrder = 0;
+    std::int64_t zOrder = 0;
     bool targetTopMost = false;
     {
         std::lock_guard<std::mutex> guard(target->lock);
@@ -5736,8 +5777,9 @@ MiniGdi::Region GuestWindowManager::VisibleRegionForWindow(HWND window, bool cli
         HWND candidateParent = nullptr;
         HWND candidateHandle = nullptr;
         bool candidateVisible = false;
-        std::uint64_t candidateZ = 0;
+        std::int64_t candidateZ = 0;
         bool candidateTopMost = false;
+        bool candidateDecorative = false;
         {
             std::lock_guard<std::mutex> guard(candidate->lock);
             candidateHandle = candidate->handle;
@@ -5745,6 +5787,14 @@ MiniGdi::Region GuestWindowManager::VisibleRegionForWindow(HWND window, bool cli
             candidateVisible = candidate->visible && !candidate->destroyed;
             candidateZ = candidate->zOrder;
             candidateTopMost = candidate->zTopMost;
+            if (candidate->windowClass)
+            {
+                const auto kind = candidate->windowClass->builtinKind;
+                candidateDecorative = (kind == BuiltinControlKind::Button &&
+                    (candidate->style & GuestAbi::BsTypeMask) == GroupBoxButtonStyle) ||
+                    (kind == BuiltinControlKind::Static &&
+                        (candidate->style & StaticTypeMask) == OwnerDrawStaticStyle);
+            }
         }
         const bool aboveTarget = candidateTopMost != targetTopMost
             ? candidateTopMost : candidateZ > zOrder;
@@ -5752,7 +5802,8 @@ MiniGdi::Region GuestWindowManager::VisibleRegionForWindow(HWND window, bool cli
             candidateParent == parent && candidateHandle != window && aboveTarget;
         const bool obscuringChild = clipChildren && (style & GuestWsClipChildren) != 0 &&
             candidateParent == window;
-        if (!candidateVisible || (!obscuringSibling && !obscuringChild)) continue;
+        if (!candidateVisible || candidateDecorative ||
+            (!obscuringSibling && !obscuringChild)) continue;
 
         HWND candidateRoot = nullptr;
         int crw = 0, crh = 0, cw = 0, ch = 0, cl = 0, ct = 0;
@@ -5781,7 +5832,7 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
         bool visible = false;
         bool menuBar = false;
         bool topMost = false;
-        std::uint64_t zOrder = 0;
+        std::int64_t zOrder = 0;
         bool zTopMost = false;
         int clientLeft = 0;
         int clientTop = 0;
@@ -5821,13 +5872,15 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
                         GuestMetrics::ControlHeightForText(GuestMetrics::TextHeight))));
             }
             snapshot.visible = record->visible;
+            if (record->windowClass &&
+                record->windowClass->builtinKind == BuiltinControlKind::Button &&
+                (record->style & GuestAbi::BsTypeMask) == GroupBoxButtonStyle)
+            {
+                snapshot.visible = false;
+            }
             snapshot.menuBar = record->menuBar;
-            const GuestMetrics::NonClientMetrics nonClient =
-                GuestMetrics::NonClientForEmbeddedWindow(
-                    record->style, record->extendedStyle,
-                    record->parent != nullptr || record->owner != nullptr);
-            snapshot.clientLeft = nonClient.left;
-            snapshot.clientTop = nonClient.top;
+            snapshot.clientLeft = record->clientArea.left;
+            snapshot.clientTop = record->clientArea.top;
             snapshot.topMost = record->windowClass &&
                 record->windowClass->builtinKind == BuiltinControlKind::ComboBox &&
                 record->comboDropped;
@@ -5910,13 +5963,12 @@ HWND GuestWindowManager::HitTestGuestWindow(HWND rootWindow, int rootX, int root
 
     if (root->menuBar)
     {
-        if (rootY < GuestMetrics::MenuHeight)
+        if (rootY < root->clientTop)
         {
             // Menu handling owns this non-client strip. Returning the root
             // prevents its toolbar from receiving clicks shifted by the menu.
             return rootWindow;
         }
-        rootY -= GuestMetrics::MenuHeight;
     }
 
     const HWND child = hitTestChildren(rootWindow, rootX, rootY);
@@ -6163,9 +6215,13 @@ bool GuestWindowManager::HandleGuestMenuPointer(HWND rootWindow, int rootX, int 
                         SaturatingAdd(hitGeometry.top, PopupMenuItemTop(
                             refreshed, static_cast<size_t>(hitItem))),
                         (std::max)(0, rootHeight - childHeight)));
-                    std::lock_guard<std::mutex> guard(m_popupMenuLock);
-                    if (m_popupMenu.open && m_popupMenu.root == rootWindow)
                     {
+                        std::lock_guard<std::mutex> guard(m_popupMenuLock);
+                        if (!m_popupMenu.open || m_popupMenu.root != rootWindow ||
+                            m_popupMenu.owner != popup.owner ||
+                            static_cast<size_t>(hitLevel) >= m_popupMenu.levels.size() ||
+                            m_popupMenu.levels[static_cast<size_t>(hitLevel)].menu != hitGeometry.menu)
+                            return true;
                         m_popupMenu.levels.resize(static_cast<size_t>(hitLevel + 1));
                         m_popupMenu.levels.push_back(PopupMenuLevel{
                             child, childLeft, childTop, hitItem, -1 });
@@ -6406,7 +6462,7 @@ HWND GuestWindowManager::ChildGuestWindowFromPoint(
         bool visible = false;
         bool enabled = false;
         bool transparent = false;
-        std::uint64_t zOrder = 0;
+        std::int64_t zOrder = 0;
         bool zTopMost = false;
     };
     std::vector<Candidate> candidates;
@@ -6470,7 +6526,7 @@ HWND GuestWindowManager::GuestWindowFromPoint(POINT point, DWORD* win32Error) co
         RECT bounds{};
         bool visible = false;
         bool enabled = false;
-        std::uint64_t zOrder = 0;
+        std::int64_t zOrder = 0;
         bool zTopMost = false;
     };
     std::vector<RootCandidate> roots;
@@ -7280,6 +7336,18 @@ BOOL GuestWindowManager::SetGuestWindowPos(
             nc.rectangles[0] = RECT{ currentLeft, currentTop,
                 SaturatingAdd(currentLeft, currentWidth),
                 SaturatingAdd(currentTop, currentHeight) };
+            nc.rectangles[1] = RECT{ previousLeft, previousTop,
+                SaturatingAdd(previousLeft, previousWidth),
+                SaturatingAdd(previousTop, previousHeight) };
+            {
+                std::lock_guard<std::mutex> guard(record->lock);
+                const RECT& client = record->clientArea;
+                nc.rectangles[2] = RECT{
+                    SaturatingAdd(previousLeft, client.left),
+                    SaturatingAdd(previousTop, client.top),
+                    SaturatingAdd(previousLeft, client.right),
+                    SaturatingAdd(previousTop, client.bottom) };
+            }
             GuestWindowPosition ncPosition{ window, insertAfter, currentLeft, currentTop,
                 currentWidth, currentHeight, flags };
             nc.windowPosition = &ncPosition;
@@ -7287,6 +7355,10 @@ BOOL GuestWindowManager::SetGuestWindowPos(
                 reinterpret_cast<LPARAM>(&nc));
             {
                 std::lock_guard<std::mutex> guard(record->lock);
+                if (!record->parent && record->menuBar)
+                    nc.rectangles[0].top = (std::min)(nc.rectangles[0].bottom,
+                        (std::max)(nc.rectangles[0].top,
+                            static_cast<LONG>(SaturatingAdd(currentTop, GuestMetrics::MenuHeight))));
                 record->clientArea = RECT{
                     nc.rectangles[0].left - currentLeft,
                     nc.rectangles[0].top - currentTop,
@@ -7697,6 +7769,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
             case 1: return Button | DefPushButton; // BS_DEFPUSHBUTTON
             case 4: case 9: return Button | RadioButton | WantArrows;
+            case GroupBoxButtonStyle: return Static;
             default: return Button | UndefPushButton;
             }
         case BuiltinControlKind::Edit:
@@ -11784,25 +11857,12 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
         if ((position.flags & GuestSwpNoSize) == 0)
         {
-            int clientWidth = position.cx;
-            int clientHeight = position.cy;
-            {
-                std::lock_guard<std::mutex> guard(window->lock);
-                const GuestMetrics::NonClientMetrics nonClient =
-                    GuestMetrics::NonClientForEmbeddedWindow(
-                        window->style, window->extendedStyle,
-                        window->parent != nullptr || window->owner != nullptr);
-                clientWidth = (std::max)(0, clientWidth -
-                    nonClient.left - nonClient.right);
-                clientHeight = (std::max)(0, clientHeight -
-                    nonClient.top - nonClient.bottom -
-                    ((!window->parent && window->menuBar) ?
-                        GuestMetrics::MenuHeight : 0));
-            }
+            RECT client{};
+            if (!GetGuestClientRect(window->handle, &client, nullptr)) return 0;
             CallWindowProcedure(window, GuestAbi::WmSize, GuestAbi::SizeRestored,
                 GuestAbi::MakeMouseLParam(
-                    static_cast<WORD>((std::min)(clientWidth, 0xffff)),
-                    static_cast<WORD>((std::min)(clientHeight, 0xffff))));
+                    static_cast<WORD>((std::min)(client.right, 0xffffL)),
+                    static_cast<WORD>((std::min)(client.bottom, 0xffffL))));
         }
         return 0;
     }
@@ -11998,6 +12058,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         bool enabled = false;
         bool visualStyles = false;
         bool pressed = false;
+        UINT buttonCheck = 0;
         size_t caret = 0;
         size_t selectionAnchor = 0;
         size_t selectionEnd = 0;
@@ -12053,9 +12114,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         COLORREF progressBackgroundColor = 0xffffffffu;
         bool progressMarquee = false;
         std::vector<std::wstring> tabItems;
+        std::vector<LPARAM> tabItemData;
         std::vector<int> tabItemImages;
         HANDLE tabImageList = nullptr;
         int tabSelectedItem = -1;
+        int tabFocusedItem = -1;
         int tabItemWidth = 0;
         int tabItemHeight = GuestMetrics::TabItemHeight;
         std::vector<std::wstring> headerItems;
@@ -12086,6 +12149,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             enabled = window->enabled;
             visualStyles = window->visualStyles;
             pressed = window->buttonPressed || window->buttonKeyboardPressed;
+            buttonCheck = window->buttonCheck;
             caret = window->editCaret;
             selectionAnchor = window->editSelectionAnchor;
             selectionEnd = window->editSelectionEnd;
@@ -12144,9 +12208,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             progressBackgroundColor = window->progressBackgroundColor;
             progressMarquee = window->progressMarquee;
             tabItems = window->tabItems;
+            tabItemData = window->tabItemData;
             tabItemImages = window->tabItemImages;
             tabImageList = window->tabImageList;
             tabSelectedItem = window->tabSelectedItem;
+            tabFocusedItem = window->tabFocusedItem;
             tabItemWidth = window->tabItemWidth;
             tabItemHeight = window->tabItemHeight;
             headerItems = window->headerItems;
@@ -12191,6 +12257,74 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
 
         const MiniGdi::DcHandle guestDc = FromGuestDc(dc);
         MiniGdi::Surface* surface = m_gdi.GetSurface(guestDc);
+        const bool staticControl = controlKind == BuiltinControlKind::Static;
+        const DWORD buttonType = style & GuestAbi::BsTypeMask;
+        const bool groupBox = controlKind == BuiltinControlKind::Button &&
+            buttonType == GroupBoxButtonStyle;
+        const bool checkBox = controlKind == BuiltinControlKind::Button &&
+            (buttonType == 2 || buttonType == 3 || buttonType == 5 || buttonType == 6);
+        const bool ownerDrawStatic = staticControl &&
+            (style & StaticTypeMask) == OwnerDrawStaticStyle;
+        HBRUSH controlBrush = nullptr;
+        MiniGdi::Color controlTextColor = enabled
+            ? MiniGdi::OpaqueBlack : MiniGdi::MakeColor(128, 128, 128);
+        MiniGdi::Color previousControlBackground{};
+        const bool wantsControlColors = surface && parent && (staticControl ||
+            groupBox || checkBox || controlKind == BuiltinControlKind::Edit);
+        const auto clearPaintClip = [this, guestDc](MiniGdi::Surface& target)
+        {
+            MiniGdi::Region clip;
+            if (!m_gdi.GetClipRegion(guestDc, &clip)) return;
+            for (const auto& dirty : MiniGdi::IntersectRegion(
+                MiniGdi::RectRegion(target.Bounds()), clip).rectangles)
+            {
+                for (int row = dirty.top; row < dirty.bottom; ++row)
+                    std::fill_n(target.PixelAt(dirty.left, row),
+                        dirty.right - dirty.left, MiniGdi::Transparent);
+            }
+        };
+        if (wantsControlColors)
+        {
+            const bool editable = controlKind == BuiltinControlKind::Edit &&
+                enabled && (style & GuestAbi::EsReadOnly) == 0;
+            MiniGdi::ObjectHandle previousFont = MiniGdi::InvalidObject;
+            const bool fontSelected = font != MiniGdi::InvalidObject &&
+                m_gdi.SelectFont(guestDc, font, &previousFont);
+            MiniGdi::Color previousColor{};
+            MiniGdi::BackgroundMode previousMode{};
+            m_gdi.SetTextColor(guestDc, controlTextColor, &previousColor);
+            m_gdi.GetBackgroundColor(guestDc, &previousControlBackground);
+            m_gdi.SetBackgroundMode(guestDc, MiniGdi::BackgroundMode::Transparent,
+                &previousMode);
+            controlBrush = reinterpret_cast<HBRUSH>(SendGuestMessage(parent,
+                editable ? 0x0133u : 0x0138u, // WM_CTLCOLOREDIT / WM_CTLCOLORSTATIC
+                reinterpret_cast<WPARAM>(dc), reinterpret_cast<LPARAM>(handle), nullptr));
+            surface = m_gdi.GetSurface(guestDc);
+            if (surface && ownerDrawStatic)
+            {
+                clearPaintClip(*surface);
+                GuestDrawItem item{};
+                item.controlType = 5; // ODT_STATIC
+                item.controlId = static_cast<UINT>(controlId);
+                item.itemAction = 1; // ODA_DRAWENTIRE
+                item.itemState = enabled ? 0u : 0x0004u; // ODS_DISABLED
+                item.itemWindow = handle;
+                item.dc = dc;
+                GetGuestClientRect(handle, &item.itemRect, nullptr);
+                SendGuestMessage(parent, 0x002bu, item.controlId,
+                    reinterpret_cast<LPARAM>(&item), nullptr); // WM_DRAWITEM
+            }
+            m_gdi.GetTextColor(guestDc, &controlTextColor);
+            m_gdi.SetTextColor(guestDc, previousColor, nullptr);
+            m_gdi.SetBackgroundColor(guestDc, previousControlBackground, nullptr);
+            m_gdi.SetBackgroundMode(guestDc, previousMode, nullptr);
+            if (fontSelected) m_gdi.SelectFont(guestDc, previousFont, nullptr);
+            if (ownerDrawStatic)
+            {
+                EndGuestPaint(handle, &paint, nullptr);
+                return 0;
+            }
+        }
         if (surface && parent && controlKind == BuiltinControlKind::Button &&
             (style & GuestAbi::BsTypeMask) == 0x0000000bu) // BS_OWNERDRAW
         {
@@ -12357,10 +12491,49 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             const MiniGdi::Color textColor = enabled
                 ? (controlKind == BuiltinControlKind::ListView
                     ? ColorFromGuestColorRef(listViewTextColor)
-                    : MiniGdi::OpaqueBlack)
+                    : controlTextColor)
                 : MiniGdi::MakeColor(128, 128, 128);
 
-            if (controlKind == BuiltinControlKind::Button)
+            const int checkSize = (std::min)({ controlTextHeight, width - 4, height - 2 });
+            if (groupBox)
+            {
+                clearPaintClip(*surface);
+                MiniGdi::Region clip;
+                m_gdi.GetClipRegion(guestDc, &clip);
+                const MiniGdi::Rect frame{ 0, controlTextHeight / 2, width, height };
+                for (const auto& dirty : MiniGdi::IntersectRegion(
+                    MiniGdi::RectRegion(fullRect), clip).rectangles)
+                {
+                    MiniGdi::DrawRectangle(*surface, frame, MiniGdi::Transparent,
+                        MiniGdi::MakeColor(160, 160, 160), 1, &dirty);
+                }
+            }
+            else if (checkBox)
+            {
+                const RECT bounds{ 0, 0, width, height };
+                BridgeFillRect(dc, &bounds, controlBrush ? controlBrush :
+                    BridgeGetSysColorBrush(COLOR_BTNFACE));
+                if (checkSize >= 4)
+                {
+                    const int top = (height - checkSize) / 2;
+                    const auto ink = enabled ? MiniGdi::OpaqueBlack : MiniGdi::MakeColor(128, 128, 128);
+                    MiniGdi::DrawRectangle(*surface,
+                        { 2, top, 2 + checkSize, top + checkSize },
+                        pressed ? MiniGdi::MakeColor(224, 224, 224) : MiniGdi::OpaqueWhite, ink);
+                    if (buttonCheck == 1)
+                    {
+                        const MiniGdi::Point middle{ 2 + checkSize / 2, top + checkSize - 3 };
+                        MiniGdi::DrawLine(*surface, { 4, top + checkSize / 2 }, middle, ink);
+                        MiniGdi::DrawLine(*surface, middle, { checkSize, top + 2 }, ink);
+                    }
+                    else if (buttonCheck == 2)
+                    {
+                        MiniGdi::FillRect(*surface,
+                            { 4, top + 2, checkSize, top + checkSize - 2 }, ink);
+                    }
+                }
+            }
+            else if (controlKind == BuiltinControlKind::Button)
             {
                 const MiniGdi::Color fill = enabled
                     ? (pressed ? MiniGdi::MakeColor(214, 214, 214) :
@@ -12382,6 +12555,18 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     fullRect,
                     MiniGdi::OpaqueWhite,
                     focused && visualStyles ? MiniGdi::MakeColor(0, 120, 215) : MiniGdi::MakeColor(128, 128, 128));
+                if (controlBrush && width > 2 && height > 2)
+                {
+                    const RECT interior{ 1, 1, width - 1, height - 1 };
+                    BridgeFillRect(dc, &interior, controlBrush);
+                }
+            }
+            else if (staticControl)
+            {
+                const RECT bounds{ 0, 0, width, height };
+                const HBRUSH background = controlBrush ? controlBrush :
+                    BridgeGetSysColorBrush(COLOR_BTNFACE);
+                BridgeFillRect(dc, &bounds, background);
             }
             else if (controlKind == BuiltinControlKind::ListView)
             {
@@ -12810,6 +12995,26 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     textX = (std::max)(0, width - visibleTextWidth - 2);
                 }
             }
+            else if (groupBox)
+            {
+                const DWORD alignment = style & ButtonHorizontalAlignmentMask;
+                textX = alignment == 0x0300u ? (std::max)(7, (width - visibleTextWidth) / 2) :
+                    (alignment == 0x0200u ? (std::max)(7, width - visibleTextWidth - 7) : 7);
+                textY = 0;
+                if (!text.empty())
+                {
+                    const RECT label{ textX - 1, 0,
+                        (std::min)(width, textX + visibleTextWidth + 1),
+                        (std::min)(height, controlTextHeight + 1) };
+                    const HBRUSH background = controlBrush ? controlBrush :
+                        BridgeGetSysColorBrush(COLOR_BTNFACE);
+                    BridgeFillRect(dc, &label, background);
+                }
+            }
+            else if (checkBox)
+            {
+                textX = (std::max)(2, checkSize + 6);
+            }
             else if (controlKind == BuiltinControlKind::Button)
             {
                 textX = (std::max)(2, (width - visibleTextWidth) / 2);
@@ -12977,7 +13182,43 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     if (right <= left) break;
                     const bool selected = static_cast<int>(index) == tabSelectedItem;
                     const RECT itemBounds{ left, selected ? 1 : 3, right, itemHeight + 1 };
-                    const UINT itemState = selected ? (0x0001u | 0x0010u) : 0u;
+                    constexpr UINT ItemSelected = 0x0001u;
+                    constexpr UINT ItemFocused = 0x0010u;
+                    const UINT itemState = (selected ? ItemSelected : 0u) |
+                        (static_cast<int>(index) == tabFocusedItem && focused ? ItemFocused : 0u);
+                    constexpr DWORD OwnerDrawFixedTab = 0x2000u; // TCS_OWNERDRAWFIXED
+                    if (parent && (style & OwnerDrawFixedTab))
+                    {
+                        MiniGdi::Region previousClip;
+                        const MiniGdi::Rect itemRect{ itemBounds.left, itemBounds.top,
+                            itemBounds.right, itemBounds.bottom };
+                        if (m_gdi.GetClipRegion(guestDc, &previousClip))
+                        {
+                            const auto itemClip = MiniGdi::IntersectRegion(
+                                previousClip, MiniGdi::RectRegion(itemRect));
+                            if (!itemClip.Empty() && m_gdi.SetClipRegion(guestDc, itemClip))
+                            {
+                                GuestDrawItem item{};
+                                item.controlType = 101; // ODT_TAB
+                                item.controlId = static_cast<UINT>(controlId);
+                                item.itemId = static_cast<UINT>(index);
+                                item.itemAction = 0x0001u; // ODA_DRAWENTIRE
+                                item.itemState = itemState;
+                                item.itemWindow = handle;
+                                item.dc = dc;
+                                item.itemRect = itemBounds;
+                                if (index < tabItemData.size())
+                                    item.itemData = static_cast<ULONG_PTR>(tabItemData[index]);
+                                SendGuestMessage(parent, 0x002bu, controlId, // WM_DRAWITEM
+                                    reinterpret_cast<LPARAM>(&item), nullptr);
+                                m_gdi.SetClipRegion(guestDc, previousClip);
+                                surface = m_gdi.GetSurface(guestDc);
+                                if (!surface) break;
+                            }
+                        }
+                        left = right;
+                        continue;
+                    }
                     DWORD itemDrawMode = CustomDrawDoDefault;
                     if ((customDrawMode & CustomDrawNotifyItemDraw) != 0)
                     {
@@ -14783,6 +15024,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             bool changed = false;
             bool activate = false;
             bool checkChanged = false;
+            bool selected = false;
+            std::vector<int> deselected;
+            std::vector<int> rangeSelected;
             UINT oldCheckState = 0;
             UINT newCheckState = 0;
             int item = -1;
@@ -14799,17 +15043,41 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 if (item >= 0 && static_cast<size_t>(item) < window->listViewItems.size())
                 {
                     previousItem = window->listViewSelectedItem;
-                    changed = previousItem != item;
-                    if (previousItem >= 0 &&
-                        static_cast<size_t>(previousItem) < window->listViewItemStates.size())
+                    auto& states = window->listViewItemStates;
+                    const bool multiSelect = (window->style & 0x0004u) == 0; // LVS_SINGLESEL
+                    const bool range = multiSelect && previousItem >= 0 &&
+                        (wParam & GuestAbi::MkShift) != 0;
+                    const bool toggle = multiSelect && !range && (wParam & GuestAbi::MkControl) != 0;
+                    const int anchor = range && window->listViewSelectionMark >= 0
+                        ? window->listViewSelectionMark : previousItem;
+                    const int firstSelected = range ? (std::min)(anchor, item) : item;
+                    const int lastSelected = range ? (std::max)(anchor, item) : item;
+                    const bool wasSelected = (states[item] & ListViewStateSelected) != 0;
+                    selected = !toggle || !wasSelected;
+                    for (size_t index = 0; index < states.size(); ++index)
                     {
-                        window->listViewItemStates[static_cast<size_t>(previousItem)] &=
-                            ~(ListViewStateSelected | ListViewStateFocused);
+                        states[index] &= ~ListViewStateFocused;
+                        if (toggle || index == static_cast<size_t>(item)) continue;
+                        const int row = static_cast<int>(index);
+                        const bool inRange = row >= firstSelected && row <= lastSelected;
+                        const bool rowWasSelected = (states[index] & ListViewStateSelected) != 0;
+                        if (inRange && !rowWasSelected)
+                        {
+                            states[index] |= ListViewStateSelected;
+                            rangeSelected.push_back(row);
+                        }
+                        else if (!inRange && rowWasSelected)
+                        {
+                            states[index] &= ~ListViewStateSelected;
+                            deselected.push_back(row);
+                        }
                     }
-                    window->listViewItemStates[static_cast<size_t>(item)] |=
-                        ListViewStateSelected | ListViewStateFocused;
+                    states[item] = (states[item] & ~ListViewStateSelected) |
+                        (selected ? ListViewStateSelected : 0u) | ListViewStateFocused;
+                    changed = wasSelected != selected || !deselected.empty() ||
+                        !rangeSelected.empty() || previousItem != item;
                     window->listViewSelectedItem = item;
-                    window->listViewSelectionMark = item;
+                    if (!range) window->listViewSelectionMark = item;
                     window->listViewPressedItem = item;
                     if ((window->listViewExtendedStyle & ListViewExtendedCheckBoxes) != 0 &&
                         x >= 0 && x < 20)
@@ -14825,7 +15093,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         changed = true;
                     }
                     const auto now = std::chrono::steady_clock::now();
-                    activate = window->listViewLastClickItem == item &&
+                    activate = !toggle && !range && window->listViewLastClickItem == item &&
                         now - window->listViewLastClick <= std::chrono::milliseconds(500);
                     window->listViewLastClick = now;
                     window->listViewLastClickItem = item;
@@ -14842,16 +15110,21 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
             if (changed)
             {
-                if (previousItem >= 0)
+                for (int oldItem : deselected)
                 {
-                    notifyOwner(ListViewNotifyItemChanged, previousItem,
+                    notifyOwner(ListViewNotifyItemChanged, oldItem,
                         ListViewStateSelected, 0, ListViewStateSelected, POINT{ x, y });
+                }
+                for (int newItem : rangeSelected)
+                {
+                    notifyOwner(ListViewNotifyItemChanged, newItem,
+                        0, ListViewStateSelected, ListViewStateSelected, POINT{ x, y });
                 }
                 notifyOwner(
                     ListViewNotifyItemChanged,
                     item,
-                    0,
-                    ListViewStateSelected,
+                    selected ? 0u : ListViewStateSelected,
+                    selected ? ListViewStateSelected : 0u,
                     ListViewStateSelected,
                     POINT{ x, y });
             }
@@ -15585,25 +15858,12 @@ LRESULT GuestWindowManager::DefaultGuestWindowProcedure(HWND window, UINT messag
         }
         if ((position.flags & GuestSwpNoSize) == 0)
         {
-            int clientWidth = position.cx;
-            int clientHeight = position.cy;
-            {
-                std::lock_guard<std::mutex> guard(record->lock);
-                const GuestMetrics::NonClientMetrics nonClient =
-                    GuestMetrics::NonClientForEmbeddedWindow(
-                        record->style, record->extendedStyle,
-                        record->parent != nullptr || record->owner != nullptr);
-                clientWidth = (std::max)(0, clientWidth -
-                    nonClient.left - nonClient.right);
-                clientHeight = (std::max)(0, clientHeight -
-                    nonClient.top - nonClient.bottom -
-                    ((!record->parent && record->menuBar) ?
-                        GuestMetrics::MenuHeight : 0));
-            }
+            RECT client{};
+            if (!GetGuestClientRect(window, &client, nullptr)) return 0;
             CallWindowProcedure(record, GuestAbi::WmSize, GuestAbi::SizeRestored,
                 GuestAbi::MakeMouseLParam(
-                    static_cast<WORD>((std::min)(clientWidth, 0xffff)),
-                    static_cast<WORD>((std::min)(clientHeight, 0xffff))));
+                    static_cast<WORD>((std::min)(client.right, 0xffffL)),
+                    static_cast<WORD>((std::min)(client.bottom, 0xffffL))));
         }
         return 0;
     }
@@ -15670,7 +15930,21 @@ void GuestWindowManager::DispatchSentMessageToken(ULONG_PTR token)
     const auto target = FindWindow(sent->window);
     if (target)
     {
-        result = CallWindowProcedure(target, sent->message, sent->wParam, sent->lParam);
+        if (sent->hostResize)
+        {
+            try
+            {
+                ResizeGuestWindowToViewport(sent->window);
+            }
+            catch (...)
+            {
+                std::lock_guard<std::mutex> guard(target->lock);
+                target->clientLayoutFromHost = false;
+                RuntimeDiagnostics::Record(L"VIEWPORT: guest resize failed.");
+            }
+        }
+        else
+            result = CallWindowProcedure(target, sent->message, sent->wParam, sent->lParam);
     }
     {
         std::lock_guard<std::mutex> guard(m_inSendStateLock);
@@ -15979,7 +16253,7 @@ BOOL GuestWindowManager::SendGuestMessageTimeout(HWND window, UINT message,
 BOOL GuestWindowManager::QueueAsynchronousSentMessage(HWND window, UINT message,
     WPARAM wParam, LPARAM lParam,
     void (CALLBACK* callback)(HWND, UINT, ULONG_PTR, LRESULT),
-    ULONG_PTR callbackData, DWORD sendState, DWORD* win32Error)
+    ULONG_PTR callbackData, DWORD sendState, DWORD* win32Error, bool hostResize)
 {
     const auto record = FindWindow(window);
     if (!record)
@@ -16000,7 +16274,11 @@ BOOL GuestWindowManager::QueueAsynchronousSentMessage(HWND window, UINT message,
     const DWORD senderThread = BridgeGetCurrentThreadId();
     if (targetThread == senderThread)
     {
-        const LRESULT value = CallWindowProcedure(record, message, wParam, lParam);
+        LRESULT value = 0;
+        if (hostResize)
+            ResizeGuestWindowToViewport(window);
+        else
+            value = CallWindowProcedure(record, message, wParam, lParam);
         InvokeGuestSendAsyncProcedure(callback, window, message, callbackData, value);
         SetWin32Error(win32Error, ERROR_SUCCESS);
         return TRUE;
@@ -16023,6 +16301,7 @@ BOOL GuestWindowManager::QueueAsynchronousSentMessage(HWND window, UINT message,
     sent->callback = callback;
     sent->callbackData = callbackData;
     sent->autoRelease = true;
+    sent->hostResize = hostResize;
     ULONG_PTR token = 0;
     {
         std::lock_guard<std::mutex> guard(m_sentMessagesLock);
@@ -16833,13 +17112,15 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
         {
             HWND handle = nullptr;
             HWND parent = nullptr;
+            HWND owner = nullptr;
             RECT bounds = {};
             bool visible = false;
             int compositionHeight = 0;
             bool topMost = false;
-            std::uint64_t zOrder = 0;
+            std::int64_t zOrder = 0;
             bool zTopMost = false;
             bool nonClientActive = false;
+            bool transparentControl = false;
             std::wstring title;
             std::wstring className;
             DWORD style = 0;
@@ -16874,11 +17155,20 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                 }
                 snapshot.handle = candidate->handle;
                 snapshot.parent = candidate->parent;
+                snapshot.owner = candidate->owner;
                 snapshot.bounds = candidate->bounds;
                 snapshot.visible = candidate->visible;
                 snapshot.compositionHeight = candidate->surface.Height();
                 snapshot.title = candidate->title;
                 if (candidate->windowClass) snapshot.className = candidate->windowClass->name;
+                if (candidate->windowClass)
+                {
+                    const auto kind = candidate->windowClass->builtinKind;
+                    snapshot.transparentControl = (kind == BuiltinControlKind::Button &&
+                        (candidate->style & GuestAbi::BsTypeMask) == GroupBoxButtonStyle) ||
+                        (kind == BuiltinControlKind::Static &&
+                            (candidate->style & StaticTypeMask) == OwnerDrawStaticStyle);
+                }
                 snapshot.style = candidate->style;
                 snapshot.extendedStyle = candidate->extendedStyle;
                 snapshot.nonClient = GuestMetrics::NonClientForEmbeddedWindow(
@@ -16967,6 +17257,7 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
             return;
         }
 
+        size_t foregroundPopup = noWindow;
         const HWND foreground = reinterpret_cast<HWND>(m_foregroundWindow.load());
         if (foreground)
         {
@@ -16978,10 +17269,9 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     std::lock_guard<std::mutex> guard(snapshots[foregroundRoot].record->lock);
                     foregroundOwner = snapshots[foregroundRoot].record->owner;
                 }
-                // An owned popup is composited over its owner using the same
-                // host surface. Let the owner refresh pixels exposed by popup
-                // movement/destruction before the popup is placed again.
+                // Keep the active popup intact while a retained owner repaints.
                 if (foregroundOwner != snapshots[root].handle) return;
+                if (snapshots[foregroundRoot].visible) foregroundPopup = foregroundRoot;
             }
         }
 
@@ -17125,10 +17415,31 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                             if (source.Empty()) continue;
                             visiblePixels += static_cast<unsigned long long>(source.right - source.left) *
                                 static_cast<unsigned long long>(source.bottom - source.top);
-                            copied = MiniGdi::CopyRect(composite,
-                                MiniGdi::Point{ SaturatingAdd(childX, source.left),
-                                    SaturatingAdd(childY, source.top) },
-                                child.record->surface, source) || copied;
+                            if (child.transparentControl)
+                            {
+                                const auto clipped = MiniGdi::IntersectRect(source, {
+                                    -childX, -childY, composite.Width() - childX,
+                                    composite.Height() - childY });
+                                if (clipped.Empty()) continue;
+                                for (int y = clipped.top; y < clipped.bottom; ++y)
+                                {
+                                    const auto* input = child.record->surface.PixelAt(clipped.left, y);
+                                    auto* output = composite.PixelAt(childX + clipped.left, childY + y);
+                                    for (int x = 0; x < clipped.right - clipped.left; ++x)
+                                    {
+                                        if (MiniGdi::Alpha(input[x]) != 0)
+                                            output[x] = MiniGdi::BlendSourceOver(input[x], output[x]);
+                                    }
+                                }
+                                copied = true;
+                            }
+                            else
+                            {
+                                copied = MiniGdi::CopyRect(composite,
+                                    MiniGdi::Point{ SaturatingAdd(childX, source.left),
+                                        SaturatingAdd(childY, source.top) },
+                                    child.record->surface, source) || copied;
+                            }
                         }
                     }
                 }
@@ -17368,15 +17679,35 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
         // top-level HWND. Keep it viewport-sized and place a smaller root at
         // its real desktop coordinates. Otherwise XAML stretches modal and
         // process-owned progress windows to fill the entire application.
-        const int viewportWidth = (std::max)(1, m_viewportWidth.load());
-        const int viewportHeight = (std::max)(1, m_viewportHeight.load());
-        if (composite.Width() != viewportWidth || composite.Height() != viewportHeight)
+        POINT origin = ViewportOrigin();
+        SIZE initialSize{};
+        {
+            std::lock_guard<std::mutex> guard(presentation->lock);
+            const auto& top = snapshots[root];
+            constexpr DWORD ToolOrNoActivate = 0x08000080u; // WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW
+            if (presentation->initialSizeHandler && !presentation->initialWindowSize.cx &&
+                !top.owner && foregroundPopup == noWindow &&
+                (top.extendedStyle & ToolOrNoActivate) == 0 &&
+                (!foreground || foreground == top.handle))
+            {
+                initialSize = { composite.Width(), composite.Height() };
+                origin = { top.bounds.left, top.bounds.top };
+            }
+        }
+        const int viewportWidth = initialSize.cx ? initialSize.cx : (std::max)(1, m_viewportWidth.load());
+        const int viewportHeight = initialSize.cy ? initialSize.cy : (std::max)(1, m_viewportHeight.load());
+        const int rootLeft = snapshots[root].bounds.left - origin.x;
+        const int rootTop = snapshots[root].bounds.top - origin.y;
+        if (composite.Width() != viewportWidth || composite.Height() != viewportHeight ||
+            rootLeft != 0 || rootTop != 0 ||
+            foregroundPopup != noWindow)
         {
             MiniGdi::Surface desktop;
             if (!desktop.Resize(viewportWidth, viewportHeight, MiniGdi::OpaqueWhite))
             {
                 return;
             }
+            bool preservedFrame = false;
             {
                 std::lock_guard<std::mutex> guard(presentation->lock);
                 if (presentation->pixels && presentation->width == viewportWidth &&
@@ -17384,16 +17715,24 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                     presentation->pixels->size() == desktop.Pixels().size())
                 {
                     desktop.Pixels() = *presentation->pixels;
+                    preservedFrame = true;
                 }
             }
 
             // Keep virtual-screen coordinates intact, including partially
             // off-screen windows. CopyRect clips pixels at the viewport edge;
             // input uses the same origin and therefore remains aligned.
-            const int rootLeft = snapshots[root].bounds.left;
-            const int rootTop = snapshots[root].bounds.top;
-            MiniGdi::CopyRect(desktop, MiniGdi::Point{ rootLeft, rootTop }, composite,
-                MiniGdi::Rect{ 0, 0, composite.Width(), composite.Height() });
+            auto redraw = MiniGdi::RectRegion(desktop.Bounds());
+            if (preservedFrame && foregroundPopup != noWindow)
+            {
+                const RECT& popup = snapshots[foregroundPopup].bounds;
+                redraw = MiniGdi::SubtractRegion(redraw,
+                    MiniGdi::RectRegion({ popup.left - origin.x, popup.top - origin.y,
+                        popup.right - origin.x, popup.bottom - origin.y }));
+            }
+            for (const auto& clip : redraw.rectangles)
+                MiniGdi::CopyRect(desktop, MiniGdi::Point{ rootLeft, rootTop },
+                    composite, composite.Bounds(), nullptr, &clip);
 
             const GuestMetrics::NonClientMetrics& nonClient = snapshots[root].nonClient;
             if (nonClient.left > 0 || nonClient.top > 0 || nonClient.right > 0 ||
@@ -17480,6 +17819,11 @@ void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)
                 return;
             }
             presentation->pixels = std::move(pixels);
+            if (initialSize.cx)
+            {
+                presentation->initialWindowSize = initialSize;
+                presentation->viewportOrigin = origin;
+            }
             presentation->width = width;
             presentation->height = height;
             ++presentation->frameSerial;
@@ -17585,6 +17929,7 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
     }
 
     const auto point = args->CurrentPoint;
+    const POINT viewportOrigin = ViewportOrigin();
     // A tracked popup is modal: it owns input even if a guest control still
     // has capture from the right-click that opened it. Route pointer input to
     // the menu before consulting capture/hit-testing, otherwise its only way
@@ -17623,7 +17968,8 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         const LPARAM menuPosition = MousePosition(
             (std::max)(1, m_viewportWidth.load()),
             (std::max)(1, m_viewportHeight.load()),
-            menuRootWidth, menuRootHeight, menuRootLeft, menuRootTop,
+            menuRootWidth, menuRootHeight, menuRootLeft - viewportOrigin.x,
+            menuRootTop - viewportOrigin.y,
             point->Position, m_surfaceImage.Get(), false);
         if (HandleGuestMenuPointer(menuRoot,
             static_cast<int>(static_cast<short>(menuPosition & 0xffff)),
@@ -17685,12 +18031,12 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
             (std::max)(1, m_viewportHeight.load()),
             rootWidth,
             rootHeight,
-            rootLeft,
-            rootTop,
+            rootLeft - viewportOrigin.x,
+            rootTop - viewportOrigin.y,
             point->Position,
-            m_surfaceImage.Get());
-        const int rootX = static_cast<int>(static_cast<WORD>(rootPosition & 0xffff));
-        const int rootY = static_cast<int>(static_cast<WORD>((rootPosition >> 16) & 0xffff));
+            m_surfaceImage.Get(), false);
+        const int rootX = static_cast<SHORT>(rootPosition & 0xffff);
+        const int rootY = static_cast<SHORT>((rootPosition >> 16) & 0xffff);
         if (HandleGuestMenuPointer(root, rootX, rootY, menuMessage))
         {
             return;
@@ -17747,10 +18093,10 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         (std::max)(1, m_viewportHeight.load()),
         targetWidth,
         targetHeight,
-        targetLeft,
-        targetTop,
+        targetLeft - viewportOrigin.x,
+        targetTop - viewportOrigin.y,
         point->Position,
-        m_surfaceImage.Get());
+        m_surfaceImage.Get(), false);
     const int localX = static_cast<int>(static_cast<short>(position & 0xffff));
     const int localY = static_cast<int>(static_cast<short>((position >> 16) & 0xffff));
     const int screenX = SaturatingAdd(targetLeft, localX);
@@ -17821,7 +18167,12 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
             : GuestAbi::XButton1;
         state |= static_cast<WPARAM>(xButton) << 16;
     }
-        PostGuestMessage(target, message, state, position, nullptr);
+    POINT clientOrigin{};
+    const LPARAM clientPosition = GetGuestClientOrigin(target, &clientOrigin, nullptr)
+        ? GuestAbi::MakeMouseLParam(SignedCoordinateWord(screenX - clientOrigin.x),
+            SignedCoordinateWord(screenY - clientOrigin.y))
+        : position;
+    PostGuestMessage(target, message, state, clientPosition, nullptr);
     }
     catch (Exception^ error)
     {
@@ -17844,6 +18195,7 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
     }
 
     const auto point = args->CurrentPoint;
+    const POINT viewportOrigin = ViewportOrigin();
     HWND target = reinterpret_cast<HWND>(m_captureWindow.load());
     if (target && (!IsGuestWindowVisibleInternal(target) || !IsGuestWindowEnabledInternal(target)))
     {
@@ -17879,12 +18231,12 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
             (std::max)(1, m_viewportHeight.load()),
             rootWidth,
             rootHeight,
-            rootLeft,
-            rootTop,
+            rootLeft - viewportOrigin.x,
+            rootTop - viewportOrigin.y,
             point->Position,
-            m_surfaceImage.Get());
-        const int rootX = static_cast<int>(static_cast<WORD>(rootPosition & 0xffff));
-        const int rootY = static_cast<int>(static_cast<WORD>((rootPosition >> 16) & 0xffff));
+            m_surfaceImage.Get(), false);
+        const int rootX = static_cast<SHORT>(rootPosition & 0xffff);
+        const int rootY = static_cast<SHORT>((rootPosition >> 16) & 0xffff);
         target = HitTestGuestWindow(root, rootX, rootY);
     }
 
@@ -17916,8 +18268,8 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
         (std::max)(1, m_viewportHeight.load()),
         targetWidth,
         targetHeight,
-        targetLeft,
-        targetTop,
+        targetLeft - viewportOrigin.x,
+        targetTop - viewportOrigin.y,
         point->Position,
         m_surfaceImage.Get());
     const int localX = static_cast<int>(static_cast<short>(position & 0xffff));
@@ -18359,6 +18711,8 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
         return;
     }
     GuestMetrics::SetCurrentScreenSize(width, height);
+    RuntimeDiagnostics::Record(L"VIEWPORT: host panel changed to " +
+        std::to_wstring(width) + L"x" + std::to_wstring(height) + L".");
 
     {
         std::lock_guard<std::mutex> guard(m_screenDcLock);
@@ -18380,50 +18734,90 @@ void GuestWindowManager::HandleHostSizeChanged(int width, int height)
     for (const auto& root : roots)
     {
         HWND handle = nullptr;
-        bool bindWidth = false;
-        bool bindHeight = false;
-        int resizedWidth = width;
-        int resizedHeight = height;
         {
             std::lock_guard<std::mutex> guard(root->lock);
-            if (root->destroyed || root->parent)
+            if (root->destroyed || root->parent || !root->visible ||
+                root->owner || root->hostResizeQueued)
                 continue;
             handle = root->handle;
-            const int oldWidth = root->bounds.right - root->bounds.left;
-            const int oldHeight = root->bounds.bottom - root->bounds.top;
-            // The host supplies the frame for an ownerless resizable guest
-            // application. Restoring saved bounds with SetWindowPos must not
-            // detach that application from subsequent host-frame resizing.
-            // Owned/popup dialogs keep their application-selected dimensions.
-            constexpr DWORD ResizableFrame = 0x00040000u; // WS_THICKFRAME
-            constexpr DWORD PopupWindow = 0x80000000u; // WS_POPUP
-            const bool hostedApplication = !root->owner &&
-                (root->style & ResizableFrame) != 0 &&
-                (root->style & PopupWindow) == 0;
-            bindWidth = root->viewportWidthBound || hostedApplication;
-            bindHeight = root->viewportHeightBound || hostedApplication;
-            resizedWidth = bindWidth ? width : oldWidth;
-            resizedHeight = bindHeight ? height : oldHeight;
-            if (oldWidth == resizedWidth && oldHeight == resizedHeight) continue;
+            root->hostResizeQueued = true;
         }
-        DWORD ignored = ERROR_SUCCESS;
-        if (SetGuestWindowPos(handle, nullptr, 0, 0, resizedWidth, resizedHeight,
-            GuestSwpNoMove | GuestSwpNoZOrder | GuestSwpNoActivate, &ignored))
+        // XAML raises this event on the host UI thread. Move the entire
+        // window transaction to the guest thread, including NCCALCSIZE and SIZE.
+        if (!QueueAsynchronousSentMessage(handle, 0, 0, 0, nullptr, 0,
+            GuestIsmexNotify, nullptr, true))
         {
-            // SetWindowPos normally detaches explicitly-sized roots. A host
-            // resize is not a guest request, so preserve each CW_USEDEFAULT
-            // binding for the next UWP size notification.
             std::lock_guard<std::mutex> guard(root->lock);
-            if (!root->destroyed)
-            {
-                root->viewportWidthBound = bindWidth;
-                root->viewportHeightBound = bindHeight;
-            }
-            RuntimeDiagnostics::Record(L"VIEWPORT: resized host-bound root to " +
-                std::to_wstring(resizedWidth) + L"x" +
-                std::to_wstring(resizedHeight) + L".");
+            root->hostResizeQueued = false;
         }
     }
+}
+
+void GuestWindowManager::ResizeGuestWindowToViewport(HWND window)
+{
+    const auto root = FindWindow(window);
+    if (!root) return;
+    const POINT origin = ViewportOrigin();
+
+    bool bindWidth = false;
+    bool bindHeight = false;
+    int width = 0;
+    int height = 0;
+    {
+        std::lock_guard<std::mutex> guard(root->lock);
+        root->hostResizeQueued = false;
+        if (root->destroyed || root->parent || root->owner || !root->visible)
+            return;
+        width = m_viewportWidth.load();
+        height = m_viewportHeight.load();
+
+        constexpr DWORD PopupWindow = 0x80000000u; // WS_POPUP
+        const bool hostedApplication = (root->style & GuestMetrics::WindowStyleThickFrame) != 0 &&
+            (root->style & PopupWindow) == 0;
+        bindWidth = root->viewportWidthBound || hostedApplication;
+        bindHeight = root->viewportHeightBound || hostedApplication;
+        if (!bindWidth) width = root->surface.Width();
+        else width = static_cast<int>((std::max)(1LL, (std::min)(8192LL,
+            static_cast<long long>(width) + origin.x - root->bounds.left)));
+        if (!bindHeight) height = root->surface.Height();
+        else height = static_cast<int>((std::max)(1LL, (std::min)(8192LL,
+            static_cast<long long>(height) + origin.y - root->bounds.top)));
+        if (width == root->surface.Width() && height == root->surface.Height())
+            return;
+    }
+
+    RECT previousClient{};
+    GetGuestClientRect(window, &previousClient, nullptr);
+    {
+        std::lock_guard<std::mutex> guard(root->lock);
+        root->clientLayoutFromHost = true;
+        root->clientSizeDispatched = false;
+    }
+    const bool resized = SetGuestWindowPos(window, nullptr, 0, 0, width, height,
+        GuestSwpNoMove | GuestSwpNoZOrder | GuestSwpNoActivate, nullptr) != FALSE;
+
+    bool sendClientSize = false;
+    {
+        std::lock_guard<std::mutex> guard(root->lock);
+        root->clientLayoutFromHost = false;
+        if (!resized || root->destroyed) return;
+        root->viewportWidthBound = bindWidth;
+        root->viewportHeightBound = bindHeight;
+        sendClientSize = !root->clientSizeDispatched;
+        width = root->surface.Width();
+        height = root->surface.Height();
+    }
+    RECT client{};
+    if (sendClientSize && GetGuestClientRect(window, &client, nullptr) &&
+        (client.right != previousClient.right || client.bottom != previousClient.bottom))
+    {
+        CallWindowProcedure(root, GuestAbi::WmSize, GuestAbi::SizeRestored,
+            GuestAbi::MakeMouseLParam(static_cast<WORD>(client.right),
+                static_cast<WORD>(client.bottom)));
+    }
+    RuntimeDiagnostics::Record(L"VIEWPORT: guest root " +
+        std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) + L" resized to " +
+        std::to_wstring(width) + L"x" + std::to_wstring(height) + L".");
 }
 
 void GuestWindowManager::DetachHostEvents()

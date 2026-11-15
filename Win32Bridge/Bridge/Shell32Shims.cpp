@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "Bridge/Comdlg32Shims.h"
 #include "Bridge/Shell32Shims.h"
 #include "Bridge/Kernel32Shims.h"
 #include "Bridge/CommonControlsShims.h"
@@ -1715,10 +1716,9 @@ void WINAPI Win32Bridge::Bridge::BridgeDragAcceptFiles(HWND, BOOL) { }
 void WINAPI Win32Bridge::Bridge::BridgeDragFinish(HANDLE) { }
 void WINAPI Win32Bridge::Bridge::BridgeSHAddToRecentDocs(UINT, LPCVOID) { }
 HRESULT WINAPI Win32Bridge::Bridge::BridgeSHCreateItemFromParsingName(
-    PCWSTR, PVOID, REFIID, void** result)
+    PCWSTR path, PVOID, REFIID iid, void** result)
 {
-    if (result) *result = nullptr;
-    return E_NOTIMPL;
+    return CreateGuestShellItemFromPath(path, iid, result);
 }
 int WINAPI Win32Bridge::Bridge::BridgeShellAboutW(HWND owner, LPCWSTR title, LPCWSTR text, HICON icon)
 {

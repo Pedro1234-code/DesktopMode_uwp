@@ -2,7 +2,7 @@
     x:Class="factoryos_10x_shell.Controls.Win32GuestWindow"
     xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
     xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
-    <Border Background="#FF202020" BorderBrush="#FF5A5A5A" BorderThickness="1" CornerRadius="4">
+    <Border x:Name="WindowFrame" Background="#FF202020" BorderBrush="#FF5A5A5A" BorderThickness="1" CornerRadius="4">
         <Grid PointerPressed="Root_PointerPressed">
             <Grid.RowDefinitions><RowDefinition Height="36" /><RowDefinition Height="*" /></Grid.RowDefinitions>
             <Grid x:Name="TitleBar" Background="#FF303030" PointerPressed="TitleBar_PointerPressed" PointerMoved="TitleBar_PointerMoved" PointerReleased="TitleBar_PointerReleased" PointerCaptureLost="TitleBar_PointerCaptureLost">
@@ -29,10 +29,14 @@
                     <TextBlock x:Name="StatusText" MaxWidth="560" HorizontalAlignment="Center" Text="{Binding Status}" TextAlignment="Center" TextWrapping="Wrap" />
                 </StackPanel>
             </Grid>
-            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />
-            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Tag="TopRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />
-            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" />
-            <Border x:Name="ResizeGrip" Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost">
+            <Border Grid.RowSpan="2" Width="5" HorizontalAlignment="Left" Margin="0,18,0,18" Background="Transparent" Tag="Left" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerReleased" PointerCanceled="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="2" Height="5" VerticalAlignment="Top" Margin="18,0,18,0" Background="Transparent" Tag="Top" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerReleased" PointerCanceled="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="2" Width="5" HorizontalAlignment="Right" Margin="0,18,0,18" Background="Transparent" Tag="Right" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerReleased" PointerCanceled="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="2" Height="5" VerticalAlignment="Bottom" Margin="18,0,18,0" Background="Transparent" Tag="Bottom" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerReleased" PointerCanceled="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Top" Background="Transparent" Tag="TopLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" PointerCanceled="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Top" Background="Transparent" Tag="TopRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" PointerCanceled="ResizeGrip_PointerReleased" />
+            <Border Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Left" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomLeft" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" PointerCanceled="ResizeGrip_PointerReleased" />
+            <Border x:Name="ResizeGrip" Grid.RowSpan="2" Width="18" Height="18" HorizontalAlignment="Right" VerticalAlignment="Bottom" Background="Transparent" Tag="BottomRight" PointerPressed="ResizeGrip_PointerPressed" PointerMoved="ResizeGrip_PointerMoved" PointerReleased="ResizeGrip_PointerReleased" PointerCaptureLost="ResizeGrip_PointerCaptureLost" PointerCanceled="ResizeGrip_PointerReleased">
                 <TextBlock HorizontalAlignment="Center" VerticalAlignment="Center" FontFamily="Segoe MDL2 Assets" FontSize="12" Foreground="#FFB0B0B0" Text="&#xE76C;" />
             </Border>
         </Grid>

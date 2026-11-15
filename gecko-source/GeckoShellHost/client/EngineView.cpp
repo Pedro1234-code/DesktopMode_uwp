@@ -1,8 +1,17 @@
 #include "pch.h"
 
 #include "client/EngineView.h"
+#include <winrt/Windows.System.Profile.h>
 
+#include <audioclient.h>
+#include <mmdeviceapi.h>
 #include <robuffer.h>
+#include <wrl.h>
+#include <chrono>
+#include <future>
+#include <winrt/Windows.Media.Devices.h>
+
+#pragma comment(lib, "mmdevapi.lib")
 #include <windows.ui.xaml.media.dxinterop.h>
 
 #include <algorithm>
@@ -78,10 +87,107 @@ void LogModuleIdentity(const wchar_t* name, HMODULE module) {
 // from Gecko's threads and has no way to ask for one.
 winrt::Windows::UI::Core::CoreDispatcher gUiDispatcher{nullptr};
 
+struct CaptureActivationResult {
+  HRESULT status;
+  winrt::com_ptr<IAudioClient> client;
+};
+
+class CaptureActivationHandler final
+    : public Microsoft::WRL::RuntimeClass<
+          Microsoft::WRL::RuntimeClassFlags<Microsoft::WRL::ClassicCom>,
+          IActivateAudioInterfaceCompletionHandler, Microsoft::WRL::FtmBase> {
+ public:
+  explicit CaptureActivationHandler(
+      std::shared_ptr<std::promise<CaptureActivationResult>> result)
+      : result_(std::move(result)) {}
+
+  HRESULT STDMETHODCALLTYPE ActivateCompleted(
+      IActivateAudioInterfaceAsyncOperation* operation) override {
+    HRESULT activation = E_FAIL;
+    winrt::com_ptr<::IUnknown> object;
+    HRESULT status = operation->GetActivateResult(&activation, object.put());
+    CaptureActivationResult result{FAILED(status) ? status : activation, {}};
+    if (SUCCEEDED(result.status)) {
+      result.status = object ? object->QueryInterface(
+                                   __uuidof(IAudioClient), result.client.put_void())
+                             : E_NOINTERFACE;
+    }
+    result_->set_value(std::move(result));
+    return S_OK;
+  }
+
+ private:
+  std::shared_ptr<std::promise<CaptureActivationResult>> result_;
+};
+
+HRESULT UwpDefaultCaptureClient(void** client) {
+  if (client) {
+    *client = nullptr;
+  }
+  try {
+    if (!gUiDispatcher || gUiDispatcher.HasThreadAccess()) {
+      return E_ILLEGAL_METHOD_CALL;
+    }
+
+    auto result = std::make_shared<std::promise<CaptureActivationResult>>();
+    auto pending = result->get_future();
+    gUiDispatcher.RunAsync(
+        winrt::Windows::UI::Core::CoreDispatcherPriority::Normal,
+        [result, activate = client != nullptr]() {
+          try {
+            using namespace winrt::Windows::Media::Devices;
+            auto id = MediaDevice::GetDefaultAudioCaptureId(
+                AudioDeviceRole::Communications);
+            if (id.empty()) {
+              id = MediaDevice::GetDefaultAudioCaptureId(AudioDeviceRole::Default);
+            }
+            if (id.empty() || !activate) {
+              result->set_value({id.empty() ? HRESULT_FROM_WIN32(ERROR_NOT_FOUND)
+                                           : S_OK, {}});
+              return;
+            }
+            auto handler = Microsoft::WRL::Make<CaptureActivationHandler>(result);
+            if (!handler) {
+              result->set_value({E_OUTOFMEMORY, {}});
+              return;
+            }
+            winrt::com_ptr<IActivateAudioInterfaceAsyncOperation> operation;
+            HRESULT hr = ActivateAudioInterfaceAsync(
+                id.c_str(), __uuidof(IAudioClient), nullptr, handler.Get(),
+                operation.put());
+            if (FAILED(hr)) {
+              result->set_value({hr, {}});
+            }
+          } catch (winrt::hresult_error const& error) {
+            result->set_value({error.code(), {}});
+          } catch (...) {
+            result->set_value({E_FAIL, {}});
+          }
+        });
+
+    if (pending.wait_for(client ? std::chrono::seconds(30)
+                                : std::chrono::seconds(2)) !=
+        std::future_status::ready) {
+      return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+    }
+    auto response = pending.get();
+    if (client && SUCCEEDED(response.status)) {
+      *client = response.client.detach();
+    }
+    return response.status;
+  } catch (winrt::hresult_error const& error) {
+    return error.code();
+  } catch (...) {
+    return E_FAIL;
+  }
+}
+
 std::mutex gClipboardMutex;
 std::wstring gClipboardText;
 std::atomic<uint32_t> gClipboardSequence{1};
 std::once_flag gClipboardWatchOnce;
+bool gGamepadHelpShowing = false;
+bool gGamepadHelpAccepted = false;
 std::once_flag gGamepadWatchOnce;
 std::atomic<bool> gGamepadListChanged{true};
 std::atomic<bool> gPointerLocked{false};
@@ -424,6 +530,16 @@ EngineView::EngineView(int32_t pixelWidth, int32_t pixelHeight,
       fullHeight_(pixelHeight),
       rawPerView_(rawPerView > 0 ? rawPerView : 1.0),
       usePhysicalScreenRoom_(usePhysicalScreenRoom) {
+  try {
+    xboxGamepad_ =
+        winrt::Windows::System::Profile::AnalyticsInfo::VersionInfo()
+            .DeviceFamily() == L"Windows.Xbox" &&
+        ::SetEnvironmentVariableW(L"GECKO_W10M_XBOX_GAMEPAD", L"1");
+    if (xboxGamepad_) {
+      ::_putenv_s("GECKO_W10M_XBOX_GAMEPAD", "1");
+    }
+  } catch (winrt::hresult_error const&) {
+  }
   // What the engine presents to when it draws on the GPU. Normally created
   // whether or not that succeeds: it stays empty and invisible under the
   // picture if the engine falls back to drawing in software, so there is no
@@ -614,6 +730,11 @@ void EngineView::WireKeyboard() {
   sink_.IsSpellCheckEnabled(false);
   sink_.IsTextPredictionEnabled(false);
   sink_.PreventKeyboardDisplayOnProgrammaticFocus(true);
+  sink_.ContextRequested([this](auto const&, auto const& args) {
+    if (gamepadMode_) {
+      args.Handled(true);
+    }
+  });
 
   // This is how the typing actually arrives. The on-screen keyboard of a phone
   // does not send characters to the window the way a physical one does: it
@@ -699,6 +820,11 @@ void EngineView::WireKeyboard() {
   window.KeyDown([this, currentModifiers, isModifier, isNonText, kControl, kAlt,
                   kMeta](winrt::Windows::UI::Core::CoreWindow const&,
                          winrt::Windows::UI::Core::KeyEventArgs const& args) {
+    if (gGamepadHelpShowing) return;
+    if (inputEnabled_ && HandleGamepadKey(args.VirtualKey())) {
+      args.Handled(true);
+      return;
+    }
     if (!inputEnabled_ || (!key2_ && !key_)) {
       return;
     }
@@ -775,6 +901,11 @@ void EngineView::WireKeyboard() {
 
   window.KeyUp([this, currentModifiers](winrt::Windows::UI::Core::CoreWindow const&,
                                          winrt::Windows::UI::Core::KeyEventArgs const& args) {
+    if (gGamepadHelpShowing) return;
+    if (inputEnabled_ && HandleGamepadKey(args.VirtualKey())) {
+      args.Handled(true);
+      return;
+    }
     if (!inputEnabled_ || !key2_) {
       return;
     }
@@ -807,6 +938,10 @@ void EngineView::WireKeyboard() {
   navigation.BackRequested(
       [this](winrt::Windows::Foundation::IInspectable const&,
              winrt::Windows::UI::Core::BackRequestedEventArgs const& args) {
+        if (gamepadMode_) {
+          args.Handled(true);
+          return;
+        }
         if (!inputEnabled_ || !key_ || !overlay_ || overlay_() != 1) {
           return;
         }
@@ -828,6 +963,13 @@ void EngineView::ArmBridge() {
   HMODULE xul = ::GetModuleHandleW(L"xul.dll");
   if (!xul) {
     return;
+  }
+  if (xboxGamepad_) {
+    using SetCaptureBroker = void (*)(HRESULT (*)(void**));
+    if (auto setCaptureBroker = reinterpret_cast<SetCaptureBroker>(
+            ::GetProcAddress(xul, "gecko_w10m_set_capture_broker"))) {
+      setCaptureBroker(&UwpDefaultCaptureClient);
+    }
   }
   if (!set_bridge_) {
     set_bridge_ = reinterpret_cast<SetBridgeSinkFn>(
@@ -900,6 +1042,17 @@ bool EngineView::Resolve() {
       ::GetProcAddress(xul, "gecko_w10m_input_mouse2"));
   wheel_ =
       reinterpret_cast<WheelFn>(::GetProcAddress(xul, "gecko_w10m_input_wheel"));
+  if (xboxGamepad_) {
+    gamepadState_ = reinterpret_cast<GamepadStateFn>(
+        ::GetProcAddress(xul, "gecko_w10m_xbox_gamepad_state"));
+    gamepadHelpRequests_ = reinterpret_cast<decltype(gamepadHelpRequests_)>(
+        ::GetProcAddress(xul, "gecko_w10m_gamepad_help_requests"));
+    gamepadPromptRequests_ = reinterpret_cast<decltype(gamepadPromptRequests_)>(
+        ::GetProcAddress(xul, "gecko_w10m_gamepad_prompt_requests"));
+    if (!gamepadState_) {
+      Log::Write(L"gamepad: Game Controls requires an updated Gecko runtime");
+    }
+  }
   dragFiles_ = reinterpret_cast<DragFilesFn>(
       ::GetProcAddress(xul, "gecko_w10m_drag_files"));
   wanted_ = reinterpret_cast<WantedFn>(
@@ -1444,7 +1597,7 @@ void EngineView::ApplyInputKind(int32_t kind) {
              L", the keyboard follows");
 }
 
-void EngineView::FollowTextInput() {
+void EngineView::FollowTextInput(bool recheck) {
   if (!inputEnabled_ || !wanted_) {
     return;
   }
@@ -1455,7 +1608,7 @@ void EngineView::FollowTextInput() {
   // to type -- even when the engine wanted text all along and the keyboard was
   // put away. Before this the keyboard only came up when "wanted" changed, so
   // a field tapped a second time after the keyboard was dismissed got none.
-  const bool again = wants && serial != lastTextSerial_;
+  const bool again = wants && (serial != lastTextSerial_ || recheck);
   if (wants == typing_ && !again) {
     return;
   }
@@ -1464,22 +1617,52 @@ void EngineView::FollowTextInput() {
 
   if (wants) {
     ApplyInputKind(static_cast<int32_t>(state & 0xff));
-    bool showKeyboard = false;
+    bool controllerConnected = false;
+    bool physicalKeyboard = false;
     try {
-      showKeyboard =
-          winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size() != 0 &&
-          winrt::Windows::Devices::Input::KeyboardCapabilities().KeyboardPresent() == 0;
+      controllerConnected =
+          winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size() != 0;
+      if (!controllerConnected) {
+        controllerConnected =
+            winrt::Windows::Gaming::Input::RawGameController::RawGameControllers()
+                .Size() != 0;
+      }
     } catch (winrt::hresult_error const& error) {
-      Log::Write(L"keyboard: device detection failed", std::wstring(error.message()));
+      Log::Write(L"keyboard: controller detection failed", std::wstring(error.message()));
     }
+    try {
+      physicalKeyboard =
+          winrt::Windows::Devices::Input::KeyboardCapabilities().KeyboardPresent() != 0;
+    } catch (winrt::hresult_error const& error) {
+      Log::Write(L"keyboard: physical keyboard detection failed", std::wstring(error.message()));
+    }
+    const bool showKeyboard = !gamepadMode_ && controllerConnected && !physicalKeyboard;
     sink_.PreventKeyboardDisplayOnProgrammaticFocus(!showKeyboard);
-    const bool focused = sink_.Focus(FocusState::Programmatic);
+    const bool focused = sink_.FocusState() != FocusState::Unfocused ||
+                         sink_.Focus(FocusState::Programmatic);
     if (focused && showKeyboard) {
       try {
-        winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView().TryShow();
+        const auto pane =
+            winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView();
+        if (pane.Visible()) {
+          return;
+        }
+        const bool accepted = pane.TryShow();
+        if (!accepted && !recheck) {
+          keyboardCheckAt_ = ::GetTickCount64() + 150;
+        }
+        Log::Write(accepted ? L"keyboard: gamepad request accepted"
+                            : L"keyboard: gamepad request declined by InputPane");
       } catch (winrt::hresult_error const& error) {
         Log::Write(L"keyboard: virtual keyboard request failed", std::wstring(error.message()));
       }
+    } else if (showKeyboard) {
+      if (!recheck) {
+        keyboardCheckAt_ = ::GetTickCount64() + 150;
+      }
+      Log::Write(L"keyboard: gamepad request skipped because the text sink refused focus");
+    } else if (controllerConnected && physicalKeyboard) {
+      Log::Write(L"keyboard: gamepad request suppressed because a physical keyboard was detected");
     }
   } else {
     Log::Write(L"view: engine no longer wants text input");
@@ -1786,7 +1969,7 @@ void EngineView::Tick() {
 
   TickExternalWindow();
 
-  PollGamepadScroll();
+  PollGamepad();
 
   // The engine commonly resolves after XAML's one and only initial
   // SizeChanged notification. Ensure the current room is sent once even when
@@ -1816,15 +1999,22 @@ void EngineView::Tick() {
   }
   // Focus changes are posted out of CompositionTarget::Rendering so XAML is
   // between frames when the hidden physical-keyboard sink takes focus.
-  const bool newField = text_state_ && wanted_ && wanted_() == 1 &&
-                         (text_state_() >> 8) != lastTextSerial_;
-  if (inputEnabled_ && wanted_ &&
-      ((wanted_() == 1) != typing_ || newField) && !textInputPending_) {
-    textInputPending_ = true;
-    PostToUi([this]() {
-      textInputPending_ = false;
-      FollowTextInput();
-    });
+  if (inputEnabled_ && wanted_ && !textInputPending_) {
+    const bool wants = wanted_() == 1;
+    const bool newField = wants && text_state_ &&
+                          (text_state_() >> 8) != lastTextSerial_;
+    const bool checkDue = keyboardCheckAt_ &&
+                          ::GetTickCount64() >= keyboardCheckAt_;
+    if (checkDue) {
+      keyboardCheckAt_ = 0;
+    }
+    if (wants != typing_ || newField || (wants && checkDue)) {
+      textInputPending_ = true;
+      PostToUi([this, checkDue, newField]() {
+        textInputPending_ = false;
+        FollowTextInput(checkDue && !newField);
+      });
+    }
   }
 
   // Once ANGLE presents directly into the SwapChainPanel there is no software
@@ -2110,6 +2300,7 @@ void EngineView::WireCoreMouse() {
     coreMouseMoved_ = coreWindow_.PointerMoved(
         [this, isMouse](CoreWindow const&, PointerEventArgs const& args) {
           if (!inputEnabled_) return;
+          if (gGamepadHelpShowing) return;
           auto point = args.CurrentPoint();
           if (!isMouse(point)) return;
           if (gPointerLocked.load()) return;
@@ -2130,15 +2321,18 @@ void EngineView::WireCoreMouse() {
         [this, isMouse](CoreWindow const&, PointerEventArgs const& args) {
           if (!inputEnabled_) return;
           using winrt::Windows::UI::Input::PointerUpdateKind;
+          if (gGamepadHelpShowing) return;
           auto point = args.CurrentPoint();
           if (!isMouse(point)) return;
           const auto properties = point.Properties();
           const auto position = CoreMousePoint(point.Position());
           int32_t externalX = 0;
           int32_t externalY = 0;
-          const bool external = externalMouse_ &&
+          const bool pointerLocked = gPointerLocked.load();
+          const bool external = !pointerLocked && externalMouse_ &&
               ToExternalFrameFromWindow(point.Position(), &externalX, &externalY);
-          if (!external && IsPointInExternalWindow(point.Position())) return;
+          if (!pointerLocked && !external &&
+              IsPointInExternalWindow(point.Position())) return;
           if (external) {
             corePointerExternal_ = true;
             lastExternalInputX_ = externalX;
@@ -2176,6 +2370,7 @@ void EngineView::WireCoreMouse() {
         [this, isMouse](CoreWindow const&, PointerEventArgs const& args) {
           if (!inputEnabled_) return;
           using winrt::Windows::UI::Input::PointerUpdateKind;
+          if (gGamepadHelpShowing) return;
           auto point = args.CurrentPoint();
           if (!isMouse(point)) return;
           const auto properties = point.Properties();
@@ -2188,10 +2383,12 @@ void EngineView::WireCoreMouse() {
               (update == PointerUpdateKind::LeftButtonReleased ||
                !properties.IsLeftButtonPressed())) {
             coreLeftDown_ = false;
-            if (corePointerExternal_ && externalMouse_)
+            if (corePointerExternal_ && externalMouse_) {
               externalMouse_(2, 0, externalX, externalY);
-            else
+            } else {
               OnMouseButton(position, 0, false);
+              keyboardCheckAt_ = ::GetTickCount64() + 150;
+            }
           }
           if (coreMiddleDown_ &&
               (update == PointerUpdateKind::MiddleButtonReleased ||
@@ -2219,6 +2416,7 @@ void EngineView::WireCoreMouse() {
     coreMouseWheel_ = coreWindow_.PointerWheelChanged(
         [this, isMouse](CoreWindow const&, PointerEventArgs const& args) {
           if (!inputEnabled_) return;
+          if (gGamepadHelpShowing) return;
           auto point = args.CurrentPoint();
           if (!isMouse(point)) return;
           int32_t externalX = 0;
@@ -2247,6 +2445,9 @@ void EngineView::SetInputEnabled(bool enabled) {
   }
 
   inputEnabled_ = enabled;
+  if (!enabled) {
+    ResetGamepadMode();
+  }
   if (!enabled && gPointerLocked.load() && exitPointerLock_) {
     exitPointerLock_();
   }
@@ -2262,6 +2463,7 @@ void EngineView::SetInputEnabled(bool enabled) {
   // Re-query Gecko's edit focus when the window becomes active again; the
   // disabled sink necessarily lost focus while another Shell surface owned it.
   typing_ = false;
+  keyboardCheckAt_ = 0;
   hardwareCharacterPending_ = false;
   pressed_ = false;
   coreLeftDown_ = false;
@@ -2415,6 +2617,7 @@ void EngineView::OnReleased(uint32_t id,
     }
     touch_(static_cast<int32_t>(id), 2, x, y);
     if (std::abs(x - last.startX) + std::abs(y - last.startY) < 20) {
+      keyboardCheckAt_ = ::GetTickCount64() + 150;
       // A tap. Where the finger was, in the frame's pixels -- the engine's
       // "tap:" line says where the page took it.
       Log::Write(L"touch: tap at " + std::to_wstring(x) + L"," +
@@ -2487,6 +2690,13 @@ void EngineView::OnMouseButton(
   if (!inputEnabled_) {
     return;
   }
+  if (gPointerLocked.load()) {
+    if (mouseButton_) {
+      mouseButton_(pressed ? 1 : 2, button, 0, 0);
+    }
+    return;
+  }
+
   int32_t x = 0;
   int32_t y = 0;
   if (!ToFrame(point, &x, &y)) {
@@ -2517,12 +2727,251 @@ void EngineView::OnMouseButton(
   }
 }
 
-void EngineView::PollGamepadScroll() {
-  if (!inputEnabled_ || !wheel_ || gamepadApiUnavailable_) {
+bool EngineView::HandleGamepadKey(winrt::Windows::System::VirtualKey key) const {
+  using winrt::Windows::System::VirtualKey;
+  return xboxGamepad_ && gamepadState_ && gamepadWindowActive_ &&
+         gamepadMode_ && key >= VirtualKey::GamepadA &&
+         key <= VirtualKey::GamepadRightThumbstickLeft;
+}
+
+void EngineView::SetGamepadMode(bool enabled, bool showStatus) {
+  if (gamepadMode_ == enabled) {
+    return;
+  }
+
+  if (enabled) {
+    try {
+      auto app = Application::Current();
+      previousPointerMode_ = app.RequiresPointerMode();
+      app.RequiresPointerMode(ApplicationRequiresPointerMode::WhenRequested);
+    } catch (winrt::hresult_error const& error) {
+      Log::Write(L"gamepad: could not switch Xbox pointer mode",
+                 std::wstring(error.message()));
+      return;
+    }
+  } else {
+    gamepadState_(0, 0, 0, 0, 0, 0, 0, 0);
+    gamepadMenuPulseUntil_ = 0;
+    try {
+      Application::Current().RequiresPointerMode(previousPointerMode_);
+    } catch (winrt::hresult_error const& error) {
+      Log::Write(L"gamepad: could not restore Xbox pointer mode",
+                 std::wstring(error.message()));
+    }
+  }
+
+  gamepadMode_ = enabled;
+  sink_.IsRightTapEnabled(!enabled);
+  if (enabled) {
+    sink_.PreventKeyboardDisplayOnProgrammaticFocus(true);
+    PostToUi([this]() {
+      if (!gamepadMode_) {
+        return;
+      }
+      try {
+        winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView().TryHide();
+      } catch (winrt::hresult_error const&) {
+      }
+    });
+  }
+  Log::Write(enabled ? L"gamepad: Game Controls" : L"gamepad: Browsing Controls");
+  if (!showStatus) {
+    if (gamepadStatus_) {
+      gamepadStatus_.Visibility(Visibility::Collapsed);
+    }
+    return;
+  }
+
+  if (!gamepadStatus_) {
+    if (!host_) {
+      return;
+    }
+    auto room = host_.try_as<Controls::Panel>();
+    if (!room) {
+      room = VisualTreeHelper::GetParent(host_).try_as<Controls::Panel>();
+    }
+    if (!room) {
+      return;
+    }
+    gamepadStatus_ = Border();
+    gamepadStatus_.HorizontalAlignment(HorizontalAlignment::Center);
+    gamepadStatus_.VerticalAlignment(VerticalAlignment::Top);
+    gamepadStatus_.Margin(Thickness{8, 50, 8, 8});
+    gamepadStatus_.Padding(Thickness{14, 8, 14, 8});
+    gamepadStatus_.Background(SolidColorBrush(
+        winrt::Windows::UI::Color{235, 24, 24, 24}));
+    gamepadStatus_.IsHitTestVisible(false);
+    gamepadStatusText_ = TextBlock();
+    gamepadStatusText_.Foreground(SolidColorBrush(
+        winrt::Windows::UI::Color{255, 255, 255, 255}));
+    gamepadStatus_.Child(gamepadStatusText_);
+    Canvas::SetZIndex(gamepadStatus_, 100);
+    room.Children().Append(gamepadStatus_);
+  }
+  gamepadStatusText_.Text(enabled ? L"Game Controls · Hold and release Menu to browse"
+                                  : L"Browsing Controls");
+  gamepadStatus_.Visibility(Visibility::Visible);
+  gamepadStatusUntil_ = ::GetTickCount64() + 2500;
+}
+
+void EngineView::ResetGamepadMode() {
+  SetGamepadMode(false, false);
+  gamepadMenuDownAt_ = 0;
+  gamepadMenuReady_ = false;
+  gamepadStatusUntil_ = 0;
+  if (gamepadStatus_) {
+    gamepadStatus_.Visibility(Visibility::Collapsed);
+  }
+}
+
+bool EngineView::RouteGamepadReading(
+    winrt::Windows::Gaming::Input::GamepadReading const& reading,
+    unsigned long long now) {
+  if (!xboxGamepad_ || !gamepadState_) {
+    return false;
+  }
+  using winrt::Windows::Gaming::Input::GamepadButtons;
+  auto pressed = [&](GamepadButtons button) {
+    return (static_cast<uint32_t>(reading.Buttons) &
+            static_cast<uint32_t>(button)) != 0;
+  };
+
+  if (gGamepadHelpShowing) {
+    return true;
+  }
+  if (gGamepadHelpAccepted) {
+    if (pressed(GamepadButtons::A)) {
+      return true;
+    }
+    gGamepadHelpAccepted = false;
+    gamepadMenuDownAt_ = 0;
+    gamepadMenuReady_ = false;
+    SetGamepadMode(true);
+  }
+
+  const bool modeButtonPressed = pressed(gamepadMode_ ? GamepadButtons::Menu
+                                                       : GamepadButtons::RightThumbstick);
+  constexpr unsigned long long kModeHoldMs = 650;
+  const bool held = gamepadMenuDownAt_ &&
+                    now - gamepadMenuDownAt_ >= kModeHoldMs;
+  if (held && !modeButtonPressed) {
+    gamepadMenuDownAt_ = 0;
+    gamepadMenuReady_ = false;
+    SetGamepadMode(!gamepadMode_);
+  } else if (!modeButtonPressed) {
+    if (gamepadMode_ && gamepadMenuDownAt_) {
+      gamepadMenuPulseUntil_ = now + 80;
+    }
+    gamepadMenuReady_ = true;
+    gamepadMenuDownAt_ = 0;
+  } else if (gamepadMenuReady_ && !gamepadMenuDownAt_) {
+    gamepadMenuDownAt_ = now;
+  }
+
+  if (!gamepadMode_) {
+    return false;
+  }
+
+  constexpr GamepadButtons buttons[] = {
+      GamepadButtons::A, GamepadButtons::B, GamepadButtons::X, GamepadButtons::Y,
+      GamepadButtons::LeftShoulder, GamepadButtons::RightShoulder,
+      GamepadButtons::None, GamepadButtons::None, GamepadButtons::View,
+      GamepadButtons::None, GamepadButtons::LeftThumbstick,
+      GamepadButtons::RightThumbstick, GamepadButtons::DPadUp,
+      GamepadButtons::DPadDown, GamepadButtons::DPadLeft, GamepadButtons::DPadRight,
+  };
+  uint32_t mask = 0;
+  for (uint32_t index = 0; index < sizeof(buttons) / sizeof(buttons[0]); ++index) {
+    if (pressed(buttons[index])) {
+      mask |= 1u << index;
+    }
+  }
+  if (now < gamepadMenuPulseUntil_) {
+    mask |= 1u << 9;
+  }
+  const auto axis = [](double value) { return std::abs(value) < 0.05 ? 0.0 : value; };
+  gamepadState_(1, mask, reading.LeftTrigger, reading.RightTrigger,
+                axis(reading.LeftThumbstickX), axis(-reading.LeftThumbstickY),
+                axis(reading.RightThumbstickX), axis(-reading.RightThumbstickY));
+  return true;
+}
+
+static void ShowGamepadHelp(uint32_t automaticRequest, uint32_t manualRequest) {
+  using winrt::Windows::Storage::ApplicationData;
+  using winrt::Windows::Foundation::IReference;
+  static uint32_t handledAutomatic = 0;
+  static uint32_t handledManual = 0;
+  static unsigned long long retryAfter = 0;
+  const bool manual = manualRequest != handledManual;
+  if (gGamepadHelpShowing ||
+      (!manual && automaticRequest == handledAutomatic) ||
+      ::GetTickCount64() < retryAfter) {
+    return;
+  }
+
+  gGamepadHelpShowing = true;
+  [](uint32_t automaticRequest, uint32_t manualRequest,
+     bool manual) -> winrt::fire_and_forget {
+    try {
+      auto settings = ApplicationData::Current().LocalSettings().Values();
+      constexpr wchar_t kSetting[] = L"ShowGamepadControlsHelp";
+      const bool showAutomatically =
+          winrt::unbox_value_or<bool>(settings.TryLookup(kSetting), true);
+      if (manual || showAutomatically) {
+        ContentDialog dialog;
+        dialog.Title(winrt::box_value(L"Game Controls"));
+
+        StackPanel content;
+        content.Spacing(12);
+        TextBlock instructions;
+        instructions.TextWrapping(TextWrapping::Wrap);
+        instructions.Text(
+            L"Switch to Game Controls? The controller will send input "
+            L"to the site. You can also press and hold "
+            L"the right stick, then release it. To return to browsing, "
+            L"hold and release Menu (☰).");
+        content.Children().Append(instructions);
+
+        CheckBox showAgain;
+        showAgain.Content(winrt::box_value(
+            L"Show this message whenever a site requests gamepad access"));
+        showAgain.IsChecked(
+            winrt::box_value(showAutomatically).as<IReference<bool>>());
+        content.Children().Append(showAgain);
+        dialog.Content(content);
+        dialog.PrimaryButtonText(L"Use game controls");
+        dialog.CloseButtonText(L"Keep browsing");
+        const auto result = co_await dialog.ShowAsync();
+
+        const auto checked = showAgain.IsChecked();
+        settings.Insert(kSetting, winrt::box_value(checked && checked.Value()));
+        gGamepadHelpAccepted = result == ContentDialogResult::Primary;
+      }
+      handledAutomatic = automaticRequest;
+      handledManual = manualRequest;
+    } catch (winrt::hresult_error const&) {
+      // UWP allows one ContentDialog at a time on the UI thread.
+      retryAfter = ::GetTickCount64() + 1000;
+    }
+    gGamepadHelpShowing = false;
+  }(automaticRequest, manualRequest, manual);
+}
+
+void EngineView::PollGamepad() {
+  if (!inputEnabled_ || !gamepadWindowActive_ || gamepadApiUnavailable_ ||
+      (!wheel_ && !gamepadState_)) {
     return;
   }
 
   const unsigned long long now = ::GetTickCount64();
+  if (gamepadState_ && !gamepadMode_ && host_) {
+    ShowGamepadHelp(gamepadHelpRequests_ ? gamepadHelpRequests_() : 0,
+                    gamepadPromptRequests_ ? gamepadPromptRequests_() : 0);
+  }
+  if (gamepadStatus_ && gamepadStatusUntil_ && now >= gamepadStatusUntil_) {
+    gamepadStatus_.Visibility(Visibility::Collapsed);
+    gamepadStatusUntil_ = 0;
+  }
   if (!lastGamepadPoll_) {
     lastGamepadPoll_ = now;
     return;
@@ -2532,34 +2981,32 @@ void EngineView::PollGamepadScroll() {
   const auto elapsed = (std::min)(now - lastGamepadPoll_, 100ull);
   lastGamepadPoll_ = now;
 
-  if (!gamepad_) {
-    bool shouldDiscover =
-        gGamepadListChanged.exchange(false, std::memory_order_relaxed);
-    if (!shouldDiscover &&
-        !gGamepadEventsAvailable.load(std::memory_order_relaxed)) {
-      shouldDiscover = !lastGamepadDiscovery_ ||
-                       now - lastGamepadDiscovery_ >= 5000;
-    }
-    if (!shouldDiscover) {
-      return;
-    }
-    lastGamepadDiscovery_ = now;
-    try {
+  const bool changed =
+      gGamepadListChanged.exchange(false, std::memory_order_relaxed);
+  const bool needsDiscovery =
+      !lastGamepadDiscovery_ ||
+      (!gGamepadEventsAvailable.load(std::memory_order_relaxed) &&
+       now - lastGamepadDiscovery_ >= 5000);
+  try {
+    if (changed || needsDiscovery) {
+      lastGamepadDiscovery_ = now;
       using winrt::Windows::Gaming::Input::Gamepad;
       const auto pads = Gamepad::Gamepads();
-      if (pads.Size() == 0) {
-        return;
+      const Gamepad next = pads.Size() ? pads.GetAt(0) : nullptr;
+      if (next != gamepad_) {
+        ResetGamepadMode();
+        gamepad_ = next;
       }
-      gamepad_ = pads.GetAt(0);
-    } catch (winrt::hresult_error const& error) {
-      gamepadApiUnavailable_ = true;
-      Log::Write(L"gamepad: input API unavailable", std::wstring(error.message()));
+    }
+    if (!gamepad_) {
       return;
     }
-  }
 
-  try {
-    const double value = gamepad_.GetCurrentReading().RightThumbstickY;
+    const auto reading = gamepad_.GetCurrentReading();
+    if (RouteGamepadReading(reading, now) || !wheel_) {
+      return;
+    }
+    const double value = reading.RightThumbstickY;
     constexpr double kDeadZone = 0.18;
     const double magnitude = std::abs(value);
     if (magnitude <= kDeadZone) {
@@ -2585,11 +3032,14 @@ void EngineView::PollGamepadScroll() {
     if (x >= 0 && y >= 0 && fullWidth_ > 0 && fullHeight_ > 0) {
       wheel_(x, y, 0.0, delta);
     }
-  } catch (winrt::hresult_error const&) {
-    // A disconnected cached controller is rediscovered on a later tick. Do
-    // not permanently disable the API merely because one device disappeared.
+  } catch (winrt::hresult_error const& error) {
+    ResetGamepadMode();
+    if (!gamepad_) {
+      gamepadApiUnavailable_ = true;
+      Log::Write(L"gamepad: input API unavailable", std::wstring(error.message()));
+      return;
+    }
     gamepad_ = nullptr;
-    lastGamepadDiscovery_ = now;
     gGamepadListChanged.store(true, std::memory_order_relaxed);
   }
 }
@@ -2653,12 +3103,40 @@ void EngineView::Start() {
   if (tick_.value) {
     return;
   }
+  if (xboxGamepad_) {
+    auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread();
+    if (window) {
+      gamepadWindowActive_ = true;
+      gamepadAccelerator_ = window.Dispatcher().AcceleratorKeyActivated(
+          winrt::auto_revoke, [this](auto const&, auto const& args) {
+            if (inputEnabled_ && HandleGamepadKey(args.VirtualKey())) {
+              args.Handled(true);
+            }
+          });
+      gamepadActivated_ = window.Activated([this](auto const&, auto const& args) {
+        using winrt::Windows::UI::Core::CoreWindowActivationState;
+        gamepadWindowActive_ =
+            args.WindowActivationState() != CoreWindowActivationState::Deactivated;
+        if (!gamepadWindowActive_) {
+          ResetGamepadMode();
+        }
+      });
+    }
+  }
   tick_ = CompositionTarget::Rendering(
       [this](winrt::Windows::Foundation::IInspectable const&,
              winrt::Windows::Foundation::IInspectable const&) { Tick(); });
 }
 
 void EngineView::Stop() {
+  ResetGamepadMode();
+  gamepadAccelerator_.revoke();
+  if (gamepadActivated_.value) {
+    if (auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread()) {
+      window.Activated(gamepadActivated_);
+    }
+    gamepadActivated_ = {};
+  }
   if (tick_.value) {
     CompositionTarget::Rendering(tick_);
     tick_ = {};

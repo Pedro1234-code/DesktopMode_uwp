@@ -180,7 +180,6 @@ namespace factoryos_10x_shell.Controls
                 else SetControlsEnabled(child, enabled);
             }
         }
-        private void Root_PointerPressed(object sender, PointerRoutedEventArgs e) => ActivationRequested?.Invoke();
         private void MoreOptions_Click(object sender, RoutedEventArgs e) => InstallOptions.Visibility =
             InstallOptions.Visibility == Visibility.Visible ? Visibility.Collapsed : Visibility.Visible;
 

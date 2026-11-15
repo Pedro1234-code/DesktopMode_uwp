@@ -31,6 +31,7 @@ namespace factoryos_10x_shell.Controls
         private double m_startWidth;
         private double m_startHeight;
         private WindowResizeCorner m_resizeCorner;
+        private UIElement m_resizeCoordinateSpace;
         private bool m_resizing;
         private bool m_started;
         private bool m_closed;
@@ -73,14 +74,27 @@ namespace factoryos_10x_shell.Controls
 
         private async Task StartGuestAsync()
         {
+            string stage = "initializing the runtime";
             try
             {
-                m_session = new RuntimeSession(RuntimeSurface);
+                m_session = new RuntimeSession(RuntimeSurface, ApplyInitialGuestSize);
                 m_logTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(1) };
                 m_logTimer.Tick += LogTimer_Tick;
                 m_logTimer.Start();
                 UpdateRuntimeInput();
-                bool prepared = await m_session.PrepareAsync(m_window.Executable, m_window.ModuleSourceFolder);
+                stage = "preparing the executable";
+                bool prepared;
+                if (string.IsNullOrEmpty(m_window.VirtualExecutablePath))
+                {
+                    prepared = await m_session.PrepareAsync(m_window.Executable,
+                        m_window.ModuleSourceFolder);
+                }
+                else
+                {
+                    prepared = await m_session.PrepareShortcutAsync(m_window.Executable,
+                        m_window.ModuleSourceFolder, m_window.VirtualExecutablePath,
+                        m_window.Arguments ?? string.Empty, m_window.WorkingDirectory ?? string.Empty);
+                }
                 if (m_closed)
                 {
                     StopLogTimer();
@@ -98,7 +112,17 @@ namespace factoryos_10x_shell.Controls
                 }
 
                 StatusPanel.Visibility = Visibility.Collapsed;
+                try
+                {
+                    var icon = m_session.LoadExecutableIcon();
+                    if (icon != null) m_window.IconSource = icon;
+                }
+                catch (Exception exception)
+                {
+                    System.Diagnostics.Debug.WriteLine("Win32 icon unavailable: " + exception.Message);
+                }
                 m_window.Status = "Desktop app";
+                stage = "running the executable";
                 int exitCode = await m_session.RunAsync();
                 StopLogTimer();
                 if (m_closed) return;
@@ -117,8 +141,26 @@ namespace factoryos_10x_shell.Controls
                 StatusPanel.Visibility = Visibility.Visible;
                 RuntimeProgress.IsActive = false;
                 StopLogTimer();
-                m_window.Status = "Runtime error: " + exception.Message;
+                m_window.Status = $"Runtime error while {stage}: {exception.Message} (0x{exception.HResult:X8})";
             }
+        }
+
+        private void ApplyInitialGuestSize(int width, int height)
+        {
+            if (m_closed || m_window == null) return;
+            var border = WindowFrame.BorderThickness;
+            double frameWidth = width + border.Left + border.Right;
+            double frameHeight = height + TitleBar.ActualHeight + border.Top + border.Bottom;
+            if (m_window.IsMaximized)
+            {
+                m_window.RestoreWidth = frameWidth;
+                m_window.RestoreHeight = frameHeight;
+                return;
+            }
+            if (m_resizing) return;
+            m_window.Width = frameWidth;
+            m_window.Height = frameHeight;
+            UpdateLayout();
         }
 
         private void Window_PropertyChanged(object sender, PropertyChangedEventArgs e)
@@ -209,35 +251,54 @@ namespace factoryos_10x_shell.Controls
 
         private void ResizeGrip_PointerPressed(object sender, PointerRoutedEventArgs e)
         {
-            if (m_window == null || m_window.IsMaximized) return;
+            if (m_window == null || m_window.IsMaximized || !(sender is UIElement grip)) return;
+            DependencyObject ancestor = VisualTreeHelper.GetParent(this);
+            while (ancestor != null && !(ancestor is Canvas))
+                ancestor = VisualTreeHelper.GetParent(ancestor);
+            m_resizeCoordinateSpace = ancestor as UIElement;
+            var point = e.GetCurrentPoint(m_resizeCoordinateSpace);
+            if (!point.Properties.IsLeftButtonPressed || !grip.CapturePointer(e.Pointer)) return;
+            m_windowManager.Activate(m_window);
             m_resizing = true;
             m_resizeCorner = WindowResize.CornerFromTag((sender as FrameworkElement)?.Tag);
-            m_resizeStart = e.GetCurrentPoint(null).Position;
+            m_resizeStart = point.Position;
             m_startLeft = m_window.Left;
             m_startTop = m_window.Top;
             m_startWidth = m_window.Width;
             m_startHeight = m_window.Height;
-            (sender as UIElement)?.CapturePointer(e.Pointer);
+            e.Handled = true;
         }
 
         private void ResizeGrip_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
             if (!m_resizing) return;
+            ResizeWindow(e.GetCurrentPoint(m_resizeCoordinateSpace).Position);
+            e.Handled = true;
+        }
+
+        private void ResizeWindow(Point position)
+        {
             Rect bounds = WindowResize.Calculate(m_resizeCorner, m_resizeStart,
-                e.GetCurrentPoint(null).Position,
+                position,
                 new Rect(m_startLeft, m_startTop, m_startWidth, m_startHeight), 480, 320);
             m_window.Left = bounds.X; m_window.Top = bounds.Y;
             m_window.Width = bounds.Width; m_window.Height = bounds.Height;
             UpdateCanvasPosition();
         }
 
-        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e) { m_resizing = false; (sender as UIElement)?.ReleasePointerCaptures(); }
+        private void ResizeGrip_PointerReleased(object sender, PointerRoutedEventArgs e)
+        {
+            if (!m_resizing) return;
+            m_resizing = false;
+            (sender as UIElement)?.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+        }
         private void ResizeGrip_PointerCaptureLost(object sender, PointerRoutedEventArgs e) => m_resizing = false;
 
         private void MouseInput_InputChanged(object sender, MouseInputChangedEventArgs e)
         {
             if (m_window == null || m_window.Visibility != Visibility.Visible) return;
-            if (e.Kind == MouseInputChangeKind.Released) { m_dragging = false; m_resizing = false; }
+            if (e.Kind == MouseInputChangeKind.Released) { m_dragging = false; }
             if (m_dragging) MoveWindow(new Point(e.Snapshot.X / s_pointerScale - m_window.Left, e.Snapshot.Y / s_pointerScale - m_window.Top));
         }
 

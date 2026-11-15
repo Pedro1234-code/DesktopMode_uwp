@@ -1616,6 +1616,26 @@ HCURSOR WINAPI Win32Bridge::Bridge::BridgeSetCursor(HCURSOR cursor)
     return previous;
 }
 
+bool Win32Bridge::Bridge::CopyGuestExecutableIconPixels(int size, MiniGdi::Surface* destination)
+{
+    if (!destination) return false;
+    constexpr ULONG_PTR GroupIconType = 14;
+    std::vector<GuestResourceIdentifier> groups;
+    if (EnumerateGuestResourceNames(nullptr, reinterpret_cast<LPCWSTR>(GroupIconType),
+        &groups) != GuestResourceStatus::Success)
+        return false;
+
+    for (const auto& group : groups)
+    {
+        const auto name = group.ordinal
+            ? reinterpret_cast<LPCWSTR>(static_cast<ULONG_PTR>(group.id))
+            : group.text.c_str();
+        if (LoadIconResourcePixels(nullptr, name, size, size, destination))
+            return true;
+    }
+    return false;
+}
+
 HICON WINAPI Win32Bridge::Bridge::BridgeLoadIconW(HINSTANCE instance, LPCWSTR iconName)
 {
     if (!iconName)
@@ -1943,29 +1963,41 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeDrawIconEx(
     const int outputHeight = height > 0 ? height : source.Height();
     source = ScaleSurface(source, outputWidth, outputHeight);
     GuestWindowManager* manager = CurrentGuestWindowManager();
-    MiniGdi::Surface* destination = manager
-        ? manager->Gdi().GetSurface(manager->GuestDcHandle(dc)) : nullptr;
+    const auto guestDc = manager ? manager->GuestDcHandle(dc) : MiniGdi::InvalidDc;
+    MiniGdi::Surface* destination = manager ? manager->Gdi().GetSurface(guestDc) : nullptr;
     if (!destination || source.Empty())
     {
         BridgeSetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
     const bool imagePass = (flags & DrawIconImage) != 0;
-    for (int sourceY = 0; sourceY < source.Height(); ++sourceY)
+    MiniGdi::Region clip;
+    if (!manager->Gdi().GetClipRegion(guestDc, &clip))
     {
-        const int destinationY = y + sourceY;
-        if (destinationY < 0 || destinationY >= destination->Height()) continue;
-        for (int sourceX = 0; sourceX < source.Width(); ++sourceX)
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    const int right = static_cast<int>((std::min)(static_cast<long long>(destination->Width()),
+        static_cast<long long>(x) + source.Width()));
+    const int bottom = static_cast<int>((std::min)(static_cast<long long>(destination->Height()),
+        static_cast<long long>(y) + source.Height()));
+    const MiniGdi::Rect target{ (std::max)(0, x), (std::max)(0, y), right, bottom };
+    if (!target.Empty())
+    {
+        for (const auto& rectangle : MiniGdi::IntersectRegion(clip,
+            MiniGdi::RectRegion(target)).rectangles)
         {
-            const int destinationX = x + sourceX;
-            if (destinationX < 0 || destinationX >= destination->Width()) continue;
-            const MiniGdi::Color* input = source.PixelAt(sourceX, sourceY);
-            MiniGdi::Color* output = destination->PixelAt(destinationX, destinationY);
-            if (!input || !output) continue;
-            if (imagePass)
-                *output = MiniGdi::BlendSourceOver(*input, *output);
-            else
-                *output = MiniGdi::Alpha(*input) == 0 ? MiniGdi::OpaqueWhite : MiniGdi::OpaqueBlack;
+            for (int row = rectangle.top; row < rectangle.bottom; ++row)
+            {
+                const auto* input = source.PixelAt(rectangle.left - x, row - y);
+                auto* output = destination->PixelAt(rectangle.left, row);
+                for (int column = 0; column < rectangle.right - rectangle.left; ++column)
+                {
+                    const auto pixel = input[column];
+                    output[column] = imagePass ? MiniGdi::BlendSourceOver(pixel, output[column]) :
+                        (MiniGdi::Alpha(pixel) == 0 ? MiniGdi::OpaqueWhite : MiniGdi::OpaqueBlack);
+                }
+            }
         }
     }
     BridgeSetLastError(ERROR_SUCCESS);
@@ -4749,6 +4781,8 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDlgItemTextW);
     else if (_wcsicmp(symbol.name.c_str(), L"senddlgitemmessagew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendDlgItemMessageW);
+    else if (_wcsicmp(symbol.name.c_str(), L"senddlgitemmessagea") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSendDlgItemMessageA);
     else if (_wcsicmp(symbol.name.c_str(), L"iswindow") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIsWindow);
     else if (_wcsicmp(symbol.name.c_str(), L"iswindowvisible") == 0)
