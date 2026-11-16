@@ -23,6 +23,10 @@ namespace factoryos_10x_shell.Services.Win32
 
     internal static class Win32StartShortcuts
     {
+        private const string AppIdPrefix = "CoreShell.Win32Shortcut.";
+
+        internal static bool IsShortcutId(string appId) =>
+            appId?.StartsWith(AppIdPrefix, StringComparison.OrdinalIgnoreCase) == true;
         private static readonly string[] Locations =
         {
             @"C:\Users\Default\AppData\Roaming\Microsoft\Windows\Start Menu",
@@ -121,6 +125,34 @@ namespace factoryos_10x_shell.Services.Win32
             return entries.OrderBy(entry => entry.IconName, StringComparer.CurrentCultureIgnoreCase).ToList();
         }
 
+        internal static async Task<StartIconModel> ResolveAsync(string appId)
+        {
+            if (!IsShortcutId(appId) || !Win32WindowManagerService.Instance.IsAppSupportEnabled)
+                return null;
+
+            string menuPath = appId.Substring(AppIdPrefix.Length);
+            string[] parts = menuPath.Split('\\');
+            if (!menuPath.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) ||
+                parts.Any(part => string.IsNullOrWhiteSpace(part) || part == "." || part == ".." ||
+                                  part.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0))
+                return null;
+
+            if (!(await ApplicationData.Current.LocalFolder.TryGetItemAsync("drive_c") is StorageFolder drive))
+                return null;
+
+            string relativeFolder = Path.GetDirectoryName(menuPath);
+            foreach (string location in Locations)
+            {
+                string shortcutFolder = string.IsNullOrEmpty(relativeFolder) ? location : Path.Combine(location, relativeFolder);
+                string folderPath = Path.Combine(drive.Path, shortcutFolder.Substring(3));
+                var entry = await ReadEntryAsync(drive, folderPath, parts[parts.Length - 1],
+                    shortcutFolder, menuPath, new StringBuilder());
+                if (entry != null) return entry;
+            }
+            return null;
+        }
+
+
         private static async Task<StartIconModel> ReadEntryAsync(StorageFolder drive, string folderPath, string name,
             string shortcutFolder, string menuPath, StringBuilder report)
         {
@@ -152,7 +184,7 @@ namespace factoryos_10x_shell.Services.Win32
                     report.AppendLine($"{menuPath}: added ({path}).");
                     return new StartIconModel
                     {
-                        AppId = "CoreShell.Win32Shortcut." + menuPath,
+                        AppId = AppIdPrefix + menuPath,
                         IconName = Path.GetFileNameWithoutExtension(name),
                         IconGlyph = "\uE7C3",
                         Data = new Win32StartShortcut

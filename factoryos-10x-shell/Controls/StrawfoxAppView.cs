@@ -4,6 +4,7 @@ using factoryos_10x_shell.Library.Services.WebApps;
 using System;
 using System.Threading.Tasks;
 using Windows.Devices.Input;
+using Windows.Gaming.Input;
 using Windows.Foundation;
 using Windows.System;
 using Windows.UI.Core;
@@ -197,11 +198,16 @@ namespace factoryos_10x_shell.Controls
                     textState = focus;
                     if (wantsText)
                     {
-                        bool physical = new KeyboardCapabilities().KeyboardPresent != 0;
-                        bool show = !physical && Windows.Gaming.Input.Gamepad.Gamepads.Count > 0;
-                        textSink.PreventKeyboardDisplayOnProgrammaticFocus = !show;
                         textSink.Focus(FocusState.Programmatic);
-                        if (show) InputPane.GetForCurrentView().TryShow();
+                        try
+                        {
+                            if (Gamepad.Gamepads.Count > 0 || RawGameController.RawGameControllers.Count > 0)
+                                InputPane.GetForCurrentView().TryShow();
+                        }
+                        catch (Exception error)
+                        {
+                            Log("keyboard", "On-screen keyboard request failed, HRESULT=0x" + error.HResult.ToString("X8"));
+                        }
                     }
                 }
             }

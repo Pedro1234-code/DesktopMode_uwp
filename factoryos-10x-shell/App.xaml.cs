@@ -1,4 +1,4 @@
-﻿using factoryos_10x_shell.Library.Constants;
+using factoryos_10x_shell.Library.Constants;
 using factoryos_10x_shell.Library.Models.Hardware;
 using factoryos_10x_shell.Library.Services.Environment;
 using factoryos_10x_shell.Library.Services.Hardware;
@@ -50,6 +50,7 @@ namespace factoryos_10x_shell
     {
         public static MediaPlayer MediaPlayer;
         private bool m_protocolInstallOpen;
+        private int m_fallbackErrorQueued;
 
 
         [Obsolete]
@@ -62,11 +63,14 @@ namespace factoryos_10x_shell
             // assemblies. Returning null here lets the native loader handle
             // them while avoiding repeated managed load attempts.
             AppDomain.CurrentDomain.AssemblyResolve += IgnoreNativeGeckoAssemblyProbe;
-            this.InitializeComponent();
+            ShellDiagnostics.Initialize();
             this.UnhandledException += OnUnhandledException;
+            TaskScheduler.UnobservedTaskException += (sender, args) =>
+                ShellDiagnostics.RecordException("Unobserved task exception", args.Exception);
+            this.InitializeComponent();
+
             this.Suspending += OnSuspending;
             this.Resuming += OnResuming;
-            ApplicationView.PreferredLaunchWindowingMode = ApplicationViewWindowingMode.FullScreen;
             if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.ContainsKey("IsBgChangeButtonVisible"))
             {
                 AppState.Instance.IsBgChangeButtonVisible = (bool)Windows.Storage.ApplicationData.Current.LocalSettings.Values["IsBgChangeButtonVisible"];
@@ -111,7 +115,7 @@ namespace factoryos_10x_shell
 
             if (rootFrame == null)
             {
-                rootFrame = new Frame();
+                rootFrame = new Frame { RequestedTheme = AppState.Instance.ShellColorMode };
 
                 rootFrame.NavigationFailed += OnNavigationFailed;
 
@@ -154,6 +158,7 @@ namespace factoryos_10x_shell
                 }
                 catch (Exception runtimeError)
                 {
+                    ShellDiagnostics.RecordException("Win32 drive preparation", runtimeError);
                     Debug.WriteLine($"Win32 drive preparation failed: {runtimeError}");
                 }
             }
@@ -162,6 +167,7 @@ namespace factoryos_10x_shell
                 // App discovery is supplemental. A package, icon, or runtime
                 // that cannot be inspected must not delay or terminate Shell
                 // startup.
+                ShellDiagnostics.RecordException("Deferred Shell startup", exception);
                 Debug.WriteLine($"Deferred startup initialization failed: {exception}");
             }
         }
@@ -174,6 +180,7 @@ namespace factoryos_10x_shell
             }
             catch (Exception error)
             {
+                ShellDiagnostics.RecordException("Start Menu package discovery", error);
                 Debug.WriteLine($"Start Menu package discovery failed: {error}");
             }
         }
@@ -187,6 +194,7 @@ namespace factoryos_10x_shell
             // contain an old value even when the failing control is Files, Firefox,
             // or another internal app, so it must not label the reported failure.
             const string diagnosticStage = "Shell XAML operation";
+            ShellDiagnostics.RecordException("Unhandled XAML exception", e.Exception);
             Debug.WriteLine($"Unhandled XAML exception during '{diagnosticStage}': {e.Exception}");
 
             Exception exceptionWithContext = new InvalidOperationException(
@@ -196,26 +204,37 @@ namespace factoryos_10x_shell
 
             try
             {
-                Window currentWindow = Window.Current;
-                if (currentWindow == null)
-                {
-                    Debug.WriteLine("FallbackErrorPage was not shown because this thread has no Window.Current.");
+                var rootFrame = Window.Current?.Content as Frame;
+                if (rootFrame == null || rootFrame.Content is Views.FallbackErrorPage ||
+                    Interlocked.CompareExchange(ref m_fallbackErrorQueued, 1, 0) != 0)
                     return;
-                }
 
-                if (currentWindow.Content is Frame rootFrame &&
-                    !(rootFrame.Content is Views.FallbackErrorPage))
+                // UnhandledException can arrive during layout or a render callback.
+                // Keep page teardown out of the current XAML operation.
+                _ = rootFrame.Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Normal, () =>
                 {
-                    rootFrame.Navigate(typeof(Views.FallbackErrorPage), exceptionWithContext);
-                }
+                    try
+                    {
+                        if (ReferenceEquals(Window.Current?.Content, rootFrame) &&
+                            !(rootFrame.Content is Views.FallbackErrorPage))
+                            rootFrame.Navigate(typeof(Views.FallbackErrorPage), exceptionWithContext);
+                    }
+                    catch (Exception failure)
+                    {
+                        ShellDiagnostics.RecordException("Fallback page navigation", failure);
+                    }
+                    finally
+                    {
+                        Interlocked.Exchange(ref m_fallbackErrorQueued, 0);
+                    }
+                });
             }
-            catch (Exception fallbackException)
+            catch (Exception failure)
             {
-                // Reporting an error must not create another unhandled exception.
-                Debug.WriteLine($"Could not display FallbackErrorPage: {fallbackException}");
+                Interlocked.Exchange(ref m_fallbackErrorQueued, 0);
+                ShellDiagnostics.RecordException("Scheduling fallback page", failure);
             }
         }
-
 
 
         protected override async void OnActivated(IActivatedEventArgs args)
@@ -231,7 +250,7 @@ namespace factoryos_10x_shell
                 Frame rootFrame = Window.Current.Content as Frame;
                 if (rootFrame == null)
                 {
-                    rootFrame = new Frame();
+                    rootFrame = new Frame { RequestedTheme = AppState.Instance.ShellColorMode };
                     rootFrame.NavigationFailed += OnNavigationFailed;
                     Window.Current.Content = rootFrame;
                 }
@@ -319,7 +338,7 @@ namespace factoryos_10x_shell
                 var frame = Window.Current.Content as Frame;
                 if (frame == null)
                 {
-                    frame = new Frame();
+                    frame = new Frame { RequestedTheme = AppState.Instance.ShellColorMode };
                     frame.NavigationFailed += OnNavigationFailed;
                     Window.Current.Content = frame;
                 }

@@ -68,6 +68,7 @@ namespace factoryos_10x_shell.Views
             Windows10XTaskbarPlate.Visibility = legacyVisibility;
             Windows11StartButton.Visibility = visibility;
             Windows11TaskViewButton.Visibility = visibility;
+            ApplyTaskbarSearchMode();
             Windows11TrayDate.Visibility = visibility;
             StartButton.Visibility = legacyVisibility;
             TaskViewButton.Visibility = legacyVisibility;
@@ -99,13 +100,29 @@ namespace factoryos_10x_shell.Views
             UpdateWin32TaskbarVisualState();
         }
 
-        private void ApplyTaskbarAlignment()
-        { TaskbarButtons.HorizontalAlignment = AppState.Instance.TaskbarAlignLeft ? HorizontalAlignment.Left : HorizontalAlignment.Center; }
+        private void ApplyTaskbarPreferences()
+        {
+            TaskbarButtons.HorizontalAlignment = AppState.Instance.TaskbarAlignLeft
+                ? HorizontalAlignment.Left : HorizontalAlignment.Center;
+            ApplyTaskbarSearchMode();
+        }
+
+        private void ApplyTaskbarSearchMode()
+        {
+            var mode = AppState.Instance.Windows11TaskbarSearchMode;
+            Windows11TaskbarSearch.Visibility = AppState.Instance.UseWindows11Skin && mode != TaskbarSearchMode.Hidden
+                ? Visibility.Visible : Visibility.Collapsed;
+            Windows11TaskbarSearch.SetSearchBoxMode(mode == TaskbarSearchMode.SearchBox);
+        }
+
+        internal event Action SearchRequested;
+
+        private void Windows11TaskbarSearch_Click(object sender, RoutedEventArgs e) => SearchRequested?.Invoke();
 
         public Default10xBar()
         {
             this.InitializeComponent();
-            ApplyTaskbarAlignment();
+            ApplyTaskbarPreferences();
             Loaded += (s, e) =>
             {
                 AppState.Instance.ShellSkinChanged += ApplyShellSkin;
@@ -114,8 +131,8 @@ namespace factoryos_10x_shell.Views
             Unloaded += (s, e) => AppState.Instance.ShellSkinChanged -= ApplyShellSkin;
             ActualThemeChanged += (s, e) => ApplyShellSkin();
             ClockText2.RegisterPropertyChangedCallback(TextBlock.TextProperty, (s, p) => UpdateTrayDate());
-            Loaded += (s, e) => { ApplyTaskbarAlignment(); AppState.Instance.TaskbarPreferencesChanged += ApplyTaskbarAlignment; };
-            Unloaded += (s, e) => AppState.Instance.TaskbarPreferencesChanged -= ApplyTaskbarAlignment;
+            Loaded += (s, e) => { ApplyTaskbarPreferences(); AppState.Instance.TaskbarPreferencesChanged += ApplyTaskbarPreferences; };
+            Unloaded += (s, e) => AppState.Instance.TaskbarPreferencesChanged -= ApplyTaskbarPreferences;
 
             DataContext = App.ServiceProvider.GetRequiredService<Default10xBarViewModel>();
             _appHelper = App.ServiceProvider.GetRequiredService<AppHelper>();
@@ -139,6 +156,7 @@ namespace factoryos_10x_shell.Views
             {
                 RefreshPinnedApps();
                 RefreshFilesTaskbar();
+                RefreshOpenWin32Apps();
             };
             _windowManager.Windows.CollectionChanged += (s, args) =>
             {
@@ -172,6 +190,9 @@ namespace factoryos_10x_shell.Views
             RefreshPinnedWebApps();
             RefreshOpenWin32Apps();
             RefreshFilesTaskbar();
+
+            foreach (var pin in _appHelper.TaskbarIcons.Where(app => Win32StartShortcuts.IsShortcutId(app.AppId)).ToList())
+                await ResolveWin32PinAsync(pin);
         }
 
 
@@ -196,7 +217,7 @@ namespace factoryos_10x_shell.Views
 
             foreach (var app in _appHelper.TaskbarIcons)
             {
-                var button = new Button
+                var button = new ShellTaskbarButton
                 {
                     Width = 48,
                     Height = 48,
@@ -242,9 +263,24 @@ namespace factoryos_10x_shell.Views
                         Path = new PropertyPath(nameof(StartIconModel.IconSource)),
                         Mode = BindingMode.OneWay
                     });
-                    stack.Children.Add(image);
+                    if (Win32StartShortcuts.IsShortcutId(app.AppId))
+                    {
+                        var icon = new Grid { Width = 32, Height = 32 };
+                        var placeholder = new FontIcon { Glyph = "\uE7C3", FontSize = 24 };
+                        icon.Children.Add(placeholder);
+                        icon.Children.Add(image);
+                        placeholder.Visibility = image.Source == null ? Visibility.Visible : Visibility.Collapsed;
+                        image.RegisterPropertyChangedCallback(Image.SourceProperty, (sender, property) =>
+                            placeholder.Visibility = image.Source == null ? Visibility.Visible : Visibility.Collapsed);
+                        stack.Children.Add(icon);
+                    }
+                    else
+                    {
+                        stack.Children.Add(image);
+                    }
                 }
                 button.Content = stack;
+                ToolTipService.SetToolTip(button, app.IconName);
 
                 button.Click += async (s, e) =>
                 {
@@ -276,6 +312,18 @@ namespace factoryos_10x_shell.Views
                             AppState.Instance.RequestFirefoxOpen();
                             return;
                         }
+                        if (Win32StartShortcuts.IsShortcutId(model.AppId))
+                        {
+                            var shortcut = await ResolveWin32PinAsync(model);
+                            if (shortcut == null) return;
+                            var existing = FindPinnedWin32Window(model);
+                            if (existing != null)
+                                _nativeWindowManager.ToggleFromTaskbar(existing);
+                            else
+                                _nativeWindowManager.Open(shortcut.Executable, shortcut.Folder, model.IconSource,
+                                    shortcut.VirtualPath, shortcut.Arguments, shortcut.WorkingDirectory);
+                            return;
+                        }
                         bool launched = await _appHelper.LaunchAppAsync(model);
                         if (!launched)
                             System.Diagnostics.Debug.WriteLine($"App não iniciado: {model.AppId} / {model.AppUri}");
@@ -294,7 +342,6 @@ namespace factoryos_10x_shell.Views
                         {
                             _appHelper.TaskbarIcons.Remove(model);
                             _appHelper.SaveTaskbarPinnedApps(_appHelper.TaskbarIcons.ToList());
-                            RefreshPinnedApps(); 
                         }
                     };
 
@@ -316,7 +363,7 @@ namespace factoryos_10x_shell.Views
             {
                 WebAppDefinition app = group.First().App;
                 bool isActive = group.Any(window => window.IsActive && window.Visibility == Visibility.Visible);
-                var button = new Button
+                var button = new ShellTaskbarButton
                 {
                     Width = 48,
                     Height = 48,
@@ -329,7 +376,7 @@ namespace factoryos_10x_shell.Views
                 button.Content = CreateWebAppIcon(app);
                 button.Click += (sender, args) => _windowManager.ToggleFromTaskbar((WebAppDefinition)((Button)sender).Tag);
                 AddWebAppTaskbarMenu(button, app);
-                UpdateRunningIndicator(button, true, isActive);
+                UpdateRunningIndicator(button, true, isActive, windowCount: group.Count());
                 OpenWebAppsPanel.Children.Add(button);
             }
         }
@@ -341,7 +388,7 @@ namespace factoryos_10x_shell.Views
             {
                 bool isOpen = _windowManager.Windows.Any(window => window.App.Id == app.Id);
                 bool isActive = _windowManager.Windows.Any(window => window.App.Id == app.Id && window.IsActive && window.Visibility == Visibility.Visible);
-                var button = new Button
+                var button = new ShellTaskbarButton
                 {
                     Width = 48,
                     Height = 48,
@@ -356,7 +403,7 @@ namespace factoryos_10x_shell.Views
                 button.Content = CreateWebAppIcon(app);
                 button.Click += (sender, args) => _windowManager.ToggleFromTaskbar((WebAppDefinition)((Button)sender).Tag);
                 AddWebAppTaskbarMenu(button, app);
-                UpdateRunningIndicator(button, isOpen, isActive);
+                UpdateRunningIndicator(button, isOpen, isActive, windowCount: _windowManager.Windows.Count(window => window.App.Id == app.Id));
                 PinnedWebAppsPanel.Children.Add(button);
             }
         }
@@ -364,10 +411,17 @@ namespace factoryos_10x_shell.Views
         private void RefreshOpenWin32Apps()
         {
             OpenWin32AppsPanel.Children.Clear();
+            var pinnedWindows = new HashSet<Win32WindowModel>();
+            foreach (var pin in _appHelper.TaskbarIcons)
+            {
+                var window = FindPinnedWin32Window(pin);
+                if (window != null) pinnedWindows.Add(window);
+            }
             foreach (Win32WindowModel window in _nativeWindowManager.Windows)
             {
+                if (pinnedWindows.Contains(window)) continue;
                 bool isActive = window.IsActive && window.Visibility == Visibility.Visible;
-                var button = new Button
+                var button = new ShellTaskbarButton
                 {
                     Width = 48,
                     Height = 48,
@@ -383,6 +437,56 @@ namespace factoryos_10x_shell.Views
                 UpdateRunningIndicator(button, true, isActive);
                 OpenWin32AppsPanel.Children.Add(button);
             }
+            UpdatePinnedWin32Indicators();
+        }
+
+        private async Task<Win32StartShortcut> ResolveWin32PinAsync(StartIconModel pin)
+        {
+            if (!_nativeWindowManager.IsAppSupportEnabled) return null;
+            if (pin.Data is Win32StartShortcut cached) return cached;
+
+            try
+            {
+                var entry = await Win32StartShortcuts.ResolveAsync(pin.AppId);
+                if (!(entry?.Data is Win32StartShortcut shortcut) || !_appHelper.TaskbarIcons.Contains(pin))
+                    return null;
+
+                pin.Data = shortcut;
+                RefreshOpenWin32Apps();
+                _ = LoadPinnedWin32IconAsync(pin, entry);
+                return shortcut;
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException("Loading pinned Win32 shortcut", error);
+                return null;
+            }
+        }
+
+        private async Task LoadPinnedWin32IconAsync(StartIconModel pin, StartIconModel entry)
+        {
+            await Win32StartShortcuts.LoadIconsAsync(new[] { entry });
+            pin.IconSource = entry.IconSource;
+        }
+
+        private Win32WindowModel FindPinnedWin32Window(StartIconModel pin)
+        {
+            if (!(pin.Data is Win32StartShortcut shortcut)) return null;
+            return _nativeWindowManager.FindWindow(shortcut.Executable, shortcut.VirtualPath,
+                shortcut.Arguments, shortcut.WorkingDirectory);
+        }
+
+        private void UpdatePinnedWin32Indicators()
+        {
+            foreach (var button in PinnedAppsPanel.Children.OfType<Button>())
+            {
+                if (!(button.Tag is StartIconModel pin) || !Win32StartShortcuts.IsShortcutId(pin.AppId)) continue;
+                var window = FindPinnedWin32Window(pin);
+                bool active = window?.IsActive == true && window.Visibility == Visibility.Visible;
+                button.Background = window == null ? new SolidColorBrush(Colors.Transparent)
+                    : new SolidColorBrush(Color.FromArgb(active ? (byte)80 : (byte)48, 70, 130, 180));
+                UpdateRunningIndicator(button, window != null, active);
+            }
         }
 
         private void ApplyTaskbarButtonSkin(Button button)
@@ -393,61 +497,19 @@ namespace factoryos_10x_shell.Views
             if (button.Style == style) return;
             button.Style = style;
             button.CornerRadius = new CornerRadius(windows11 ? 6 : 0);
+            if (button is ShellTaskbarButton)
+                button.Margin = new Thickness(windows11 ? 0 : 2);
+            if (!windows11) button.ClearValue(Control.BorderBrushProperty);
         }
 
-        private void UpdateRunningIndicator(Button button, bool isOpen, bool isActive, UIElement replacementIcon = null)
+        private void UpdateRunningIndicator(Button button, bool isOpen, bool isActive, UIElement replacementIcon = null, int windowCount = 1)
         {
             ApplyTaskbarButtonSkin(button);
-            var plate = button.Content as Grid;
-            bool wrapped = plate?.Tag as string == "Windows11RunningIndicator";
-            if (!AppState.Instance.UseWindows11Skin)
-            {
-                if (wrapped)
-                {
-                    var icon = plate.Children[0];
-                    plate.Children.RemoveAt(0);
-                    button.Content = replacementIcon ?? icon;
-                }
-                else if (replacementIcon != null) button.Content = replacementIcon;
-                return;
-            }
-
-            if (!wrapped)
-            {
-                var icon = replacementIcon ?? button.Content as UIElement;
-                if (icon == null) return;
-                button.Content = null;
-                plate = new Grid { Tag = "Windows11RunningIndicator", Width = 36, Height = 40 };
-                plate.Children.Add(icon);
-                plate.Children.Add(new Border
-                {
-                    Height = 3, CornerRadius = new CornerRadius(1.5),
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    VerticalAlignment = VerticalAlignment.Bottom,
-                    IsHitTestVisible = false
-                });
-                button.Content = plate;
-            }
-            else if (replacementIcon != null)
-            {
-                plate.Children.RemoveAt(0);
-                plate.Children.Insert(0, replacementIcon);
-            }
-
-            bool dark = ActualTheme == ElementTheme.Dark;
-            var indicator = (Border)plate.Children[1];
-            indicator.Visibility = isOpen ? Visibility.Visible : Visibility.Collapsed;
-            indicator.Width = isActive ? 16 : 6;
-            Color color = isActive
-                ? (dark ? Color.FromArgb(255, 96, 205, 255) : Color.FromArgb(255, 0, 103, 192))
-                : (dark ? Color.FromArgb(255, 157, 159, 165) : Color.FromArgb(255, 97, 101, 109));
-            if (!(indicator.Background is SolidColorBrush brush) || brush.Color != color)
-                indicator.Background = new SolidColorBrush(color);
-            button.Background = isActive
-                ? new SolidColorBrush(dark ? Color.FromArgb(28, 255, 255, 255) : Color.FromArgb(150, 255, 255, 255))
-                : new SolidColorBrush(Colors.Transparent);
+            if (replacementIcon != null)
+                button.Content = replacementIcon;
+            if (button is ShellTaskbarButton taskButton)
+                taskButton.SetWindowState(isOpen, isActive, windowCount > 1);
         }
-
         private void UpdateWebAppTaskbarVisualState()
         {
             UpdateWebAppButtons(OpenWebAppsPanel);
@@ -466,12 +528,13 @@ namespace factoryos_10x_shell.Views
                 button.Background = isOpen
                     ? new SolidColorBrush(Color.FromArgb(isActive ? (byte)80 : (byte)48, 70, 130, 180))
                     : new SolidColorBrush(Colors.Transparent);
-                UpdateRunningIndicator(button, isOpen, isActive);
+                UpdateRunningIndicator(button, isOpen, isActive, windowCount: _windowManager.Windows.Count(window => window.App.Id == app.Id));
             }
         }
 
         private void UpdateWin32TaskbarVisualState()
         {
+            UpdatePinnedWin32Indicators();
             foreach (Button button in OpenWin32AppsPanel.Children.OfType<Button>())
             {
                 if (!(button.Tag is Win32WindowModel window)) continue;
@@ -647,7 +710,7 @@ namespace factoryos_10x_shell.Views
             {
                 var installer = item.Identity as factoryos_10x_shell.Controls.AppInstallerWindow;
                 if (installer == null) continue;
-                var button = new Button {
+                var button = new ShellTaskbarButton {
                     Width = 48, Height = 48, Margin = new Thickness(2), Tag = installer,
                     Style = (Style)Application.Current.Resources["TaskbarButtonStyle"],
                     Content = new Image { Width = 28, Height = 28, Stretch = Stretch.Uniform,
@@ -659,7 +722,7 @@ namespace factoryos_10x_shell.Views
             }
             foreach (FileOperationModel operation in FileOperationService.Instance.Windows)
             {
-                var operationButton = new Button
+                var operationButton = new ShellTaskbarButton
                 {
                     Width = 48, Height = 48, Margin = new Thickness(2), Tag = operation,
                     Style = (Style)Application.Current.Resources["TaskbarButtonStyle"],
@@ -671,40 +734,90 @@ namespace factoryos_10x_shell.Views
             }
             if (AppState.Instance.IsFilesOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Files"))
             {
-                var filesButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Files", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Files"), Content = CreateFilesIcon(28) };
+                var filesButton = new ShellTaskbarButton { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Files", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Files"), Content = CreateFilesIcon(28) };
                 ToolTipService.SetToolTip(filesButton, "Files");
                 filesButton.Click += (sender, args) => AppState.Instance.RequestFilesOpen();
                 OpenFilesPanel.Children.Add(filesButton);
             }
             if (AppState.Instance.IsNotepadOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Notepad"))
             {
-                var button = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Notepad", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Notepad"), Content = CreateNotepadIcon(27) };
+                var button = new ShellTaskbarButton { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Notepad", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Notepad"), Content = CreateNotepadIcon(27) };
                 ToolTipService.SetToolTip(button, "Notepad");
                 button.Click += (sender, args) => AppState.Instance.RequestNotepadOpen();
                 OpenFilesPanel.Children.Add(button);
             }
             if (AppState.Instance.IsSettingsOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Settings"))
             {
-                var settingsButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Settings", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Settings"), Content = CreateSettingsIcon(25) };
+                var settingsButton = new ShellTaskbarButton { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Settings", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Settings"), Content = CreateSettingsIcon(25) };
                 ToolTipService.SetToolTip(settingsButton, "Settings");
                 settingsButton.Click += (sender, args) => AppState.Instance.RequestSettingsOpen();
                 OpenFilesPanel.Children.Add(settingsButton);
             }
             if (AppState.Instance.IsCalculatorOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Calculator"))
             {
-                var calculatorButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Calculator", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Calculator"), Content = CreateCalculatorIcon(24) };
+                var calculatorButton = new ShellTaskbarButton { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Calculator", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Calculator"), Content = CreateCalculatorIcon(24) };
                 ToolTipService.SetToolTip(calculatorButton, "Calculator");
                 calculatorButton.Click += (sender, args) => AppState.Instance.RequestCalculatorOpen();
                 OpenFilesPanel.Children.Add(calculatorButton);
             }
             if (AppState.Instance.IsFirefoxOpen && !_appHelper.TaskbarIcons.Any(app => app.AppId == "CoreShell.Firefox"))
             {
-                var firefoxButton = new Button { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Firefox", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Firefox"), Content = CreateFirefoxIcon(26) };
+                var firefoxButton = new ShellTaskbarButton { Width = 48, Height = 48, Margin = new Thickness(2), Tag = "CoreShell.Firefox", Style = (Style)Application.Current.Resources["TaskbarButtonStyle"], Background = GetPinnedAppBackground("CoreShell.Firefox"), Content = CreateFirefoxIcon(26) };
                 ToolTipService.SetToolTip(firefoxButton, "Strawfox");
                 firefoxButton.Click += (sender, args) => AppState.Instance.RequestFirefoxOpen();
                 OpenFilesPanel.Children.Add(firefoxButton);
             }
             UpdateInternalTaskbarVisualState();
+        }
+    }
+
+    public sealed class Windows11SearchButton : Button
+    {
+        private bool _showSearchBox;
+
+        internal void SetSearchBoxMode(bool showSearchBox)
+        {
+            _showSearchBox = showSearchBox;
+            Width = showSearchBox ? 160 : 48;
+            VisualStateManager.GoToState(this, showSearchBox ? "SearchBox" : "SearchIcon", false);
+        }
+
+
+        protected override void OnApplyTemplate()
+        {
+            base.OnApplyTemplate();
+            SetSearchBoxMode(_showSearchBox);
+        }
+    }
+
+    public sealed class ShellTaskbarButton : Button
+    {
+        private bool _isOpen;
+        private bool _isActive;
+        private bool _isGrouped;
+
+        public void SetWindowState(bool isOpen, bool isActive, bool isGrouped)
+        {
+            if (_isOpen == isOpen && _isActive == isActive && _isGrouped == isGrouped)
+                return;
+
+            _isOpen = isOpen;
+            _isActive = isActive;
+            _isGrouped = isGrouped;
+            UpdateWindowStates();
+        }
+
+        protected override void OnApplyTemplate()
+        {
+            base.OnApplyTemplate();
+            UpdateWindowStates();
+        }
+
+        private void UpdateWindowStates()
+        {
+            VisualStateManager.GoToState(this, _isGrouped ? "MultipleWindows" : "SingleWindow", false);
+            string state = !_isOpen ? "ClosedApp" : _isActive ? "ActiveApp" : "InactiveApp";
+            VisualStateManager.GoToState(this, state, false);
         }
     }
 }

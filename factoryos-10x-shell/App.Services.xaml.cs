@@ -1,4 +1,4 @@
-﻿using factoryos_10x_shell.Library.Services.Environment;
+using factoryos_10x_shell.Library.Services.Environment;
 using Microsoft.Extensions.DependencyInjection;
 using System;
 using System.Collections.Generic;
@@ -62,7 +62,7 @@ namespace factoryos_10x_shell
                 .AddTransient<IPinManagerService, PinManagerService>()
                 .AddTransient<Default10xBarViewModel>()
                 .AddTransient<MainDesktopViewModel>()
-                .AddTransient<StartMenuViewModel>()
+                .AddSingleton<StartMenuViewModel>()
                 .AddTransient<ActionCenterHomeViewModel>()
                 .AddTransient<PowerDialogViewModel>()
                 .AddTransient<DebugMenuViewModel>();

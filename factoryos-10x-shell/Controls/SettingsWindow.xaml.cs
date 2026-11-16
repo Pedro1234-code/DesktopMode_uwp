@@ -70,8 +70,12 @@ namespace factoryos_10x_shell.Controls
                 .GetRequiredService<AppHelper>().IsLivePackageTrackingEnabled;
             CurrentVersionText.Text = UpdateCheckService.CurrentVersion.ToString();
             ShellSkinCombo.SelectedIndex = AppState.Instance.UseWindows11Skin ? 1 : 0;
+            ShellColorModeCombo.SelectedIndex = (int)AppState.Instance.ShellColorMode;
+            ActualThemeChanged += (sender, args) => UpdateDefaultWallpaperPreview();
             TaskbarAutoHideToggle.IsOn = AppState.Instance.TaskbarAutoHide;
             TaskbarAlignmentCombo.SelectedIndex = AppState.Instance.TaskbarAlignLeft ? 1 : 0;
+            TaskbarSearchModeCombo.SelectedIndex = (int)AppState.Instance.Windows11TaskbarSearchMode;
+            UpdateTaskbarSearchSetting();
             m_initializing = false;
             PopulateDeviceInformation();
         }
@@ -93,7 +97,11 @@ namespace factoryos_10x_shell.Controls
             Visibility = Visibility.Visible;
             AppState.Instance.SetSettingsWindowState(true, false);
             AppState.Instance.ActivateSettings();
-            if (opening) BeginPortalLoad();
+            if (opening)
+            {
+                UpdateDefaultWallpaperPreview();
+                BeginPortalLoad();
+            }
         }
         public void CloseFromTaskView() => Close();
         private void Close() { CancelPortalLoad(); Visibility = Visibility.Collapsed; AppState.Instance.SetSettingsWindowState(false, false); ShowHome(); }
@@ -128,7 +136,9 @@ namespace factoryos_10x_shell.Controls
 
         private void System_Click(object sender, RoutedEventArgs e) { OpenDetail("System", DisplayNav.IsEnabled ? "Display" : "About"); }
         private void Network_Click(object sender, RoutedEventArgs e) { OpenDetail("Network & Internet", "Status"); }
-        private void Personalization_Click(object sender, RoutedEventArgs e) { OpenDetail("Personalization", "Background"); }
+        private void Personalization_Click(object sender, RoutedEventArgs e) => OpenPersonalization();
+
+        internal void OpenPersonalization() => OpenDetail("Personalization", "Background");
         private async void Apps_Click(object sender, RoutedEventArgs e)
         {
             await m_webApps.InitializeAsync();
@@ -229,8 +239,34 @@ namespace factoryos_10x_shell.Controls
         }
         private void ShellSkin_Changed(object sender, SelectionChangedEventArgs e)
         {
-            if (!m_initializing && sender is ComboBox combo && combo.SelectedIndex >= 0)
-                AppState.Instance.UseWindows11Skin = combo.SelectedIndex == 1;
+            if (m_initializing || !(sender is ComboBox combo) || combo.SelectedIndex < 0) return;
+            AppState.Instance.UseWindows11Skin = combo.SelectedIndex == 1;
+            UpdateDefaultWallpaperPreview();
+            UpdateTaskbarSearchSetting();
+        }
+
+        private void ShellColorMode_Changed(object sender, SelectionChangedEventArgs e)
+        {
+            if (!m_initializing && ShellColorModeCombo.SelectedIndex >= 0)
+                AppState.Instance.ShellColorMode = (ElementTheme)ShellColorModeCombo.SelectedIndex;
+        }
+
+        private void UpdateDefaultWallpaperPreview()
+        {
+            if (string.IsNullOrWhiteSpace(ApplicationData.Current.LocalSettings.Values["backgroundImagePath"] as string))
+                WallpaperPreview.Source = new BitmapImage(new Uri(AppState.Instance.DefaultWallpaper(ActualTheme)));
+        }
+
+        private void UpdateTaskbarSearchSetting()
+        {
+            TaskbarSearchModeCombo.Visibility = AppState.Instance.UseWindows11Skin
+                ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void TaskbarSearchMode_Changed(object sender, SelectionChangedEventArgs e)
+        {
+            if (!m_initializing && TaskbarSearchModeCombo.SelectedIndex >= 0)
+                AppState.Instance.Windows11TaskbarSearchMode = (TaskbarSearchMode)TaskbarSearchModeCombo.SelectedIndex;
         }
 
         private void TaskbarAutoHide_Toggled(object sender, RoutedEventArgs e)

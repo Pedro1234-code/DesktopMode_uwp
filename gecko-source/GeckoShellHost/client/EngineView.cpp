@@ -1302,8 +1302,8 @@ void EngineView::EnsureBitmap(int32_t width, int32_t height) {
   }
   width_ = width;
   height_ = height;
+  // Keep the last published frame until Gecko fills this allocation.
   bitmap_ = WriteableBitmap(width, height);
-  image_.Source(bitmap_);
   Log::Write(L"view: frame size " + std::to_wstring(width) + L"x" +
              std::to_wstring(height));
 }
@@ -1618,7 +1618,6 @@ void EngineView::FollowTextInput(bool recheck) {
   if (wants) {
     ApplyInputKind(static_cast<int32_t>(state & 0xff));
     bool controllerConnected = false;
-    bool physicalKeyboard = false;
     try {
       controllerConnected =
           winrt::Windows::Gaming::Input::Gamepad::Gamepads().Size() != 0;
@@ -1630,17 +1629,13 @@ void EngineView::FollowTextInput(bool recheck) {
     } catch (winrt::hresult_error const& error) {
       Log::Write(L"keyboard: controller detection failed", std::wstring(error.message()));
     }
-    try {
-      physicalKeyboard =
-          winrt::Windows::Devices::Input::KeyboardCapabilities().KeyboardPresent() != 0;
-    } catch (winrt::hresult_error const& error) {
-      Log::Write(L"keyboard: physical keyboard detection failed", std::wstring(error.message()));
+    // Focus the text sink for hardware input, then request the OSK explicitly
+    // so UWP's keyboard detection does not decide whether to raise it.
+    sink_.PreventKeyboardDisplayOnProgrammaticFocus(true);
+    if (sink_.FocusState() == FocusState::Unfocused) {
+      sink_.Focus(FocusState::Programmatic);
     }
-    const bool showKeyboard = !gamepadMode_ && controllerConnected && !physicalKeyboard;
-    sink_.PreventKeyboardDisplayOnProgrammaticFocus(!showKeyboard);
-    const bool focused = sink_.FocusState() != FocusState::Unfocused ||
-                         sink_.Focus(FocusState::Programmatic);
-    if (focused && showKeyboard) {
+    if (controllerConnected) {
       try {
         const auto pane =
             winrt::Windows::UI::ViewManagement::InputPane::GetForCurrentView();
@@ -1656,13 +1651,8 @@ void EngineView::FollowTextInput(bool recheck) {
       } catch (winrt::hresult_error const& error) {
         Log::Write(L"keyboard: virtual keyboard request failed", std::wstring(error.message()));
       }
-    } else if (showKeyboard) {
-      if (!recheck) {
-        keyboardCheckAt_ = ::GetTickCount64() + 150;
-      }
-      Log::Write(L"keyboard: gamepad request skipped because the text sink refused focus");
-    } else if (controllerConnected && physicalKeyboard) {
-      Log::Write(L"keyboard: gamepad request suppressed because a physical keyboard was detected");
+    } else {
+      Log::Write(L"keyboard: virtual keyboard suppressed because no controller is connected");
     }
   } else {
     Log::Write(L"view: engine no longer wants text input");
@@ -1940,6 +1930,11 @@ void EngineView::Tick() {
   if (softwareMain && !softwareMainVisible_) {
     softwareMainVisible_ = true;
     g_panelPresenting.store(false);
+    // Discard a popup frame left over from GPU presentation. Publish the
+    // replacement only after a complete copy from the software compositor.
+    chromeOverlayVisible_ = false;
+    lastChromeOverlayCopy_ = 0;
+    image_.Source(winrt::Windows::UI::Xaml::Media::ImageSource{nullptr});
     seen_ = 0;
     Log::Write(L"view: main compositor fell back to the software surface");
   } else if (!softwareMain && softwareMainVisible_ &&
@@ -2020,15 +2015,18 @@ void EngineView::Tick() {
   // Once ANGLE presents directly into the SwapChainPanel there is no software
   // bitmap to update. Calling frame_copy anyway can copy a residual headless
   // frame and incorrectly put the browser on the expensive software path.
-  // Popup/menu widgets are separate headless windows and are composited into
-  // the software frame exposed by frame_copy. Keep that path alive while an
-  // overlay is visible and for one final frame after it closes. That last
-  // transparent frame is what erases the old menu from the Image above the
-  // SwapChainPanel.
-  const bool hasChromeOverlay = overlay_ && overlay_() == 1;
-  if (g_panelPresenting.load()) {
+  // The Image above the SwapChainPanel is only needed for chrome popups.
+  // Remove it as soon as the popup closes rather than waiting for another
+  // buffer copy, which can be skipped when the frame lock is busy.
+  if (!softwareMain && g_panelPresenting.load()) {
+    const bool hasChromeOverlay = overlay_ && overlay_() == 1;
     const bool overlayWasVisible = chromeOverlayVisible_;
-    if (!hasChromeOverlay && !overlayWasVisible) {
+    if (!hasChromeOverlay) {
+      if (overlayWasVisible) {
+        image_.Source(winrt::Windows::UI::Xaml::Media::ImageSource{nullptr});
+        chromeOverlayVisible_ = false;
+        lastChromeOverlayCopy_ = 0;
+      }
       return;
     }
 
@@ -2076,6 +2074,9 @@ void EngineView::Tick() {
   if (copy_(pixels, capacity, &width, &height, &serial) == 1) {
     seen_ = serial;
     bitmap_.Invalidate();
+    if (image_.Source() != bitmap_) {
+      image_.Source(bitmap_);
+    }
     if (firstFrame_) {
       CompleteFirstFrame();
     }

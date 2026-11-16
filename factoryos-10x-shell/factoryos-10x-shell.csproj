@@ -181,8 +181,11 @@
     </Compile>
     <Compile Include="Services\Hardware\BluetoothService.cs" />
     <Compile Include="Services\Helpers\AppState.cs" />
+    <Compile Include="Services\Helpers\ShellDiagnostics.cs" />
     <Compile Include="Services\Helpers\UpdateCheckService.cs" />
     <Compile Include="Services\Files\ArchiveService.cs" />
+    <Compile Include="Services\Files\DesktopItems.cs" />
+    <Compile Include="Services\Files\NativeFolderListing.cs" />
     <Compile Include="Controls\SettingsWindow.DevicePortal.cs">
       <DependentUpon>SettingsWindow.xaml</DependentUpon>
     </Compile>
@@ -321,6 +324,10 @@
     <Content Include="Assets\Wide310x150Logo.scale-200.png" />
     <Content Include="Assets\Files\files.png" />
     <Content Include="Assets\Windows11\*.ico" />
+    <Content Include="Assets\Windows11\wallpaper_dark.jpg" />
+    <Content Include="Assets\Windows11\wallpaper_white.jpg" />
+    <Content Include="Assets\Windows11\whitesearch_fordarktheme.png" />
+    <Content Include="Assets\Windows11\darksearch_forwhitetheme.png" />
     <Content Include="Assets\Files\FluentIcons\SidebarSections\*.png" />
     <Content Include="Assets\Files\FluentIcons\Package.png" />
     <Content Include="Assets\Files\FluentIcons\*.txt" />

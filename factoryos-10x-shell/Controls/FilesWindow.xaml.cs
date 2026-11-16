@@ -33,7 +33,7 @@ namespace factoryos_10x_shell.Controls
         private Point m_fileDragOrigin;
         private uint m_fileDragPointerId;
         private bool m_fileDragInProgress;
-        private List<IStorageItem> m_dragFiles;
+        private List<FileEntry> m_dragEntries;
 
         private void ItemsList_FilePointerPressed(object sender, PointerRoutedEventArgs e)
         {
@@ -44,7 +44,7 @@ namespace factoryos_10x_shell.Controls
                 !point.Properties.IsLeftButtonPressed) return;
             var row = FindVisualAncestor<ListViewItem>(e.OriginalSource as DependencyObject);
             int index = row == null ? -1 : ItemsList.IndexFromContainer(row);
-            if (index < 0 || !(ItemsList.Items[index] is FileEntry entry) || entry.File == null) return;
+            if (index < 0 || !(ItemsList.Items[index] is FileEntry entry) || entry.IsDirectory) return;
             m_fileDragCandidate = entry;
             m_fileDragRow = row;
             m_fileDragOrigin = point.Position;
@@ -67,15 +67,14 @@ namespace factoryos_10x_shell.Controls
             m_fileDragCandidate = null;
             var selection = ItemsList.SelectedItems.OfType<FileEntry>().ToList();
             if (!selection.Contains(candidate)) selection = new List<FileEntry> { candidate };
-            m_dragFiles = selection.Select(entry => entry.File).Where(file => file != null)
-                .Cast<IStorageItem>().ToList();
-            if (m_dragFiles.Count == 0) return;
+            m_dragEntries = selection.Where(entry => !entry.IsDirectory).ToList();
+            if (m_dragEntries.Count == 0) return;
             m_fileDragInProgress = true;
             source.DragStarting += ItemsList_DragStarting;
             e.Handled = true;
             try
             {
-                LogFileDrag("start requested; files=" + m_dragFiles.Count);
+                LogFileDrag("start requested; files=" + m_dragEntries.Count);
                 var result = await source.StartDragAsync(e.GetCurrentPoint(source));
                 LogFileDrag("completed; result=" + result);
             }
@@ -90,7 +89,7 @@ namespace factoryos_10x_shell.Controls
                 if (m_fileDragCursorRequested) MainPage.SetPopupCursorVisibility(false);
                 m_fileDragCursorRequested = false;
                 m_fileDragInProgress = false;
-                m_dragFiles = null;
+                m_dragEntries = null;
             }
         }
 
@@ -99,21 +98,33 @@ namespace factoryos_10x_shell.Controls
             if (e.Pointer.PointerId == m_fileDragPointerId) m_fileDragCandidate = null;
         }
 
-        private void ItemsList_DragStarting(UIElement sender, DragStartingEventArgs e)
+        private async void ItemsList_DragStarting(UIElement sender, DragStartingEventArgs e)
         {
-            if (!m_fileDragInProgress || m_dragFiles == null || m_dragFiles.Count == 0)
+            if (!m_fileDragInProgress || m_dragEntries == null || m_dragEntries.Count == 0)
             { e.Cancel = true; return; }
-            e.Cancel = false;
-            e.AllowedOperations = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
-            e.Data.SetStorageItems(m_dragFiles, true);
-            e.Data.RequestedOperation = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
-            FirefoxWindow.BeginFileDrag();
-            LogFileDrag("DragStarting; storage items supplied");
-            if (!m_fileDragCursorRequested)
+            var deferral = e.GetDeferral();
+            try
             {
-                m_fileDragCursorRequested = true;
-                MainPage.SetPopupCursorVisibility(true);
+                var files = await StorageItemsAsync(m_dragEntries);
+                if (files.Count == 0) { e.Cancel = true; return; }
+                e.Cancel = false;
+                e.AllowedOperations = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
+                e.Data.SetStorageItems(files, true);
+                e.Data.RequestedOperation = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
+                FirefoxWindow.BeginFileDrag();
+                LogFileDrag("DragStarting; storage items supplied");
+                if (!m_fileDragCursorRequested)
+                {
+                    m_fileDragCursorRequested = true;
+                    MainPage.SetPopupCursorVisibility(true);
+                }
             }
+            catch (Exception error)
+            {
+                e.Cancel = true;
+                ShellDiagnostics.RecordException("Preparing Files drag", error);
+            }
+            finally { deferral.Complete(); }
         }
 
         private static void LogFileDrag(string detail)
@@ -130,6 +141,8 @@ namespace factoryos_10x_shell.Controls
 
         private const string MountPrefix = "CoreShell.Files.Mount.";
         private const string RemovableMediaNameKey = "CoreShell.Files.RemovableMediaName";
+        private readonly List<NavigationViewItem> m_logicalDriveItems = new List<NavigationViewItem>();
+        private bool m_loadingLogicalDrives;
         private StorageFolder m_currentFolder;
         private string m_currentDisplayName = "Home";
         private Stack<FolderLocation> m_history = new Stack<FolderLocation>();
@@ -183,6 +196,7 @@ namespace factoryos_10x_shell.Controls
             ItemsList.ItemsSource = m_items;
             LocationsNavigation.SelectedItem = HomeNavigationItem;
             RestoreRemovableMediaName();
+            _ = RefreshLogicalDrivesAsync();
             CreateInitialTab();
             FileOperationService.Instance.OperationCompleted += RefreshAfterFileOperation;
         }
@@ -316,6 +330,7 @@ namespace factoryos_10x_shell.Controls
 
         public void Restore()
         {
+            _ = RefreshLogicalDrivesAsync();
             Visibility = Visibility.Visible;
             AppState.Instance.SetFilesWindowState(true, false);
             AppState.Instance.ActivateFiles();
@@ -370,9 +385,9 @@ namespace factoryos_10x_shell.Controls
 
         private void SelectFile(string path, string name)
         {
-            FileEntry entry = m_items.FirstOrDefault(item => item.File != null &&
-                ((!string.IsNullOrEmpty(path) && string.Equals(item.File.Path, path, StringComparison.OrdinalIgnoreCase)) ||
-                 string.Equals(item.File.Name, name, StringComparison.OrdinalIgnoreCase)));
+            FileEntry entry = m_items.FirstOrDefault(item => !item.IsDirectory &&
+                ((!string.IsNullOrEmpty(path) && string.Equals(item.Path, path, StringComparison.OrdinalIgnoreCase)) ||
+                 string.Equals(item.Name, name, StringComparison.OrdinalIgnoreCase)));
             if (entry == null) return;
             ItemsList.SelectedItems.Clear();
             ItemsList.SelectedItem = entry;
@@ -446,7 +461,7 @@ namespace factoryos_10x_shell.Controls
                     .OfType<MenuFlyoutSubItem>()
                     .FirstOrDefault(item => string.Equals(item.Tag as string, "ArchiveActions", StringComparison.Ordinal));
                 if (archiveMenu != null)
-                    archiveMenu.Visibility = ArchiveService.IsArchive(entry.File)
+                    archiveMenu.Visibility = entry.IsArchive
                         ? Visibility.Visible
                         : Visibility.Collapsed;
             }
@@ -563,7 +578,10 @@ namespace factoryos_10x_shell.Controls
                 await OpenFolderAsync(ApplicationData.Current.LocalFolder, "Home", false);
                 return;
             }
-            await OpenLibraryAsync(location);
+            if (selectedItem != null && m_logicalDriveItems.Contains(selectedItem))
+                await OpenLogicalDriveAsync(location);
+            else
+                await OpenLibraryAsync(location);
         }
 
         private async void ResetAuthorizedFolders_Click(object sender, RoutedEventArgs e)
@@ -610,6 +628,58 @@ namespace factoryos_10x_shell.Controls
             ResetAuthorizedFoldersStatus.Visibility = Visibility.Visible;
         }
 
+        private async Task RefreshLogicalDrivesAsync()
+        {
+            if (m_loadingLogicalDrives) return;
+            m_loadingLogicalDrives = true;
+            try
+            {
+                var roots = await Task.Run(NativeFolderListing.ReadDriveRoots);
+                if (m_logicalDriveItems.Select(item => item.Tag as string).SequenceEqual(roots)) return;
+                var items = LocationsNavigation.MenuItems;
+                foreach (var item in m_logicalDriveItems) items.Remove(item);
+                m_logicalDriveItems.Clear();
+
+                foreach (string root in roots)
+                {
+                    var item = new NavigationViewItem
+                    {
+                        Content = root.TrimEnd(System.IO.Path.DirectorySeparatorChar),
+                        Tag = root,
+                        Icon = new FontIcon { Glyph = "\uEDA2" }
+                    };
+                    items.Add(item);
+                    m_logicalDriveItems.Add(item);
+                }
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException("Listing logical drives in Files", error);
+            }
+            finally { m_loadingLogicalDrives = false; }
+        }
+
+        private async Task OpenLogicalDriveAsync(string root)
+        {
+            var folder = await GetMountedFolderAsync(root);
+            if (folder == null)
+            {
+                try { folder = await StorageFolder.GetFolderFromPathAsync(root); }
+                catch (Exception error) when (error is UnauthorizedAccessException ||
+                    error is System.IO.FileNotFoundException || error is System.IO.DirectoryNotFoundException ||
+                    error is System.Runtime.InteropServices.COMException)
+                {
+                    // The drive mask describes the device, not the application's access.
+                }
+            }
+
+            if (folder == null)
+                await OpenLibraryAsync(root);
+            else
+                await OpenFolderAsync(folder, root.TrimEnd(System.IO.Path.DirectorySeparatorChar), true);
+        }
+
+
         private async Task OpenLibraryAsync(string location)
         {
             if (string.IsNullOrWhiteSpace(location)) return;
@@ -641,6 +711,7 @@ namespace factoryos_10x_shell.Controls
 
         private async Task<StorageFolder> GetMountedFolderAsync(string location)
         {
+            if (location == DesktopItems.FolderName) return await DesktopItems.GetFolderAsync();
             string token = MountPrefix + location;
             if (!StorageApplicationPermissions.FutureAccessList.ContainsItem(token)) return null;
             try { return await StorageApplicationPermissions.FutureAccessList.GetFolderAsync(token); }
@@ -672,40 +743,20 @@ namespace factoryos_10x_shell.Controls
             m_allItems.Clear();
             try
             {
-                var loadedItems = new List<FileEntry>();
-                foreach (StorageFolder child in await folder.GetFoldersAsync())
-                    loadedItems.Add(new FileEntry
-                    {
-                        Name = child.Name,
-                        Kind = "Folder",
-                        FallbackIcon = CreatePackagedIcon("folders/folder.ico"),
-                        Folder = child,
-                        DateModifiedText = FormatDate(child.DateCreated)
-                    });
-                foreach (StorageFile child in await folder.GetFilesAsync())
-                {
-                    BasicProperties properties = await child.GetBasicPropertiesAsync();
-                    var entry = new FileEntry
-                    {
-                        Name = child.Name,
-                        Kind = string.IsNullOrWhiteSpace(child.DisplayType) ? child.FileType : child.DisplayType,
-                        SizeText = FormatSize(properties.Size),
-                        DateModifiedText = FormatDate(properties.DateModified),
-                        FallbackIcon = AppPackageService.IsPackage(child)
-                            ? new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png"))
-                            : CreatePackagedIcon(GetFileIconPath(child)),
-                        File = child
-                    };
-                    loadedItems.Add(entry);
-                }
+                string path = folder.Path;
+                var nativeItems = await Task.Run(() => NativeFolderListing.TryRead(path)?
+                    .OrderBy(item => !item.IsDirectory)
+                    .ThenBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToList());
+                if (loadRevision != m_folderLoadRevision || !ReferenceEquals(targetTab, m_activeTab)) return;
+                var icons = new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
+                var loadedItems = nativeItems != null
+                    ? nativeItems.Select(item => CreateNativeFileEntry(folder, item, icons)).ToList()
+                    : await ReadBrokeredFolderAsync(folder);
 
                 // A slower storage provider must not overwrite the contents after the
                 // user has already changed to another tab or navigated somewhere else.
                 if (loadRevision != m_folderLoadRevision || !ReferenceEquals(targetTab, m_activeTab)) return;
                 m_allItems.AddRange(loadedItems);
-                foreach (FileEntry entry in loadedItems.Where(item => item.File != null &&
-                    !string.Equals(item.File.FileType, ".exe", StringComparison.OrdinalIgnoreCase)))
-                    _ = LoadItemThumbnailAsync(entry);
                 ApplyFilter();
             }
             catch (Exception)
@@ -718,6 +769,69 @@ namespace factoryos_10x_shell.Controls
                 }
                 await new ContentDialog { Title = "Folder unavailable", Content = "CoreShell no longer has access to this folder. Choose it again from the sidebar.", CloseButtonText = "OK" }.ShowAsync();
             }
+        }
+
+        private static FileEntry CreateNativeFileEntry(StorageFolder parent, NativeFolderListing.Entry item,
+            Dictionary<string, ImageSource> icons)
+        {
+            string extension = System.IO.Path.GetExtension(item.Name);
+            string iconUri = !item.IsDirectory && IsPackageExtension(extension)
+                ? "ms-appx:///Assets/Files/FluentIcons/Package.png"
+                : "ms-appx:///Assets/Files/Windows11Icons/" +
+                    (item.IsDirectory ? "folders/folder.ico" : GetExtensionIconPath(extension));
+            if (!icons.TryGetValue(iconUri, out var icon))
+                icons.Add(iconUri, icon = new BitmapImage(new Uri(iconUri)));
+            return new FileEntry
+            {
+                Parent = parent,
+                Name = item.Name,
+                Directory = item.IsDirectory,
+                Kind = item.IsDirectory ? "Folder" : string.IsNullOrEmpty(extension) ? "File" : extension.Substring(1).ToUpperInvariant() + " file",
+                SizeText = item.IsDirectory ? string.Empty : FormatSize(item.Size),
+                DateModifiedText = FormatDate(item.DateModified),
+                FallbackIcon = icon
+            };
+        }
+
+        private static bool IsPackageExtension(string extension)
+        {
+            switch (extension?.ToLowerInvariant())
+            {
+                case ".appx": case ".appxbundle": case ".msix": case ".msixbundle": return true;
+                default: return false;
+            }
+        }
+
+        private static async Task<List<FileEntry>> ReadBrokeredFolderAsync(StorageFolder folder)
+        {
+            var loadedItems = new List<FileEntry>();
+            foreach (StorageFolder child in await folder.GetFoldersAsync())
+                loadedItems.Add(new FileEntry
+                {
+                    Name = child.Name,
+                    Kind = "Folder",
+                    FallbackIcon = CreatePackagedIcon("folders/folder.ico"),
+                    Folder = child,
+                    DateModifiedText = FormatDate(child.DateCreated)
+                });
+            foreach (StorageFile child in await folder.GetFilesAsync())
+            {
+                BasicProperties properties = await child.GetBasicPropertiesAsync();
+                var entry = new FileEntry
+                {
+                    Name = child.Name,
+                    Kind = string.IsNullOrWhiteSpace(child.DisplayType) ? child.FileType : child.DisplayType,
+                    SizeText = FormatSize(properties.Size),
+                    DateModifiedText = FormatDate(properties.DateModified),
+                    FallbackIcon = AppPackageService.IsPackage(child)
+                        ? new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png"))
+                        : CreatePackagedIcon(GetFileIconPath(child)),
+                    File = child
+                };
+                loadedItems.Add(entry);
+            }
+
+            return loadedItems;
         }
 
         private async void ItemsList_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
@@ -736,13 +850,34 @@ namespace factoryos_10x_shell.Controls
         private async Task OpenEntryAsync(FileEntry entry)
         {
             if (entry == null) return;
-            if (entry.Folder != null) await OpenFolderAsync(entry.Folder, entry.Folder.Name, true);
-            else if (entry.File != null) await OpenFileAsync(entry.File, m_currentFolder);
+            var parent = entry.Parent ?? m_currentFolder;
+            int revision = m_folderLoadRevision;
+            var item = await entry.ResolveAsync();
+            if (revision != m_folderLoadRevision) return;
+            if (item is StorageFolder folder) await OpenFolderAsync(folder, entry.Name, true);
+            else if (item is StorageFile file) await OpenFileAsync(file, parent);
+            else await ShowOperationErrorAsync("This item is no longer available.");
         }
 
-        private async Task OpenFileAsync(StorageFile file, StorageFolder folder)
+        internal async Task OpenDesktopFolderAsync(StorageFolder folder = null)
         {
-            if (AppPackageService.IsPackage(file))
+            var desktop = await DesktopItems.GetFolderAsync();
+            folder = folder ?? desktop;
+            SettingsPage.Visibility = Visibility.Collapsed;
+            Restore();
+            LocationsNavigation.SelectedItem = DesktopNavigationItem;
+            if (m_activeTab != null) m_activeTab.SelectedNavigationItem = DesktopNavigationItem;
+            await OpenFolderAsync(folder, folder.Path == desktop.Path ? DesktopItems.FolderName : folder.DisplayName, true);
+        }
+
+        internal async Task OpenFileAsync(StorageFile file, StorageFolder folder)
+        {
+            if (DesktopItems.IsShortcut(file))
+            {
+                if (!await DesktopItems.OpenShortcutAsync(file))
+                    await ShowOperationErrorAsync("The app for this shortcut is unavailable.");
+            }
+            else if (AppPackageService.IsPackage(file))
                 await Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () => AppInstallerWindow.RequestOpen(file));
             else if (string.Equals(file.FileType, ".exe", StringComparison.OrdinalIgnoreCase))
             {
@@ -781,13 +916,23 @@ namespace factoryos_10x_shell.Controls
         // the navigation path rather than attempting to access an unapproved parent.
         private void Up_Click(object sender, RoutedEventArgs e) => Back_Click(sender, e);
 
+        private void ItemsList_ContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs e)
+        {
+            if (!e.InRecycleQueue && e.Phase == 0 && e.Item is FileEntry entry && !entry.IsDirectory &&
+                !entry.ThumbnailRequested && !IsPackageExtension(entry.Extension) &&
+                !string.Equals(entry.Extension, ".exe", StringComparison.OrdinalIgnoreCase))
+            {
+                entry.ThumbnailRequested = true;
+                _ = LoadItemThumbnailAsync(entry);
+            }
+        }
+
         private static async Task LoadItemThumbnailAsync(FileEntry entry)
         {
-            if (entry?.File == null || entry.Thumbnail != null || AppPackageService.IsPackage(entry.File)) return;
-
             try
             {
-                using (StorageItemThumbnail thumbnail = await entry.File.GetThumbnailAsync(
+                if (!(await entry.ResolveAsync() is StorageFile file)) return;
+                using (StorageItemThumbnail thumbnail = await file.GetThumbnailAsync(
                     ThumbnailMode.SingleItem,
                     64,
                     ThumbnailOptions.UseCurrentScale | ThumbnailOptions.ResizeThumbnail))
@@ -858,9 +1003,11 @@ namespace factoryos_10x_shell.Controls
             return unit == 0 ? bytes + " B" : value.ToString(value >= 10 ? "0" : "0.0") + " " + units[unit];
         }
 
-        private static string GetFileIconPath(StorageFile file)
+        internal static string GetFileIconPath(StorageFile file) => GetExtensionIconPath(file?.FileType);
+
+        private static string GetExtensionIconPath(string fileType)
         {
-            string extension = (file?.FileType ?? string.Empty).ToLowerInvariant();
+            string extension = (fileType ?? string.Empty).ToLowerInvariant();
             if (extension == ".exe") return "files/windowprogram.ico";
             if (extension.Equals(".zip", StringComparison.OrdinalIgnoreCase) ||
                 extension.Equals(".7z", StringComparison.OrdinalIgnoreCase) ||
@@ -880,11 +1027,11 @@ namespace factoryos_10x_shell.Controls
             if (extension == ".txt" || extension == ".log") return "files/text.ico";
             if (extension == ".ini" || extension == ".config") return "files/configuration.ico";
             if (extension == ".url" || extension == ".htm" || extension == ".html") return "objects/globe.ico";
-            if (extension == ".lnk") return "files/window.ico";
+            if (extension == ".lnk" || extension == DesktopItems.ShortcutExtension) return "files/window.ico";
             return "files/generic.ico";
         }
 
-        private static BitmapImage CreatePackagedIcon(string relativePath)
+        internal static BitmapImage CreatePackagedIcon(string relativePath)
         {
             return new BitmapImage(new Uri("ms-appx:///Assets/Files/Windows11Icons/" + relativePath));
         }
@@ -923,6 +1070,7 @@ namespace factoryos_10x_shell.Controls
         private async void Paste_Click(object sender, RoutedEventArgs e)
         {
             if (m_currentFolder == null || m_clipboardEntries.Count == 0) return;
+            var destination = m_currentFolder;
             bool cut = m_cutOperation;
             if (cut && m_cutPasteInProgress) return;
             List<FileEntry> entries = m_clipboardEntries.ToList();
@@ -931,7 +1079,7 @@ namespace factoryos_10x_shell.Controls
             try
             {
                 FileOperationModel operation = FileOperationService.Instance.StartTransfer(
-                    StorageItems(entries), m_currentFolder, cut ? FileOperationKind.Move : FileOperationKind.Copy);
+                    await StorageItemsAsync(entries), destination, cut ? FileOperationKind.Move : FileOperationKind.Copy);
                 FileOperationResult result = await operation.Completion;
                 if (cut && revision == m_clipboardRevision)
                     m_clipboardEntries.RemoveAll(entry => result.Succeeded.Contains((IStorageItem)entry.File ?? entry.Folder));
@@ -949,7 +1097,7 @@ namespace factoryos_10x_shell.Controls
             string prompt = entries.Count == 1 ? "Delete " + entries[0].Name + "?" : "Delete these " + entries.Count + " items?";
             var dialog = new ContentDialog { Title = "Delete", Content = prompt, PrimaryButtonText = "Delete", CloseButtonText = "Cancel" };
             if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
-            FileOperationService.Instance.StartTransfer(StorageItems(entries), null, FileOperationKind.Delete);
+            FileOperationService.Instance.StartTransfer(await StorageItemsAsync(entries), null, FileOperationKind.Delete);
         }
 
         private async void MoveTo_Click(object sender, RoutedEventArgs e)
@@ -960,7 +1108,7 @@ namespace factoryos_10x_shell.Controls
             picker.FileTypeFilter.Add("*");
             StorageFolder destination = await picker.PickSingleFolderAsync();
             if (destination == null) return;
-            FileOperationService.Instance.StartTransfer(StorageItems(entries), destination, FileOperationKind.Move);
+            FileOperationService.Instance.StartTransfer(await StorageItemsAsync(entries), destination, FileOperationKind.Move);
         }
 
         private async void Rename_Click(object sender, RoutedEventArgs e)
@@ -976,8 +1124,9 @@ namespace factoryos_10x_shell.Controls
             if (await dialog.ShowAsync() != ContentDialogResult.Primary || string.IsNullOrWhiteSpace(nameBox.Text)) return;
             try
             {
-                if (entry.Folder != null) await entry.Folder.RenameAsync(nameBox.Text.Trim(), NameCollisionOption.GenerateUniqueName);
-                else if (entry.File != null) await entry.File.RenameAsync(nameBox.Text.Trim(), NameCollisionOption.GenerateUniqueName);
+                var item = await entry.ResolveAsync();
+                if (item == null) { await ShowOperationErrorAsync("This item is no longer available."); return; }
+                await item.RenameAsync(nameBox.Text.Trim(), NameCollisionOption.GenerateUniqueName);
                 await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
             }
             catch (Exception) { await ShowOperationErrorAsync("CoreShell could not rename this item."); }
@@ -986,24 +1135,25 @@ namespace factoryos_10x_shell.Controls
         private async void ArchiveExtractHere_Click(object sender, RoutedEventArgs e)
         {
             FileEntry entry = GetEntry(sender);
-            if (entry?.File == null || m_currentFolder == null) return;
-            await ExtractArchiveWithPasswordAsync(entry.File, m_currentFolder);
+            var destination = m_currentFolder;
+            if (destination == null || entry == null) return;
+            if (await entry.ResolveAsync() is StorageFile file) await ExtractArchiveWithPasswordAsync(file, destination);
         }
 
         private async void ArchiveExtractTo_Click(object sender, RoutedEventArgs e)
         {
             FileEntry entry = GetEntry(sender);
-            if (entry?.File == null) return;
+            if (entry == null || !(await entry.ResolveAsync() is StorageFile file)) return;
             var picker = new FolderPicker { SuggestedStartLocation = PickerLocationId.Downloads };
             picker.FileTypeFilter.Add("*");
             StorageFolder destination = await picker.PickSingleFolderAsync();
-            if (destination != null) await ExtractArchiveWithPasswordAsync(entry.File, destination);
+            if (destination != null) await ExtractArchiveWithPasswordAsync(file, destination);
         }
 
         private async void ArchiveOpen_Click(object sender, RoutedEventArgs e)
         {
             FileEntry entry = GetEntry(sender);
-            if (entry?.File != null) await OpenArchivePreviewAsync(entry.File);
+            if (entry != null && await entry.ResolveAsync() is StorageFile file) await OpenArchivePreviewAsync(file);
         }
 
         private async void CompressZip_Click(object sender, RoutedEventArgs e) =>
@@ -1071,22 +1221,19 @@ namespace factoryos_10x_shell.Controls
             }
         }
 
-        private Task CompressEntryAsync(FileEntry entry, bool sevenZip)
+        private async Task CompressEntryAsync(FileEntry entry, bool sevenZip)
         {
-            if (entry == null || m_currentFolder == null) return Task.CompletedTask;
+            var destination = m_currentFolder;
+            if (entry == null || destination == null) return;
             var selectedEntries = ItemsList.SelectedItems.Cast<FileEntry>().ToList();
             if (!selectedEntries.Contains(entry)) selectedEntries = new List<FileEntry> { entry };
-            var items = selectedEntries
-                .Select(item => (IStorageItem)item.File ?? item.Folder)
-                .Where(item => item != null)
-                .ToList();
-            if (items.Count == 0) return Task.CompletedTask;
+            var items = await StorageItemsAsync(selectedEntries);
+            if (items.Count == 0) return;
             string extension = sevenZip ? ".7z" : ".zip";
             string baseName = selectedEntries.Count == 1
                 ? System.IO.Path.GetFileNameWithoutExtension(entry.Name)
                 : "Archive";
-            FileOperationService.Instance.StartCompression(items, m_currentFolder, baseName + extension, sevenZip);
-            return Task.CompletedTask;
+            FileOperationService.Instance.StartCompression(items, destination, baseName + extension, sevenZip);
         }
 
         private async void RefreshAfterFileOperation(FileOperationModel operation)
@@ -1103,8 +1250,16 @@ namespace factoryos_10x_shell.Controls
             catch { }
         }
 
-        private static IReadOnlyList<IStorageItem> StorageItems(IEnumerable<FileEntry> entries) =>
-            entries.Select(entry => (IStorageItem)entry.File ?? entry.Folder).Where(item => item != null).ToList();
+        private static async Task<IReadOnlyList<IStorageItem>> StorageItemsAsync(IEnumerable<FileEntry> entries)
+        {
+            var items = new List<IStorageItem>();
+            foreach (var entry in entries)
+            {
+                var item = await entry.ResolveAsync();
+                if (item != null) items.Add(item);
+            }
+            return items;
+        }
 
         private static async Task<string> RequestArchivePasswordAsync(string archiveName)
         {
@@ -1152,7 +1307,7 @@ namespace factoryos_10x_shell.Controls
 
         private string GetLocationDisplayName(string location, StorageFolder folder)
         {
-            return location == "Removable media" ? GetRemovableMediaName(folder) : location;
+            return location == "Removable media" ? GetRemovableMediaName(folder) : location.TrimEnd(System.IO.Path.DirectorySeparatorChar);
         }
 
         private void RestoreRemovableMediaName()
@@ -1173,7 +1328,7 @@ namespace factoryos_10x_shell.Controls
         {
             string path = folder?.Path ?? string.Empty;
             string root = System.IO.Path.GetPathRoot(path);
-            string drive = string.IsNullOrWhiteSpace(root) ? "Removable media" : root.TrimEnd('\\');
+            string drive = string.IsNullOrWhiteSpace(root) ? "Removable media" : root.TrimEnd(System.IO.Path.DirectorySeparatorChar);
             string label = string.IsNullOrWhiteSpace(folder?.DisplayName) ? folder?.Name : folder.DisplayName;
             return string.IsNullOrWhiteSpace(label) ? drive : drive + " - " + label;
         }
@@ -1209,7 +1364,45 @@ namespace factoryos_10x_shell.Controls
             public string DateModifiedText { get; set; }
             public StorageFolder Folder { get; set; }
             public StorageFile File { get; set; }
-            public Visibility ArchiveVisibility => ArchiveService.IsArchive(File) ? Visibility.Visible : Visibility.Collapsed;
+            public StorageFolder Parent { get; set; }
+            public bool Directory { get; set; }
+            public bool IsDirectory => Directory || Folder != null;
+            public string Extension => IsDirectory ? string.Empty : System.IO.Path.GetExtension(Name);
+            public string Path => File?.Path ?? Folder?.Path ??
+                (string.IsNullOrEmpty(Parent?.Path) ? null : System.IO.Path.Combine(Parent.Path, Name));
+            public bool IsArchive
+            {
+                get
+                {
+                    switch (Extension.ToLowerInvariant())
+                    {
+                        case ".zip": case ".rar": case ".7z": return true;
+                        default: return false;
+                    }
+                }
+            }
+            public Visibility ArchiveVisibility => IsArchive ? Visibility.Visible : Visibility.Collapsed;
+            public bool ThumbnailRequested { get; set; }
+
+            public async Task<IStorageItem> ResolveAsync()
+            {
+                var cached = (IStorageItem)File ?? Folder;
+                if (cached != null || Parent == null) return cached;
+                try
+                {
+                    var item = await Parent.TryGetItemAsync(Name);
+                    cached = (IStorageItem)File ?? Folder;
+                    if (cached != null) return cached;
+                    File = item as StorageFile;
+                    Folder = item as StorageFolder;
+                    return item;
+                }
+                catch (Exception error)
+                {
+                    ShellDiagnostics.RecordException("Resolving Files entry", error);
+                    return null;
+                }
+            }
             private ImageSource m_thumbnail;
             public ImageSource Thumbnail
             {

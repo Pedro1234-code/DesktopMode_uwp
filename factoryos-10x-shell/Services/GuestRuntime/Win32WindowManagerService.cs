@@ -41,12 +41,7 @@ namespace factoryos_10x_shell.Services.Win32
             string virtualPath = null, string arguments = null, string workingDirectory = null)
         {
             if (!IsAppSupportEnabled || executable == null || sourceFolder == null) return null;
-            Win32WindowModel existing = Windows.FirstOrDefault(item =>
-                string.Equals(item.Executable?.Path, executable.Path, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(item.VirtualExecutablePath, virtualPath, StringComparison.OrdinalIgnoreCase) &&
-                string.Equals(item.Arguments, arguments, StringComparison.Ordinal) &&
-                string.Equals(item.WorkingDirectory, workingDirectory, StringComparison.OrdinalIgnoreCase) &&
-                !string.IsNullOrWhiteSpace(executable.Path));
+            Win32WindowModel existing = FindWindow(executable, virtualPath, arguments, workingDirectory);
             if (existing != null)
             {
                 if (iconSource != null) existing.IconSource = iconSource;
@@ -69,6 +64,19 @@ namespace factoryos_10x_shell.Services.Win32
             Activate(window);
             return window;
         }
+
+        internal Win32WindowModel FindWindow(StorageFile executable, string virtualPath, string arguments, string workingDirectory)
+        {
+            string path = executable?.Path;
+            if (string.IsNullOrWhiteSpace(path)) return null;
+
+            return Windows.FirstOrDefault(item =>
+                string.Equals(item.Executable?.Path, path, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(item.VirtualExecutablePath, virtualPath, StringComparison.OrdinalIgnoreCase) &&
+                string.Equals(item.Arguments, arguments, StringComparison.Ordinal) &&
+                string.Equals(item.WorkingDirectory, workingDirectory, StringComparison.OrdinalIgnoreCase));
+        }
+
 
         public void Activate(Win32WindowModel window)
         {

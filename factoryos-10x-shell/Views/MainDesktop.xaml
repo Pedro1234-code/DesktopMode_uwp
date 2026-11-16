@@ -29,6 +29,98 @@
             HorizontalAlignment="Left"
             VerticalAlignment="Top"
             IsHitTestVisible="False" />
+        <Grid x:Name="DesktopSurface" Margin="0,0,0,50" Background="Transparent">
+            <Grid.ContextFlyout>
+                <MenuFlyout Opened="DesktopMenu_Opened" Closed="DesktopMenu_Closed">
+                    <ToggleMenuFlyoutItem x:Name="DesktopShowIconsItem" Text="Show icons in Desktop" Click="DesktopShowIcons_Click" />
+                    <MenuFlyoutItem Text="Personalize" Click="DesktopPersonalize_Click" />
+                </MenuFlyout>
+            </Grid.ContextFlyout>
+            <GridView x:Name="DesktopIcons" Margin="8,8,8,2" Padding="0" Background="Transparent" SizeChanged="DesktopIcons_SizeChanged" ContainerContentChanging="DesktopIcons_ContainerContentChanging" SelectionMode="Extended" IsMultiSelectCheckBoxEnabled="False"
+                      ScrollViewer.HorizontalScrollMode="Auto" ScrollViewer.HorizontalScrollBarVisibility="Hidden"
+                      ScrollViewer.VerticalScrollMode="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                      KeyDown="DesktopIcons_KeyDown" AutomationProperties.Name="Desktop">
+                <GridView.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <ItemsWrapGrid Orientation="Vertical" ItemWidth="86" ItemHeight="94" />
+                    </ItemsPanelTemplate>
+                </GridView.ItemsPanel>
+                <GridView.ItemContainerStyle>
+                    <Style TargetType="GridViewItem">
+                        <Setter Property="UseSystemFocusVisuals" Value="True" />
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="GridViewItem">
+                                    <Grid Background="Transparent" Margin="2">
+                                        <VisualStateManager.VisualStateGroups>
+                                            <VisualStateGroup x:Name="CommonStates">
+                                                <VisualState x:Name="Normal" />
+                                                <VisualState x:Name="PointerOver">
+                                                    <VisualState.Setters><Setter Target="Plate.Background" Value="#24FFFFFF" /></VisualState.Setters>
+                                                </VisualState>
+                                                <VisualState x:Name="Pressed">
+                                                    <VisualState.Setters><Setter Target="Plate.Background" Value="#30FFFFFF" /></VisualState.Setters>
+                                                </VisualState>
+                                                <VisualState x:Name="Selected">
+                                                    <VisualState.Setters>
+                                                        <Setter Target="Plate.Background" Value="#32FFFFFF" />
+                                                        <Setter Target="Plate.BorderBrush" Value="#55FFFFFF" />
+                                                    </VisualState.Setters>
+                                                </VisualState>
+                                                <VisualState x:Name="PointerOverSelected">
+                                                    <VisualState.Setters>
+                                                        <Setter Target="Plate.Background" Value="#40FFFFFF" />
+                                                        <Setter Target="Plate.BorderBrush" Value="#55FFFFFF" />
+                                                    </VisualState.Setters>
+                                                </VisualState>
+                                                <VisualState x:Name="PressedSelected">
+                                                    <VisualState.Setters><Setter Target="Plate.Background" Value="#38FFFFFF" /></VisualState.Setters>
+                                                </VisualState>
+                                            </VisualStateGroup>
+                                        </VisualStateManager.VisualStateGroups>
+                                        <Border x:Name="Plate" CornerRadius="4" BorderThickness="1" IsHitTestVisible="False">
+                                            <Border.BackgroundTransition><BrushTransition Duration="0:0:0.083" /></Border.BackgroundTransition>
+                                        </Border>
+                                        <ContentPresenter Content="{TemplateBinding Content}" ContentTemplate="{TemplateBinding ContentTemplate}"
+                                                          HorizontalAlignment="Stretch" VerticalAlignment="Stretch" />
+                                    </Grid>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </GridView.ItemContainerStyle>
+                <GridView.ItemTemplate>
+                    <DataTemplate>
+                        <Grid x:Name="DesktopTile" Background="Transparent" DoubleTapped="DesktopItem_DoubleTapped"
+                              AutomationProperties.Name="{Binding Name}">
+                            <Grid.ContextFlyout>
+                                <MenuFlyout Opened="DesktopMenu_Opened" Closed="DesktopMenu_Closed">
+                                    <MenuFlyoutItem Text="Open" Click="DesktopItemOpen_Click" />
+                                    <MenuFlyoutItem Text="Delete" Click="DesktopItemDelete_Click" />
+                                </MenuFlyout>
+                            </Grid.ContextFlyout>
+                            <StackPanel Margin="4,7,4,0" Spacing="3" VerticalAlignment="Top">
+                                <Grid Width="48" Height="48" HorizontalAlignment="Center">
+                                    <Image Source="{Binding Icon}" Stretch="Uniform" />
+                                    <FontIcon Glyph="&#xE8A7;" FontSize="12" Foreground="White" HorizontalAlignment="Left"
+                                              VerticalAlignment="Bottom" Visibility="{Binding ShortcutBadgeVisibility}" />
+                                </Grid>
+                                <Grid>
+                                    <TextBlock Text="{Binding Name}" Foreground="#E0000000" Margin="1,1,0,0" FontSize="12"
+                                               TextAlignment="Center" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxLines="2" />
+                                    <TextBlock Text="{Binding Name}" Foreground="White" FontSize="12" TextAlignment="Center"
+                                               TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxLines="2" />
+                                </Grid>
+                            </StackPanel>
+                        </Grid>
+                    </DataTemplate>
+                </GridView.ItemTemplate>
+            </GridView>
+            <Canvas IsHitTestVisible="False">
+                <Border x:Name="DesktopSelectionRectangle" Visibility="Collapsed" BorderThickness="1"
+                        Background="#330078D4" BorderBrush="#CC60CDFF" />
+            </Canvas>
+        </Grid>
         <ItemsControl x:Name="WindowHost" IsHitTestVisible="True">
             <ItemsControl.ItemsPanel>
                 <ItemsPanelTemplate>

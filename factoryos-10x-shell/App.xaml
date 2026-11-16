@@ -15,13 +15,24 @@
                     <SolidColorBrush x:Key="Windows11ItemHoverFill" Color="#0FFFFFFF" />
                     <SolidColorBrush x:Key="Windows11ItemPressedFill" Color="#0AFFFFFF" />
                     <SolidColorBrush x:Key="Windows11TaskbarHoverFill" Color="#17FFFFFF" />
-                    <SolidColorBrush x:Key="Windows11TaskbarHoverStroke" Color="#1CFFFFFF" />
+                    <LinearGradientBrush x:Key="Windows11TaskbarHoverStroke" StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Color="
+                    #1CFFFFFF
+                    " Offset="0" />
+                        <GradientStop Color="
+                    #0AFFFFFF
+                    " Offset="1" />
+                    </LinearGradientBrush>
+                    <SolidColorBrush x:Key="Windows11TaskbarPressedStroke" Color="
+                    #0AFFFFFF
+                    " />
                     <AcrylicBrush x:Key="Windows11StartAcrylic" BackgroundSource="Backdrop"
                                   TintColor="#FF2B2B2B" TintOpacity="0.15" TintLuminosityOpacity="0.91" FallbackColor="#FF2C2C2C" />
                     <AcrylicBrush x:Key="Windows11TaskbarAcrylic" BackgroundSource="Backdrop"
                                   TintColor="#FF202020" TintOpacity="0.05" TintLuminosityOpacity="0.84" FallbackColor="#FF202020" />
                     <BitmapImage x:Key="Windows11StartGlyph" UriSource="ms-appx:///Assets/Windows11/start_darktheme.ico" />
                     <BitmapImage x:Key="Windows11TaskViewGlyph" UriSource="ms-appx:///Assets/Windows11/taskview_darktheme.ico" />
+                    <BitmapImage x:Key="Windows11TaskbarSearchGlyph" UriSource="ms-appx:///Assets/Windows11/whitesearch_fordarktheme.png" />
                     <BitmapImage x:Key="PowerButtonImageSource" UriSource="ms-appx:///powerDark.png" />
                     <AcrylicBrush
                         x:Key="ElementAcrylicBrush"
@@ -41,13 +52,24 @@
                     <SolidColorBrush x:Key="Windows11ItemHoverFill" Color="#0FFFFFFF" />
                     <SolidColorBrush x:Key="Windows11ItemPressedFill" Color="#0AFFFFFF" />
                     <SolidColorBrush x:Key="Windows11TaskbarHoverFill" Color="#17FFFFFF" />
-                    <SolidColorBrush x:Key="Windows11TaskbarHoverStroke" Color="#1CFFFFFF" />
+                    <LinearGradientBrush x:Key="Windows11TaskbarHoverStroke" StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Color="
+                    #1CFFFFFF
+                    " Offset="0" />
+                        <GradientStop Color="
+                    #0AFFFFFF
+                    " Offset="1" />
+                    </LinearGradientBrush>
+                    <SolidColorBrush x:Key="Windows11TaskbarPressedStroke" Color="
+                    #0AFFFFFF
+                    " />
                     <AcrylicBrush x:Key="Windows11StartAcrylic" BackgroundSource="Backdrop"
                                   TintColor="#FF2B2B2B" TintOpacity="0.15" TintLuminosityOpacity="0.91" FallbackColor="#FF2C2C2C" />
                     <AcrylicBrush x:Key="Windows11TaskbarAcrylic" BackgroundSource="Backdrop"
                                   TintColor="#FF202020" TintOpacity="0.05" TintLuminosityOpacity="0.84" FallbackColor="#FF202020" />
                     <BitmapImage x:Key="Windows11StartGlyph" UriSource="ms-appx:///Assets/Windows11/start_darktheme.ico" />
                     <BitmapImage x:Key="Windows11TaskViewGlyph" UriSource="ms-appx:///Assets/Windows11/taskview_darktheme.ico" />
+                    <BitmapImage x:Key="Windows11TaskbarSearchGlyph" UriSource="ms-appx:///Assets/Windows11/whitesearch_fordarktheme.png" />
                     <BitmapImage x:Key="PowerButtonImageSource" UriSource="ms-appx:///powerDark.png" />
                     <AcrylicBrush
                         x:Key="ElementAcrylicBrush"
@@ -67,13 +89,24 @@
                     <SolidColorBrush x:Key="Windows11ItemHoverFill" Color="#0A000000" />
                     <SolidColorBrush x:Key="Windows11ItemPressedFill" Color="#06000000" />
                     <SolidColorBrush x:Key="Windows11TaskbarHoverFill" Color="#80FFFFFF" />
-                    <SolidColorBrush x:Key="Windows11TaskbarHoverStroke" Color="#17000000" />
+                    <LinearGradientBrush x:Key="Windows11TaskbarHoverStroke" StartPoint="0,0" EndPoint="0,1">
+                        <GradientStop Color="
+                    #17000000
+                    " Offset="0" />
+                        <GradientStop Color="
+                    #05000000
+                    " Offset="1" />
+                    </LinearGradientBrush>
+                    <SolidColorBrush x:Key="Windows11TaskbarPressedStroke" Color="
+                    #05000000
+                    " />
                     <AcrylicBrush x:Key="Windows11StartAcrylic" BackgroundSource="Backdrop"
                                   TintColor="#FFF3F3F3" TintOpacity="0" TintLuminosityOpacity="0.86" FallbackColor="#FFF3F3F3" />
                     <AcrylicBrush x:Key="Windows11TaskbarAcrylic" BackgroundSource="Backdrop"
                                   TintColor="#FFF3F3F3" TintOpacity="0.15" TintLuminosityOpacity="0.79" FallbackColor="#FFEDEFF4" />
                     <BitmapImage x:Key="Windows11StartGlyph" UriSource="ms-appx:///Assets/Windows11/start_whitetheme.ico" />
                     <BitmapImage x:Key="Windows11TaskViewGlyph" UriSource="ms-appx:///Assets/Windows11/taskview_whitetheme.ico" />
+                    <BitmapImage x:Key="Windows11TaskbarSearchGlyph" UriSource="ms-appx:///Assets/Windows11/darksearch_forwhitetheme.png" />
                     <BitmapImage x:Key="PowerButtonImageSource" UriSource="ms-appx:///powerLight.png" />
                     <AcrylicBrush
                         x:Key="ElementAcrylicBrush"
@@ -94,10 +127,12 @@
                     <SolidColorBrush x:Key="Windows11ItemPressedFill" Color="{ThemeResource SystemColorGrayTextColor}" />
                     <SolidColorBrush x:Key="Windows11TaskbarHoverFill" Color="{ThemeResource SystemColorGrayTextColor}" />
                     <SolidColorBrush x:Key="Windows11TaskbarHoverStroke" Color="{ThemeResource SystemColorWindowTextColor}" />
+                    <SolidColorBrush x:Key="Windows11TaskbarPressedStroke" Color="{ThemeResource SystemColorWindowTextColor}" />
                     <SolidColorBrush x:Key="Windows11StartAcrylic" Color="{ThemeResource SystemColorWindowColor}" />
                     <SolidColorBrush x:Key="Windows11TaskbarAcrylic" Color="{ThemeResource SystemColorWindowColor}" />
                     <BitmapImage x:Key="Windows11StartGlyph" UriSource="ms-appx:///Assets/Windows11/start_darktheme.ico" />
                     <BitmapImage x:Key="Windows11TaskViewGlyph" UriSource="ms-appx:///Assets/Windows11/taskview_darktheme.ico" />
+                    <BitmapImage x:Key="Windows11TaskbarSearchGlyph" UriSource="ms-appx:///Assets/Windows11/whitesearch_fordarktheme.png" />
                     <AcrylicBrush
                         x:Key="TaskbarAcrylicBrush"
                         BackgroundSource="Backdrop"

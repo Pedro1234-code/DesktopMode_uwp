@@ -12,50 +12,192 @@
     <Page.Resources>
         <Style x:Key="Windows11TaskbarAppStyle" TargetType="Button">
             <Setter Property="Padding" Value="0" />
-            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="UseSystemFocusVisuals" Value="True" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Grid Background="Transparent">
+                        <Grid Background="Transparent" Margin="2,3">
                             <VisualStateManager.VisualStateGroups>
                                 <VisualStateGroup x:Name="CommonStates">
-                                    <VisualStateGroup.Transitions>
-                                        <VisualTransition GeneratedDuration="0:0:0.083" />
-                                    </VisualStateGroup.Transitions>
                                     <VisualState x:Name="Normal" />
                                     <VisualState x:Name="PointerOver">
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="Hover" Storyboard.TargetProperty="Opacity" To="1" Duration="0" />
-                                        </Storyboard>
+                                        <VisualState.Setters>
+                                            <Setter Target="BackgroundElement.Background" Value="{ThemeResource Windows11TaskbarHoverFill}" />
+                                            <Setter Target="BackgroundElement.BorderBrush" Value="{ThemeResource Windows11TaskbarHoverStroke}" />
+                                            <Setter Target="MultiWindowElement.Background" Value="{ThemeResource Windows11TaskbarHoverFill}" />
+                                        </VisualState.Setters>
                                     </VisualState>
                                     <VisualState x:Name="Pressed">
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="PressedPlate" Storyboard.TargetProperty="Opacity" To="1" Duration="0" />
-                                            <DoubleAnimation Storyboard.TargetName="ItemContent" Storyboard.TargetProperty="Opacity" To="0.8" Duration="0" />
-                                        </Storyboard>
+                                        <VisualState.Setters>
+                                            <Setter Target="BackgroundElement.Background" Value="{ThemeResource Windows11ItemPressedFill}" />
+                                            <Setter Target="BackgroundElement.BorderBrush" Value="{ThemeResource Windows11TaskbarPressedStroke}" />
+                                            <Setter Target="MultiWindowElement.Background" Value="{ThemeResource Windows11ItemPressedFill}" />
+                                        </VisualState.Setters>
                                     </VisualState>
                                     <VisualState x:Name="Disabled">
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="ItemContent" Storyboard.TargetProperty="Opacity" To="0.4" Duration="0" />
-                                        </Storyboard>
+                                        <VisualState.Setters>
+                                            <Setter Target="Icon.Opacity" Value="0.4" />
+                                        </VisualState.Setters>
+                                    </VisualState>
+                                </VisualStateGroup>
+                                <VisualStateGroup x:Name="WindowGroupStates">
+                                    <VisualState x:Name="SingleWindow" />
+                                    <VisualState x:Name="MultipleWindows">
+                                        <VisualState.Setters>
+                                            <Setter Target="MultiWindowElement.Visibility" Value="Visible" />
+                                            <Setter Target="BackgroundElement.Margin" Value="0,0,4,0" />
+                                            <Setter Target="ActivePlate.Margin" Value="0,0,4,0" />
+                                            <Setter Target="Icon.Margin" Value="0,0,4,0" />
+                                            <Setter Target="RunningIndicator.Margin" Value="0,0,4,3" />
+                                        </VisualState.Setters>
+                                    </VisualState>
+                                </VisualStateGroup>
+                                <VisualStateGroup x:Name="RunningIndicatorStates">
+                                    <VisualState x:Name="ClosedApp" />
+                                    <VisualState x:Name="InactiveApp">
+                                        <VisualState.Setters>
+                                            <Setter Target="RunningIndicator.Visibility" Value="Visible" />
+                                        </VisualState.Setters>
+                                    </VisualState>
+                                    <VisualState x:Name="ActiveApp">
+                                        <VisualState.Setters>
+                                            <Setter Target="RunningIndicator.Visibility" Value="Visible" />
+                                            <Setter Target="RunningIndicator.Width" Value="16" />
+                                            <Setter Target="RunningIndicator.Fill" Value="{ThemeResource SystemControlHighlightAccentBrush}" />
+                                        </VisualState.Setters>
                                     </VisualState>
                                 </VisualStateGroup>
                             </VisualStateManager.VisualStateGroups>
-                            <Border Background="{TemplateBinding Background}" CornerRadius="{TemplateBinding CornerRadius}" IsHitTestVisible="False" />
-                            <Border x:Name="Hover" Background="{ThemeResource Windows11TaskbarHoverFill}"
-                                    BorderBrush="{ThemeResource Windows11TaskbarHoverStroke}" BorderThickness="1" CornerRadius="{TemplateBinding CornerRadius}"
-                                    Opacity="0" IsHitTestVisible="False" />
-                            <Border x:Name="PressedPlate" Background="{ThemeResource Windows11ItemPressedFill}"
-                                    CornerRadius="{TemplateBinding CornerRadius}" Opacity="0" IsHitTestVisible="False" />
-                            <ContentPresenter x:Name="ItemContent" Content="{TemplateBinding Content}"
-                                              ContentTemplate="{TemplateBinding ContentTemplate}" Margin="{TemplateBinding Padding}"
-                                              HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
-                                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
+                            <Border x:Name="MultiWindowElement" Width="9" HorizontalAlignment="Right"
+                                    CornerRadius="0,4,4,0" Visibility="Collapsed" IsHitTestVisible="False"
+                                    BorderThickness="0,1,1,1" BorderBrush="{ThemeResource Windows11TaskbarHoverStroke}"
+                                    Background="{ThemeResource Windows11ItemHoverFill}">
+                                <Border.BackgroundTransition><BrushTransition Duration="0:0:0.083" /></Border.BackgroundTransition>
+                            </Border>
+                            <Border x:Name="ActivePlate" CornerRadius="{TemplateBinding CornerRadius}"
+                                    Background="{ThemeResource Windows11ItemHoverFill}" Visibility="Collapsed"
+                                    BorderBrush="{ThemeResource Windows11TaskbarHoverStroke}" BorderThickness="1"
+                                    IsHitTestVisible="False" />
+                            <Border x:Name="BackgroundElement" CornerRadius="{TemplateBinding CornerRadius}"
+                                    Background="Transparent" BorderThickness="1" IsHitTestVisible="False">
+                                <Border.BackgroundTransition><BrushTransition Duration="0:0:0.083" /></Border.BackgroundTransition>
+                            </Border>
+                            <ContentPresenter x:Name="Icon" Content="{TemplateBinding Content}"
+                                              ContentTemplate="{TemplateBinding ContentTemplate}"
+                                              Foreground="{TemplateBinding Foreground}" FontSize="{TemplateBinding FontSize}"
+                                              HorizontalAlignment="Center" VerticalAlignment="Center" />
+                            <Rectangle x:Name="RunningIndicator" Width="6" Height="3" RadiusX="1.5" RadiusY="1.5"
+                                       Margin="0,0,0,3" HorizontalAlignment="Center" VerticalAlignment="Bottom"
+                                       Fill="{ThemeResource SystemControlForegroundBaseMediumBrush}"
+                                       Visibility="Collapsed" IsHitTestVisible="False" />
                         </Grid>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>
         </Style>
+        <Style x:Key="Windows11TaskbarSearchStyle" TargetType="local:Windows11SearchButton">
+            <Setter Property="Height" Value="48" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="CornerRadius" Value="6" />
+            <Setter Property="UseSystemFocusVisuals" Value="True" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="local:Windows11SearchButton">
+                        <Grid Background="Transparent">
+                            <VisualStateManager.VisualStateGroups>
+                                <VisualStateGroup x:Name="CommonStates">
+                                    <VisualStateGroup.Transitions>
+                                        <VisualTransition To="Pressed" GeneratedDuration="0:0:0.07" />
+                                        <VisualTransition From="Pressed" GeneratedDuration="0:0:0.18">
+                                            <VisualTransition.GeneratedEasingFunction>
+                                                <CubicEase EasingMode="EaseOut" />
+                                            </VisualTransition.GeneratedEasingFunction>
+                                        </VisualTransition>
+                                        <VisualTransition GeneratedDuration="0:0:0.12" />
+                                    </VisualStateGroup.Transitions>
+                                    <VisualState x:Name="Normal">
+                                        <VisualState.Setters>
+                                            <Setter Target="InteractionPlate.Opacity" Value="0" />
+                                        </VisualState.Setters>
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleX" To="1" Duration="0" />
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleY" To="1" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="PointerOver">
+                                        <VisualState.Setters>
+                                            <Setter Target="InteractionPlate.Opacity" Value="1" />
+                                            <Setter Target="InteractionPlate.Background" Value="{ThemeResource Windows11TaskbarHoverFill}" />
+                                            <Setter Target="InteractionPlate.BorderBrush" Value="{ThemeResource Windows11TaskbarHoverStroke}" />
+                                        </VisualState.Setters>
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleX" To="1.04" Duration="0" />
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleY" To="1.04" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="Pressed">
+                                        <VisualState.Setters>
+                                            <Setter Target="InteractionPlate.Opacity" Value="1" />
+                                            <Setter Target="InteractionPlate.Background" Value="{ThemeResource Windows11ItemPressedFill}" />
+                                            <Setter Target="InteractionPlate.BorderBrush" Value="{ThemeResource Windows11TaskbarPressedStroke}" />
+                                        </VisualState.Setters>
+                                        <Storyboard>
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleX" To="0.85" Duration="0" />
+                                            <DoubleAnimation Storyboard.TargetName="IconScale" Storyboard.TargetProperty="ScaleY" To="0.85" Duration="0" />
+                                        </Storyboard>
+                                    </VisualState>
+                                    <VisualState x:Name="Disabled">
+                                        <VisualState.Setters>
+                                            <Setter Target="SearchContent.Opacity" Value="0.4" />
+                                        </VisualState.Setters>
+                                    </VisualState>
+                                </VisualStateGroup>
+                                <VisualStateGroup x:Name="SearchDisplayStates">
+                                    <VisualState x:Name="SearchIcon" />
+                                    <VisualState x:Name="SearchBox">
+                                        <VisualState.Setters>
+                                            <Setter Target="SearchContent.Height" Value="32" />
+                                            <Setter Target="BackgroundElement.CornerRadius" Value="16" />
+                                            <Setter Target="InteractionPlate.CornerRadius" Value="16" />
+                                            <Setter Target="BackgroundElement.Opacity" Value="1" />
+                                            <Setter Target="IconHost.HorizontalAlignment" Value="Left" />
+                                            <Setter Target="IconHost.Margin" Value="12,0,0,0" />
+                                            <Setter Target="SearchIconImage.Visibility" Value="Collapsed" />
+                                            <Setter Target="SearchBoxFontIcon.Visibility" Value="Visible" />
+                                            <Setter Target="SearchBoxTextBlock.Visibility" Value="Visible" />
+                                        </VisualState.Setters>
+                                    </VisualState>
+                                </VisualStateGroup>
+                            </VisualStateManager.VisualStateGroups>
+                            <Grid x:Name="SearchContent" Height="40" Margin="2,0" VerticalAlignment="Center" IsHitTestVisible="False">
+                                <Border x:Name="BackgroundElement" Opacity="0" CornerRadius="{TemplateBinding CornerRadius}"
+                                        BorderThickness="1" BorderBrush="{ThemeResource Windows11TaskbarHoverStroke}"
+                                        Background="{ThemeResource SystemControlBackgroundBaseLowBrush}" />
+                                <Border x:Name="InteractionPlate" Opacity="0" CornerRadius="{TemplateBinding CornerRadius}"
+                                        BorderThickness="1" BorderBrush="Transparent" Background="Transparent">
+                                    <Border.BackgroundTransition><BrushTransition Duration="0:0:0.083" /></Border.BackgroundTransition>
+                                    <Border.OpacityTransition><ScalarTransition Duration="0:0:0.083" /></Border.OpacityTransition>
+                                </Border>
+                                <Grid x:Name="IconHost" HorizontalAlignment="Center" VerticalAlignment="Center"
+                                      RenderTransformOrigin="0.5,0.5" AutomationProperties.AccessibilityView="Raw">
+                                    <Grid.RenderTransform><ScaleTransform x:Name="IconScale" /></Grid.RenderTransform>
+                                    <Image x:Name="SearchIconImage" Width="24" Height="24" Stretch="Uniform"
+                                           Source="{ThemeResource Windows11TaskbarSearchGlyph}" />
+                                    <FontIcon x:Name="SearchBoxFontIcon" Glyph="&#xF78B;" FontSize="16"
+                                              FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                              Foreground="{TemplateBinding Foreground}" Visibility="Collapsed" />
+                                </Grid>
+                                <TextBlock x:Name="SearchBoxTextBlock" Text="Search" Margin="37,0,16,1" FontSize="14"
+                                           Foreground="{ThemeResource SystemControlForegroundBaseMediumHighBrush}"
+                                           VerticalAlignment="Center" Visibility="Collapsed"
+                                           AutomationProperties.AccessibilityView="Raw" />
+                            </Grid>
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <Style x:Key="Windows11LaunchButtonStyle" TargetType="Button">
             <Setter Property="Width" Value="48" />
             <Setter Property="Height" Value="42" />
@@ -98,8 +240,10 @@
                                     </VisualState>
                                 </VisualStateGroup>
                             </VisualStateManager.VisualStateGroups>
-                            <Border x:Name="HoverPlate" CornerRadius="{TemplateBinding CornerRadius}" Opacity="0"
-                                    Background="{ThemeResource SystemControlHighlightListLowBrush}" />
+                            <Border x:Name="HoverPlate" Width="40" Height="40" CornerRadius="4" Opacity="0"
+                                    HorizontalAlignment="Center" VerticalAlignment="Center" IsHitTestVisible="False"
+                                    Background="{ThemeResource Windows11TaskbarHoverFill}"
+                                    BorderBrush="{ThemeResource Windows11TaskbarHoverStroke}" BorderThickness="1" />
                             <ContentPresenter x:Name="IconPresenter" Content="{TemplateBinding Content}"
                                               HorizontalAlignment="Center" VerticalAlignment="Center" RenderTransformOrigin="0.5,0.5">
                                 <ContentPresenter.RenderTransform>
@@ -311,6 +455,12 @@
                     Command="{x:Bind Mode=OneWay, Path=ViewModel.StartButtonClickedCommand}">
                 <Image Width="24" Height="24" Source="{ThemeResource Windows11StartGlyph}" Stretch="Uniform" />
             </Button>
+
+            <local:Windows11SearchButton x:Name="Windows11TaskbarSearch" Visibility="Collapsed"
+                                         Style="{StaticResource Windows11TaskbarSearchStyle}"
+                                         Foreground="{x:Bind ViewModel.ThemedIconBrush, Mode=OneWay}"
+                                         AllowFocusOnInteraction="False" AutomationProperties.Name="Search" ToolTipService.ToolTip="Search"
+                                         Click="Windows11TaskbarSearch_Click" />
 
             <Button
                 x:Name="TaskViewButton"

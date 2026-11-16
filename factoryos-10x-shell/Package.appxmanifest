@@ -13,7 +13,7 @@
   <Identity
     Name="Microsoft.MicrosoftEdge.CoreShell"
     Publisher="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
-    Version="1.0.46.0" />
+    Version="1.0.47.0" />
 
   <mp:PhoneIdentity PhoneProductId="27a684a3-fafc-4a41-a89d-7fd468179a57" PhonePublisherId="00000000-0000-0000-0000-000000000000"/>
 

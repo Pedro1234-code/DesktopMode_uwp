@@ -52,6 +52,7 @@ namespace factoryos_10x_shell.Controls
         {
             if (m_window != null) m_window.PropertyChanged -= Window_PropertyChanged;
             m_window = args.NewValue as Win32WindowModel;
+            UpdateTitleIconPlaceholder();
             if (m_window == null) return;
             Width = m_window.Width;
             Height = m_window.Height;
@@ -163,8 +164,14 @@ namespace factoryos_10x_shell.Controls
             UpdateLayout();
         }
 
+        private void UpdateTitleIconPlaceholder()
+        {
+            TitleIconPlaceholder.Visibility = m_window?.IconSource == null ? Visibility.Visible : Visibility.Collapsed;
+        }
+
         private void Window_PropertyChanged(object sender, PropertyChangedEventArgs e)
         {
+            if (e.PropertyName == nameof(Win32WindowModel.IconSource)) UpdateTitleIconPlaceholder();
             if (e.PropertyName == nameof(Win32WindowModel.Width)) Width = m_window.Width;
             if (e.PropertyName == nameof(Win32WindowModel.Height)) Height = m_window.Height;
             if (e.PropertyName == nameof(Win32WindowModel.IsActive) || e.PropertyName == nameof(Win32WindowModel.Visibility))

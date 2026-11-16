@@ -26,7 +26,7 @@ namespace factoryos_10x_shell.Services.Helpers
 
     public static class UpdateCheckService
     {
-        public const int CurrentVersion = 21286;
+        public const int CurrentVersion = 22000;
         public const string VersionUrl =
             "https://github.com/Pedro1234-code/DesktopMode_uwp/releases/download/updt/version.txt";
 

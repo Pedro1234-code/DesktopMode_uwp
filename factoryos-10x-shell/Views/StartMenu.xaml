@@ -9,44 +9,43 @@
 
     <Page.Resources>
         <Style x:Key="Windows11StartEntryStyle" TargetType="Button">
-            <Setter Property="Padding" Value="8,4" />
+            <Setter Property="Padding" Value="11,4" />
             <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderBrush" Value="Transparent" />
+            <Setter Property="UseSystemFocusVisuals" Value="True" />
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
                         <Grid Background="Transparent">
                             <VisualStateManager.VisualStateGroups>
                                 <VisualStateGroup x:Name="CommonStates">
-                                    <VisualStateGroup.Transitions>
-                                        <VisualTransition GeneratedDuration="0:0:0.083" />
-                                    </VisualStateGroup.Transitions>
                                     <VisualState x:Name="Normal" />
                                     <VisualState x:Name="PointerOver">
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="Hover" Storyboard.TargetProperty="Opacity" To="1" Duration="0" />
-                                        </Storyboard>
+                                        <VisualState.Setters>
+                                            <Setter Target="Backplate.Background" Value="{ThemeResource Windows11ItemHoverFill}" />
+                                        </VisualState.Setters>
                                     </VisualState>
                                     <VisualState x:Name="Pressed">
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="PressedPlate" Storyboard.TargetProperty="Opacity" To="1" Duration="0" />
-                                            <DoubleAnimation Storyboard.TargetName="ItemContent" Storyboard.TargetProperty="Opacity" To="0.8" Duration="0" />
-                                        </Storyboard>
+                                        <VisualState.Setters>
+                                            <Setter Target="Backplate.Background" Value="{ThemeResource Windows11ItemPressedFill}" />
+                                        </VisualState.Setters>
                                     </VisualState>
                                     <VisualState x:Name="Disabled">
-                                        <Storyboard>
-                                            <DoubleAnimation Storyboard.TargetName="ItemContent" Storyboard.TargetProperty="Opacity" To="0.4" Duration="0" />
-                                        </Storyboard>
+                                        <VisualState.Setters>
+                                            <Setter Target="ItemContent.Opacity" Value="0.4" />
+                                        </VisualState.Setters>
                                     </VisualState>
                                 </VisualStateGroup>
                             </VisualStateManager.VisualStateGroups>
-                            <Border Background="{TemplateBinding Background}" CornerRadius="{TemplateBinding CornerRadius}" IsHitTestVisible="False" />
-                            <Border x:Name="Hover" Background="{ThemeResource Windows11ItemHoverFill}"
-                                    CornerRadius="{TemplateBinding CornerRadius}"
-                                    Opacity="0" IsHitTestVisible="False" />
-                            <Border x:Name="PressedPlate" Background="{ThemeResource Windows11ItemPressedFill}"
-                                    CornerRadius="{TemplateBinding CornerRadius}" Opacity="0" IsHitTestVisible="False" />
+                            <Border x:Name="Backplate" Background="{TemplateBinding Background}"
+                                    BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="1"
+                                    CornerRadius="{TemplateBinding CornerRadius}" IsHitTestVisible="False">
+                                <Border.BackgroundTransition><BrushTransition Duration="0:0:0.083" /></Border.BackgroundTransition>
+                            </Border>
                             <ContentPresenter x:Name="ItemContent" Content="{TemplateBinding Content}"
-                                              ContentTemplate="{TemplateBinding ContentTemplate}" Margin="{TemplateBinding Padding}"
+                                              ContentTemplate="{TemplateBinding ContentTemplate}"
+                                              Foreground="{TemplateBinding Foreground}" FontSize="{TemplateBinding FontSize}"
+                                              Margin="{TemplateBinding Padding}"
                                               HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
                                               VerticalAlignment="{TemplateBinding VerticalContentAlignment}" />
                         </Grid>
@@ -76,7 +75,7 @@
 
         <Border x:Name="Windows10XStartPlate" Grid.RowSpan="2" CornerRadius="4"
                 Background="{ThemeResource TaskbarAcrylicBrush}" IsHitTestVisible="False" />
-        <Border x:Name="Windows11StartPlate" Grid.RowSpan="2" CornerRadius="12" BorderThickness="1"
+        <Border x:Name="Windows11StartPlate" Grid.RowSpan="2" CornerRadius="8" BorderThickness="1"
                 Background="{ThemeResource Windows11StartAcrylic}" IsHitTestVisible="False" Visibility="Collapsed" />
         <Grid Grid.Row="0">
             <Border
@@ -97,9 +96,16 @@
                         <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="*" />
                     </Grid.ColumnDefinitions>
+                    <Border x:Name="Windows11SearchBackground" Grid.RowSpan="2" Grid.ColumnSpan="2"
+                            CornerRadius="4" BorderThickness="1" IsHitTestVisible="False" Visibility="Collapsed" />
+                    <Border x:Name="Windows11SearchUnderline" Grid.RowSpan="2" Grid.ColumnSpan="2"
+                            Height="2" Margin="1,0,1,0" VerticalAlignment="Bottom" CornerRadius="0,0,3,3"
+                            Background="{ThemeResource SystemControlHighlightAccentBrush}"
+                            IsHitTestVisible="False" Visibility="Collapsed" />
                     <TextBlock
                         Grid.RowSpan="2"
                         Grid.Column="0"
+                        x:Name="SearchIcon"
                         Margin="17,16,0,0"
                         VerticalAlignment="Top"
                         FontFamily="Segoe MDL2 Assets"
@@ -116,8 +122,13 @@
                         VerticalAlignment="Top"
                         PlaceholderText="Search the web or your devices"
                         TextChanged="AppSearchBox_TextChanged"
-                        KeyDown="AppSearchBox_KeyDown"
-                        Style="{ThemeResource TextBoxStyleBlack}" />
+                        KeyDown="AppSearchBox_KeyDown">
+                        <TextBox.Resources>
+                            <SolidColorBrush x:Key="TextControlBackground" Color="Transparent" />
+                            <SolidColorBrush x:Key="TextControlBackgroundPointerOver" Color="Transparent" />
+                            <SolidColorBrush x:Key="TextControlBackgroundFocused" Color="Transparent" />
+                        </TextBox.Resources>
+                    </TextBox>
                 </Grid>
             </Border>
         </Grid>
@@ -178,6 +189,7 @@
                                         <Button.ContextFlyout>
                                             <MenuFlyout Opened="ContextFlyout_Opened" Closed="ContextFlyout_Closed">
                                                 <MenuFlyoutItem Click="PinToTaskbar_Click" Text="Pin to taskbar" />
+                                                <MenuFlyoutItem Click="CreateDesktopShortcut_Click" Text="Create desktop shortcut" Tag="DesktopShortcut" />
                                             </MenuFlyout>
                                         </Button.ContextFlyout>
                                     </Button>
@@ -219,6 +231,7 @@
                                             <MenuFlyout Opened="ContextFlyout_Opened" Closed="ContextFlyout_Closed">
                                                 <MenuFlyoutItem Click="NewWebAppWindow_Click" Text="{Binding NewInstanceText}" />
                                                 <MenuFlyoutItem Click="PinWebApp_Click" Text="Pin to taskbar" />
+                                                <MenuFlyoutItem Click="CreateDesktopShortcut_Click" Text="Create desktop shortcut" Tag="DesktopShortcut" />
                                                     <MenuFlyoutItem Click="UninstallWebApp_Click" Text="Uninstall" />
                                                 </MenuFlyout>
                                             </Button.ContextFlyout>
@@ -293,42 +306,70 @@
                 <RowDefinition Height="*" />
                 <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
-            <Grid Margin="30,6,30,8">
+            <Grid Height="42" Margin="63,0,64,0">
                 <TextBlock x:Name="Windows11StartHeading" Text="Pinned" FontSize="16" FontWeight="SemiBold" VerticalAlignment="Center" />
-                <Button x:Name="Windows11AppsToggle" Content="All apps  ›" Click="Windows11AppsToggle_Click"
-                        HorizontalAlignment="Right" FontSize="12" CornerRadius="5" />
+                <Button x:Name="Windows11AppsToggle" Click="Windows11AppsToggle_Click"
+                        HorizontalAlignment="Right" VerticalAlignment="Center" MinHeight="0" Padding="7,2,6,4" CornerRadius="4"
+                        AutomationProperties.Name="{Binding Text, ElementName=Windows11AppsToggleLabel}">
+                    <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+                        <FontIcon x:Name="Windows11BackChevron" Glyph="&#xE76B;" FontSize="10" Margin="0,0,10,-1"
+                                  FontFamily="{ThemeResource SymbolThemeFontFamily}" MirroredWhenRightToLeft="True"
+                                  VerticalAlignment="Center" Visibility="Collapsed" />
+                        <TextBlock x:Name="Windows11AppsToggleLabel" Text="All apps" FontSize="12"
+                                   VerticalAlignment="Center" TextWrapping="NoWrap" />
+                        <FontIcon x:Name="Windows11ForwardChevron" Glyph="&#xE76C;" FontSize="10" Margin="10,0,0,-1"
+                                  FontFamily="{ThemeResource SymbolThemeFontFamily}" MirroredWhenRightToLeft="True"
+                                  VerticalAlignment="Center" />
+                    </StackPanel>
+                </Button>
             </Grid>
-            <ScrollViewer Grid.Row="1" HorizontalScrollMode="Disabled" VerticalScrollBarVisibility="Auto">
-                <StackPanel Margin="24,0,24,16">
-                    <GridView x:Name="Windows11Pins" ItemsSource="{x:Bind Windows11PinnedApps}"
-                              SelectionMode="None" ScrollViewer.VerticalScrollMode="Disabled"
-                              ScrollViewer.VerticalScrollBarVisibility="Disabled" HorizontalAlignment="Center">
-                        <GridView.ItemsPanel><ItemsPanelTemplate><ItemsWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="6" /></ItemsPanelTemplate></GridView.ItemsPanel>
-                        <GridView.ItemTemplate>
-                            <DataTemplate>
-                                <Button Width="86" Height="76" Padding="0" CornerRadius="6" Style="{StaticResource Windows11StartEntryStyle}"
+            <ScrollViewer x:Name="Windows11PinnedScroll" Grid.Row="1" HorizontalScrollMode="Disabled" VerticalScrollBarVisibility="Auto">
+                <StackPanel Margin="32,0,4,16">
+                    <Grid x:Name="Windows11PinsArea" Height="264" Margin="0,3,0,0" Background="Transparent" SizeChanged="Windows11PinsArea_SizeChanged">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="24" />
+                        </Grid.ColumnDefinitions>
+                        <GridView x:Name="Windows11Pins"
+                                   ItemsSource="{x:Bind Windows11PinnedApps}"
+                                   Height="264" SelectionMode="None" Padding="0"
+                                   ScrollViewer.VerticalScrollMode="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled"
+                                   HorizontalAlignment="Stretch">
+                            <GridView.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <ItemsWrapGrid Orientation="Horizontal" ItemWidth="92" ItemHeight="88" MaximumRowsOrColumns="6" />
+                                </ItemsPanelTemplate>
+                            </GridView.ItemsPanel>
+                            <GridView.ItemTemplate>
+                                <DataTemplate>
+                                    <Button Width="86" Height="76" Padding="0" CornerRadius="6" Style="{StaticResource Windows11StartEntryStyle}"
                                         Click="Windows11App_Click" RightTapped="Windows11App_RightTapped" ToolTipService.ToolTip="{Binding IconName}">
-                                    <StackPanel Spacing="5" HorizontalAlignment="Center">
-                                        <Grid Width="32" Height="32" HorizontalAlignment="Center">
-                                            <FontIcon Glyph="{Binding IconGlyph}" FontSize="25" />
-                                            <Image Source="{Binding IconSource}" Stretch="Uniform" />
-                                        </Grid>
-                                        <TextBlock Width="72" Text="{Binding IconName}" FontSize="11" TextAlignment="Center" TextTrimming="CharacterEllipsis" />
-                                    </StackPanel>
-                                </Button>
-                            </DataTemplate>
-                        </GridView.ItemTemplate>
-                    </GridView>
-                    <StackPanel x:Name="Windows11Recommended" Margin="6,20,6,0" Spacing="8">
-                        <TextBlock Text="Recommended" FontSize="16" FontWeight="SemiBold" />
-                        <TextBlock x:Name="Windows11RecentHint" Text="Apps you open will appear here." Opacity="0.65" />
+                                        <StackPanel Spacing="5" HorizontalAlignment="Center">
+                                            <Grid Width="32" Height="32" HorizontalAlignment="Center">
+                                                <FontIcon Glyph="{Binding IconGlyph}" FontSize="25" />
+                                                <Image Source="{Binding IconSource}" Stretch="Uniform" />
+                                            </Grid>
+                                            <TextBlock Width="72" Text="{Binding IconName}" FontSize="12" TextAlignment="Center" TextWrapping="Wrap" MaxLines="2" TextTrimming="CharacterEllipsis" />
+                                        </StackPanel>
+                                    </Button>
+                                </DataTemplate>
+                            </GridView.ItemTemplate>
+                        </GridView>
+                        <StackPanel x:Name="Windows11PinPager" Grid.Column="1" HorizontalAlignment="Center"
+                                    VerticalAlignment="Center" Visibility="Collapsed" />
+                    </Grid>
+                    <StackPanel x:Name="Windows11Recommended" Margin="31,20,59,0">
+                        <TextBlock Text="Recommended" Height="42" FontSize="16" FontWeight="SemiBold" LineHeight="42"
+                                   LineStackingStrategy="BlockLineHeight" />
+                        <TextBlock x:Name="Windows11RecentHint" Text="Apps you open will appear here." Margin="0,3,0,0"
+                                   TextWrapping="Wrap" FontSize="12" Opacity="0.72" />
                         <GridView ItemsSource="{x:Bind Windows11RecentApps}" SelectionMode="None"
                                   ScrollViewer.VerticalScrollMode="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled">
                             <GridView.ItemsPanel><ItemsPanelTemplate><ItemsWrapGrid Orientation="Horizontal" MaximumRowsOrColumns="2" /></ItemsPanelTemplate></GridView.ItemsPanel>
                             <GridView.ItemTemplate>
                                 <DataTemplate>
                                     <Button Style="{StaticResource Windows11StartEntryStyle}" CornerRadius="6" HorizontalAlignment="Stretch"
-                                            HorizontalContentAlignment="Left" Click="Windows11App_Click">
+                                            HorizontalContentAlignment="Left" Click="Windows11App_Click" RightTapped="Windows11App_RightTapped">
                                         <StackPanel Width="218" Orientation="Horizontal" Spacing="10">
                                             <Image Source="{Binding IconSource}" Width="24" Height="24" />
                                             <TextBlock MaxWidth="170" Text="{Binding IconName}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
@@ -338,40 +379,107 @@
                             </GridView.ItemTemplate>
                         </GridView>
                     </StackPanel>
-                    <ItemsControl x:Name="Windows11AllApps" ItemsSource="{x:Bind Windows11ListedApps}" Visibility="Collapsed">
-                        <ItemsControl.ItemTemplate>
-                            <DataTemplate>
-                                <Button MinHeight="42" Style="{StaticResource Windows11StartEntryStyle}" CornerRadius="6"
-                                        HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
-                                        Click="Windows11App_Click" RightTapped="Windows11App_RightTapped">
-                                    <StackPanel Orientation="Horizontal" Spacing="12">
-                                        <Grid Width="24" Height="24">
-                                            <FontIcon Glyph="{Binding IconGlyph}" FontSize="19" />
-                                            <Image Source="{Binding IconSource}" Stretch="Uniform" />
-                                        </Grid>
-                                        <TextBlock Text="{Binding IconName}" VerticalAlignment="Center" />
-                                    </StackPanel>
-                                </Button>
-                            </DataTemplate>
-                        </ItemsControl.ItemTemplate>
-                    </ItemsControl>
-                    <TextBlock x:Name="Windows11NoResults" Text="No apps found." Margin="12" Visibility="Collapsed" />
                 </StackPanel>
             </ScrollViewer>
-            <Border x:Name="Windows11BottomBar" Grid.Row="2" CornerRadius="0,0,12,12" Padding="26,5">
+            <ListView x:Name="Windows11AllApps" Grid.Row="1" Margin="52,0,48,0" Padding="0,0,0,16"
+                      Visibility="Collapsed" SelectionMode="None"
+                      ScrollViewer.HorizontalScrollMode="Disabled" ScrollViewer.HorizontalScrollBarVisibility="Disabled">
+                <ListView.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <ItemsStackPanel AreStickyGroupHeadersEnabled="False" />
+                    </ItemsPanelTemplate>
+                </ListView.ItemsPanel>
+                <ListView.GroupStyle>
+                    <GroupStyle>
+                        <GroupStyle.HeaderContainerStyle>
+                            <Style TargetType="ListViewHeaderItem">
+                                <Setter Property="Padding" Value="0" />
+                                <Setter Property="MinHeight" Value="0" />
+                                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                <Setter Property="IsTabStop" Value="False" />
+                                <Setter Property="Template">
+                                    <Setter.Value>
+                                        <ControlTemplate TargetType="ListViewHeaderItem">
+                                            <ContentPresenter Content="{TemplateBinding Content}"
+                                                              ContentTemplate="{TemplateBinding ContentTemplate}"
+                                                              HorizontalAlignment="Stretch" VerticalAlignment="Center" />
+                                        </ControlTemplate>
+                                    </Setter.Value>
+                                </Setter>
+                            </Style>
+                        </GroupStyle.HeaderContainerStyle>
+                        <GroupStyle.HeaderTemplate>
+                            <DataTemplate x:DataType="local:Windows11AppGroup">
+                                <Button Tag="{x:Bind Key}" AutomationProperties.Name="{x:Bind Key}"
+                                        Style="{StaticResource Windows11StartEntryStyle}" HorizontalAlignment="Stretch"
+                                        HorizontalContentAlignment="Left" MinHeight="40" CornerRadius="4"
+                                        Click="Windows11AlphabetHeader_Click">
+                                    <TextBlock Text="{x:Bind Label}" FontSize="14" FontWeight="Normal"
+                                               FontFamily="{x:Bind LabelFontFamily}" />
+                                </Button>
+                            </DataTemplate>
+                        </GroupStyle.HeaderTemplate>
+                    </GroupStyle>
+                </ListView.GroupStyle>
+                <ListView.ItemContainerStyle>
+                    <Style TargetType="ListViewItem">
+                        <Setter Property="Padding" Value="0" />
+                        <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                        <Setter Property="IsTabStop" Value="False" />
+                        <Setter Property="MinHeight" Value="0" />
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="ListViewItem">
+                                    <ContentPresenter Content="{TemplateBinding Content}"
+                                                      ContentTemplate="{TemplateBinding ContentTemplate}"
+                                                      HorizontalAlignment="Stretch" VerticalAlignment="Center" />
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                </ListView.ItemContainerStyle>
+                <ListView.ItemTemplate>
+                    <DataTemplate>
+                        <Button MinHeight="40" Style="{StaticResource Windows11StartEntryStyle}" CornerRadius="4"
+                                HorizontalAlignment="Stretch" HorizontalContentAlignment="Left"
+                                Click="Windows11App_Click" RightTapped="Windows11App_RightTapped">
+                            <StackPanel Orientation="Horizontal" Spacing="12">
+                                <Grid Width="24" Height="24">
+                                    <FontIcon Glyph="{Binding IconGlyph}" FontSize="19" />
+                                    <Image Source="{Binding IconSource}" Stretch="Uniform" />
+                                </Grid>
+                                <TextBlock Text="{Binding IconName}" VerticalAlignment="Center" TextTrimming="CharacterEllipsis" />
+                            </StackPanel>
+                        </Button>
+                    </DataTemplate>
+                </ListView.ItemTemplate>
+            </ListView>
+            <ScrollViewer x:Name="Windows11AlphabetView" Grid.Row="1" Visibility="Collapsed"
+                          HorizontalScrollMode="Disabled" HorizontalScrollBarVisibility="Disabled"
+                          KeyDown="Windows11AlphabetView_KeyDown">
+                <Grid x:Name="Windows11AlphabetGrid" Margin="0,24,0,16" HorizontalAlignment="Center" />
+            </ScrollViewer>
+
+            <TextBlock x:Name="Windows11NoResults" Grid.Row="1" Text="No apps found." Margin="63,12,63,0"
+                       VerticalAlignment="Top" IsHitTestVisible="False" Visibility="Collapsed" />
+            <Border x:Name="Windows11BottomBar" Grid.Row="2" Height="64" CornerRadius="0,0,8,8" Padding="54,0">
                 <Grid>
-                    <Button Background="Transparent" BorderThickness="0" CornerRadius="6" Click="SettingsButton_click"
-                            ToolTipService.ToolTip="Settings" HorizontalAlignment="Left">
+                    <Button Style="{StaticResource Windows11StartEntryStyle}" Height="40" CornerRadius="4" Click="SettingsButton_click"
+                            ToolTipService.ToolTip="Settings" HorizontalAlignment="Left" VerticalAlignment="Center">
                         <StackPanel Orientation="Horizontal" Spacing="9">
-                            <SymbolIcon Symbol="Contact" />
+                            <Grid Width="32" Height="32">
+                                <Ellipse Fill="{ThemeResource SystemControlForegroundBaseHighBrush}" />
+                                <FontIcon Glyph="&#xE77B;" FontSize="20"
+                                          Foreground="{ThemeResource SystemControlBackgroundAltHighBrush}" />
+                            </Grid>
                             <TextBlock Text="Desktop Mode" VerticalAlignment="Center" />
                         </StackPanel>
                     </Button>
-                    <StackPanel HorizontalAlignment="Right" Orientation="Horizontal" Spacing="6">
-                        <Button Background="Transparent" BorderThickness="0" CornerRadius="6" Click="InstallWebAppButton_Click" ToolTipService.ToolTip="Install app">
+                    <StackPanel HorizontalAlignment="Right" VerticalAlignment="Center" Orientation="Horizontal" Spacing="6">
+                        <Button Style="{StaticResource Windows11StartEntryStyle}" Width="40" Height="40" Padding="0" CornerRadius="4" Click="InstallWebAppButton_Click" ToolTipService.ToolTip="Install app">
                             <SymbolIcon Symbol="Add" />
                         </Button>
-                        <Button Background="Transparent" BorderThickness="0" CornerRadius="6" Click="PowerButton_click" ToolTipService.ToolTip="Power">
+                        <Button Style="{StaticResource Windows11StartEntryStyle}" Width="40" Height="40" Padding="0" CornerRadius="4" Click="PowerButton_click" ToolTipService.ToolTip="Power">
                             <FontIcon Glyph="&#xE7E8;" FontSize="17" />
                         </Button>
                     </StackPanel>

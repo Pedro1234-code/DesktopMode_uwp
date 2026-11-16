@@ -30,6 +30,8 @@ using Windows.UI.Xaml.Navigation;
 using Windows.System.UserProfile;
 using Windows.Storage;
 using Windows.Storage.Pickers;
+using Windows.Storage.Search;
+using System.Collections.Specialized;
 using System.Threading.Tasks;
 using factoryos_10x_shell.Services.Helpers;
 using factoryos_10x_shell.Library.Services.WebApps;
@@ -43,6 +45,8 @@ namespace factoryos_10x_shell.Views
     public sealed partial class MainDesktop : Page
     {
         private Storyboard OpenStartStoryboard { get; set; }
+        private bool m_startOpening;
+        private bool m_taskbarSearchFocusPending;
         private Storyboard CloseStartStoryboard { get; set; }
 
         private Storyboard OpenActionStoryboard { get; set; }
@@ -112,6 +116,9 @@ namespace factoryos_10x_shell.Views
                 m_taskbarHideTimer.Stop();
             };
             DataContext = App.ServiceProvider.GetRequiredService<MainDesktopViewModel>();
+            // The Start view model registers the built-in apps in the shared catalog.
+            _ = App.ServiceProvider.GetRequiredService<StartMenuViewModel>();
+            ActualThemeChanged += (sender, args) => ApplyDefaultWallpaper();
 
             m_startManager = App.ServiceProvider.GetRequiredService<IStartManagerService>();
             m_startManager.StartVisibilityChanged += StartManager_StartVisibilityChanged;
@@ -120,6 +127,22 @@ namespace factoryos_10x_shell.Views
             m_actionManager.ActionVisibilityChanged += ActionCenterManager_ActionVisibilityChanged;
             m_windowManager = App.ServiceProvider.GetRequiredService<IWindowManagerService>();
             m_webAppService = App.ServiceProvider.GetRequiredService<IWebAppService>();
+            DesktopSurface.AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler(DesktopIcons_PointerPressed), true);
+            DesktopSurface.AddHandler(UIElement.PointerMovedEvent, new PointerEventHandler(DesktopIcons_PointerMoved), true);
+            DesktopSurface.AddHandler(UIElement.PointerReleasedEvent, new PointerEventHandler(DesktopIcons_PointerReleased), true);
+            DesktopSurface.PointerCanceled += DesktopIcons_PointerCanceled;
+            DesktopSurface.PointerCaptureLost += (sender, args) =>
+            {
+                if (ReferenceEquals(args.OriginalSource, DesktopSurface))
+                    EndDesktopSelection();
+            };
+            DesktopIcons.PointerCaptureLost += (sender, args) =>
+            {
+                if (ReferenceEquals(args.OriginalSource, DesktopIcons))
+                    DesktopIcons_PointerCanceled(sender, args);
+            };
+            Loaded += DesktopIcons_Loaded;
+            Unloaded += DesktopIcons_Unloaded;
             m_shellWindowCoordinator = App.ServiceProvider.GetRequiredService<ShellWindowCoordinator>();
             m_windowManager.DesktopFocusRequested += WindowManager_DesktopFocusRequested;
             m_windowManager.TaskViewChanged += WindowManager_TaskViewChanged;
@@ -138,6 +161,7 @@ namespace factoryos_10x_shell.Views
             Loaded += MainDesktop_Loaded;
             SizeChanged += MainDesktop_SizeChanged;
 
+            ApplyDefaultWallpaper();
             LoadBackgroundImage();
 
             this.PointerPressed += OnPointerPressed;
@@ -155,6 +179,8 @@ namespace factoryos_10x_shell.Views
                 }
                 else
                 {
+                    if (TaskbarFrame.Content is Default10xBar taskbar)
+                        taskbar.SearchRequested += OpenStartForSearch;
                     LogTaskbarStartup("Default10xBar navigation succeeded", null);
                 }
             }
@@ -492,9 +518,492 @@ namespace factoryos_10x_shell.Views
 
         }
 
+        private StorageFolder m_desktopFolder;
+        private StorageItemQueryResult m_desktopQuery;
+        private bool m_desktopIconsLoaded;
+        private bool m_desktopRefreshPending;
+        private bool m_desktopRefreshing;
+        private const string DesktopIconsVisibleKey = "Desktop.ShowIcons";
+        private const int DesktopTileWidth = 86;
+        private const int DesktopTileHeight = 94;
+        private const int MaxDesktopSlot = 4096;
+        private IReadOnlyList<DesktopIconEntry> m_desktopEntries = Array.Empty<DesktopIconEntry>();
+        private readonly ApplicationDataContainer m_desktopPositions = ApplicationData.Current.LocalSettings
+            .CreateContainer("DesktopPositions", ApplicationDataCreateDisposition.Always);
+        private FrameworkElement m_desktopDragTile;
+        private DesktopIconEntry m_desktopDragEntry;
+        private Point m_desktopDragStart;
+        private uint m_desktopDragPointer;
+        private bool m_desktopDragging;
+        private uint? m_desktopSelectionPointer;
+        private Point m_desktopSelectionStart;
+        private bool m_desktopSelectionRefreshPending;
+        private readonly Dictionary<DesktopIconEntry, Rect> m_desktopSelectionBounds = new Dictionary<DesktopIconEntry, Rect>();
+
+        private bool DesktopShowsIcons =>
+            !(ApplicationData.Current.LocalSettings.Values[DesktopIconsVisibleKey] is bool visible) || visible;
+
+        private async void DesktopIcons_Loaded(object sender, RoutedEventArgs e)
+        {
+            m_desktopIconsLoaded = true;
+            DesktopIcons.Visibility = DesktopShowsIcons ? Visibility.Visible : Visibility.Collapsed;
+            DesktopItems.ShortcutCreated += DesktopRefreshRequested;
+            var appHelper = App.ServiceProvider.GetRequiredService<AppHelper>();
+            appHelper.StartIcons.CollectionChanged += DesktopAppListChanged;
+            appHelper.AppIconsMaterialized += DesktopRefreshRequested;
+            m_webAppService.InstalledApps.CollectionChanged += DesktopAppListChanged;
+            await RefreshDesktopItemsAsync();
+        }
+
+        private void DesktopIcons_Unloaded(object sender, RoutedEventArgs e)
+        {
+            m_desktopIconsLoaded = false;
+            DesktopItems.ShortcutCreated -= DesktopRefreshRequested;
+            var appHelper = App.ServiceProvider.GetRequiredService<AppHelper>();
+            appHelper.StartIcons.CollectionChanged -= DesktopAppListChanged;
+            appHelper.AppIconsMaterialized -= DesktopRefreshRequested;
+            m_webAppService.InstalledApps.CollectionChanged -= DesktopAppListChanged;
+            if (m_desktopQuery != null) m_desktopQuery.ContentsChanged -= DesktopContentsChanged;
+            m_desktopQuery = null;
+        }
+
+        private void DesktopAppListChanged(object sender, NotifyCollectionChangedEventArgs e) => DesktopRefreshRequested();
+
+        private async void DesktopContentsChanged(IStorageQueryResultBase sender, object args)
+        {
+            await Dispatcher.RunAsync(CoreDispatcherPriority.Low, DesktopRefreshRequested);
+        }
+
+        private void DesktopRefreshRequested() => _ = RefreshDesktopItemsAsync();
+
+        private async Task RefreshDesktopItemsAsync()
+        {
+            if (!m_desktopIconsLoaded) return;
+            m_desktopRefreshPending = true;
+            if (m_desktopRefreshing) return;
+            m_desktopRefreshing = true;
+            try
+            {
+                while (m_desktopIconsLoaded && m_desktopRefreshPending)
+                {
+                    m_desktopRefreshPending = false;
+                    if (m_desktopQuery == null)
+                    {
+                        m_desktopFolder = await DesktopItems.GetFolderAsync();
+                        if (!m_desktopIconsLoaded) return;
+                        m_desktopQuery = m_desktopFolder.CreateItemQuery();
+                        m_desktopQuery.ContentsChanged += DesktopContentsChanged;
+                    }
+
+                    var entries = new List<DesktopIconEntry>();
+                    var query = m_desktopQuery;
+                    var items = await query.GetItemsAsync();
+                    foreach (var item in items.OrderBy(item => item is StorageFolder ? 0 : 1)
+                                              .ThenBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase))
+                    {
+                        var file = item as StorageFile;
+                        bool shortcut = DesktopItems.IsShortcut(file);
+                        var icon = shortcut ? await GetDesktopShortcutIconAsync(file) : null;
+                        if (icon == null)
+                        {
+                            icon = file != null && AppPackageService.IsPackage(file)
+                                ? new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png"))
+                                : factoryos_10x_shell.Controls.FilesWindow.CreatePackagedIcon(
+                                    item is StorageFolder ? "folders/folder.ico" :
+                                    factoryos_10x_shell.Controls.FilesWindow.GetFileIconPath(file));
+                        }
+
+                        entries.Add(new DesktopIconEntry
+                        {
+                            Item = item, Icon = icon,
+                            Name = shortcut ? Path.GetFileNameWithoutExtension(item.Name) : item.Name,
+                            ShortcutBadgeVisibility = shortcut ? Visibility.Visible : Visibility.Collapsed
+                        });
+                    }
+
+                    if (m_desktopQuery != query) continue;
+                    m_desktopEntries = entries;
+                    if (m_desktopSelectionPointer.HasValue) m_desktopSelectionRefreshPending = true;
+                    else if (m_desktopDragTile == null) ApplyDesktopPositions();
+                }
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException("Reading desktop items", error);
+            }
+            finally
+            {
+                m_desktopRefreshing = false;
+            }
+        }
+
+        private void ApplyDesktopPositions()
+        {
+            var selected = new HashSet<string>(DesktopIcons.SelectedItems.OfType<DesktopIconEntry>()
+                .Select(entry => entry.Item?.Name), StringComparer.OrdinalIgnoreCase);
+            var slots = new List<DesktopIconEntry>();
+            var unplaced = new List<DesktopIconEntry>();
+            foreach (var entry in m_desktopEntries)
+            {
+                if (!(m_desktopPositions.Values[entry.Item.Name] is int slot) || slot < 0 || slot >= MaxDesktopSlot)
+                {
+                    unplaced.Add(entry);
+                    continue;
+                }
+
+                while (slots.Count <= slot) slots.Add(null);
+                if (slots[slot] == null) slots[slot] = entry;
+                else unplaced.Add(entry);
+            }
+
+            int next = 0;
+            foreach (var entry in unplaced)
+            {
+                while (next < slots.Count && slots[next] != null) next++;
+                if (next == slots.Count) slots.Add(entry);
+                else slots[next] = entry;
+                next++;
+            }
+
+            DesktopIcons.ItemsSource = slots.Select((entry, index) =>
+            {
+                entry = entry ?? new DesktopIconEntry();
+                entry.Slot = index;
+                return entry;
+            }).ToList();
+            foreach (var entry in m_desktopEntries.Where(entry => selected.Contains(entry.Item.Name)))
+                DesktopIcons.SelectedItems.Add(entry);
+        }
+
+        private void DesktopIcons_SizeChanged(object sender, SizeChangedEventArgs e)
+        {
+            if (DesktopIcons.ItemsPanelRoot is ItemsWrapGrid panel)
+                panel.MaximumRowsOrColumns = DesktopGridRows;
+        }
+
+        private int DesktopGridRows => Math.Max(1, (int)(DesktopIcons.ActualHeight / DesktopTileHeight));
+
+        private void DesktopIcons_ContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs e)
+        {
+            if (!e.InRecycleQueue)
+                e.ItemContainer.IsEnabled = (e.Item as DesktopIconEntry)?.Item != null;
+        }
+
+        private void DesktopIcons_PointerPressed(object sender, PointerRoutedEventArgs e)
+        {
+            if (m_desktopDragging || m_desktopSelectionPointer.HasValue || !e.GetCurrentPoint(DesktopIcons).Properties.IsLeftButtonPressed) return;
+            ClearDesktopDrag();
+            for (var source = e.OriginalSource as DependencyObject; source != null && source != DesktopSurface;
+                 source = VisualTreeHelper.GetParent(source))
+            {
+                if (!(source is FrameworkElement tile) || tile.Name != "DesktopTile" ||
+                    !(tile.DataContext is DesktopIconEntry entry) || entry.Item == null) continue;
+
+                m_desktopDragTile = tile;
+                m_desktopDragEntry = entry;
+                m_desktopDragPointer = e.Pointer.PointerId;
+                m_desktopDragStart = e.GetCurrentPoint(DesktopIcons).Position;
+                return;
+            }
+            DesktopIcons.SelectedItems.Clear();
+            if (DesktopIcons.Visibility != Visibility.Visible || !DesktopSurface.CapturePointer(e.Pointer)) return;
+            m_desktopSelectionPointer = e.Pointer.PointerId;
+            m_desktopSelectionStart = e.GetCurrentPoint(DesktopSurface).Position;
+            foreach (var entry in m_desktopEntries)
+            {
+                if (DesktopIcons.ContainerFromItem(entry) is FrameworkElement item && item.ActualWidth > 0 && item.ActualHeight > 0)
+                    m_desktopSelectionBounds[entry] = item.TransformToVisual(DesktopSurface)
+                        .TransformBounds(new Rect(0, 0, item.ActualWidth, item.ActualHeight));
+            }
+            e.Handled = true;
+        }
+
+        private void DesktopIcons_PointerMoved(object sender, PointerRoutedEventArgs e)
+        {
+            if (m_desktopSelectionPointer == e.Pointer.PointerId)
+            {
+                UpdateDesktopSelection(e.GetCurrentPoint(DesktopSurface).Position);
+                e.Handled = true;
+                return;
+            }
+            if (m_desktopDragTile == null || e.Pointer.PointerId != m_desktopDragPointer) return;
+            var pointer = e.GetCurrentPoint(DesktopIcons);
+            if (!pointer.Properties.IsLeftButtonPressed)
+            {
+                ClearDesktopDrag();
+                return;
+            }
+
+            double x = pointer.Position.X - m_desktopDragStart.X;
+            double y = pointer.Position.Y - m_desktopDragStart.Y;
+            if (!m_desktopDragging)
+            {
+                if (Math.Abs(x) < 6 && Math.Abs(y) < 6) return;
+                if (!DesktopIcons.CapturePointer(e.Pointer))
+                {
+                    if (DesktopIcons.ContainerFromItem(m_desktopDragEntry) is UIElement container)
+                        container.ReleasePointerCapture(e.Pointer);
+                    if (!DesktopIcons.CapturePointer(e.Pointer)) return;
+                }
+                m_desktopDragging = true;
+                m_desktopDragTile.RenderTransform = new TranslateTransform();
+            }
+            var transform = (TranslateTransform)m_desktopDragTile.RenderTransform;
+            transform.X = x;
+            transform.Y = y;
+            e.Handled = true;
+        }
+
+        private void DesktopIcons_PointerReleased(object sender, PointerRoutedEventArgs e)
+        {
+            if (m_desktopSelectionPointer == e.Pointer.PointerId)
+            {
+                EndDesktopSelection();
+                DesktopSurface.ReleasePointerCapture(e.Pointer);
+                e.Handled = true;
+                return;
+            }
+            if (m_desktopDragTile == null || e.Pointer.PointerId != m_desktopDragPointer) return;
+            var source = m_desktopDragEntry;
+            bool dragging = m_desktopDragging;
+            var point = e.GetCurrentPoint(DesktopIcons).Position;
+            ClearDesktopDrag();
+            if (!dragging) return;
+
+            DesktopIcons.ReleasePointerCapture(e.Pointer);
+            e.Handled = true;
+            if (point.X < 0 || point.Y < 0 || point.X >= DesktopIcons.ActualWidth ||
+                point.Y >= DesktopIcons.ActualHeight || !m_desktopEntries.Any(entry => entry.Item.Name == source.Item.Name))
+            {
+                ApplyDesktopPositions();
+                return;
+            }
+
+            int rows = DesktopGridRows;
+            int row = Math.Max(0, Math.Min(rows - 1, source.Slot % rows +
+                (int)Math.Round((point.Y - m_desktopDragStart.Y) / DesktopTileHeight, MidpointRounding.AwayFromZero)));
+            int column = Math.Max(0, source.Slot / rows +
+                (int)Math.Round((point.X - m_desktopDragStart.X) / DesktopTileWidth, MidpointRounding.AwayFromZero));
+            int target = column * rows + row;
+            if (target != source.Slot && target < MaxDesktopSlot)
+            {
+                foreach (var entry in m_desktopEntries)
+                {
+                    if (!Equals(m_desktopPositions.Values[entry.Item.Name], entry.Slot))
+                        m_desktopPositions.Values[entry.Item.Name] = entry.Slot;
+                }
+                var occupied = m_desktopEntries.FirstOrDefault(entry => entry.Slot == target && entry.Item.Name != source.Item.Name);
+                if (occupied != null) m_desktopPositions.Values[occupied.Item.Name] = source.Slot;
+                m_desktopPositions.Values[source.Item.Name] = target;
+            }
+            ApplyDesktopPositions();
+        }
+
+        private void UpdateDesktopSelection(Point point)
+        {
+            double x = Math.Max(0, Math.Min(point.X, DesktopSurface.ActualWidth));
+            double y = Math.Max(0, Math.Min(point.Y, DesktopSurface.ActualHeight));
+            var rect = new Rect(Math.Min(x, m_desktopSelectionStart.X), Math.Min(y, m_desktopSelectionStart.Y),
+                Math.Abs(x - m_desktopSelectionStart.X), Math.Abs(y - m_desktopSelectionStart.Y));
+            if (DesktopSelectionRectangle.Visibility == Visibility.Collapsed && rect.Width < 4 && rect.Height < 4) return;
+
+            Canvas.SetLeft(DesktopSelectionRectangle, rect.X);
+            Canvas.SetTop(DesktopSelectionRectangle, rect.Y);
+            DesktopSelectionRectangle.Width = rect.Width;
+            DesktopSelectionRectangle.Height = rect.Height;
+            DesktopSelectionRectangle.Visibility = Visibility.Visible;
+
+            foreach (var pair in m_desktopSelectionBounds)
+            {
+                var bounds = pair.Value;
+                bool intersects = rect.Right > bounds.Left && rect.Left < bounds.Right &&
+                                  rect.Bottom > bounds.Top && rect.Top < bounds.Bottom;
+                bool selected = DesktopIcons.SelectedItems.Contains(pair.Key);
+                if (intersects && !selected)
+                    DesktopIcons.SelectedItems.Add(pair.Key);
+                else if (!intersects && selected)
+                    DesktopIcons.SelectedItems.Remove(pair.Key);
+            }
+        }
+
+        private void EndDesktopSelection()
+        {
+            if (!m_desktopSelectionPointer.HasValue) return;
+            m_desktopSelectionPointer = null;
+            DesktopSelectionRectangle.Visibility = Visibility.Collapsed;
+            m_desktopSelectionBounds.Clear();
+            if (m_desktopSelectionRefreshPending)
+            {
+                m_desktopSelectionRefreshPending = false;
+                ApplyDesktopPositions();
+            }
+        }
+
+        private void DesktopIcons_PointerCanceled(object sender, PointerRoutedEventArgs e)
+        {
+            if (m_desktopSelectionPointer == e.Pointer.PointerId) EndDesktopSelection();
+            if (m_desktopDragTile != null && e.Pointer.PointerId == m_desktopDragPointer)
+                ClearDesktopDrag();
+        }
+
+        private void ClearDesktopDrag()
+        {
+            if (m_desktopDragging && m_desktopDragTile != null)
+                m_desktopDragTile.RenderTransform = null;
+            m_desktopDragging = false;
+            m_desktopDragTile = null;
+            m_desktopDragEntry = null;
+        }
+
+
+        private async Task<ImageSource> GetDesktopShortcutIconAsync(StorageFile file)
+        {
+            try
+            {
+                string id = await DesktopItems.ReadShortcutIdAsync(file);
+                if (string.IsNullOrWhiteSpace(id)) return null;
+                if (id.StartsWith("web:", StringComparison.Ordinal))
+                {
+                    var webApp = m_webAppService.InstalledApps.FirstOrDefault(app => "web:" + app.Id == id);
+                    return Uri.TryCreate(webApp?.IconUri, UriKind.Absolute, out var uri) ? new BitmapImage(uri) : null;
+                }
+
+                if (id == "CoreShell.Files" && AppState.Instance.UseWindows11Skin)
+                    return (ImageSource)Application.Current.Resources["Windows11FilesIcon"];
+
+                var helper = App.ServiceProvider.GetRequiredService<AppHelper>();
+                var model = helper.StartIcons.FirstOrDefault(app => string.Equals(app.AppId, id, StringComparison.OrdinalIgnoreCase));
+                if (model?.IconSource != null) return model.IconSource;
+                if (!Win32StartShortcuts.IsShortcutId(id)) return null;
+                var entry = await Win32StartShortcuts.ResolveAsync(id);
+                if (entry == null) return null;
+                await Win32StartShortcuts.LoadIconsAsync(new[] { entry });
+                return entry.IconSource;
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException("Reading desktop shortcut icon", error);
+                return null;
+            }
+        }
+
+        private async void DesktopItem_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
+        {
+            if (!((sender as FrameworkElement)?.DataContext is DesktopIconEntry entry) || entry.Item == null) return;
+            e.Handled = true;
+            await OpenDesktopItemAsync(entry);
+        }
+
+        private async void DesktopItemOpen_Click(object sender, RoutedEventArgs e)
+        {
+            if ((sender as MenuFlyoutItem)?.DataContext is DesktopIconEntry entry)
+                await OpenDesktopItemAsync(entry);
+        }
+
+        private async void DesktopIcons_KeyDown(object sender, KeyRoutedEventArgs e)
+        {
+            if (e.Key != VirtualKey.Enter || !(DesktopIcons.SelectedItem is DesktopIconEntry entry)) return;
+            e.Handled = true;
+            await OpenDesktopItemAsync(entry);
+        }
+
+        private async Task OpenDesktopItemAsync(DesktopIconEntry entry)
+        {
+            try
+            {
+                if (entry.Item is StorageFolder folder)
+                    await EnsureFilesWindow().OpenDesktopFolderAsync(folder);
+                else if (entry.Item is StorageFile file)
+                {
+                    if (DesktopItems.IsShortcut(file))
+                    {
+                        if (!await DesktopItems.OpenShortcutAsync(file))
+                            await new ContentDialog { Title = "The app for this shortcut is unavailable", CloseButtonText = "OK" }.ShowAsync();
+                    }
+                    else
+                    {
+                        await EnsureFilesWindow().OpenFileAsync(file, m_desktopFolder);
+                    }
+                }
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException("Opening desktop item", error);
+                await new ContentDialog { Title = "Could not open desktop item", CloseButtonText = "OK" }.ShowAsync();
+            }
+        }
+
+        private async void DesktopItemDelete_Click(object sender, RoutedEventArgs e)
+        {
+            if (!((sender as MenuFlyoutItem)?.DataContext is DesktopIconEntry entry) ||
+                !(entry.Item is StorageFile file) || !DesktopItems.IsShortcut(file)) return;
+
+            try
+            {
+                await file.DeleteAsync();
+                m_desktopPositions.Values.Remove(file.Name);
+                await RefreshDesktopItemsAsync();
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException("Deleting desktop shortcut", error);
+                await new ContentDialog { Title = "Could not delete desktop shortcut", CloseButtonText = "OK" }.ShowAsync();
+            }
+        }
+
+        private void DesktopShowIcons_Click(object sender, RoutedEventArgs e)
+        {
+            bool show = ((ToggleMenuFlyoutItem)sender).IsChecked;
+            ApplicationData.Current.LocalSettings.Values[DesktopIconsVisibleKey] = show;
+            DesktopIcons.Visibility = show ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private void DesktopPersonalize_Click(object sender, RoutedEventArgs e)
+        {
+            var settings = EnsureSettingsWindow();
+            settings.Open();
+            settings.OpenPersonalization();
+        }
+
+        private void DesktopMenu_Opened(object sender, object e)
+        {
+            if (sender is MenuFlyout menu && menu.Target?.DataContext is DesktopIconEntry entry)
+            {
+                DesktopIcons.SelectedItem = entry;
+                foreach (var item in menu.Items)
+                    item.DataContext = entry;
+                var delete = menu.Items.OfType<MenuFlyoutItem>().Last();
+                delete.Visibility = DesktopItems.IsShortcut(entry.Item as StorageFile) ? Visibility.Visible : Visibility.Collapsed;
+            }
+            else
+            {
+                DesktopShowIconsItem.IsChecked = DesktopShowsIcons;
+            }
+            MainPage.SetPopupCursorVisibility(true);
+        }
+        private void DesktopMenu_Closed(object sender, object e) => MainPage.SetPopupCursorVisibility(false);
+
+        public sealed class DesktopIconEntry
+        {
+            public IStorageItem Item { get; set; }
+            public string Name { get; set; }
+            public ImageSource Icon { get; set; }
+            public int Slot { get; set; }
+            public Visibility ShortcutBadgeVisibility { get; set; } = Visibility.Collapsed;
+        }
+
+
         private void FilesRequested(bool resetHome)
         {
-            EnsureFilesWindow();
+            try
+            {
+                EnsureFilesWindow();
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException("Constructing the Files window", error);
+                throw;
+            }
             if (resetHome) FilesWindow.OpenHome();
             else FilesWindow.Restore();
         }
@@ -1038,6 +1547,11 @@ namespace factoryos_10x_shell.Views
                     IsActive = m_shellWindowCoordinator.IsActive(ShellWindowKind.AppInstaller, installer),
                     IsMinimized = installer.Visibility != Visibility.Visible
                 });
+            ShellDiagnostics.UpdateWindows($"active={m_shellWindowCoordinator.ActiveWindow?.Kind.ToString() ?? "none"}; " +
+                $"taskView={m_windowManager.IsTaskViewOpen}; skin={(AppState.Instance.UseWindows11Skin ? "Windows11" : "Windows10X")}; " +
+                $"strawfoxFullscreen={FirefoxWindow?.IsFullscreen == true}; " +
+                string.Join(", ", descriptors.GroupBy(window => window.Kind)
+                    .Select(group => $"{group.Key}={group.Count()} ({group.Count(window => window.IsMinimized)} minimized)")));
             m_shellWindowCoordinator.Synchronize(descriptors);
             TaskViewEmptyState.Visibility = descriptors.Count == 0
                 ? Visibility.Visible
@@ -1078,7 +1592,13 @@ namespace factoryos_10x_shell.Views
                 : null;
         }
 
-            private async void LoadBackgroundImage()
+        private void ApplyDefaultWallpaper()
+        {
+            if (string.IsNullOrWhiteSpace(ApplicationData.Current.LocalSettings.Values["backgroundImagePath"] as string))
+                BackgroundWallpaper.Source = new BitmapImage(new Uri(AppState.Instance.DefaultWallpaper(ActualTheme)));
+        }
+
+        private async void LoadBackgroundImage()
         {
             Windows.Storage.ApplicationDataContainer localSettings = Windows.Storage.ApplicationData.Current.LocalSettings;
             if (localSettings.Values.ContainsKey("backgroundImagePath"))
@@ -1314,6 +1834,8 @@ namespace factoryos_10x_shell.Views
         }
         private void UpdateDesktopSkin()
         {
+            ApplyDefaultWallpaper();
+            DesktopRefreshRequested();
             UpdateStartMenuAlignment();
             SynchronizeShellWindows();
         }
@@ -1497,6 +2019,11 @@ namespace factoryos_10x_shell.Views
 
             OpenStartStoryboard = new Storyboard();
             OpenStartStoryboard.Children.Add(slideInAnimation);
+            OpenStartStoryboard.Completed += (sender, args) =>
+            {
+                m_startOpening = false;
+                FocusPendingTaskbarSearch();
+            };
         }
         private void InitStartClose()
         {
@@ -1516,16 +2043,40 @@ namespace factoryos_10x_shell.Views
         }
 
 
+        private void OpenStartForSearch()
+        {
+            m_taskbarSearchFocusPending = true;
+            if (!m_startManager.IsStartOpen)
+                m_startManager.RequestStartVisibilityChange(true);
+            else
+                FocusPendingTaskbarSearch();
+        }
+
+        private void FocusPendingTaskbarSearch()
+        {
+            if (m_startOpening || !m_taskbarSearchFocusPending || !m_startManager.IsStartOpen) return;
+            m_taskbarSearchFocusPending = false;
+            (StartMenuFrame.Content as StartMenu)?.FocusTaskbarSearch();
+        }
+
+
         private void StartManager_StartVisibilityChanged(object sender, Library.Events.StartVisibilityChangedEventArgs e)
         {
             if (e.CurrentVisibility)
             {
                 EnsureStartMenu();
+                m_startOpening = true;
                 OpenStartStoryboard.Begin();
                 if (StartMenuFrame.Content is StartMenu menu)
                     _ = menu.RefreshWin32ShortcutsAsync();
             }
-            else { CloseStartStoryboard.Begin(); }
+            else
+            {
+                m_startOpening = false;
+                m_taskbarSearchFocusPending = false;
+                CloseStartStoryboard.Begin();
+            }
+
             UpdateNativeInputSuppression();
         }
 

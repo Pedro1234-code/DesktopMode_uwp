@@ -413,6 +413,8 @@ namespace factoryos_10x_shell
                 ResizeCursorTransform.Y = position.Y - halfSize;
             }
             if (corner == m_hoveredResizeCorner) return;
+            if (corner.HasValue && (m_hasOpenXamlPopup || m_popupCursorRequests > 0))
+                m_hasOpenXamlPopup = VisualTreeHelper.GetOpenPopups(Window.Current).Count > 0;
             m_hoveredResizeCorner = corner;
             switch (corner)
             {
@@ -437,10 +439,10 @@ namespace factoryos_10x_shell
 
         private void UpdateCursorPresentation()
         {
-            bool allowResize = m_popupCursorRequests == 0 && !m_hasOpenXamlPopup && m_isWindowActive;
+            bool allowResize = !m_hasOpenXamlPopup && m_isWindowActive;
             bool showResize = allowResize && m_hoveredResizeCorner.HasValue;
             bool drawResize = showResize && m_customCursorEnabled;
-            bool useSystemCursor = !allowResize || !m_customCursorEnabled;
+            bool useSystemCursor = !allowResize || !m_customCursorEnabled || (!showResize && m_popupCursorRequests > 0);
             Stopwatch cursorClock = Stopwatch.StartNew();
             bool cursorChanged = false;
             if (useSystemCursor)

@@ -96,6 +96,11 @@
                         </NavigationViewItem.Icon>
                     </NavigationViewItem>
                     <NavigationViewItemHeader Content="Pinned" />
+                    <NavigationViewItem x:Name="DesktopNavigationItem" Content="Desktop" Tag="Desktop">
+                        <NavigationViewItem.Icon>
+                            <BitmapIcon UriSource="ms-appx:///Assets/Files/Windows11Icons/folders/desktop.ico" ShowAsMonochrome="False" />
+                        </NavigationViewItem.Icon>
+                    </NavigationViewItem>
                     <NavigationViewItem Content="Downloads" Tag="Downloads">
                         <NavigationViewItem.Icon>
                             <BitmapIcon ShowAsMonochrome="False" UriSource="ms-appx:///Assets/Files/Windows11Icons/folders/downloads.ico" />
@@ -205,7 +210,7 @@
                         <TextBlock Grid.Column="2" VerticalAlignment="Center" FontSize="12" Opacity="0.65" Text="Type" />
                         <TextBlock Grid.Column="3" HorizontalAlignment="Right" VerticalAlignment="Center" FontSize="12" Opacity="0.65" Text="Size" />
                     </Grid>
-                    <ListView x:Name="ItemsList" Grid.Row="3" Margin="8,2" Background="Transparent" DoubleTapped="ItemsList_DoubleTapped" KeyDown="ItemsList_KeyDown" RightTapped="ItemsList_RightTapped" SelectionChanged="ItemsList_SelectionChanged" SelectionMode="Extended" CanDragItems="False">
+                    <ListView x:Name="ItemsList" ContainerContentChanging="ItemsList_ContainerContentChanging" Grid.Row="3" Margin="8,2" Background="Transparent" DoubleTapped="ItemsList_DoubleTapped" KeyDown="ItemsList_KeyDown" RightTapped="ItemsList_RightTapped" SelectionChanged="ItemsList_SelectionChanged" SelectionMode="Extended" CanDragItems="False">
                         <ListView.Resources>
                             <MenuFlyout x:Key="BackgroundContextMenu" Opened="ContextFlyout_Opened" Closed="ContextFlyout_Closed">
                                 <MenuFlyoutItem Text="New folder" Click="NewFolder_Click">

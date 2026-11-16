@@ -1,4 +1,4 @@
-﻿using factoryos_10x_shell.Library.Events;
+using factoryos_10x_shell.Library.Events;
 using factoryos_10x_shell.Library.Models.InternalData;
 using factoryos_10x_shell.Library.Services.Helpers;
 using System;
@@ -685,6 +685,8 @@ namespace factoryos_10x_shell.Services.Helpers
                  string.Equals(candidate.AppId, pinned.AppId, StringComparison.OrdinalIgnoreCase)));
         }
 
+        internal event Action AppIconsMaterialized;
+
         private void ScheduleIconMaterialization(IReadOnlyList<StartIconModel> models)
         {
             m_iconMaterializationCancellation?.Cancel();
@@ -726,6 +728,7 @@ namespace factoryos_10x_shell.Services.Helpers
                         LogStartMenuRefresh($"App icon decode failed: {ex.GetType().Name}: {ex.Message}");
                     }
                 }
+                AppIconsMaterialized?.Invoke();
             }
             catch (OperationCanceledException)
             {
