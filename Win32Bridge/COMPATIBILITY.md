@@ -60,7 +60,7 @@ The counts do not represent Windows export coverage or a test pass rate.
 - **Partial** · Failed load rollback and unload ordering
 - **Partial** · Cross-module exception unwinding
 - **Planned** · Managed PE and CLR hosting
-- **Planned** · x86/WOW64 guest execution (outside current target)
+- **Planned** · x86/WOW64 guest execution (needs JIT)
 
 ## Kernel32
 
