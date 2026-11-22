@@ -103,6 +103,7 @@ BOOL WINAPI BridgeGetHandleInformation(HANDLE handle, LPDWORD flags)
     if (kernel && kernel->Pipes().Owns(handle)) result = kernel->Pipes().Flags(handle, &value, 0, false, &error);
     else if (kernel && kernel->Console().Owns(handle)) result = kernel->Console().Flags(handle, &value, 0, false, &error);
     else if (kernel && kernel->Owns(handle)) result = kernel->HandleFlags(handle, &value, 0, false, &error);
+    else if (FileMappingHandleFlags(handle, value, 0, false, error)) result = error == ERROR_SUCCESS;
     else if (auto storage = CurrentGuestStorageContext()) result = storage->FileHandleFlags(handle, &value, 0, false, &error);
     if (result && !CopyConsoleBytes(flags, &value, sizeof(value))) error = ERROR_NOACCESS;
     SetGuestLastError(error); return result && error == ERROR_SUCCESS ? TRUE : FALSE;
@@ -114,6 +115,7 @@ BOOL WINAPI BridgeSetHandleInformation(HANDLE handle, DWORD mask, DWORD flags)
     if (kernel && kernel->Pipes().Owns(handle)) result = kernel->Pipes().Flags(handle, &flags, mask, true, &error);
     else if (kernel && kernel->Console().Owns(handle)) result = kernel->Console().Flags(handle, &flags, mask, true, &error);
     else if (kernel && kernel->Owns(handle)) result = kernel->HandleFlags(handle, &flags, mask, true, &error);
+    else if (FileMappingHandleFlags(handle, flags, mask, true, error)) result = error == ERROR_SUCCESS;
     else if (auto storage = CurrentGuestStorageContext()) result = storage->FileHandleFlags(handle, &flags, mask, true, &error);
     SetGuestLastError(error); return result ? TRUE : FALSE;
 }
@@ -129,16 +131,19 @@ BOOL WINAPI BridgeDuplicateHandle(HANDLE sourceProcess, HANDLE source, HANDLE ta
     else
     {
         const bool sameAccess = (options & 2u) != 0;
-        if (!sameAccess)
+        if (!DuplicateFileMappingHandle(source, access, inherit, sameAccess, result, error))
         {
-            if (kernel->Owns(source)) kernel->Duplicate(source, inherit != FALSE, &result, &error, access, false);
-            else error = ERROR_NOT_SUPPORTED;
+            if (!sameAccess)
+            {
+                if (kernel->Owns(source)) kernel->Duplicate(source, inherit != FALSE, &result, &error, access, false);
+                else error = ERROR_NOT_SUPPORTED;
+            }
+            else if (kernel->Pipes().Owns(source)) kernel->Pipes().Duplicate(source, inherit != FALSE, &result, &error);
+            else if (kernel->Console().Owns(source)) kernel->Console().Duplicate(source, inherit != FALSE, &result, &error);
+            else if (kernel->Owns(source)) kernel->Duplicate(source, inherit != FALSE, &result, &error);
+            else if (auto storage = CurrentGuestStorageContext()) storage->DuplicateFile(source, inherit != FALSE, &result, &error);
+            else error = ERROR_INVALID_HANDLE;
         }
-        else if (kernel->Pipes().Owns(source)) kernel->Pipes().Duplicate(source, inherit != FALSE, &result, &error);
-        else if (kernel->Console().Owns(source)) kernel->Console().Duplicate(source, inherit != FALSE, &result, &error);
-        else if (kernel->Owns(source)) kernel->Duplicate(source, inherit != FALSE, &result, &error);
-        else if (auto storage = CurrentGuestStorageContext()) storage->DuplicateFile(source, inherit != FALSE, &result, &error);
-        else error = ERROR_INVALID_HANDLE;
     }
     if (closeSource && sourceProcess == BridgeGetCurrentProcess()) BridgeCloseHandle(source);
     if (error == ERROR_SUCCESS && !CopyConsoleBytes(target, &result, sizeof(result)))

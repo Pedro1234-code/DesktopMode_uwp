@@ -1355,6 +1355,7 @@ ImportResolution Win32Bridge::Bridge::ResolveGdi32Import(const ImportedSymbol& s
     else if (_wcsicmp(symbol.name.c_str(), L"selectcliprgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSelectClipRgn);
     else if (_wcsicmp(symbol.name.c_str(), L"extselectcliprgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExtSelectClipRgn);
     else if (_wcsicmp(symbol.name.c_str(), L"getclipbox") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipBox);
+    else if (_wcsicmp(symbol.name.c_str(), L"getdcorgex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDCOrgEx);
     else if (_wcsicmp(symbol.name.c_str(), L"intersectcliprect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeIntersectClipRect);
     else if (_wcsicmp(symbol.name.c_str(), L"excludecliprect") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExcludeClipRect);
     else if (_wcsicmp(symbol.name.c_str(), L"getcliprgn") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetClipRgn);

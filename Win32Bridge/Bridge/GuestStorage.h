@@ -31,8 +31,22 @@ namespace Bridge
     {
         struct FileRecord;
         struct FileRangeState;
+        struct SharedFiles;
+        struct MappedFileState;
 
     public:
+        class MappedFile final
+        {
+        public:
+            explicit operator bool() const { return m_state != nullptr; }
+            DWORD Populate(BYTE* buffer, SIZE_T size) const;
+            DWORD Flush(ULONGLONG offset, const BYTE* buffer, SIZE_T size) const;
+
+        private:
+            friend class GuestStorageContext;
+            std::shared_ptr<MappedFileState> m_state;
+        };
+
         class DiskFile final
         {
         public:
@@ -45,6 +59,7 @@ namespace Bridge
         private:
             friend class GuestStorageContext;
             std::shared_ptr<FileRecord> m_record;
+            std::shared_ptr<SharedFiles> m_namespace;
             const GuestStorageContext* m_owner = nullptr;
         };
 
@@ -70,10 +85,12 @@ namespace Bridge
             DWORD* win32Error);
         bool ReadFile(HANDLE guestHandle, void* buffer, DWORD bytesToRead, DWORD* bytesRead, DWORD* win32Error);
         bool ReadFileAt(HANDLE guestHandle, void* buffer, DWORD bytesToRead,
-            ULONGLONG offset, DWORD* bytesRead, DWORD* win32Error, bool mappedIo = false);
+            ULONGLONG offset, DWORD* bytesRead, DWORD* win32Error);
         bool WriteFile(HANDLE guestHandle, const void* buffer, DWORD bytesToWrite, DWORD* bytesWritten, DWORD* win32Error);
         bool WriteFileAt(HANDLE guestHandle, const void* buffer, DWORD bytesToWrite,
-            ULONGLONG offset, DWORD* bytesWritten, DWORD* win32Error, bool mappedIo = false);
+            ULONGLONG offset, DWORD* bytesWritten, DWORD* win32Error);
+        DWORD CaptureMappedFile(HANDLE file, bool writable, bool executable,
+            MappedFile& backing, ULONGLONG& size) const;
         bool CloseFile(HANDLE guestHandle, DWORD* win32Error);
         bool OwnsFile(HANDLE guestHandle) const;
         DWORD FileDataAccess(HANDLE guestHandle) const;
@@ -137,11 +154,12 @@ namespace Bridge
         void CloseAll();
 
     private:
-        struct SharedFiles;
         void ReleaseFileRanges(const std::shared_ptr<FileRecord>& record);
         static std::shared_ptr<SharedFiles> AcquireFileNamespace(Windows::Storage::StorageFolder^ root);
         bool RegisterFileLocked(const std::shared_ptr<FileRecord>& record, DWORD flags, HANDLE* value, DWORD* error);
         bool CloseDescription(const std::shared_ptr<FileRecord>& record, DWORD* error);
+        static std::wstring FilePathSnapshot(SharedFiles& files, const FileRecord& record);
+        bool DeleteGuestFileLocked(const GuestPath& path, DWORD* win32Error);
         struct FindRecord;
 
         bool Resolve(LPCWSTR path, GuestPath* resolved, DWORD* win32Error) const;

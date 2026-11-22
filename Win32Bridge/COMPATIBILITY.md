@@ -11,7 +11,7 @@ The counts do not represent Windows export coverage or a test pass rate.
 | API or subsystem | Implemented | Partial | Planned | Total |
 | --- | ---: | ---: | ---: | ---: |
 | PE loader | 7 | 3 | 2 | 12 |
-| Kernel32 | 8 | 5 | 2 | 15 |
+| Kernel32 | 9 | 4 | 4 | 17 |
 | NTDLL | 3 | 4 | 2 | 9 |
 | USER32 | 5 | 6 | 2 | 13 |
 | GDI32 | 6 | 4 | 1 | 11 |
@@ -70,13 +70,15 @@ The counts do not represent Windows export coverage or a test pass rate.
 - **Implemented** · Named pipes
 - **Implemented** · Overlapped I/O and IOCP
 - **Implemented** · Byte-range locks
-- **Partial** · File identity across rename
+- **Implemented** · Open-handle identity across local file renames
 - **Implemented** · File mappings and directory notifications
 - **Implemented** · Guest environment and current directory
 - **Partial** · Extended startup attributes and jobs
 - **Partial** · Named kernel-object namespaces and inheritance
 - **Partial** · Threadpool and alertable waits
 - **Partial** · File metadata and reparse points
+- **Planned** · File identity across aliases and overlay boundaries
+- **Planned** · Case-only rename and atomic directory moves
 - **Planned** · Memory-mapped coherency across independent views
 - **Planned** · Windows service hosting
 

@@ -22,6 +22,11 @@ Multi-object waits cover all-or-nothing consumption, lowest-index selection,
 invalid handles, aliases, mutex abandonment, APC interruption and the message
 queue requirement of MWMO_WAITALL.
 
+The mapping cases cover independent view addresses, shared visibility,
+copy-on-write isolation, interior-address flushes and named handle access.
+The file-backed test closes the original handles, renames the backing file,
+reuses its old path, and checks both files after the flush.
+
 The fixture has not been compiled or executed. Its native Python reference
 probe is separate and does not validate the bridge implementation. On failure
 while a child is still running, its temporary file may remain until cleanup.

@@ -8,11 +8,13 @@ one handle does not dispose the stream used by another process or duplicate.
 The stream closes once, after the last handle, serialized against ongoing I/O.
 
 Storage contexts using the same LocalFolder root share an open-description
-registry, delete-pending state, namespace mutex and byte-range lock registry.
+registry, delete-pending state, a namespace operation lock and byte-range
+state shared by descriptions for the same open file.
 Create/open, delete and move checks consult all open descriptions rather than
 only the current process table. Byte-range lock owners include their process
-context so an inherited numeric token cannot release a parent's locks. This
-does not make the preexisting byte-range I/O enforcement/blocking complete.
+context so an inherited numeric token cannot release a parent's locks.
+Successful local file renames carry the descriptions and their byte-range
+state to the new name.
 
 CreateFileW honors SECURITY_ATTRIBUTES.bInheritHandle; CreateFileA now has a
 real conversion adapter through that same path. Get/SetHandleInformation and
@@ -37,9 +39,19 @@ itself as a child through the actual CreateProcess adapter and verifies the
 same stream/cursor/lifetime path. No C++ build or guest execution was performed.
 Source delimiters, project XML and diffs were checked; export alias check passed.
 
-Remaining limitations include concurrent-open reservation races between the
-share check and physical WinRT open, open-handle rename/path bookkeeping,
-complete byte-range enforcement, ACL/security descriptors, and rights-reducing
-or cross-process DuplicateHandle. CRT standard descriptors/FILE streams now
-route to startup handles (CRT-STREAMS.md). Terminal presentation remains pending;
-CMD and shell redirection have not passed runtime validation in the bridge.
+## File mappings
+
+Guest mapping handles reference anonymous host sections created with the UWP
+mapping APIs. Each map call creates its own view with the requested protection.
+Views of one section share writes, and copy-on-write changes remain private.
+Named opens keep their own rights, including when duplicated.
+
+A file-backed section holds a cloned WinRT stream with an independent cursor.
+Explicit flushes accept addresses within a view and write through that stream.
+Closing the original file handle, renaming the file, or reusing its old path
+does not redirect a view. A writable mapping can extend its backing file.
+
+WinRT-backed sections are initialized from a snapshot. Independent sections
+of the same file and ordinary file I/O still lack full coherency. Writeback
+currently requires an explicit flush. Mapping inheritance and cross-process
+handle duplication still require runtime integration.

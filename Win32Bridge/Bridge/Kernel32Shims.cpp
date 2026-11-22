@@ -655,30 +655,47 @@ namespace
     constexpr ULONG_PTR FirstFileMappingHandle = 0x74000000;
     std::atomic<ULONG_PTR> g_nextFileMappingHandle{ FirstFileMappingHandle };
 
+    bool IsWritableMappingProtection(DWORD protection)
+    {
+        const DWORD page = protection & 0xffu;
+        return page == PAGE_READWRITE || page == PAGE_EXECUTE_READWRITE;
+    }
+
     struct GuestFileMapping final
     {
         BYTE* memory = nullptr;
         SIZE_T size = 0;
         DWORD protection = PAGE_READONLY;
-        std::wstring name;
-        std::wstring sourcePath;
+        GuestStorageContext::MappedFile backing;
+        HANDLE nativeSection = nullptr;
 
         ~GuestFileMapping()
         {
-            if (memory) ::VirtualFree(memory, 0, MEM_RELEASE);
+            if (memory) ::UnmapViewOfFile(memory);
+            if (nativeSection) ::CloseHandle(nativeSection);
         }
     };
 
     struct GuestMappingView final
     {
         std::shared_ptr<GuestFileMapping> mapping;
-        std::shared_ptr<void> privateAllocation;
+        std::shared_ptr<void> allocation;
+        ULONGLONG offset = 0;
         SIZE_T size = 0;
-        ULONG references = 0;
+        bool copyOnWrite = false;
     };
 
+    struct GuestMappingHandle final
+    {
+        std::shared_ptr<GuestFileMapping> mapping;
+        DWORD access = 0;
+        DWORD flags = 0;
+    };
+
+    constexpr DWORD FullMappingAccess = FILE_MAP_ALL_ACCESS | FILE_MAP_EXECUTE;
+    std::mutex g_namedMappingCreationLock;
     std::mutex g_fileMappingsLock;
-    std::unordered_map<ULONG_PTR, std::shared_ptr<GuestFileMapping>> g_fileMappings;
+    std::unordered_map<ULONG_PTR, GuestMappingHandle> g_fileMappings;
     std::unordered_map<std::wstring, std::weak_ptr<GuestFileMapping>> g_namedFileMappings;
     std::unordered_map<const void*, GuestMappingView> g_fileMappingViews;
 
@@ -692,7 +709,7 @@ namespace
         return key;
     }
 
-    HANDLE RegisterFileMappingLocked(const std::shared_ptr<GuestFileMapping>& mapping)
+    HANDLE RegisterFileMappingLocked(const std::shared_ptr<GuestFileMapping>& mapping, DWORD access, DWORD flags)
     {
         if (!mapping) return nullptr;
         for (size_t attempt = 0; attempt < 4096; ++attempt)
@@ -704,25 +721,68 @@ namespace
                 g_nextFileMappingHandle.store(token + 1);
             }
             if (g_fileMappings.find(token) != g_fileMappings.end()) continue;
-            g_fileMappings.emplace(token, mapping);
+            g_fileMappings.emplace(token, GuestMappingHandle{mapping, access, flags});
             return reinterpret_cast<HANDLE>(token);
         }
         return nullptr;
     }
 
-    std::shared_ptr<GuestFileMapping> LookupFileMapping(HANDLE handle)
+    GuestMappingHandle LookupFileMapping(HANDLE handle)
     {
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
         const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
-        return found == g_fileMappings.end() ? nullptr : found->second;
+        return found == g_fileMappings.end() ? GuestMappingHandle{} : found->second;
     }
 
-    bool CloseFileMappingHandle(HANDLE handle)
+    bool FileMappingHandleFlags(HANDLE handle, DWORD& flags, DWORD mask, bool set, DWORD& error)
     {
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
         const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
         if (found == g_fileMappings.end()) return false;
-        g_fileMappings.erase(found);
+        if (mask & ~(HANDLE_FLAG_INHERIT | HANDLE_FLAG_PROTECT_FROM_CLOSE))
+        {
+            error = ERROR_INVALID_PARAMETER;
+            return true;
+        }
+        if (set) found->second.flags = (found->second.flags & ~mask) | (flags & mask);
+        flags = found->second.flags;
+        error = ERROR_SUCCESS;
+        return true;
+    }
+
+    bool DuplicateFileMappingHandle(HANDLE handle, DWORD access, BOOL inherit, bool sameAccess,
+        HANDLE& result, DWORD& error)
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
+        if (found == g_fileMappings.end()) return false;
+        const auto source = found->second;
+        const DWORD granted = sameAccess ? source.access : access;
+        if ((granted & ~source.access) != 0)
+        {
+            error = ERROR_ACCESS_DENIED;
+            return true;
+        }
+        try
+        {
+            result = RegisterFileMappingLocked(source.mapping, granted, inherit ? HANDLE_FLAG_INHERIT : 0);
+            error = result ? ERROR_SUCCESS : ERROR_TOO_MANY_OPEN_FILES;
+        }
+        catch (const std::bad_alloc&) { error = ERROR_NOT_ENOUGH_MEMORY; }
+        return true;
+    }
+
+    bool CloseFileMappingHandle(HANDLE handle, DWORD& error)
+    {
+        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+        const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
+        if (found == g_fileMappings.end()) return false;
+        if (found->second.flags & HANDLE_FLAG_PROTECT_FROM_CLOSE) error = ERROR_INVALID_HANDLE;
+        else
+        {
+            g_fileMappings.erase(found);
+            error = ERROR_SUCCESS;
+        }
         return true;
     }
 
@@ -1404,9 +1464,10 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileW(
             std::to_wstring(error) + L".");
         return INVALID_HANDLE_VALUE;
     }
+    const DWORD creationResult = error;
     if (!storage->FileHandleFlags(handle, &handleFlags, 1u, true, &error))
     { DWORD ignored = ERROR_SUCCESS; storage->CloseFile(handle, &ignored); SetGuestLastError(error); return INVALID_HANDLE_VALUE; }
-    SetGuestLastError(ERROR_SUCCESS);
+    SetGuestLastError(creationResult);
     return handle;
 }
 
@@ -1658,13 +1719,13 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCloseHandle(HANDLE object)
         { const bool result = kernel->CloseHandle(object, &error); SetGuestLastError(error); return result ? TRUE : FALSE; }
     }
 
-    if (CloseFileMappingHandle(object))
+    DWORD error = ERROR_INVALID_HANDLE;
+    if (CloseFileMappingHandle(object, error))
     {
-        SetGuestLastError(ERROR_SUCCESS);
-        return TRUE;
+        SetGuestLastError(error);
+        return error == ERROR_SUCCESS;
     }
 
-    DWORD error = ERROR_INVALID_HANDLE;
     GuestStorageContext* storage = CurrentGuestStorageContext();
     if (!storage)
     {
@@ -3965,9 +4026,9 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenEventW(
     return handle;
 }
 
-HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenFileMappingW(DWORD, BOOL, LPCWSTR name)
+HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenFileMappingW(DWORD desiredAccess, BOOL inherit, LPCWSTR name)
 {
-    if (!name || !*name)
+    if (!name || !*name || !desiredAccess || (desiredAccess & ~FullMappingAccess))
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
@@ -3986,9 +4047,19 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenFileMappingW(DWORD, BOOL, LPCWSTR n
         SetGuestLastError(ERROR_FILE_NOT_FOUND);
         return nullptr;
     }
-    const HANDLE handle = RegisterFileMappingLocked(mapping);
-    SetGuestLastError(handle ? ERROR_SUCCESS : ERROR_TOO_MANY_OPEN_FILES);
-    return handle;
+    const DWORD access = (desiredAccess & FILE_MAP_COPY) && (desiredAccess & FILE_MAP_ALL_ACCESS) != FILE_MAP_ALL_ACCESS
+        ? (desiredAccess & ~FILE_MAP_COPY) | FILE_MAP_READ : desiredAccess;
+    try
+    {
+        const HANDLE handle = RegisterFileMappingLocked(mapping, access, inherit ? HANDLE_FLAG_INHERIT : 0);
+        SetGuestLastError(handle ? ERROR_SUCCESS : ERROR_TOO_MANY_OPEN_FILES);
+        return handle;
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
 }
 
 LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
@@ -4015,16 +4086,15 @@ LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
         SetGuestLastError(error);
         return nullptr;
     };
-    const std::shared_ptr<GuestFileMapping> mapping = LookupFileMapping(handle);
+    const auto opened = LookupFileMapping(handle);
+    const auto& mapping = opened.mapping;
     if (!mapping)
     {
         return fail(ERROR_INVALID_HANDLE, L"unknown mapping handle");
     }
 
     const DWORD pageProtection = mapping->protection & 0xffu;
-    const bool writableMapping = pageProtection == PAGE_READWRITE ||
-        pageProtection == PAGE_WRITECOPY || pageProtection == PAGE_EXECUTE_READWRITE ||
-        pageProtection == PAGE_EXECUTE_WRITECOPY;
+    const bool writableMapping = IsWritableMappingProtection(pageProtection);
     const bool executableMapping = pageProtection == PAGE_EXECUTE_READ ||
         pageProtection == PAGE_EXECUTE_READWRITE || pageProtection == PAGE_EXECUTE_WRITECOPY;
     // FILE_MAP_ALL_ACCESS contains the numeric FILE_MAP_COPY bit.  Treating
@@ -4036,8 +4106,13 @@ LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
     const bool readRequested = allAccess || (desiredAccess & FileMapRead) != 0 ||
         desiredAccess == 0;
     const bool executeRequested = (desiredAccess & FileMapExecute) != 0;
-    const bool readableMapping = pageProtection == PAGE_READONLY || writableMapping ||
-        executableMapping;
+    const DWORD dataAccess = writeRequested && !copyRequested ? FileMapWrite :
+        (copyRequested || readRequested || !executeRequested ? FileMapRead : 0);
+    const DWORD neededAccess = dataAccess | (executeRequested ? FileMapExecute : 0);
+    if ((opened.access & neededAccess) != neededAccess)
+        return fail(ERROR_ACCESS_DENIED, L"view access exceeds the mapping handle rights");
+    const bool readableMapping = pageProtection == PAGE_READONLY || pageProtection == PAGE_WRITECOPY ||
+        writableMapping || executableMapping;
     if (writeRequested && !writableMapping)
     {
         return fail(ERROR_ACCESS_DENIED, L"write access is incompatible with protection");
@@ -4076,38 +4151,19 @@ LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
         return fail(ERROR_INVALID_PARAMETER, L"view size exceeds mapping size");
     }
 
-    BYTE* address = mapping->memory + static_cast<SIZE_T>(offset.QuadPart);
-    std::shared_ptr<void> privateAllocation;
-    if (copyRequested)
+    void* address = ::MapViewOfFileFromApp(mapping->nativeSection,
+        desiredAccess ? desiredAccess : FileMapRead, offset.QuadPart, viewSize);
+    if (!address) return fail(::GetLastError(), L"native section view failed");
+    try
     {
-        void* copy = VirtualAllocFromApp(
-            nullptr, viewSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
-        if (!copy)
-        {
-            return fail(ERROR_NOT_ENOUGH_MEMORY, L"private view allocation failed");
-        }
-        memcpy(copy, address, viewSize);
-        try
-        {
-            privateAllocation = std::shared_ptr<void>(copy, [](void* allocation)
-            {
-                if (allocation) ::VirtualFree(allocation, 0, MEM_RELEASE);
-            });
-        }
-        catch (const std::bad_alloc&)
-        {
-            ::VirtualFree(copy, 0, MEM_RELEASE);
-            return fail(ERROR_NOT_ENOUGH_MEMORY, L"private view registration failed");
-        }
-        address = static_cast<BYTE*>(copy);
-    }
-    {
+        std::shared_ptr<void> allocation(address, [](void* view) { ::UnmapViewOfFile(view); });
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
-        GuestMappingView& view = g_fileMappingViews[address];
-        view.mapping = mapping;
-        view.privateAllocation = std::move(privateAllocation);
-        view.size = viewSize;
-        ++view.references;
+        g_fileMappingViews.emplace(address, GuestMappingView{
+            mapping, std::move(allocation), offset.QuadPart, viewSize, copyRequested});
+    }
+    catch (const std::bad_alloc&)
+    {
+        return fail(ERROR_NOT_ENOUGH_MEMORY, L"view registration failed");
     }
     RuntimeDiagnostics::Record(
         L"STORAGE: mapped a " + std::to_wstring(viewSize) +
@@ -4130,32 +4186,48 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeUnmapViewOfFile(LPCVOID baseAddress)
         SetGuestLastError(ERROR_INVALID_ADDRESS);
         return FALSE;
     }
-    if (found->second.references > 1) --found->second.references;
-    else g_fileMappingViews.erase(found);
+    g_fileMappingViews.erase(found);
     SetGuestLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeFlushViewOfFile(LPCVOID baseAddress, SIZE_T bytes)
 {
-    std::shared_ptr<GuestFileMapping> mapping; SIZE_T viewSize = 0; bool privateView = false;
+    GuestMappingView view;
+    const ULONG_PTR address = reinterpret_cast<ULONG_PTR>(baseAddress);
+    SIZE_T displacement = 0;
+    SIZE_T remaining = 0;
     {
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
-        const auto found = g_fileMappingViews.find(baseAddress);
+        auto found = g_fileMappingViews.find(baseAddress);
+        if (found == g_fileMappingViews.end())
+        {
+            found = std::find_if(g_fileMappingViews.begin(), g_fileMappingViews.end(), [&](const auto& entry)
+            {
+                const ULONG_PTR start = reinterpret_cast<ULONG_PTR>(entry.first);
+                return address >= start && address - start < entry.second.size;
+            });
+        }
         if (found == g_fileMappingViews.end()) { SetGuestLastError(ERROR_INVALID_ADDRESS); return FALSE; }
-        mapping = found->second.mapping; viewSize = found->second.size; privateView = !!found->second.privateAllocation;
+        view = found->second;
+        displacement = address - reinterpret_cast<ULONG_PTR>(found->first);
+        remaining = view.size - displacement;
     }
-    if (privateView || !mapping || mapping->sourcePath.empty()) { SetGuestLastError(ERROR_SUCCESS); return TRUE; }
-    const SIZE_T count = bytes ? (std::min)(bytes, viewSize) : viewSize;
-    HANDLE file = BridgeCreateFileW(mapping->sourcePath.c_str(), GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return FALSE;
-    DWORD written = 0; const SIZE_T offset = static_cast<const BYTE*>(baseAddress) - mapping->memory;
-    GuestStorageContext* storage = CurrentGuestStorageContext(); DWORD error = ERROR_SUCCESS;
-    const BOOL result = storage && count <= MAXDWORD && storage->WriteFileAt(file, baseAddress,
-        static_cast<DWORD>(count), offset, &written, &error, true);
-    if (result) BridgeFlushFileBuffers(file); BridgeCloseHandle(file);
-    return result && written == count;
+    if (bytes > remaining) { SetGuestLastError(ERROR_INVALID_ADDRESS); return FALSE; }
+
+    DWORD error = ERROR_SUCCESS;
+    const SIZE_T count = bytes ? bytes : remaining;
+    if (!view.mapping->backing)
+    {
+        if (!::FlushViewOfFile(baseAddress, count)) error = ::GetLastError();
+    }
+    else if (!view.copyOnWrite && IsWritableMappingProtection(view.mapping->protection))
+    {
+        const auto offset = view.offset + displacement;
+        error = view.mapping->backing.Flush(offset, view.mapping->memory + static_cast<SIZE_T>(offset), count);
+    }
+    SetGuestLastError(error);
+    return error == ERROR_SUCCESS;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetFileInformationByHandle(HANDLE file, LPBY_HANDLE_FILE_INFORMATION information)
@@ -4726,7 +4798,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeFindCloseChangeNotification(HANDLE change
 }
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
     HANDLE file,
-    LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES security,
     DWORD protection,
     DWORD maximumSizeHigh,
     DWORD maximumSizeLow,
@@ -4742,9 +4814,17 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
         return nullptr;
     }
 
+    DWORD flags = 0, error = ERROR_SUCCESS;
+    if (!ReadHandleSecurityAttributes(security, &flags, &error))
+    {
+        SetGuestLastError(error);
+        return nullptr;
+    }
     const std::wstring nameKey = FileMappingNameKey(name);
+    std::unique_lock<std::mutex> creation(g_namedMappingCreationLock, std::defer_lock);
     if (!nameKey.empty())
     {
+        creation.lock();
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
         const auto named = g_namedFileMappings.find(nameKey);
         if (named != g_namedFileMappings.end())
@@ -4752,9 +4832,17 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
             const std::shared_ptr<GuestFileMapping> existing = named->second.lock();
             if (existing)
             {
-                const HANDLE handle = RegisterFileMappingLocked(existing);
-                SetGuestLastError(handle ? ERROR_ALREADY_EXISTS : ERROR_TOO_MANY_OPEN_FILES);
-                return handle;
+                try
+                {
+                    const HANDLE handle = RegisterFileMappingLocked(existing, FullMappingAccess, flags);
+                    SetGuestLastError(handle ? ERROR_ALREADY_EXISTS : ERROR_TOO_MANY_OPEN_FILES);
+                    return handle;
+                }
+                catch (const std::bad_alloc&)
+                {
+                    SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+                    return nullptr;
+                }
             }
             g_namedFileMappings.erase(named);
         }
@@ -4765,10 +4853,7 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
     requestedSize.LowPart = maximumSizeLow;
     ULONGLONG mappingSize = requestedSize.QuadPart;
     ULONGLONG sourceSize = 0;
-    GuestStorageContext* storage = nullptr;
-    DWORD error = ERROR_SUCCESS;
-    LARGE_INTEGER originalPosition{};
-    bool restorePosition = false;
+    GuestStorageContext::MappedFile backing;
 
     if (file == INVALID_HANDLE_VALUE)
     {
@@ -4780,14 +4865,16 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
     }
     else
     {
-        storage = CurrentGuestStorageContext();
-        LARGE_INTEGER size{};
-        if (!storage || !storage->GetFileSize(file, &size, &error) || size.QuadPart < 0)
+        const auto storage = CurrentGuestStorageContext();
+        const bool executable = pageProtection == PAGE_EXECUTE_READ ||
+            pageProtection == PAGE_EXECUTE_READWRITE || pageProtection == PAGE_EXECUTE_WRITECOPY;
+        error = storage ? storage->CaptureMappedFile(file, IsWritableMappingProtection(protection),
+            executable, backing, sourceSize) : ERROR_INVALID_HANDLE;
+        if (error != ERROR_SUCCESS)
         {
-            SetGuestLastError(storage ? error : ERROR_INVALID_HANDLE);
+            SetGuestLastError(error);
             return nullptr;
         }
-        sourceSize = static_cast<ULONGLONG>(size.QuadPart);
         if (mappingSize == 0) mappingSize = sourceSize;
         if (mappingSize == 0)
         {
@@ -4808,55 +4895,47 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
         mapping = std::make_shared<GuestFileMapping>();
         mapping->size = static_cast<SIZE_T>(mappingSize);
         mapping->protection = protection;
-        mapping->name = name ? name : L"";
-        if (storage) storage->GetFilePath(file, &mapping->sourcePath, nullptr);
+        mapping->backing = std::move(backing);
     }
     catch (const std::bad_alloc&)
     {
         SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
         return nullptr;
     }
-    mapping->memory = static_cast<BYTE*>(VirtualAllocFromApp(
-        nullptr, mapping->size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
-    if (!mapping->memory)
+    DWORD nativeProtection = protection;
+    if (mapping->backing)
     {
-        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return nullptr;
-    }
-
-    if (storage && sourceSize != 0)
-    {
-        LARGE_INTEGER zero{};
-        if (!storage->SetFilePointer(file, zero, &originalPosition, FILE_CURRENT, &error) ||
-            !storage->SetFilePointer(file, zero, nullptr, FILE_BEGIN, &error))
+        // The host section holds a snapshot for WinRT-backed files. Keep an
+        // internal write view to populate/flush it, while guest views enforce
+        // the original protection and access independently.
+        if ((protection & ~(0xffu | SEC_COMMIT | SEC_RESERVE)) != 0)
         {
-            SetGuestLastError(error);
+            SetGuestLastError(ERROR_NOT_SUPPORTED);
             return nullptr;
         }
-        restorePosition = true;
-        const ULONGLONG bytesToRead = (std::min)(sourceSize, mappingSize);
-        ULONGLONG offset = 0;
-        while (offset < bytesToRead)
-        {
-            const DWORD request = static_cast<DWORD>((std::min)(
-                bytesToRead - offset, static_cast<ULONGLONG>(8 * 1024 * 1024)));
-            DWORD received = 0;
-            if (!storage->ReadFileAt(file, mapping->memory + static_cast<SIZE_T>(offset),
-                    request, ~0ull, &received, &error, true) || received == 0)
-            {
-                if (received == 0 && error == ERROR_SUCCESS) error = ERROR_READ_FAULT;
-                LARGE_INTEGER ignored{};
-                storage->SetFilePointer(file, originalPosition, &ignored, FILE_BEGIN, nullptr);
-                SetGuestLastError(error);
-                return nullptr;
-            }
-            offset += received;
-        }
+        const bool executable = pageProtection == PAGE_EXECUTE_READ ||
+            pageProtection == PAGE_EXECUTE_READWRITE || pageProtection == PAGE_EXECUTE_WRITECOPY;
+        nativeProtection = executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE;
     }
-    if (restorePosition)
+    // Guest names remain in the bridge namespace, even with native views.
+    mapping->nativeSection = ::CreateFileMappingFromApp(INVALID_HANDLE_VALUE,
+        nullptr, nativeProtection, mappingSize, nullptr);
+    if (!mapping->nativeSection)
     {
-        LARGE_INTEGER ignored{};
-        if (!storage->SetFilePointer(file, originalPosition, &ignored, FILE_BEGIN, &error))
+        SetGuestLastError(::GetLastError());
+        return nullptr;
+    }
+    if (mapping->backing)
+    {
+        mapping->memory = static_cast<BYTE*>(::MapViewOfFileFromApp(mapping->nativeSection,
+            FILE_MAP_WRITE, 0, mapping->size));
+        if (!mapping->memory)
+        {
+            SetGuestLastError(::GetLastError());
+            return nullptr;
+        }
+        error = mapping->backing.Populate(mapping->memory, mapping->size);
+        if (error != ERROR_SUCCESS)
         {
             SetGuestLastError(error);
             return nullptr;
@@ -4866,8 +4945,17 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
     HANDLE handle = nullptr;
     {
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
-        handle = RegisterFileMappingLocked(mapping);
-        if (handle && !nameKey.empty()) g_namedFileMappings[nameKey] = mapping;
+        try
+        {
+            handle = RegisterFileMappingLocked(mapping, FullMappingAccess, flags);
+            if (handle && !nameKey.empty()) g_namedFileMappings[nameKey] = mapping;
+        }
+        catch (const std::bad_alloc&)
+        {
+            if (handle) g_fileMappings.erase(reinterpret_cast<ULONG_PTR>(handle));
+            SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return nullptr;
+        }
     }
     if (!handle)
     {

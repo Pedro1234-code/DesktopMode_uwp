@@ -837,9 +837,6 @@ BOOL WINAPI BridgeRedrawWindow(HWND window, const RECT* update, HRGN region, UIN
     if ((flags & RDW_NOERASE) != 0 &&
         !manager->SetGuestErasePending(window, FALSE, &error))
         goto Failure;
-    else if ((flags & RDW_ERASE) != 0 &&
-        !manager->SetGuestErasePending(window, TRUE, &error))
-        goto Failure;
     if ((flags & RDW_INTERNALPAINT) != 0 &&
         !manager->SetGuestInternalPaint(window, TRUE, &error))
         goto Failure;
@@ -847,7 +844,7 @@ BOOL WINAPI BridgeRedrawWindow(HWND window, const RECT* update, HRGN region, UIN
         !manager->SetGuestInternalPaint(window, FALSE, &error))
         goto Failure;
 
-    if ((flags & RDW_ALLCHILDREN) != 0)
+    if ((flags & (RDW_ALLCHILDREN | RDW_NOCHILDREN)) == RDW_ALLCHILDREN)
     {
         POINT parentOrigin{};
         manager->GetGuestClientOrigin(window, &parentOrigin, nullptr);
@@ -888,8 +885,6 @@ BOOL WINAPI BridgeRedrawWindow(HWND window, const RECT* update, HRGN region, UIN
             }
             if ((flags & RDW_NOERASE) != 0)
                 manager->SetGuestErasePending(child, FALSE, nullptr);
-            else if ((flags & RDW_ERASE) != 0)
-                manager->SetGuestErasePending(child, TRUE, nullptr);
             if ((flags & RDW_INTERNALPAINT) != 0)
                 manager->SetGuestInternalPaint(child, TRUE, nullptr);
             if ((flags & RDW_NOINTERNALPAINT) != 0)
@@ -897,12 +892,21 @@ BOOL WINAPI BridgeRedrawWindow(HWND window, const RECT* update, HRGN region, UIN
         }
     }
 
-    if ((flags & (RDW_UPDATENOW | RDW_ERASENOW)) != 0)
+    if ((flags & RDW_UPDATENOW) != 0)
     {
         if (!manager->UpdateGuestWindow(window, &error)) goto Failure;
-        if ((flags & RDW_ALLCHILDREN) != 0)
+        if ((flags & (RDW_ALLCHILDREN | RDW_NOCHILDREN)) == RDW_ALLCHILDREN)
             for (HWND child : manager->SnapshotGuestWindows(window, true))
                 manager->UpdateGuestWindow(child, nullptr);
+    }
+    else if ((flags & RDW_ERASENOW) != 0)
+    {
+        // Erase only. Keep the update region pending for the next WM_PAINT.
+        manager->GetGuestUpdateRegion(window, nullptr, TRUE, &error);
+        if (error != ERROR_SUCCESS) goto Failure;
+        if ((flags & (RDW_ALLCHILDREN | RDW_NOCHILDREN)) == RDW_ALLCHILDREN)
+            for (HWND child : manager->SnapshotGuestWindows(window, true))
+                manager->GetGuestUpdateRegion(child, nullptr, TRUE, nullptr);
     }
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
@@ -1420,15 +1424,35 @@ int WINAPI BridgeExcludeUpdateRgn(HDC dc, HWND window)
     }
     MiniGdi::Region update;
     DWORD error = ERROR_SUCCESS;
-    if (!manager->GetGuestUpdateRegion(window, &update, FALSE, &error))
+    const BOOL dirty = manager->GetGuestUpdateRegion(window, &update, FALSE, &error);
+    if (error != ERROR_SUCCESS)
     {
-        if (error != ERROR_SUCCESS)
+        BridgeSetLastError(error);
+        return ERROR;
+    }
+
+    if (dirty)
+    {
+        POINT windowOrigin{}, dcOrigin{};
+        if (!manager->GetGuestClientOrigin(window, &windowOrigin, &error) ||
+            !manager->GetGuestDcOrigin(dc, &dcOrigin, &error))
         {
             BridgeSetLastError(error);
             return ERROR;
         }
-        BridgeSetLastError(ERROR_SUCCESS);
-        return NULLREGION;
+        const auto translate = [](int value, LONG from, LONG to)
+        {
+            const long long offset = static_cast<long long>(value) + from - to;
+            return static_cast<int>((std::max)(static_cast<long long>((std::numeric_limits<int>::min)()),
+                (std::min)(static_cast<long long>((std::numeric_limits<int>::max)()), offset)));
+        };
+        for (auto& rect : update.rectangles)
+        {
+            rect.left = translate(rect.left, windowOrigin.x, dcOrigin.x);
+            rect.top = translate(rect.top, windowOrigin.y, dcOrigin.y);
+            rect.right = translate(rect.right, windowOrigin.x, dcOrigin.x);
+            rect.bottom = translate(rect.bottom, windowOrigin.y, dcOrigin.y);
+        }
     }
 
     MiniGdi::Region clip;
@@ -1438,15 +1462,19 @@ int WINAPI BridgeExcludeUpdateRgn(HDC dc, HWND window)
         BridgeSetLastError(ERROR_INVALID_HANDLE);
         return ERROR;
     }
-    const MiniGdi::Region remaining = MiniGdi::SubtractRegion(clip, update);
-    if (!manager->Gdi().SetClipRegion(guestDc, remaining))
+    if (dirty && !manager->Gdi().SetClipRegion(guestDc, MiniGdi::SubtractRegion(clip, update)))
+    {
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
+        return ERROR;
+    }
+    if (dirty && !manager->Gdi().GetClipRegion(guestDc, &clip))
     {
         BridgeSetLastError(ERROR_INVALID_HANDLE);
         return ERROR;
     }
     BridgeSetLastError(ERROR_SUCCESS);
-    return remaining.Empty() ? NULLREGION :
-        (remaining.rectangles.size() == 1 ? SIMPLEREGION : COMPLEXREGION);
+    return clip.Empty() ? NULLREGION :
+        (clip.rectangles.size() == 1 ? SIMPLEREGION : COMPLEXREGION);
 }
 
 void WINAPI BridgeMouseEvent(DWORD, DWORD, DWORD, DWORD, ULONG_PTR)

@@ -1135,7 +1135,6 @@ DcHandle GdiContext::CreateDc(Surface* surface)
     dc.surface = surface;
     dc.clip = RectRegion(surface->Bounds());
     dc.isMemoryDc = false;
-    dc.clipIsDefault = true;
     return AllocateDc(dc);
 }
 
@@ -1146,7 +1145,6 @@ DcHandle GdiContext::CreateMemoryDc()
     dc.clip = Region{};
     dc.bitmap = InvalidObject;
     dc.isMemoryDc = true;
-    dc.clipIsDefault = true;
     return AllocateDc(dc);
 }
 
@@ -1177,7 +1175,8 @@ bool GdiContext::RestoreDc(DcHandle dc, int saved)
     // A window DC keeps its current backing surface after a resize. A memory
     // DC instead restores the selected bitmap along with the drawing state.
     restored.surface = context->isMemoryDc ? ResolveBitmap(restored.bitmap) : context->surface;
-    if (restored.clipIsDefault && restored.surface) restored.clip = RectRegion(restored.surface->Bounds());
+    restored.paintClip = std::move(context->paintClip);
+    RefreshClip(restored);
     *context = std::move(restored);
     stack.resize(static_cast<size_t>(index));
     return true;
@@ -1487,19 +1486,7 @@ bool GdiContext::SelectBitmap(DcHandle dc, BitmapHandle bitmap, BitmapHandle* pr
 
     context->bitmap = bitmap;
     context->surface = ResolveBitmap(bitmap);
-    if (context->surface == nullptr)
-    {
-        context->clip = Region{};
-    }
-    else if (context->clipIsDefault)
-    {
-        context->clip = RectRegion(context->surface->Bounds());
-    }
-    else
-    {
-        context->clip = IntersectRegion(
-            RectRegion(context->surface->Bounds()), context->clip);
-    }
+    RefreshClip(*context);
 
     return true;
 }
@@ -1517,8 +1504,8 @@ bool GdiContext::SetClipRegion(DcHandle dc, const Region& clip)
         return false;
     }
 
-    context->clip = IntersectRegion(RectRegion(context->surface->Bounds()), clip);
-    context->clipIsDefault = false;
+    context->applicationClip = {clip, true};
+    RefreshClip(*context);
     return true;
 }
 
@@ -1530,8 +1517,8 @@ bool GdiContext::ResetClip(DcHandle dc)
         return false;
     }
 
-    context->clip = RectRegion(context->surface->Bounds());
-    context->clipIsDefault = true;
+    context->applicationClip = {};
+    RefreshClip(*context);
     return true;
 }
 
@@ -1552,6 +1539,31 @@ bool GdiContext::GetClipRegion(DcHandle dc, Region* clip) const
     const DeviceContext* context = FindDc(dc);
     if (context == nullptr || clip == nullptr) return false;
     *clip = context->clip;
+    return true;
+}
+
+void GdiContext::RefreshClip(DeviceContext& context)
+{
+    context.clip = context.surface ? RectRegion(context.surface->Bounds()) : Region{};
+    if (context.paintClip.selected) context.clip = IntersectRegion(context.clip, context.paintClip.region);
+    if (context.applicationClip.selected) context.clip = IntersectRegion(context.clip, context.applicationClip.region);
+}
+
+bool GdiContext::GetApplicationClip(DcHandle dc, ClipSelection* clip) const
+{
+    const auto context = FindDc(dc);
+    if (!context || !clip) return false;
+    *clip = context->applicationClip;
+    return true;
+}
+
+bool GdiContext::SetPaintClip(DcHandle dc, ClipSelection clip, ClipSelection* previous)
+{
+    auto context = FindDc(dc);
+    if (!context || !context->surface) return false;
+    if (previous) *previous = std::move(context->paintClip);
+    context->paintClip = std::move(clip);
+    RefreshClip(*context);
     return true;
 }
 

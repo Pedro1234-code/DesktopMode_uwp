@@ -380,6 +380,13 @@ namespace MiniGdi
         bool ResetClip(DcHandle dc);
         bool GetClipRect(DcHandle dc, Rect* clip) const;
         bool GetClipRegion(DcHandle dc, Region* clip) const;
+        struct ClipSelection
+        {
+            Region region;
+            bool selected = false;
+        };
+        bool GetApplicationClip(DcHandle dc, ClipSelection* clip) const;
+        bool SetPaintClip(DcHandle dc, ClipSelection clip, ClipSelection* previous = nullptr);
 
         bool MoveTo(DcHandle dc, Point point, Point* previous = nullptr);
         bool GetCurrentPosition(DcHandle dc, Point* point) const;
@@ -452,13 +459,14 @@ namespace MiniGdi
         {
             Surface* surface = nullptr;
             Region clip;
+            ClipSelection applicationClip;
+            ClipSelection paintClip;
             Point current;
             ObjectHandle pen = InvalidObject;
             ObjectHandle brush = InvalidObject;
             ObjectHandle font = InvalidObject;
             BitmapHandle bitmap = InvalidObject;
             bool isMemoryDc = false;
-            bool clipIsDefault = true;
             Color textColor = OpaqueBlack;
             Color backgroundColor = OpaqueWhite;
             BackgroundMode backgroundMode = BackgroundMode::Opaque;
@@ -466,6 +474,7 @@ namespace MiniGdi
 
         DeviceContext* FindDc(DcHandle dc);
         const DeviceContext* FindDc(DcHandle dc) const;
+        static void RefreshClip(DeviceContext& context);
         const Pen& ResolvePen(ObjectHandle object) const;
         const Brush& ResolveBrush(ObjectHandle object) const;
         const Font& ResolveFont(ObjectHandle object) const;

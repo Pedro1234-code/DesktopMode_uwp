@@ -183,6 +183,7 @@ namespace Bridge
         // expose only opaque integer handles, never host UI resources.
         bool IsGuestDc(HDC dc) const;
         MiniGdi::DcHandle GuestDcHandle(HDC dc) const;
+        BOOL GetGuestDcOrigin(HDC dc, LPPOINT origin, DWORD* win32Error) const;
 
         MiniGdi::GdiContext& Gdi() { return m_gdi; }
         const MiniGdi::GdiContext& Gdi() const { return m_gdi; }

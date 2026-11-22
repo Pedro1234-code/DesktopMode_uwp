@@ -456,21 +456,6 @@ bool RasterizePolygonRegion(
     return true;
 }
 
-MiniGdi::Region LogicalToDeviceRegion(
-    const GuestDcCompatibilityState& state, const MiniGdi::Region& source)
-{
-    MiniGdi::Region result;
-    for (const MiniGdi::Rect& rect : source.rectangles)
-    {
-        const POINT first = LogicalToDevicePoint(state, rect.left, rect.top);
-        const POINT second = LogicalToDevicePoint(state, rect.right, rect.bottom);
-        result = MiniGdi::UnionRegion(result, MiniGdi::RectRegion({
-            (std::min)(first.x, second.x), (std::min)(first.y, second.y),
-            (std::max)(first.x, second.x), (std::max)(first.y, second.y) }));
-    }
-    return result;
-}
-
 MiniGdi::Region DeviceToLogicalRegion(
     const GuestDcCompatibilityState& state, const MiniGdi::Region& source)
 {
@@ -977,43 +962,44 @@ BOOL WINAPI BridgeEqualRgn(HRGN first, HRGN second)
     return TRUE;
 }
 
-int WINAPI BridgeSelectClipRgn(HDC dc, HRGN region)
+int EffectiveClipComplexity(MiniGdi::GdiContext& gdi, MiniGdi::DcHandle dc)
 {
-    GuestWindowManager* manager = CurrentManagerOrFail();
-    if (!manager) return ERROR;
-    if (!region) return manager->Gdi().ResetClip(FromGuestDc(dc)) ? NULLREGION : ERROR;
-    std::lock_guard<std::mutex> guard(g_gdiCompatibilityLock);
-    const auto found = g_regions.find(reinterpret_cast<ULONG_PTR>(region));
-    if (found == g_regions.end()) return ERROR;
-    const MiniGdi::Region mapped = LogicalToDeviceRegion(
-        g_dcCompatibility[reinterpret_cast<ULONG_PTR>(dc)], found->second.geometry);
-    return manager->Gdi().SetClipRegion(FromGuestDc(dc), mapped)
-        ? RegionComplexity(mapped) : ERROR;
+    MiniGdi::Region clip;
+    return gdi.GetClipRegion(dc, &clip) ? RegionComplexity(clip) : ERROR;
 }
 
 int WINAPI BridgeExtSelectClipRgn(HDC dc, HRGN region, int mode)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager) return ERROR;
-    if (!region && mode == RGN_COPY)
-        return manager->Gdi().ResetClip(FromGuestDc(dc)) ? NULLREGION : ERROR;
+    auto& gdi = manager->Gdi();
+    const auto handle = FromGuestDc(dc);
+    if (!region)
+        return mode == RGN_COPY && gdi.ResetClip(handle) ? EffectiveClipComplexity(gdi, handle) : ERROR;
     MiniGdi::Region source;
-    MiniGdi::Region current;
-    if (!CopyRegionHandle(region, &source) ||
-        !manager->Gdi().GetClipRegion(FromGuestDc(dc), &current)) return ERROR;
-    const MiniGdi::Region mapped = LogicalToDeviceRegion(DcState(dc), source);
+    if (!CopyRegionHandle(region, &source)) return ERROR;
+    MiniGdi::GdiContext::ClipSelection application;
+    if (!gdi.GetApplicationClip(handle, &application)) return ERROR;
+    MiniGdi::Region visible;
+    if (!application.selected && mode != RGN_COPY && mode != RGN_AND &&
+        !gdi.GetClipRegion(handle, &visible)) return ERROR;
+    const MiniGdi::Region& current = application.selected ? application.region : visible;
     MiniGdi::Region result;
     switch (mode)
     {
-    case RGN_COPY: result = mapped; break;
-    case RGN_AND: result = MiniGdi::IntersectRegion(current, mapped); break;
-    case RGN_OR: result = MiniGdi::UnionRegion(current, mapped); break;
-    case RGN_XOR: result = MiniGdi::XorRegion(current, mapped); break;
-    case RGN_DIFF: result = MiniGdi::SubtractRegion(current, mapped); break;
+    case RGN_COPY: result = std::move(source); break;
+    case RGN_AND: result = application.selected ? MiniGdi::IntersectRegion(current, source) : std::move(source); break;
+    case RGN_OR: result = MiniGdi::UnionRegion(current, source); break;
+    case RGN_XOR: result = MiniGdi::XorRegion(current, source); break;
+    case RGN_DIFF: result = MiniGdi::SubtractRegion(current, source); break;
     default: return ERROR;
     }
-    return manager->Gdi().SetClipRegion(FromGuestDc(dc), result)
-        ? RegionComplexity(result) : ERROR;
+    return gdi.SetClipRegion(handle, result) ? EffectiveClipComplexity(gdi, handle) : ERROR;
+}
+
+int WINAPI BridgeSelectClipRgn(HDC dc, HRGN region)
+{
+    return BridgeExtSelectClipRgn(dc, region, RGN_COPY);
 }
 
 int WINAPI BridgeGetClipBox(HDC dc, LPRECT bounds)
@@ -1025,33 +1011,48 @@ int WINAPI BridgeGetClipBox(HDC dc, LPRECT bounds)
     const MiniGdi::Region logical = DeviceToLogicalRegion(DcState(dc), clip);
     const MiniGdi::Rect value = logical.Bounds();
     *bounds = { value.left, value.top, value.right, value.bottom };
-    return RegionComplexity(logical);
+    return RegionComplexity(clip);
+}
+
+BOOL WINAPI BridgeGetDCOrgEx(HDC dc, LPPOINT origin)
+{
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    if (!manager) return FALSE;
+    DWORD error = ERROR_SUCCESS;
+    const BOOL result = manager->GetGuestDcOrigin(dc, origin, &error);
+    if (!result) BridgeSetLastError(error);
+    return result;
 }
 
 int WINAPI BridgeIntersectClipRect(HDC dc, int left, int top, int right, int bottom)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager) return ERROR;
-    MiniGdi::Region current;
-    if (!manager->Gdi().GetClipRegion(FromGuestDc(dc), &current)) return ERROR;
+    const auto handle = FromGuestDc(dc);
+    auto& gdi = manager->Gdi();
+    MiniGdi::GdiContext::ClipSelection application;
+    if (!gdi.GetApplicationClip(handle, &application)) return ERROR;
     const auto state = DcState(dc);
     const POINT first = LogicalToDevicePoint(state, left, top);
     const POINT second = LogicalToDevicePoint(state, right, bottom);
     const MiniGdi::Rect mapped{
         (std::min)(first.x, second.x), (std::min)(first.y, second.y),
         (std::max)(first.x, second.x), (std::max)(first.y, second.y) };
-    const MiniGdi::Region result = MiniGdi::IntersectRegion(
-        current, MiniGdi::RectRegion(mapped));
-    return manager->Gdi().SetClipRegion(FromGuestDc(dc), result)
-        ? RegionComplexity(result) : ERROR;
+    const auto requested = MiniGdi::RectRegion(mapped);
+    const auto result = application.selected ? MiniGdi::IntersectRegion(application.region, requested) : requested;
+    return gdi.SetClipRegion(handle, result) ? EffectiveClipComplexity(gdi, handle) : ERROR;
 }
 
 int WINAPI BridgeExcludeClipRect(HDC dc, int left, int top, int right, int bottom)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager) return ERROR;
-    MiniGdi::Region current;
-    if (!manager->Gdi().GetClipRegion(FromGuestDc(dc), &current)) return ERROR;
+    const auto handle = FromGuestDc(dc);
+    auto& gdi = manager->Gdi();
+    MiniGdi::GdiContext::ClipSelection application;
+    if (!gdi.GetApplicationClip(handle, &application)) return ERROR;
+    MiniGdi::Region visible;
+    if (!application.selected && !gdi.GetClipRegion(handle, &visible)) return ERROR;
     const auto state = DcState(dc);
     const POINT first = LogicalToDevicePoint(state, left, top);
     const POINT second = LogicalToDevicePoint(state, right, bottom);
@@ -1059,23 +1060,22 @@ int WINAPI BridgeExcludeClipRect(HDC dc, int left, int top, int right, int botto
     top = (std::min)(first.y, second.y);
     right = (std::max)(first.x, second.x);
     bottom = (std::max)(first.y, second.y);
-    const MiniGdi::Region result = MiniGdi::SubtractRegion(current,
+    const MiniGdi::Region result = MiniGdi::SubtractRegion(application.selected ? application.region : visible,
         MiniGdi::RectRegion({ left, top, right, bottom }));
-    if (!manager->Gdi().SetClipRegion(FromGuestDc(dc), result)) return ERROR;
-    return RegionComplexity(result);
+    return gdi.SetClipRegion(handle, result) ? EffectiveClipComplexity(gdi, handle) : ERROR;
 }
 
 int WINAPI BridgeGetClipRgn(HDC dc, HRGN region)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager || !region) return -1;
-    MiniGdi::Region clip;
-    if (!manager->Gdi().GetClipRegion(FromGuestDc(dc), &clip)) return -1;
+    MiniGdi::GdiContext::ClipSelection clip;
+    if (!manager->Gdi().GetApplicationClip(FromGuestDc(dc), &clip)) return -1;
     std::lock_guard<std::mutex> guard(g_gdiCompatibilityLock);
-    const auto state = g_dcCompatibility[reinterpret_cast<ULONG_PTR>(dc)];
     const auto target = g_regions.find(reinterpret_cast<ULONG_PTR>(region));
     if (target == g_regions.end()) return -1;
-    target->second.geometry = DeviceToLogicalRegion(state, clip);
+    if (!clip.selected) return 0;
+    target->second.geometry = std::move(clip.region);
     return 1;
 }
 

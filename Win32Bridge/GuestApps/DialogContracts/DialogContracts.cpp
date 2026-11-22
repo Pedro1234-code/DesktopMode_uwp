@@ -23,6 +23,86 @@ namespace
     void Check(bool result, int line) { if (!result && !failure) failure = line; }
 #define CHECK(expression) Check(!!(expression), __LINE__)
 
+    const RECT PaintArea{ 6, 8, 26, 30 };
+    unsigned paints = 0, erases = 0;
+    bool measuringPaint = false;
+    HRGN appRegion = nullptr, copiedRegion = nullptr;
+
+    LRESULT CALLBACK PaintProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
+    {
+        if (message == WM_ERASEBKGND && measuringPaint)
+        {
+            ++erases;
+            return TRUE;
+        }
+        if (message == WM_PAINT)
+        {
+            PAINTSTRUCT paint{};
+            const HDC dc = BeginPaint(window, &paint);
+            if (dc && measuringPaint)
+            {
+                ++paints;
+                CHECK(!paint.fErase && EqualRect(&paint.rcPaint, &PaintArea));
+                CHECK(GetClipRgn(dc, copiedRegion) == 0);
+                CHECK(SelectClipRgn(dc, appRegion) == SIMPLEREGION);
+                RECT bounds{};
+                CHECK(GetClipBox(dc, &bounds) == SIMPLEREGION && EqualRect(&bounds, &PaintArea));
+                CHECK(SelectClipRgn(dc, nullptr) == SIMPLEREGION);
+                CHECK(GetClipBox(dc, &bounds) == SIMPLEREGION && EqualRect(&bounds, &PaintArea));
+            }
+            if (dc) EndPaint(window, &paint);
+            return 0;
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    void CheckPaintContracts(HINSTANCE instance)
+    {
+        WNDCLASSW windowClass{};
+        windowClass.hInstance = instance;
+        windowClass.lpfnWndProc = PaintProcedure;
+        windowClass.lpszClassName = L"Win32BridgePaintContracts";
+        CHECK(RegisterClassW(&windowClass));
+        const HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"", WS_POPUP | WS_VISIBLE,
+            0, 0, 120, 100, nullptr, nullptr, instance, nullptr);
+        CHECK(window != nullptr);
+        if (!window) return;
+        appRegion = CreateRectRgn(0, 0, 120, 100);
+        copiedRegion = CreateRectRgn(1, 1, 2, 2);
+        CHECK(appRegion && copiedRegion);
+        const HDC dc = GetDC(window);
+        CHECK(dc != nullptr);
+        if (dc)
+        {
+            RECT bounds{};
+            const RECT deviceRegion{ 0, 0, 120, 100 };
+            POINT origin{}, screen{};
+            CHECK(GetDCOrgEx(dc, &origin) && ClientToScreen(window, &screen));
+            CHECK(origin.x == screen.x && origin.y == screen.y);
+            CHECK(GetClipRgn(dc, copiedRegion) == 0);
+            CHECK(SetViewportOrgEx(dc, 10, 12, nullptr));
+            CHECK(SelectClipRgn(dc, appRegion) == SIMPLEREGION && GetClipRgn(dc, copiedRegion) == 1);
+            CHECK(GetRgnBox(copiedRegion, &bounds) == SIMPLEREGION && EqualRect(&bounds, &deviceRegion));
+            CHECK(SelectClipRgn(dc, nullptr) == SIMPLEREGION && GetClipRgn(dc, copiedRegion) == 0);
+            CHECK(SetViewportOrgEx(dc, 0, 0, nullptr));
+            CHECK(ReleaseDC(window, dc));
+        }
+        CHECK(ValidateRect(window, nullptr));
+        measuringPaint = true;
+        CHECK(RedrawWindow(window, &PaintArea, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ERASENOW));
+        CHECK(erases == 1 && paints == 0);
+        RECT dirty{};
+        CHECK(GetUpdateRect(window, &dirty, FALSE) && EqualRect(&dirty, &PaintArea));
+        CHECK(RedrawWindow(window, nullptr, nullptr, RDW_UPDATENOW));
+        CHECK(erases == 1 && paints == 1 && !GetUpdateRect(window, nullptr, FALSE));
+        CHECK(RedrawWindow(window, &PaintArea, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW));
+        CHECK(erases == 2 && paints == 2 && !GetUpdateRect(window, nullptr, FALSE));
+        measuringPaint = false;
+        DestroyWindow(window);
+        if (appRegion) DeleteObject(appRegion);
+        if (copiedRegion) DeleteObject(copiedRegion);
+    }
+
     INT_PTR CALLBACK PageProcedure(HWND page, UINT message, WPARAM, LPARAM parameter)
     {
         if (message == WM_INITDIALOG)
@@ -68,6 +148,7 @@ namespace
 
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 {
+    CheckPaintContracts(instance);
     INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_TAB_CLASSES };
     CHECK(InitCommonControlsEx(&controls));
     EmptyTemplate content{};

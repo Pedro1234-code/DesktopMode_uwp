@@ -2740,10 +2740,10 @@ struct GuestWindowManager::WindowRecord final
     bool erasePending = false;
     bool internalPaintPending = false;
     bool paintActive = false;
-    bool paintClipSaved = false;
     MiniGdi::Region updateRegion;
-    MiniGdi::Region paintPreviousClip;
-    std::vector<MiniGdi::Region> commonDcClipStack;
+    MiniGdi::GdiContext::ClipSelection paintPreviousClip;
+    MiniGdi::GdiContext::ClipSelection paintPreviousApplicationClip;
+    std::vector<MiniGdi::GdiContext::ClipSelection> commonDcClipStack;
     bool destroyed = false;
     bool nonClientCreated = false;
     bool nonClientActive = false;
@@ -13323,13 +13323,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     constexpr DWORD OwnerDrawFixedTab = 0x2000u; // TCS_OWNERDRAWFIXED
                     if (parent && (style & OwnerDrawFixedTab))
                     {
-                        MiniGdi::Region previousClip;
+                        MiniGdi::Region effectiveClip;
+                        MiniGdi::GdiContext::ClipSelection previousClip;
                         const MiniGdi::Rect itemRect{ itemBounds.left, itemBounds.top,
                             itemBounds.right, itemBounds.bottom };
-                        if (m_gdi.GetClipRegion(guestDc, &previousClip))
+                        if (m_gdi.GetClipRegion(guestDc, &effectiveClip) &&
+                            m_gdi.GetApplicationClip(guestDc, &previousClip))
                         {
                             const auto itemClip = MiniGdi::IntersectRegion(
-                                previousClip, MiniGdi::RectRegion(itemRect));
+                                effectiveClip, MiniGdi::RectRegion(itemRect));
                             if (!itemClip.Empty() && m_gdi.SetClipRegion(guestDc, itemClip))
                             {
                                 GuestDrawItem item{};
@@ -13345,7 +13347,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                                     item.itemData = static_cast<ULONG_PTR>(tabItemData[index]);
                                 SendGuestMessage(parent, 0x002bu, controlId, // WM_DRAWITEM
                                     reinterpret_cast<LPARAM>(&item), nullptr);
-                                m_gdi.SetClipRegion(guestDc, previousClip);
+                                if (previousClip.selected) m_gdi.SetClipRegion(guestDc, previousClip.region);
+                                else m_gdi.ResetClip(guestDc);
                                 surface = m_gdi.GetSurface(guestDc);
                                 if (!surface) break;
                             }
@@ -16911,15 +16914,30 @@ BOOL GuestWindowManager::GetGuestUpdateRegion(
     if (shouldErase)
     {
         const HDC dc = ToGuestDc(record->dc);
-        MiniGdi::Region previousClip;
-        const bool clipped = m_gdi.GetClipRegion(record->dc, &previousClip) &&
-            m_gdi.SetClipRegion(record->dc, MiniGdi::IntersectRegion(previousClip, update));
-        const LRESULT handled = CallWindowProcedure(record, GuestAbi::WmEraseBkgnd,
-            reinterpret_cast<WPARAM>(dc), 0);
-        const MiniGdi::Rect bounds = update.Bounds();
-        if (handled == 0) EraseGuestBackground(record, dc,
-            { bounds.left, bounds.top, bounds.right, bounds.bottom });
-        if (clipped) m_gdi.SetClipRegion(record->dc, previousClip);
+        const auto handle = FromGuestDc(dc);
+        MiniGdi::GdiContext::ClipSelection previousClip;
+        MiniGdi::GdiContext::ClipSelection previousApplicationClip;
+        bool erased = false;
+        if (m_gdi.GetApplicationClip(handle, &previousApplicationClip) &&
+            m_gdi.SetPaintClip(handle, {update, true}, &previousClip))
+        {
+            const LRESULT handled = SendGuestMessage(window, GuestAbi::WmEraseBkgnd,
+                reinterpret_cast<WPARAM>(dc), 0, nullptr);
+            const MiniGdi::Rect bounds = update.Bounds();
+            erased = handled != 0 || EraseGuestBackground(record, dc,
+                { bounds.left, bounds.top, bounds.right, bounds.bottom });
+            m_gdi.SetPaintClip(handle, std::move(previousClip));
+            if (previousApplicationClip.selected) m_gdi.SetClipRegion(handle, previousApplicationClip.region);
+            else m_gdi.ResetClip(handle);
+        }
+        if (!erased)
+        {
+            std::lock_guard<std::mutex> guard(record->lock);
+            if (!record->destroyed && record->invalidated &&
+                !MiniGdi::IntersectRegion(update, record->updateRegion).Empty())
+                record->erasePending = true;
+        }
+        else if (IsGuestWindowVisibleInternal(window)) Present(record);
     }
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return dirty ? TRUE : FALSE;
@@ -16973,7 +16991,13 @@ BOOL GuestWindowManager::UpdateGuestWindow(HWND window, DWORD* win32Error)
     }
     if (needsPaint)
     {
-        CallWindowProcedure(record, GuestAbi::WmPaint, 0, 0);
+        DWORD error = ERROR_SUCCESS;
+        SendGuestMessage(window, GuestAbi::WmPaint, 0, 0, &error);
+        if (error != ERROR_SUCCESS)
+        {
+            SetWin32Error(win32Error, error);
+            return FALSE;
+        }
     }
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
@@ -17020,10 +17044,10 @@ HDC GuestWindowManager::BeginGuestPaint(HWND window, GuestAbi::PaintStruct* pain
         record->paintActive = true;
     }
 
-    MiniGdi::Region previousClip;
-    if (!m_gdi.GetClipRegion(record->dc, &previousClip) ||
-        !m_gdi.SetClipRegion(record->dc,
-            MiniGdi::IntersectRegion(previousClip, updateRegion)))
+    MiniGdi::GdiContext::ClipSelection previousClip;
+    MiniGdi::GdiContext::ClipSelection previousApplicationClip;
+    if (!m_gdi.GetApplicationClip(FromGuestDc(dc), &previousApplicationClip) ||
+        !m_gdi.SetPaintClip(FromGuestDc(dc), {updateRegion, true}, &previousClip))
     {
         std::lock_guard<std::mutex> guard(record->lock);
         record->paintActive = false;
@@ -17038,8 +17062,8 @@ HDC GuestWindowManager::BeginGuestPaint(HWND window, GuestAbi::PaintStruct* pain
     }
     {
         std::lock_guard<std::mutex> guard(record->lock);
-        record->paintPreviousClip = previousClip;
-        record->paintClipSaved = true;
+        record->paintPreviousClip = std::move(previousClip);
+        record->paintPreviousApplicationClip = std::move(previousApplicationClip);
     }
 
     memset(paint, 0, sizeof(*paint));
@@ -17069,10 +17093,7 @@ HDC GuestWindowManager::BeginGuestPaint(HWND window, GuestAbi::PaintStruct* pain
             SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
             return nullptr;
         }
-        if (handled == 0)
-        {
-            EraseGuestBackground(record, dc, update);
-        }
+        paint->fErase = handled == 0 && !EraseGuestBackground(record, dc, update);
     }
 
     SetWin32Error(win32Error, ERROR_SUCCESS);
@@ -17088,8 +17109,8 @@ BOOL GuestWindowManager::EndGuestPaint(HWND window, const GuestAbi::PaintStruct*
         return FALSE;
     }
 
-    MiniGdi::Region previousClip;
-    bool restoreClip = false;
+    MiniGdi::GdiContext::ClipSelection previousClip;
+    MiniGdi::GdiContext::ClipSelection previousApplicationClip;
     {
         std::lock_guard<std::mutex> guard(record->lock);
         if (record->destroyed || FromGuestDc(paint->hdc) != record->dc || !record->paintActive)
@@ -17098,11 +17119,13 @@ BOOL GuestWindowManager::EndGuestPaint(HWND window, const GuestAbi::PaintStruct*
             return FALSE;
         }
         record->paintActive = false;
-        restoreClip = record->paintClipSaved;
-        previousClip = record->paintPreviousClip;
-        record->paintClipSaved = false;
+        previousClip = std::move(record->paintPreviousClip);
+        previousApplicationClip = std::move(record->paintPreviousApplicationClip);
     }
-    if (restoreClip) m_gdi.SetClipRegion(record->dc, previousClip);
+    const auto dc = FromGuestDc(paint->hdc);
+    m_gdi.SetPaintClip(dc, std::move(previousClip));
+    if (previousApplicationClip.selected) m_gdi.SetClipRegion(dc, previousApplicationClip.region);
+    else m_gdi.ResetClip(dc);
     if (IsGuestWindowVisibleInternal(window))
     {
         Present(record);
@@ -17152,8 +17175,8 @@ HDC GuestWindowManager::GetGuestDC(HWND window, DWORD* win32Error)
     // as well can permanently leave an occluded portion of the backing store
     // blank. Preserve only the caller-visible DC state here and restore it in
     // ReleaseDC.
-    MiniGdi::Region previousClip;
-    if (!m_gdi.GetClipRegion(record->dc, &previousClip))
+    MiniGdi::GdiContext::ClipSelection previousClip;
+    if (!m_gdi.GetApplicationClip(record->dc, &previousClip))
     {
         SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
         return nullptr;
@@ -17162,7 +17185,6 @@ HDC GuestWindowManager::GetGuestDC(HWND window, DWORD* win32Error)
         std::lock_guard<std::mutex> guard(record->lock);
         if (record->destroyed)
         {
-            m_gdi.SetClipRegion(record->dc, previousClip);
             SetWin32Error(win32Error, ERROR_INVALID_WINDOW_HANDLE);
             return nullptr;
         }
@@ -17195,7 +17217,7 @@ int GuestWindowManager::ReleaseGuestDC(HWND window, HDC dc, DWORD* win32Error)
         SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
         return 0;
     }
-    MiniGdi::Region previousClip;
+    MiniGdi::GdiContext::ClipSelection previousClip;
     {
         std::lock_guard<std::mutex> guard(record->lock);
         if (record->commonDcClipStack.empty())
@@ -17206,7 +17228,8 @@ int GuestWindowManager::ReleaseGuestDC(HWND window, HDC dc, DWORD* win32Error)
         previousClip = std::move(record->commonDcClipStack.back());
         record->commonDcClipStack.pop_back();
     }
-    m_gdi.SetClipRegion(record->dc, previousClip);
+    if (previousClip.selected) m_gdi.SetClipRegion(record->dc, previousClip.region);
+    else m_gdi.ResetClip(record->dc);
     if (IsGuestWindowVisibleInternal(window))
     {
         Present(record);
@@ -17225,6 +17248,31 @@ MiniGdi::DcHandle GuestWindowManager::GuestDcHandle(HDC dc) const
 {
     const MiniGdi::DcHandle handle = FromGuestDc(dc);
     return m_gdi.HasDc(handle) ? handle : MiniGdi::InvalidDc;
+}
+
+BOOL GuestWindowManager::GetGuestDcOrigin(HDC dc, LPPOINT origin, DWORD* win32Error) const
+{
+    const auto handle = GuestDcHandle(dc);
+    if (!origin || handle == MiniGdi::InvalidDc)
+    {
+        SetWin32Error(win32Error, origin ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    HWND window = nullptr;
+    {
+        std::lock_guard<std::mutex> guard(m_windowsLock);
+        for (const auto& entry : m_windows)
+        {
+            const auto& record = entry.second;
+            if (record->dc != handle) continue;
+            window = record->handle;
+            break;
+        }
+    }
+    if (window) return GetGuestClientOrigin(window, origin, win32Error);
+    *origin = {};
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return TRUE;
 }
 
 void GuestWindowManager::Present(const std::shared_ptr<WindowRecord>& window)

@@ -56,7 +56,7 @@ Use the import and runtime logs in the app's LocalState to distinguish a missing
 - **Windowing and controls.** Improve paint, clipping, resize and focus behavior, nested modal loops, owner-draw notifications, and the fidelity of common controls. Exercise these paths through operations such as opening, saving, editing, and closing documents.
 - **CRT and C++.** Expand dynamic MSVCP/STL coverage and verify ABI compatibility across modules. Finish console locale and code-page edge cases and validate exception propagation across guest DLL boundaries.
 - **DirectX.** Broaden D3D11 resource and context identity coverage and test shared-handle lifetimes. Validate D3D12 SDK selection, swap-chain resize, and device-loss recovery on the supported hosts, including Xbox. D3D12 features depend on the host runtime.
-- **Storage and system services.** Track open-file identity across rename so existing byte-range locks apply to new opens under the new name. Plan REGF-compatible hives and broaden filesystem, COM, and activation-context contracts. Full host WinSxS integration and language fallback remain future work.
+- **Storage and system services.** Local file renames preserve handle paths, share modes, and byte-range locks. Remaining filesystem work includes case-only renames, stronger directory move atomicity, and file identity across path aliases and overlay boundaries. Plan REGF-compatible hives and broaden COM and activation-context contracts. Full host WinSxS integration and language fallback remain future work.
 - **Release validation.** Run the contract fixtures and representative GUI, console, and graphics workloads on Windows UWP and Xbox. Record results per host and build. Networking is deferred.
 
 ## Scope

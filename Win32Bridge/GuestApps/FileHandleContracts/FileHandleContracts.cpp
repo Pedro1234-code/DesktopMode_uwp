@@ -19,6 +19,11 @@ struct TemporaryFile
     wchar_t path[MAX_PATH]{};
     ~TemporaryFile() { if (*path) DeleteFileW(path); }
 };
+struct View
+{
+    char* bytes = nullptr;
+    ~View() { if (bytes) UnmapViewOfFile(bytes); }
+};
 #define REQUIRE(expression) do { if (!(expression)) return __LINE__; } while (false)
 int ChildWriter(HANDLE ready)
 {
@@ -968,6 +973,144 @@ int CheckByteRangeLocks(const wchar_t* temporaryPath)
     alias.Reset();
     REQUIRE(SetFilePointerEx(peer.value, offset, nullptr, FILE_BEGIN));
     REQUIRE(ReadFile(peer.value, data, 2, &count, nullptr) && count == 2);
+
+    Handle append;
+    append.value = CreateFileW(scratch.path, FILE_APPEND_DATA, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(append.value != INVALID_HANDLE_VALUE);
+    REQUIRE(SetFilePointerEx(append.value, offset, nullptr, FILE_BEGIN));
+    REQUIRE(LockFile(peer.value, 16, 0, 1, 0));
+    REQUIRE(!WriteFile(append.value, "!", 1, &count, nullptr) && GetLastError() == ERROR_LOCK_VIOLATION);
+    REQUIRE(UnlockFile(peer.value, 16, 0, 1, 0));
+    REQUIRE(WriteFile(append.value, "!", 1, &count, nullptr) && count == 1);
+    LARGE_INTEGER position{};
+    REQUIRE(SetFilePointerEx(append.value, {}, &position, FILE_CURRENT) && position.QuadPart == 17);
+    position.QuadPart = 16;
+    REQUIRE(SetFilePointerEx(peer.value, position, nullptr, FILE_BEGIN));
+    REQUIRE(ReadFile(peer.value, data, 1, &count, nullptr) && count == 1 && data[0] == '!');
+    return 0;
+}
+
+int CheckRenameOpenFile(const wchar_t* temporaryPath)
+{
+    constexpr DWORD ShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    TemporaryFile source, destination;
+    REQUIRE(GetTempFileNameW(temporaryPath, L"rns", 0, source.path));
+    REQUIRE(GetTempFileNameW(temporaryPath, L"rnd", 0, destination.path));
+    Handle original, alias, replaced, reopened, oldName;
+    original.value = CreateFileW(source.path, GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(original.value != INVALID_HANDLE_VALUE);
+    DWORD count = 0;
+    REQUIRE(WriteFile(original.value, "source", 6, &count, nullptr) && count == 6);
+    REQUIRE(DuplicateHandle(GetCurrentProcess(), original.value, GetCurrentProcess(), &alias.value,
+        0, FALSE, DUPLICATE_SAME_ACCESS));
+    REQUIRE(LockFile(original.value, 0, 0, 2, 0));
+
+    replaced.value = CreateFileW(destination.path, 0, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(replaced.value != INVALID_HANDLE_VALUE);
+    REQUIRE(!MoveFileExW(source.path, destination.path, MOVEFILE_REPLACE_EXISTING) &&
+        GetLastError() == ERROR_ACCESS_DENIED);
+    replaced.Reset();
+    REQUIRE(MoveFileExW(source.path, destination.path, MOVEFILE_REPLACE_EXISTING));
+
+    wchar_t finalPath[MAX_PATH]{};
+    const DWORD pathLength = GetFinalPathNameByHandleW(alias.value, finalPath, MAX_PATH, 0);
+    const wchar_t* finalName = wcsrchr(finalPath, L'\\');
+    const wchar_t* destinationName = wcsrchr(destination.path, L'\\');
+    REQUIRE(pathLength > 0 && pathLength < MAX_PATH && finalName && destinationName &&
+        _wcsicmp(finalName, destinationName) == 0);
+    reopened.value = CreateFileW(destination.path, GENERIC_WRITE, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(reopened.value == INVALID_HANDLE_VALUE && GetLastError() == ERROR_SHARING_VIOLATION);
+    reopened.value = CreateFileW(destination.path, GENERIC_READ, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(reopened.value != INVALID_HANDLE_VALUE);
+    char data[2]{};
+    REQUIRE(!ReadFile(reopened.value, data, sizeof(data), &count, nullptr) && GetLastError() == ERROR_LOCK_VIOLATION);
+
+    oldName.value = CreateFileW(source.path, GENERIC_READ | GENERIC_WRITE, ShareAll, nullptr, CREATE_NEW, 0, nullptr);
+    REQUIRE(oldName.value != INVALID_HANDLE_VALUE);
+    REQUIRE(WriteFile(oldName.value, "new", 3, &count, nullptr) && count == 3);
+    REQUIRE(LockFile(oldName.value, 0, 0, 2, 0));
+    REQUIRE(UnlockFile(oldName.value, 0, 0, 2, 0));
+    REQUIRE(UnlockFile(alias.value, 0, 0, 2, 0));
+    REQUIRE(ReadFile(reopened.value, data, sizeof(data), &count, nullptr) &&
+        count == sizeof(data) && memcmp(data, "so", sizeof(data)) == 0);
+
+    // CREATE_ALWAYS truncates the current file, so descriptions opened before
+    // it still see the same file contents and locks.
+    REQUIRE(LockFile(oldName.value, 0, 0, 2, 0));
+    Handle truncate;
+    truncate.value = CreateFileW(source.path, GENERIC_WRITE, ShareAll, nullptr, CREATE_ALWAYS, 0, nullptr);
+    REQUIRE(truncate.value != INVALID_HANDLE_VALUE && GetLastError() == ERROR_ALREADY_EXISTS);
+    LARGE_INTEGER size{};
+    REQUIRE(GetFileSizeEx(oldName.value, &size) && size.QuadPart == 0);
+    REQUIRE(!WriteFile(truncate.value, "n", 1, &count, nullptr) && GetLastError() == ERROR_LOCK_VIOLATION);
+    REQUIRE(UnlockFile(oldName.value, 0, 0, 2, 0));
+    REQUIRE(WriteFile(truncate.value, "n", 1, &count, nullptr) && count == 1);
+    REQUIRE(GetFileSizeEx(oldName.value, &size) && size.QuadPart == 1);
+    return 0;
+}
+
+int CheckFileMappings(const wchar_t* temporaryPath)
+{
+    constexpr DWORD ShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    TemporaryFile source, renamed;
+    REQUIRE(GetTempFileNameW(temporaryPath, L"mps", 0, source.path));
+    REQUIRE(GetTempFileNameW(temporaryPath, L"mpd", 0, renamed.path));
+    REQUIRE(DeleteFileW(renamed.path));
+    Handle file, section;
+    file.value = CreateFileW(source.path, GENERIC_READ | GENERIC_WRITE, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(file.value != INVALID_HANDLE_VALUE);
+    DWORD bytes = 0;
+    REQUIRE(WriteFile(file.value, "01234567", 8, &bytes, nullptr) && bytes == 8);
+    section.value = CreateFileMappingW(file.value, nullptr, PAGE_READWRITE, 0, 32, nullptr);
+    REQUIRE(section.value);
+    LARGE_INTEGER position{};
+    REQUIRE(SetFilePointerEx(file.value, {}, &position, FILE_CURRENT) && position.QuadPart == 8);
+    REQUIRE(GetFileSizeEx(file.value, &position) && position.QuadPart == 32);
+    View read, write, privateCopy;
+    read.bytes = static_cast<char*>(MapViewOfFile(section.value, FILE_MAP_READ, 0, 0, 0));
+    write.bytes = static_cast<char*>(MapViewOfFile(section.value, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+    privateCopy.bytes = static_cast<char*>(MapViewOfFile(section.value, FILE_MAP_COPY, 0, 0, 0));
+    REQUIRE(read.bytes && write.bytes && privateCopy.bytes);
+    REQUIRE(read.bytes != write.bytes && privateCopy.bytes != write.bytes);
+    section.Reset();
+    file.Reset();
+    REQUIRE(MoveFileExW(source.path, renamed.path, 0));
+    file.value = CreateFileW(source.path, GENERIC_READ | GENERIC_WRITE, ShareAll, nullptr, CREATE_NEW, 0, nullptr);
+    REQUIRE(file.value != INVALID_HANDLE_VALUE);
+    REQUIRE(WriteFile(file.value, "new", 3, &bytes, nullptr) && bytes == 3);
+
+    privateCopy.bytes[1] = 'X';
+    REQUIRE(FlushViewOfFile(privateCopy.bytes + 1, 1) && read.bytes[1] == '1');
+    write.bytes[3] = 'Z';
+    REQUIRE(read.bytes[3] == 'Z' && FlushViewOfFile(write.bytes + 3, 1));
+    char contents[8]{};
+    Handle reader;
+    reader.value = CreateFileW(renamed.path, GENERIC_READ, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(reader.value != INVALID_HANDLE_VALUE);
+    REQUIRE(ReadFile(reader.value, contents, sizeof(contents), &bytes, nullptr) && bytes == sizeof(contents));
+    REQUIRE(memcmp(contents, "012Z4567", sizeof(contents)) == 0);
+    REQUIRE(SetFilePointerEx(file.value, {}, nullptr, FILE_BEGIN));
+    REQUIRE(ReadFile(file.value, contents, 3, &bytes, nullptr) && bytes == 3 && memcmp(contents, "new", 3) == 0);
+
+    wchar_t sectionName[64]{};
+    swprintf_s(sectionName, L"Win32BridgeFileHandleContracts-%lu", GetCurrentProcessId());
+    section.value = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, 4096, sectionName);
+    REQUIRE(section.value && GetLastError() != ERROR_ALREADY_EXISTS);
+    Handle readOnly, duplicate;
+    readOnly.value = OpenFileMappingW(FILE_MAP_READ, FALSE, sectionName);
+    REQUIRE(readOnly.value != nullptr);
+    REQUIRE(!MapViewOfFile(readOnly.value, FILE_MAP_WRITE, 0, 0, 0) && GetLastError() == ERROR_ACCESS_DENIED);
+    REQUIRE(DuplicateHandle(GetCurrentProcess(), readOnly.value, GetCurrentProcess(), &duplicate.value,
+        0, FALSE, DUPLICATE_SAME_ACCESS));
+    readOnly.Reset();
+    REQUIRE(!MapViewOfFile(duplicate.value, FILE_MAP_WRITE, 0, 0, 0) && GetLastError() == ERROR_ACCESS_DENIED);
+    View namedRead, namedWrite;
+    namedRead.bytes = static_cast<char*>(MapViewOfFile(duplicate.value, FILE_MAP_READ, 0, 0, 0));
+    namedWrite.bytes = static_cast<char*>(MapViewOfFile(section.value, FILE_MAP_WRITE, 0, 0, 0));
+    REQUIRE(namedRead.bytes && namedWrite.bytes);
+    namedWrite.bytes[9] = 'M';
+    REQUIRE(namedRead.bytes[9] == 'M');
     return 0;
 }
 
@@ -1319,6 +1462,10 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command, int)
     if (nativeDiskIo) return nativeDiskIo;
     const int byteRangeLocks = CheckByteRangeLocks(directory);
     if (byteRangeLocks) return byteRangeLocks;
+    const int renameOpenFile = CheckRenameOpenFile(directory);
+    if (renameOpenFile) return renameOpenFile;
+    const int fileMappings = CheckFileMappings(directory);
+    if (fileMappings) return fileMappings;
     const int signalAndWait = CheckSignalAndWait();
     if (signalAndWait) return signalAndWait;
     const int multipleWaits = CheckMultipleWaits();
