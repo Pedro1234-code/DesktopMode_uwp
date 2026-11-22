@@ -1,16 +1,20 @@
 #include "pch.h"
+#include "Bridge/CRT/CrtExceptions.h"
+#include "Bridge/GuestModule.h"
 #include "Bridge/CommonControlsShims.h"
 #include "Bridge/ActivationContext.h"
 #include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestWindow.h"
-#include "Bridge/Gdi32Shims.h"
+#include "Bridge/GDI/Gdi32Shims.h"
 #include "Bridge/Kernel32Shims.h"
 #include "Bridge/User32Shims.h"
 #include "Bridge/DialogResources.h"
 #include "Bridge/RuntimeDiagnostics.h"
-#include "Bridge\\MiniGdi.h"
+#include "Bridge\\GDI\\MiniGdi.h"
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -206,6 +210,10 @@ namespace
         PVOID callback;
     };
 
+    static_assert(sizeof(GuestPropertySheetPageW) == 72, "PROPSHEETPAGE V1 x64 ABI");
+    static_assert(offsetof(GuestPropertySheetPageW, callback) == 56, "PSP callback ABI");
+    static_assert(offsetof(GuestPropertySheetHeaderW, pages) == 56, "PSH page union ABI");
+    static_assert(sizeof(GuestPropertySheetHeaderW) == 72, "PROPSHEETHEADER V1 x64 ABI");
     struct GuestTaskDialogButton final
     {
         int identifier;
@@ -256,27 +264,26 @@ namespace
     constexpr DWORD PropertySheetHeaderPagesAreStructures = 0x00000008;
     constexpr DWORD PropertySheetHeaderUsesStartPageName = 0x00000040;
 
-    bool ReadBoundedGuestString(LPCWSTR source, std::wstring* result)
+    template<class Character> bool BoundedPropertyTextLength(const Character* source, size_t* length)
     {
-        if (!result) return false;
-        result->clear();
         if (!source || reinterpret_cast<ULONG_PTR>(source) <= 0xffff) return false;
         __try
         {
-            constexpr std::size_t MaximumCaptionCharacters = 4096;
-            std::size_t length = 0;
-            while (length < MaximumCaptionCharacters && source[length]) ++length;
-            if (length == MaximumCaptionCharacters) return false;
-            result->assign(source, source + length);
-            return true;
+            size_t count = 0;
+            while (count < 4096 && source[count]) ++count;
+            if (count == 4096) return false;
+            *length = count; return true;
         }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-            result->clear();
-            return false;
-        }
+        __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
     }
-
+    bool ReadBoundedGuestString(LPCWSTR source, std::wstring* result)
+    {
+        if (!result) return false;
+        result->clear(); size_t length = 0;
+        if (!BoundedPropertyTextLength(source, &length)) return false;
+        // Allocation failures are C++ errors, not invalid guest pointers.
+        result->assign(source, length); return true;
+    }
     bool ResolveTaskDialogText(HINSTANCE instance, LPCWSTR source,
         std::wstring* result)
     {
@@ -373,7 +380,7 @@ namespace
         __try
         {
             const DWORD size = *static_cast<const DWORD*>(source);
-            if (size < offsetof(GuestPropertySheetHeaderW, callback)) return false;
+            if (size < sizeof(GuestPropertySheetHeaderW)) return false;
             ZeroMemory(result, sizeof(*result));
             memcpy(result, source, (std::min)(static_cast<size_t>(size), sizeof(*result)));
             return true;
@@ -387,7 +394,7 @@ namespace
         __try
         {
             *size = *reinterpret_cast<const DWORD*>(source);
-            if (*size < offsetof(GuestPropertySheetPageW, callback) || *size > 4096) return false;
+            if (*size < sizeof(GuestPropertySheetPageW) || *size > 4096) return false;
             ZeroMemory(result, sizeof(*result));
             memcpy(result, source, (std::min)(static_cast<size_t>(*size), sizeof(*result)));
             return true;
@@ -552,8 +559,10 @@ namespace
     {
         __try
         {
-            return procedure(frame->window, frame->message, frame->wParam,
-                frame->lParam, identifier, referenceData);
+            LRESULT result = 0;
+            InvokeCrtFunction(&result, procedure, frame->window, frame->message,
+                frame->wParam, frame->lParam, identifier, referenceData);
+            return result;
         }
         __except (GetExceptionCode() == GuestExitException
             ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
@@ -1148,81 +1157,7 @@ HWND WINAPI Win32Bridge::Bridge::BridgeCreateStatusWindowW(LONG style, LPCWSTR t
         0, 0, 100, GuestMetrics::StatusBarHeight, parent,
         reinterpret_cast<HMENU>(static_cast<ULONG_PTR>(identifier)), nullptr, nullptr, &error) : nullptr;
 }
-INT_PTR WINAPI Win32Bridge::Bridge::BridgePropertySheetW(const void* headerPointer)
-{
-    if (!headerPointer || reinterpret_cast<ULONG_PTR>(headerPointer) <= 0xffff)
-        return -1;
-    GuestPropertySheetHeaderW header = {};
-    if (!ReadPropertySheetHeader(headerPointer, &header)) return -1;
-    if (header.pageCount == 0 || header.pageCount > 256 || !header.pages ||
-        (header.flags & PropertySheetHeaderPagesAreStructures) == 0)
-    {
-        RuntimeDiagnostics::Record(L"PROPERTYSHEET: unsupported or empty page collection.");
-        return -1;
-    }
-
-    UINT selected = (header.flags & PropertySheetHeaderUsesStartPageName) != 0
-        ? 0
-        : (std::min)(static_cast<UINT>(header.startPage), header.pageCount - 1);
-    const BYTE* cursor = reinterpret_cast<const BYTE*>(header.pages);
-    std::vector<GuestPropertyPageDescriptor> pages;
-    std::vector<std::wstring> pageTitles;
-    pages.reserve(header.pageCount);
-    pageTitles.reserve(header.pageCount);
-    for (UINT index = 0; index < header.pageCount; ++index)
-    {
-        DWORD pageSize = 0;
-        GuestPropertySheetPageW page = {};
-        if (!ReadPropertySheetPage(cursor, &page, &pageSize)) return -1;
-        RuntimeDiagnostics::Record(
-            L"PROPERTYSHEET: page " + std::to_wstring(index) +
-            L" size " + std::to_wstring(pageSize) +
-            L", flags " + std::to_wstring(page.flags) + L".");
-
-        GuestPropertyPageDescriptor descriptor;
-        descriptor.instance = page.instance ? page.instance : header.instance;
-        descriptor.templateName = page.templateName;
-        descriptor.dialogProcedure = page.dialogProcedure;
-        descriptor.initParameter = reinterpret_cast<LPARAM>(cursor);
-        std::wstring pageTitle;
-        if ((page.flags & 0x00000008u) != 0) // PSP_USETITLE
-            ReadBoundedGuestString(page.title, &pageTitle);
-        pageTitles.push_back(std::move(pageTitle));
-        descriptor.title = nullptr;
-        pages.push_back(descriptor);
-
-        if ((header.flags & PropertySheetHeaderUsesStartPageName) != 0 &&
-            header.startPage > 0xffff && !pageTitles.back().empty())
-        {
-            std::wstring requestedTitle;
-            if (ReadBoundedGuestString(
-                    reinterpret_cast<LPCWSTR>(header.startPage), &requestedTitle) &&
-                _wcsicmp(requestedTitle.c_str(), pageTitles.back().c_str()) == 0)
-            {
-                selected = index;
-            }
-        }
-        cursor += pageSize;
-    }
-    for (UINT index = 0; index < header.pageCount; ++index)
-    {
-        if (!pageTitles[index].empty()) pages[index].title = pageTitles[index].c_str();
-    }
-    RuntimeDiagnostics::Record(L"PROPERTYSHEET: presenting page " +
-        std::to_wstring(selected) + L" of " + std::to_wstring(header.pageCount) + L".");
-
-    std::wstring caption;
-    ReadBoundedGuestString(header.caption, &caption);
-    GuestPropertySheetDescriptor sheet;
-    sheet.parent = header.parent;
-    sheet.instance = header.instance;
-    sheet.caption = caption.empty() ? nullptr : caption.c_str();
-    sheet.pages = pages.data();
-    sheet.pageCount = static_cast<UINT>(pages.size());
-    sheet.startPage = selected;
-    sheet.flags = header.flags;
-    return ShowGuestPropertySheet(sheet);
-}
+#include "Bridge/PropertySheetShims.inl"
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeImageListRemove(GuestImageList imageList, int index)
 {
@@ -1376,11 +1311,6 @@ HRESULT WINAPI Win32Bridge::Bridge::BridgeDllGetVersion(GuestDllVersionInfo* ver
     versionInfo->dwBuildNumber = 0;
     versionInfo->dwPlatformID = VER_PLATFORM_WIN32_NT;
     return S_OK;
-}
-
-HANDLE WINAPI Win32Bridge::Bridge::BridgeCreatePropertySheetPageW(const void* page)
-{
-    return page ? const_cast<void*>(page) : nullptr;
 }
 
 HRESULT WINAPI BridgeTaskDialogIndirect(const GuestTaskDialogConfig* source,
@@ -1593,6 +1523,9 @@ Win32Bridge::Bridge::ImportResolution Win32Bridge::Bridge::ResolveCommonControls
         else if (_wcsicmp(symbol.name.c_str(), L"drawinsert") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawInsert);
         else if (_wcsicmp(symbol.name.c_str(), L"lbitemfrompt") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeListBoxItemFromPoint);
         else if (_wcsicmp(symbol.name.c_str(), L"propertysheetw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePropertySheetW);
+        else if (_wcsicmp(symbol.name.c_str(), L"propertysheeta") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePropertySheetA);
+        else if (_wcsicmp(symbol.name.c_str(), L"createpropertysheetpagea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePropertySheetPageA);
+        else if (_wcsicmp(symbol.name.c_str(), L"destroypropertysheetpage") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDestroyPropertySheetPage);
         else if (_wcsicmp(symbol.name.c_str(), L"createpropertysheetpagew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePropertySheetPageW);
         else if (_wcsicmp(symbol.name.c_str(), L"dllgetversion") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDllGetVersion);
         else if (_wcsicmp(symbol.name.c_str(), L"drawshadowtext") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDrawShadowText);

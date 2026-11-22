@@ -66,6 +66,11 @@ namespace Win32Bridge
             Platform::String^ workingDirectory);
         Windows::Foundation::IAsyncOperation<int>^ RunAsync();
 
+        property bool IsConsoleApplication { bool get(); }
+        unsigned int ConsoleInputMode();
+        void SetConsoleSize(unsigned int columns, unsigned int rows);
+        bool FeedConsoleInput(Platform::String^ text);
+        Platform::String^ DrainConsoleOutput();
         void SetInputEnabled(bool enabled);
         void FlushDiagnostics();
         Windows::UI::Xaml::Media::ImageSource^ LoadExecutableIcon();

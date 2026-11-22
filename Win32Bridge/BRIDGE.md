@@ -1,188 +1,64 @@
 # Win32Bridge
 
-<img width="1280" height="720" alt="image" src="https://github.com/user-attachments/assets/46d8e2f3-2ae6-495b-bfb1-903d148ac57a" />
+<img width="1280" height="720" alt="Win32Bridge running inside Desktop Mode" src="https://github.com/user-attachments/assets/46d8e2f3-2ae6-495b-bfb1-903d148ac57a" />
 
-A proof-of-concept compatibility layer designed to load and execute Windows Win32 binaries (`.exe`) within a Universal Windows Platform (UWP) application.
+Win32Bridge is an experimental compatibility layer for running native Windows x64 applications inside the Desktop Mode UWP shell. Its main targets are Windows UWP and Xbox Developer Mode. Guest machine code executes on the host CPU inside the runtime process. The bridge maps PE images, supplies guest-facing Win32 APIs, and presents application windows or console output through the shell.
 
-## Overview
+## Compatibility map
 
-**Win32Bridge** is an experimental project that explores the feasibility of running traditional Windows desktop applications inside the restricted execution environment of UWP.
+![Win32Bridge progress by API family and subsystem. Green shows implemented milestones, amber shows partial milestones, and slate shows planned milestones.](compatibility-progress.svg)
 
-Unlike conventional emulators or virtual machines, Win32Bridge aims to provide a compatibility layer between Win32 applications and the UWP runtime, allowing supported executables to operate without requiring a complete desktop Windows environment.
+Each segment is one milestone. See the [detailed compatibility inventory](COMPATIBILITY.md) for counts by library and the status of every tracked capability. The count in each tile shows implemented milestones out of the tracked total for that area. Amber covers partial, stubbed, or host-dependent implementations. Slate covers planned, deferred, and out-of-scope work. Windows export coverage and Xbox test results are separate measures.
 
-The project primarily targets Windows 10/11 UWP environments, with particular interest in Xbox consoles operating in Developer Mode.
+To update the map and inventory, edit the [milestone list](Tools/Generate-CompatibilityMap.py) and run `python Win32Bridge/Tools/Generate-CompatibilityMap.py` from the repository root.
 
-## Project Goals
+## Execution model
 
-The primary objectives of Win32Bridge are:
+1. Desktop Mode launches a runtime session from Files, a guest Start Menu shortcut, or the Terminal entry.
+2. [PeImage, PeMapper, and RuntimeImage](Bridge/RuntimeImage.cpp) parse and map the PE32+ image, apply relocations and section protections, register x64 unwind metadata, and prepare thread-local storage.
+3. [ImportBinder](Bridge/ImportBinder.cpp) and [GuestModule](Bridge/GuestModule.cpp) bind imports and resolve guest dependencies by module, name, or ordinal. Resolution includes delay imports, forwarded exports, API-set mapping, and activation-context redirects. DLL and TLS callbacks participate in process and thread initialization and teardown.
+4. [GuestRuntime](Bridge/GuestRuntime.cpp) sets up the guest environment and transfers execution to the entry point. GUI applications use virtual HWNDs in a shell-managed window. Console applications use the virtual console and the shell's Terminal frontend.
 
-- Load and execute compatible Windows Portable Executable (PE) binaries.
-- Provide compatibility with essential Win32 APIs.
-- Translate or implement unsupported Win32 functionality through UWP-compatible mechanisms.
-- Support basic desktop application windows, controls, and graphical interfaces.
-- Handle executable dependencies, memory management, and runtime initialization.
-- Investigate the possibility of running traditional desktop software on Xbox consoles through UWP.
-- Expand application compatibility incrementally without requiring a full Windows desktop subsystem.
+Import resolution can select a bridge implementation, a supported host API, or an export from a mapped guest DLL. Generated export aliases and optional stubs help resolve some imports. A resolved symbol establishes that an entry point is available. Its behavior depends on the implementation behind it.
 
-## Architecture
+## Implemented subsystems
 
-Win32Bridge is intended to operate as an intermediary between a Win32 executable and its UWP host.
+| Area | Current implementation |
+| --- | --- |
+| PE resources and activation | Resource lookup by type and name, string tables, menu and dialog templates, icons, bitmaps, cursors, version information, and raw resources. Manifest support includes activation contexts, guest assembly lookup, and Common Controls redirection. See [GuestResources](Bridge/GuestResources.cpp) and [ActivationContext](Bridge/ActivationContext.cpp). |
+| USER32 and Common Controls | Virtual window classes, focus and modality, message queues and cross-thread sends, invalidation and paint regions, menu and context-menu tracking, accelerators, dialog navigation, and property-sheet pages. Built-in controls include Edit, ListView, TreeView, Tab, Toolbar, Rebar, and StatusBar. Message, notification, and custom-draw coverage varies by control. See [GuestWindow](Bridge/GuestWindow.cpp), [GuestMessageQueue](Bridge/GuestMessageQueue.cpp), and [Common Controls](Bridge/CommonControlsShims.cpp). |
+| GDI and text | MiniGDI device contexts, transforms and clipping regions, paths and drawing primitives, DIBs, raster operations, alpha and transparent blits, and DirectWrite-backed text layout and metrics. See [GDI sources](Bridge/GDI/). |
+| DirectX | D3D11 and D3D12 paths backed by host graphics APIs, with DXGI swap-chain presentation and resize in guest windows. Includes device identity wrappers for supported contexts and resources, shared texture and fence paths, and a D3D12 device-factory path that checks host SDK availability. See [DirectX sources](Bridge/DirectX/) and [GraphicsContracts](GuestApps/GraphicsContracts/README.md). |
+| Files and synchronization | Virtual drive C: backed by app-local storage, guest handles and share modes, handle duplication and inheritance, mappings, named pipes, directory changes, byte-range locks, and overlapped and native file I/O with cancellation and completion ports. Includes guest events, mutexes, semaphores, and timers. See [File handles](Tools/FILE-HANDLES.md) and [Pipes](Tools/PIPES.md). |
+| Processes and console | CreateProcessA/W launches supported PEs as guest sessions with guest process and thread handles. Console support includes screen buffers, input records, standard streams, redirection through files or pipes, and terminal presentation. See [Console](Tools/CONSOLE.md), [Terminal](Tools/TERMINAL.md), and [CMD compatibility](Tools/CMD-COMPATIBILITY.md). |
+| Registry | A persistent guest registry with machine and user hives. SYSTEM and SOFTWARE are stored under `drive_c\Windows\System32\config`, and the default user hive is stored as `drive_c\Users\Default\NTUSER.DAT`. These files use the bridge's own serialized format. See [GuestRegistry](Bridge/GuestRegistry.cpp). |
+| C and C++ runtime | CRT adapters for startup, heap and aligned allocation, descriptors and stdio, formatting and scanning, locale and multibyte conversions, and console I/O. The x64 C++ exception path includes MSVC exception metadata handling, RTTI, and exception pointer support. See [CRT sources](Bridge/CRT/), [CRT exception handling](Tools/CRT-EH.md), and [CRT streams](Tools/CRT-STREAMS.md). |
+| Shell integration | Virtual file dialogs, Shell folder and context-menu interfaces, a properties verb backed by guest file metadata, and Start Menu discovery of guest .lnk files. The shell reads PE icons for shortcuts and running windows. See [Shell32 shims](Bridge/Shell32Shims.cpp), [File dialog COM support](Bridge/FileDialogCom.inl), and [Start shortcuts](../factoryos-10x-shell/Services/GuestRuntime/Win32StartShortcuts.cs). |
 
-The proposed architecture consists of several components.
+## Running and validating
 
-## How to test
+Open an x64 executable from **Files** in Desktop Mode. Keep its companion DLLs and data files in the directory structure expected by the application. After guest Windows files have been provisioned, the **Terminal** entry launches the guest CMD. Shortcuts under the guest Start Menu directories can also provide launch entries.
 
-Just double click on a PE from Desktop Mode Files application.
+Use the import and runtime logs in the app's LocalState to distinguish a missing import from a failure during initialization or later execution. When emitted, the crash log adds native exception details. [Audit-GuestImports.py](Tools/Audit-GuestImports.py) supports static triage of PE imports. Resolution audits alone do not exercise the APIs.
 
-### 1. PE Loader
+| Test asset | What it checks |
+| --- | --- |
+| [FileHandleContracts](GuestApps/FileHandleContracts/README.md) | File descriptions, handle lifetime, synchronization and I/O. The source also includes byte-range lock cases for aliases, native lock keys, and cancellation. |
+| [DialogContracts](GuestApps/DialogContracts/README.md) | Dialog behavior and message routing. |
+| [GraphicsContracts](GuestApps/GraphicsContracts/README.md) | D3D11 and D3D12 windowed presentation, resize, device identity, synchronization, and selected shared-handle and factory paths. |
+| [BridgeTests](GuestApps/BridgeTests/) | Focused CRT, console, loader, and other compatibility fixtures. |
 
-Responsible for interpreting and preparing Windows executable files for execution.
+7-Zip, classic Notepad, Notepad++, and CMD have been used during development. These are application test targets. Compatibility varies with the executable version, exercised feature, build, and host. A successful launch is only one part of validation.
 
-Potential responsibilities include:
+## Planned work
 
-- Parsing PE headers and sections.
-- Mapping executable images into memory.
-- Processing relocations.
-- Resolving imported functions and dependencies.
-- Preparing executable memory and runtime structures.
-- Initializing the application's entry point.
+- **Loader and imports.** Expand API behavior based on shared contracts and real binaries. Continue testing dependency search and initialization order, unload and unwind edge cases, and import resolution across application-local and system module layouts. Use ReactOS and primary Windows documentation as references for semantics.
+- **Windowing and controls.** Improve paint, clipping, resize and focus behavior, nested modal loops, owner-draw notifications, and the fidelity of common controls. Exercise these paths through operations such as opening, saving, editing, and closing documents.
+- **CRT and C++.** Expand dynamic MSVCP/STL coverage and verify ABI compatibility across modules. Finish console locale and code-page edge cases and validate exception propagation across guest DLL boundaries.
+- **DirectX.** Broaden D3D11 resource and context identity coverage and test shared-handle lifetimes. Validate D3D12 SDK selection, swap-chain resize, and device-loss recovery on the supported hosts, including Xbox. D3D12 features depend on the host runtime.
+- **Storage and system services.** Track open-file identity across rename so existing byte-range locks apply to new opens under the new name. Plan REGF-compatible hives and broaden filesystem, COM, and activation-context contracts. Full host WinSxS integration and language fallback remain future work.
+- **Release validation.** Run the contract fixtures and representative GUI, console, and graphics workloads on Windows UWP and Xbox. Record results per host and build. Networking is deferred.
 
-Loading a PE image does not, by itself, guarantee that its machine code can execute within UWP restrictions.
+## Scope
 
-### 2. Win32 API Compatibility Layer
-
-Traditional desktop applications depend on Windows APIs that may be unavailable, restricted, or incompatible with the UWP application model.
-
-Win32Bridge aims to implement or adapt the necessary functionality through a compatibility layer.
-
-Relevant API categories include:
-
-- **Kernel32:** Process initialization, memory management, file operations, and synchronization.
-- **User32:** Window creation, message handling, and user interaction.
-- **GDI32:** Graphics rendering and drawing operations.
-- **Advapi32:** Registry access and other system services.
-- **Comctl32:** Common Windows controls.
-- **Shell32:** Shell-related functionality and application integration.
-
-Many of these APIs have not been implemented yet.
-
-### 3. Windowing and Graphics
-
-One of the project's central challenges is supporting the graphical interfaces of traditional Win32 applications.
-
-Desktop applications generally rely on window handles (`HWND`), window procedures, message loops, and graphics APIs that do not directly correspond to the UWP application model.
-
-Win32Bridge therefore investigates mechanisms for representing Win32 windows and controls inside a UWP-hosted interface.
-
-Potential responsibilities include:
-
-- Window creation and lifecycle management.
-- Win32 message dispatching.
-- Rendering and invalidation.
-- Keyboard and mouse input translation.
-- Basic support for menus, toolbars, dialogs, and common controls.
-
-### 4. Runtime and Dependency Management
-
-Win32 executables may require additional DLLs, runtime libraries, and operating system functionality.
-
-A compatibility implementation must account for dependency resolution, initialization order, and interactions between application code and the host environment.
-
-Not all Windows desktop dependencies can be loaded or reproduced directly inside UWP.
-
-## Execution Model
-
-The intended execution sequence is:
-
-1. The UWP host selects a supported Win32 executable.
-2. Win32Bridge parses the executable's PE structure.
-3. Required sections and dependencies are prepared.
-4. Imports are resolved against available compatibility implementations.
-5. The runtime environment is initialized.
-6. Execution is transferred to the application's entry point, where permitted.
-7. Win32 API requests are handled by the compatibility layer.
-8. Application output and graphical interfaces are presented through the UWP host.
-
-This sequence describes the intended architecture rather than a guarantee that every stage is fully implemented.
-
-## Experimental Progress
-
-Win32Bridge has demonstrated partial execution and graphical initialization of selected desktop applications during development.
-
-Previously observed results include:
-
-| Application | Experimental observations |
-|---|---|
-| Windows 7 Notepad | Successful graphical rendering reported in earlier tests. |
-| 7-Zip | Graphical rendering achieved in earlier tests; Renders almost fully, with app functionality such as file extraction working |
-| Notepad++ | Progressed beyond earlier crashes, creating a window and toolbar. Scintilla fails to load and the editor remains a black retangle. |
-
-These observations demonstrate progress toward compatibility but do not establish complete application functionality.
-
-The current state of individual applications may differ between development revisions.
-
-## UWP and Xbox Limitations
-
-UWP operates under a restricted application model that differs significantly from the traditional Win32 desktop environment.
-
-Important limitations include:
-
-- Restricted access to operating system resources.
-- Application sandboxing and filesystem restrictions.
-- Limitations on process creation and execution.
-- Restrictions involving executable memory and dynamic code generation.
-- Differences between UWP and desktop window management.
-- Limited access to unsupported or undocumented system APIs.
-- Architecture-specific binary compatibility requirements.
-
-Xbox Developer Mode introduces additional constraints and does not provide unrestricted access to the underlying Windows operating system.
-
-**Win32Bridge does not bypass UWP security restrictions by design.** Its feasibility depends on the capabilities available to the host application and the compatibility mechanisms that can be implemented within those boundaries.
-
-## Compatibility Considerations
-
-Win32Bridge is not intended to provide universal Win32 compatibility in its initial stages.
-
-Application compatibility depends on several factors, including:
-
-- CPU architecture.
-- Imported DLLs and API requirements.
-- Graphical subsystem dependencies.
-- Runtime libraries.
-- Filesystem and registry expectations.
-- Threading and synchronization behavior.
-- UWP security and execution restrictions.
-
-Applications with relatively simple dependencies and graphical interfaces are more practical initial targets than software requiring complex system integration, drivers, or privileged services.
-
-## Future Development
-
-Potential development priorities include:
-
-- Improving PE loading and dependency resolution.
-- Expanding Win32 API coverage.
-- Stabilizing existing application compatibility.
-- Improving window rendering and message processing.
-- Supporting additional graphical controls.
-- Implementing more complete filesystem and registry compatibility.
-- Investigating additional runtime libraries and desktop application frameworks.
-- Improving diagnostic logging and crash analysis.
-- Evaluating compatibility across Windows UWP and Xbox Developer Mode environments.
-
-These are development directions, not confirmed implemented features.
-
-## Project Status
-
-**Status: Experimental / Proof of Concept**
-
-Win32Bridge remains a research and development project. Its purpose is to investigate how far Win32 binary compatibility can be extended within the UWP application model.
-
-Successful loading, window creation, or partial graphical rendering should not be interpreted as complete application compatibility.
-
-## Disclaimer
-
-Win32Bridge is an experimental compatibility project and is not a complete implementation of the Windows desktop subsystem.
-
-At this stage, most PEs you try loading will not even attempt to execute due to missing imports.
-
-The project is not affiliated with or endorsed by Microsoft.
+The supported guest architecture is native x64 PE32+. Compatibility depends on the host UWP capabilities and on how much of the guest's API behavior is implemented. Guest process and window abstractions live within the bridge. Applications that require kernel drivers, privileged services, or desktop OS integration outside the host's available capabilities are outside the current scope.

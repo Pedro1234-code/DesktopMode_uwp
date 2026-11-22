@@ -216,8 +216,16 @@ namespace
         });
     }
 
+    bool LoggingEnabled()
+    {
+        wchar_t disabled[2]{};
+        return ::GetEnvironmentVariableW(L"DESKTOPMODE_DISABLE_LOGGING", disabled, 2) != 1 ||
+            disabled[0] != L'1';
+    }
+
     void PersistReport(const std::wstring& report)
     {
+        if (!LoggingEnabled()) return;
         try
         {
             auto text = ref new String(report.c_str());
@@ -226,7 +234,8 @@ namespace
                 CreationCollisionOption::ReplaceExisting))
                 .then([text](StorageFile^ file)
             {
-                return FileIO::WriteTextAsync(file, text);
+                if (!LoggingEnabled()) return task_from_result();
+                return create_task(FileIO::WriteTextAsync(file, text));
             }).then([](task<void> completed)
             {
                 try { completed.get(); }
@@ -248,7 +257,7 @@ namespace
         }
     }
 
-    std::wstring BuildImportReport(const std::wstring& executableName, const GuestRuntime& runtime)
+    std::wstring BuildImportReport(const std::wstring& executableName, const GuestRuntime& runtime, bool finalBinding = false)
     {
         const auto& image = runtime.Metadata();
         const auto& binding = runtime.Bindings();
@@ -273,6 +282,8 @@ namespace
             if (resolution.disposition == ImportDisposition::Deferred) ++deferred;
         }
 
+        report += finalBinding ? L"Stage: final process binding.\n" : L"Stage: preliminary binding; unresolved regular imports will be retried at process startup.\n";
+        report += L"Delay imports retained for on-demand resolution: " + std::to_wstring(binding.deferred) + L"\n";
         report += L"x64 PE accepted. " + std::to_wstring(image.imports.size()) +
             L" imports; IAT: " + std::to_wstring(binding.bound) + L" bound, " +
             std::to_wstring(binding.unresolved) + L" unresolved. Catalog: " +
@@ -281,14 +292,22 @@ namespace
         report += L"PE32+ x64\nEntry point RVA (decimal): " +
             std::to_wstring(image.entryPointRva) + L"\n\n";
 
+        size_t resolutionIndex = 0;
         for (size_t index = 0; index < image.imports.size(); ++index)
         {
             const auto& symbol = image.imports[index];
-            report += L"[";
-            if (index < binding.resolutions.size())
+            if (symbol.delayLoaded)
             {
-                const auto& resolution = binding.resolutions[index];
-                report += DispositionLabel(resolution.disposition);
+                report += L"[DELAY-LOAD] " + symbol.library + L"!" +
+                    (symbol.importedByOrdinal ? L"#" + std::to_wstring(symbol.ordinal) : symbol.name) +
+                    L"\n    Preserved linker thunk; resolved on first use, not a missing-import diagnosis.\n";
+                continue;
+            }
+            report += L"[";
+            if (resolutionIndex < binding.resolutions.size())
+            {
+                const auto& resolution = binding.resolutions[resolutionIndex++];
+                report += !finalBinding && !resolution.targetAddress ? L"DEFERRED" : DispositionLabel(resolution.disposition);
                 report += L"] " + symbol.library + L"!";
                 report += symbol.importedByOrdinal
                     ? L"#" + std::to_wstring(symbol.ordinal)
@@ -309,26 +328,30 @@ namespace
 
     void PersistImportReport(const std::wstring& report)
     {
+        if (!LoggingEnabled()) return;
         try
         {
             auto text = ref new String(report.c_str());
-            create_task(ApplicationData::Current->LocalFolder->CreateFileAsync(
-                ref new String(ImportLogFileName),
-                CreationCollisionOption::ReplaceExisting))
-                .then([text](StorageFile^ file)
+            static std::mutex importReportLock;
+            static task<void> pending = task_from_result();
+            std::lock_guard<std::mutex> guard(importReportLock);
+            pending = pending.then([text]()
             {
-                return FileIO::WriteTextAsync(file, text);
+                return create_task(ApplicationData::Current->LocalFolder->CreateFileAsync(
+                    ref new String(ImportLogFileName), CreationCollisionOption::ReplaceExisting))
+                    .then([text](StorageFile^ file)
+                {
+                    if (!LoggingEnabled()) return task_from_result();
+                    return create_task(FileIO::WriteTextAsync(file, text));
+                });
             }).then([](task<void> completed)
             {
-                try { completed.get(); }
-                catch (...) { }
+                try { completed.get(); } catch (...) { }
             });
         }
-        catch (...)
-        {
-            // Import diagnostics must never prevent the guest from starting.
-        }
+        catch (...) { } // Diagnostics must never prevent the guest from starting.
     }
+
 }
 
 struct Win32Bridge::RuntimeSessionState final
@@ -566,10 +589,13 @@ IAsyncOperation<int>^ Win32Bridge::RuntimeSession::RunAsync()
     return create_async([state]() -> int
     {
         state->running.store(true);
-        state->windows->SetInputEnabled(true);
+        state->windows->SetInputEnabled(state->runtime->Metadata().subsystem != IMAGE_SUBSYSTEM_WINDOWS_CUI);
         int exitCode = -1;
         std::wstring error;
-        const bool succeeded = state->runtime->Run(&exitCode, &error);
+        const bool succeeded = state->runtime->Run(&exitCode, &error, [state]()
+        {
+            PersistImportReport(BuildImportReport(state->executableName, *state->runtime, true));
+        });
         state->running.store(false);
         state->windows->SetInputEnabled(false);
         if (!succeeded)
@@ -581,6 +607,17 @@ IAsyncOperation<int>^ Win32Bridge::RuntimeSession::RunAsync()
         return exitCode;
     });
 }
+
+bool Win32Bridge::RuntimeSession::IsConsoleApplication::get()
+{ return m_state && m_state->prepared.load() && m_state->runtime && m_state->runtime->Metadata().subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI; }
+void Win32Bridge::RuntimeSession::SetConsoleSize(unsigned columns, unsigned rows)
+{ if (m_state && m_state->prepared.load() && m_state->runtime) m_state->runtime->SetConsoleSize(columns, rows); }
+unsigned int Win32Bridge::RuntimeSession::ConsoleInputMode()
+{ return m_state && m_state->prepared.load() && m_state->runtime ? m_state->runtime->ConsoleInputMode() : 7; }
+bool Win32Bridge::RuntimeSession::FeedConsoleInput(String^ text)
+{ return text && m_state && !m_state->closeRequested.load() && m_state->prepared.load() && m_state->runtime && m_state->runtime->FeedConsoleInput(std::wstring(text->Data(), text->Length())); }
+String^ Win32Bridge::RuntimeSession::DrainConsoleOutput()
+{ auto text = m_state && m_state->prepared.load() && m_state->runtime ? m_state->runtime->DrainConsoleOutput() : std::wstring(); return ref new String(text.data(), static_cast<unsigned>(text.size())); }
 
 void Win32Bridge::RuntimeSession::SetInputEnabled(bool enabled)
 {
@@ -804,10 +841,10 @@ void Win32Bridge::RuntimeSession::Close()
     {
         return;
     }
+    if (m_state->prepared.load() && m_state->runtime) m_state->runtime->RequestStop();
     if (m_state->windows)
     {
         m_state->windows->SetInputEnabled(false);
-        m_state->windows->PostGuestQuitMessage(0);
     }
     PersistDiagnostics();
 }

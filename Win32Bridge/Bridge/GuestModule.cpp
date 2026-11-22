@@ -1,4 +1,5 @@
 #include "pch.h"
+#include "Bridge/CRT/CrtExceptions.h"
 #include "Bridge/GuestModule.h"
 
 #include "Bridge/ApiSet.h"
@@ -9,6 +10,7 @@
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <algorithm>
+#include <locale.h>
 #include <cwctype>
 #include <cwchar>
 #include <initializer_list>
@@ -85,9 +87,7 @@ namespace
         const auto entry = reinterpret_cast<DllEntry>(base + entryPointRva);
         __try
         {
-            const BOOL value = entry(reinterpret_cast<HINSTANCE>(base), reason, reserved);
-            if (result) *result = value;
-            return true;
+            return InvokeCrtFunction(result, entry, reinterpret_cast<HINSTANCE>(base), reason, reserved);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -208,16 +208,21 @@ struct GuestModuleLoader::ModuleCandidate final
 GuestModuleLoader::GuestModuleLoader(
     std::shared_ptr<GuestStorageContext> storage,
     ImportResolver resolver,
-    StorageFolder^ moduleSourceFolder)
+    StorageFolder^ moduleSourceFolder, std::shared_ptr<GuestKernelContext> kernel,
+    const std::vector<CrtStartupFile>& inherited)
     : m_storage(std::move(storage)),
+      m_crtFiles(CreateGuestCrtFileBackend(m_storage, std::move(kernel))),
+      m_stdio(m_crtFiles),
       m_resolver(std::move(resolver)),
       m_moduleSourceFolder(moduleSourceFolder)
 {
+    if (!m_crtFiles.InitializeStandards(inherited)) throw std::bad_alloc();
 }
 
 GuestModuleLoader::~GuestModuleLoader()
 {
     ReleaseAll();
+    m_stdio.CloseAll(true, !m_crtState.suppressStdioFlush.load());
 }
 
 bool GuestModuleLoader::BuildCandidates(
@@ -372,6 +377,18 @@ bool GuestModuleLoader::BuildCandidates(
             !addVirtual(JoinPath(m_storage->CurrentDirectory(), normalized)))
         {
             return false;
+        }
+        if (classicSearch)
+        {
+            for (const auto& directory : m_environment.SearchDirectories())
+            {
+                std::wstring canonical;
+                DWORD ignored = ERROR_SUCCESS;
+                // An invalid PATH segment does not abort the whole search.
+                // Canonicalization confines every candidate to guest storage.
+                if (m_storage->CanonicalPath(JoinPath(directory, normalized).c_str(), &canonical, &ignored) &&
+                    !addVirtual(canonical)) return false;
+            }
         }
     }
 
@@ -819,98 +836,7 @@ bool GuestModuleLoader::LoadLibrary(
 
     const ImportResolver dependencyResolver = [this, candidate, searchFlags](const ImportedSymbol& symbol)
     {
-        ImportResolution resolution = m_resolver(symbol);
-        if (resolution.targetAddress != 0) return resolution;
-        const auto recordMissing = [&]()
-        {
-            RuntimeDiagnostics::Record(
-                L"DLL IMPORT MISSING: importer='" + candidate->canonicalName +
-                L"' symbol=" + symbol.library + L"!" +
-                (symbol.importedByOrdinal ? L"#" + std::to_wstring(symbol.ordinal) : symbol.name) +
-                L" reason='" + resolution.note + L"'.");
-        };
-
-        const std::wstring dependencyName = ApiSetHostLibrary(symbol.library);
-        const std::wstring dependencyKey = Lowercase(FileNameOf(dependencyName));
-        HMODULE dependency = nullptr;
-        DWORD error = ERROR_SUCCESS;
-
-        // Snap a dependency once per importing module, not once per symbol.
-        // A dependency that is already being mapped is a cycle edge: its base
-        // is valid for IAT addresses, but taking another load-count reference
-        // would create a permanent reference cycle.
-        {
-            std::lock_guard<std::mutex> guard(m_lock);
-            const auto cached = candidate->dependencyModules.find(dependencyKey);
-            if (cached != candidate->dependencyModules.end())
-            {
-                dependency = cached->second;
-            }
-            else
-            {
-                const auto existing = FindModuleByBaseNameLocked(dependencyKey);
-                if (existing)
-                {
-                    dependency = reinterpret_cast<HMODULE>(existing->runtime.Base());
-                    candidate->dependencyModules.emplace(dependencyKey, dependency);
-                    if (!existing->loading && existing != candidate)
-                    {
-                        ++existing->references;
-                        candidate->dependencyReferences.push_back(dependency);
-                    }
-                }
-            }
-        }
-        if (!GetModuleHandle(dependencyName.c_str(), &dependency, &error))
-        {
-            if (!dependency && (searchFlags & LoadLibrarySearchDllLoadDir) != 0)
-            {
-                const std::wstring dependencyPath =
-                    JoinPath(DirectoryOf(candidate->canonicalName), dependencyName);
-                LoadLibrary(dependencyPath.c_str(), &dependency, &error);
-            }
-            const DWORD inheritedFlags = searchFlags & ~LoadLibrarySearchDllLoadDir;
-            if (!dependency &&
-                ((searchFlags & LoadLibrarySearchDllLoadDir) == 0 || inheritedFlags != 0))
-            {
-                LoadLibrary(dependencyName.c_str(), &dependency, &error, inheritedFlags);
-            }
-            if (!dependency)
-            {
-                recordMissing();
-                return resolution;
-            }
-
-            std::lock_guard<std::mutex> guard(m_lock);
-            const auto inserted = candidate->dependencyModules.emplace(
-                dependencyKey, dependency);
-            if (inserted.second)
-                candidate->dependencyReferences.push_back(dependency);
-        }
-
-        LPCSTR requested = symbol.importedByOrdinal
-            ? reinterpret_cast<LPCSTR>(static_cast<ULONG_PTR>(symbol.ordinal))
-            : nullptr;
-        std::string asciiName;
-        if (!symbol.importedByOrdinal)
-        {
-            asciiName.reserve(symbol.name.size());
-            for (const wchar_t character : symbol.name)
-            {
-                if (character > 0x7f) return resolution;
-                asciiName.push_back(static_cast<char>(character));
-            }
-            requested = asciiName.c_str();
-        }
-
-        const FARPROC procedure = GetProcAddress(dependency, requested, &error);
-        if (procedure)
-        {
-            resolution.targetAddress = reinterpret_cast<ULONGLONG>(procedure);
-            resolution.note = L"Resolved from guest dependency " + dependencyName + L".";
-        }
-        else recordMissing();
-        return resolution;
+        return ResolveModuleImport(symbol, candidate, searchFlags, nullptr);
     };
 
     if (!ImportBinder::Bind(
@@ -1039,56 +965,155 @@ bool GuestModuleLoader::LoadLibrary(
 }
 
 ImportResolution GuestModuleLoader::ResolveImport(
-    const ImportedSymbol& symbol,
-    DWORD searchFlags)
+    const ImportedSymbol& symbol, DWORD searchFlags, DWORD* win32Error)
+{
+    return ResolveModuleImport(symbol, nullptr, searchFlags, win32Error);
+}
+
+ImportResolution GuestModuleLoader::ResolveModuleImport(
+    const ImportedSymbol& symbol, const std::shared_ptr<Module>& importer,
+    DWORD searchFlags, DWORD* win32Error)
 {
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
-    ImportResolution resolution = m_resolver(symbol);
-    if (resolution.targetAddress != 0) return resolution;
-
-    const std::wstring requestedLibrary = ApiSetHostLibrary(symbol.library);
-    const std::wstring key = Lowercase(requestedLibrary);
-    HMODULE dependency = nullptr;
+    ImportedSymbol canonical = symbol;
+    canonical.library = ApiSetHostLibrary(symbol.library);
+    ImportResolution resolution = m_resolver(canonical);
+    // Keep MSVCP's objects, helpers and allocators in one runtime image when
+    // the application supplies it. A partial virtual STL can only be a fallback.
+    const bool preferGuestMsvcp = _wcsicmp(canonical.library.c_str(), L"msvcp140.dll") == 0 ||
+        _wcsicmp(canonical.library.c_str(), L"msvcp140_app.dll") == 0;
+    if (resolution.targetAddress != 0 && !preferGuestMsvcp)
     {
-        std::lock_guard<std::mutex> guard(m_lock);
-        const auto found = m_importModules.find(key);
-        if (found != m_importModules.end()) dependency = found->second;
-    }
-    DWORD error = ERROR_SUCCESS;
-    if (!dependency)
-    {
-        if (!LoadLibrary(requestedLibrary.c_str(), &dependency, &error, searchFlags))
-            return resolution;
-        std::lock_guard<std::mutex> guard(m_lock);
-        m_importModules.emplace(key, dependency);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return resolution;
     }
 
-    LPCSTR requested = nullptr;
+    const std::wstring importName = canonical.importedByOrdinal
+        ? L"#" + std::to_wstring(canonical.ordinal) : canonical.name;
+    const auto fail = [&](DWORD error, const wchar_t* reason)
+    {
+        SetWin32Error(win32Error, error);
+        resolution.targetAddress = 0;
+        resolution.disposition = ImportDisposition::Unsupported;
+        resolution.note = reason;
+        RuntimeDiagnostics::Record(std::wstring(importer ? L"DLL IMPORT MISSING: importer='" : L"IMPORT MISSING: importer='") +
+            (importer ? importer->canonicalName : L"<process>") + L"' symbol=" +
+            canonical.library + L"!" + importName + L" error=" + std::to_wstring(error) +
+            L" reason='" + reason + L"'.");
+        return resolution;
+    };
+
     std::string asciiName;
-    if (symbol.importedByOrdinal)
+    LPCSTR requested = nullptr;
+    if (canonical.importedByOrdinal)
     {
-        requested = reinterpret_cast<LPCSTR>(static_cast<ULONG_PTR>(symbol.ordinal));
+        if (!canonical.ordinal) return fail(ERROR_PROC_NOT_FOUND, L"Invalid export ordinal.");
+        requested = reinterpret_cast<LPCSTR>(static_cast<ULONG_PTR>(canonical.ordinal));
     }
     else
     {
-        asciiName.reserve(symbol.name.size());
-        for (const wchar_t character : symbol.name)
+        if (canonical.name.empty()) return fail(ERROR_INVALID_PARAMETER, L"Empty export name.");
+        for (const wchar_t character : canonical.name)
         {
-            if (character > 0x7f) return resolution;
+            if (character == 0 || character > 0x7f)
+                return fail(ERROR_NO_UNICODE_TRANSLATION, L"Export name is not ASCII.");
             asciiName.push_back(static_cast<char>(character));
         }
         requested = asciiName.c_str();
     }
-    const FARPROC procedure = GetProcAddress(dependency, requested, &error);
-    if (procedure)
+
+    const std::wstring key = Lowercase(canonical.library);
+    HMODULE dependency = nullptr;
     {
-        resolution.targetAddress = reinterpret_cast<ULONGLONG>(procedure);
-        resolution.disposition = ImportDisposition::NeedsBridge;
-        resolution.note = symbol.importedByOrdinal
-            ? L"Resolved ordinal #" + std::to_wstring(symbol.ordinal) +
-                L" from guest dependency " + requestedLibrary + L"."
-            : L"Resolved from guest dependency " + requestedLibrary + L".";
+        std::lock_guard<std::mutex> guard(m_lock);
+        auto& cache = importer ? importer->dependencyModules : m_importModules;
+        const auto cached = cache.find(key);
+        if (cached != cache.end()) dependency = cached->second;
+        if (!dependency)
+        {
+            const auto existing = FindModuleByBaseNameLocked(FileNameOf(canonical.library));
+            if (existing && canonical.library.find_first_of(L"\\/") == std::wstring::npos)
+            {
+                dependency = reinterpret_cast<HMODULE>(existing->runtime.Base());
+                cache.emplace(key, dependency);
+                // A loading module forms a non-owning dependency cycle edge.
+                // Process-level imports still retain their own reference.
+                if (!importer || (!existing->loading && existing != importer))
+                {
+                    ++existing->references;
+                    if (importer) importer->dependencyReferences.push_back(dependency);
+                }
+            }
+        }
     }
+    DWORD error = ERROR_SUCCESS;
+    if (!dependency)
+    {
+        if (importer && (searchFlags & LoadLibrarySearchDllLoadDir) != 0)
+        {
+            const std::wstring path = JoinPath(DirectoryOf(importer->canonicalName), canonical.library);
+            LoadLibrary(path.c_str(), &dependency, &error);
+        }
+        const DWORD inheritedFlags = importer ? searchFlags & ~LoadLibrarySearchDllLoadDir : searchFlags;
+        if (!dependency && (!importer || (searchFlags & LoadLibrarySearchDllLoadDir) == 0 || inheritedFlags != 0))
+            LoadLibrary(canonical.library.c_str(), &dependency, &error, inheritedFlags);
+        if (!dependency)
+        {
+            if (preferGuestMsvcp && resolution.targetAddress && error == ERROR_MOD_NOT_FOUND)
+            {
+                SetWin32Error(win32Error, ERROR_SUCCESS);
+                return resolution;
+            }
+            return fail(error, L"Guest dependency could not be loaded.");
+        }
+        // DllMain may have re-entered resolution and populated the cache.
+        // Transfer our load reference if that entry was only a cycle edge;
+        // otherwise release the duplicate reference outside m_lock.
+        bool releaseDuplicate = false;
+        const HMODULE loaded = dependency;
+        {
+            std::lock_guard<std::mutex> guard(m_lock);
+            auto& cache = importer ? importer->dependencyModules : m_importModules;
+            const auto inserted = cache.emplace(key, loaded);
+            dependency = inserted.first->second;
+            if (importer && dependency == loaded &&
+                std::find(importer->dependencyReferences.begin(), importer->dependencyReferences.end(), loaded) ==
+                    importer->dependencyReferences.end())
+                importer->dependencyReferences.push_back(loaded);
+            else
+                releaseDuplicate = !inserted.second;
+        }
+        if (releaseDuplicate)
+        {
+            DWORD ignored = ERROR_SUCCESS;
+            FreeLibrary(loaded, &ignored);
+        }
+    }
+    // Track export traversal after loading. DllMain may legitimately query
+    // this same symbol while its module is being initialized.
+    for (const auto& pending : m_resolvingImports)
+    {
+        if (_wcsicmp(pending.library.c_str(), canonical.library.c_str()) == 0 &&
+            pending.importedByOrdinal == canonical.importedByOrdinal &&
+            (canonical.importedByOrdinal ? pending.ordinal == canonical.ordinal
+                                        : pending.name == canonical.name))
+            return fail(ERROR_PROC_NOT_FOUND, L"Recursive import resolution.");
+    }
+    if (m_resolvingImports.size() >= 64)
+        return fail(ERROR_PROC_NOT_FOUND, L"Import resolution depth exceeded.");
+    m_resolvingImports.push_back(canonical);
+    struct ResolutionScope
+    {
+        std::vector<ImportedSymbol>& pending;
+        ~ResolutionScope() { pending.pop_back(); }
+    } scope{ m_resolvingImports };
+
+    const FARPROC procedure = GetProcAddress(dependency, requested, &error);
+    if (!procedure) return fail(error, L"Guest dependency does not provide the requested export.");
+    resolution.targetAddress = reinterpret_cast<ULONGLONG>(procedure);
+    resolution.disposition = ImportDisposition::NeedsBridge;
+    resolution.note = L"Resolved from guest dependency " + canonical.library + L".";
+    SetWin32Error(win32Error, ERROR_SUCCESS);
     return resolution;
 }
 
@@ -1306,50 +1331,20 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
                 forwarded.name = forwardedName;
             }
 
-            const ImportResolution bridgeResolution = m_resolver(forwarded);
-            if (bridgeResolution.targetAddress != 0)
+            ++g_forwarderDepth;
+            struct ForwarderScope
+            {
+                ~ForwarderScope() { --g_forwarderDepth; }
+            } scope;
+            DWORD error = ERROR_SUCCESS;
+            const auto resolution = ResolveModuleImport(forwarded, candidate, 0, &error);
+            if (resolution.targetAddress != 0)
             {
                 SetWin32Error(win32Error, ERROR_SUCCESS);
-                return reinterpret_cast<FARPROC>(bridgeResolution.targetAddress);
-            }
-
-            HMODULE forwardedModule = nullptr;
-            DWORD error = ERROR_SUCCESS;
-            if ((GetModuleHandle(library.c_str(), &forwardedModule, &error) ||
-                 LoadLibrary(library.c_str(), &forwardedModule, &error)) &&
-                forwardedModule)
-            {
-                std::string asciiName;
-                LPCSTR forwardedProcedure = nullptr;
-                if (forwarded.importedByOrdinal)
-                {
-                    forwardedProcedure = reinterpret_cast<LPCSTR>(
-                        static_cast<ULONG_PTR>(forwarded.ordinal));
-                }
-                else
-                {
-                    bool ascii = true;
-                    for (const wchar_t character : forwarded.name)
-                    {
-                        if (character > 0x7f) { ascii = false; break; }
-                        asciiName.push_back(static_cast<char>(character));
-                    }
-                    if (ascii) forwardedProcedure = asciiName.c_str();
-                }
-                if (forwardedProcedure)
-                {
-                    ++g_forwarderDepth;
-                    FARPROC result = GetProcAddress(forwardedModule, forwardedProcedure, &error);
-                    --g_forwarderDepth;
-                    if (result)
-                    {
-                        SetWin32Error(win32Error, ERROR_SUCCESS);
-                        RuntimeDiagnostics::Record(
-                            L"GetProcAddress FORWARDED: " + candidate->canonicalName + L"!" +
-                            requested + L" -> " + found->forwarder + L".");
-                        return result;
-                    }
-                }
+                RuntimeDiagnostics::Record(
+                    L"GetProcAddress FORWARDED: " + candidate->canonicalName + L"!" +
+                    requested + L" -> " + found->forwarder + L".");
+                return reinterpret_cast<FARPROC>(resolution.targetAddress);
             }
         }
     }
@@ -1591,6 +1586,14 @@ bool GuestModuleLoader::NotifyThread(DWORD reason, std::wstring* error)
     return true;
 }
 
+void GuestModuleLoader::ReleaseThreadTls()
+{
+    std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    std::lock_guard<std::mutex> guard(m_lock);
+    for (const auto& module : m_modules)
+        if (module) module->runtime.ReleaseThreadTls();
+}
+
 void GuestModuleLoader::ReleaseAll()
 {
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
@@ -1638,13 +1641,29 @@ GuestModuleLoader* Win32Bridge::Bridge::CurrentGuestModuleLoader()
     return g_currentModuleLoader;
 }
 
-GuestModuleScope::GuestModuleScope(GuestModuleLoader* loader)
+CrtThreadExceptionState* GuestModuleLoader::ExceptionThreadState(bool freshThread)
+{
+    std::lock_guard<std::mutex> guard(m_exceptionThreadLock);
+    const bool initialThread=m_exceptionThreads.empty()&&!freshThread;
+    auto& state = m_exceptionThreads[::GetCurrentThreadId()];
+    if (!state) state = std::make_unique<CrtThreadExceptionState>();
+    else if (freshThread) *state = CrtThreadExceptionState{};
+    state->process = &m_crtState.exceptions;
+    state->process->locales.InitializeThread(state->locale,initialThread);
+    return state.get();
+}
+GuestModuleScope::GuestModuleScope(GuestModuleLoader* loader, bool freshThread)
     : m_previous(g_currentModuleLoader)
 {
+    // Allocate before modifying either TLS scope, so a failed allocation
+    // leaves the host's previous process/thread context intact.
+    auto exceptions = loader ? loader->ExceptionThreadState(freshThread) : nullptr;
+    m_previousExceptions = SetCrtThreadExceptionState(exceptions);
     g_currentModuleLoader = loader;
 }
 
 GuestModuleScope::~GuestModuleScope()
 {
+    SetCrtThreadExceptionState(m_previousExceptions);
     g_currentModuleLoader = m_previous;
 }

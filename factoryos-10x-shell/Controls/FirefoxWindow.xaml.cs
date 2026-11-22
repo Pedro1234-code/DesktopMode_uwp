@@ -128,7 +128,7 @@ namespace factoryos_10x_shell.Controls
             {
                 e.AcceptedOperation = DataPackageOperation.None;
                 if (m_uploadDrag == drag) CancelUploadDrag();
-                System.Diagnostics.Debug.WriteLine($"Upload drag preparation failed: 0x{exception.HResult:X8}");
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Upload drag preparation failed: 0x{exception.HResult:X8}");
             }
             finally { deferral.Complete(); }
         }
@@ -203,7 +203,7 @@ namespace factoryos_10x_shell.Controls
             }
             catch (Exception exception)
             {
-                System.Diagnostics.Debug.WriteLine($"Upload drop failed: 0x{exception.HResult:X8}");
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Upload drop failed: 0x{exception.HResult:X8}");
             }
             finally
             {
@@ -508,7 +508,8 @@ namespace factoryos_10x_shell.Controls
         private void UpdateNativeCursorRequest()
         {
             bool requested = AppState.Instance.IsFirefoxOpen && !AppState.Instance.IsFirefoxMinimized &&
-                m_pointerInsideWindow && IsHitTestVisible && Visibility == Visibility.Visible;
+                m_isWindowActive && !m_inputSuppressed && m_pointerInsideWindow &&
+                IsHitTestVisible && Visibility == Visibility.Visible;
             if (requested == m_nativeCursorRequested) return;
 
             m_nativeCursorRequested = requested;
@@ -558,8 +559,11 @@ namespace factoryos_10x_shell.Controls
             AppState.Instance.SetFirefoxWindowState(true, true);
         }
 
-        private void Root_PointerPressed(object sender, PointerRoutedEventArgs e) =>
+        private void Root_PointerPressed(object sender, PointerRoutedEventArgs e)
+        {
             AppState.Instance.ActivateFirefox();
+            UpdateHostInput();
+        }
 
         private void Root_PointerEntered(object sender, PointerRoutedEventArgs e)
         {

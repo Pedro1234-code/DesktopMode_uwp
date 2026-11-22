@@ -14,6 +14,13 @@ namespace factoryos_10x_shell.Services.Helpers
         Hidden
     }
 
+    internal enum TaskbarSizeMode
+    {
+        Small,
+        Medium,
+        Big
+    }
+
     public class AppState
     {
         private static AppState _instance;
@@ -56,6 +63,26 @@ namespace factoryos_10x_shell.Services.Helpers
         }
 
         public event Action TaskbarPreferencesChanged;
+        internal TaskbarSizeMode TaskbarSize
+        {
+            get
+            {
+                var value = ApplicationData.Current.LocalSettings.Values["TaskbarSize"] as int?;
+                return value == (int)TaskbarSizeMode.Small ? TaskbarSizeMode.Small
+                    : value == (int)TaskbarSizeMode.Big ? TaskbarSizeMode.Big
+                    : TaskbarSizeMode.Medium;
+            }
+            set
+            {
+                if (TaskbarSize == value) return;
+                ApplicationData.Current.LocalSettings.Values["TaskbarSize"] = (int)value;
+                TaskbarPreferencesChanged?.Invoke();
+            }
+        }
+
+        internal double TaskbarHeightInPixels => TaskbarSize == TaskbarSizeMode.Small ? 45
+            : TaskbarSize == TaskbarSizeMode.Big ? 69 : 57;
+
         internal TaskbarSearchMode Windows11TaskbarSearchMode
         {
             get

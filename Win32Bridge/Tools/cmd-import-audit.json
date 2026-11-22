@@ -1,0 +1,1840 @@
+{
+  "pe": "Win32Bridge\\GuestApps\\cmd\\cmd.exe",
+  "sha256": "ccd79a7568ea9240ccd6fe124807b9d3e4dbc3a4cf92954299ac3029f4a91d02",
+  "verification": "Static source-registration audit only: no C++ build, address resolution or guest execution. Conditional DLL guards and native linking require runtime validation.",
+  "regular": 286,
+  "delay": 19,
+  "uncovered": [],
+  "imports": [
+    {
+      "library": "api-ms-win-crt-string-l1-1-0.dll",
+      "name": "wcscmp",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-string-l1-1-0.dll",
+      "name": "wcsncmp",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-string-l1-1-0.dll",
+      "name": "memset",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-string-l1-1-0.dll",
+      "name": "wcsspn",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-time-l1-1-0.dll",
+      "name": "_time32",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-runtime-l1-1-0.dll",
+      "name": "_initterm",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-runtime-l1-1-0.dll",
+      "name": "_initterm_e",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-runtime-l1-1-0.dll",
+      "name": "_register_thread_local_exe_atexit_callback",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-runtime-l1-1-0.dll",
+      "name": "_c_exit",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__get_initial_narrow_environment",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__get_osfhandle",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__getch",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__initialize_narrow_environment",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__initialize_onexit_table",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__invalid_parameter_noinfo",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__open_osfhandle",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__pclose",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__pipe",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__purecall",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__register_onexit_function",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__seh_filter_exe",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__set_app_type",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__set_fmode",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__set_new_mode",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__setmode",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__tell",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__configure_narrow_argv",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__ultoa",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__ultoa_s",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "__intrinsic_setjmp",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__wcsicmp",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__wcslwr",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__wcsnicmp",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__wcsupr",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__wpopen",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__wtol",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_calloc",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_exit",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_feof",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_ferror",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_fflush",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_fgets",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_free",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_iswalpha",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_iswdigit",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_iswspace",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_iswxdigit",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_malloc",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_qsort",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_rand",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_realloc",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_setlocale",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_srand",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_terminate",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_towlower",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_towupper",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_wcstol",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o_wcstoul",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "__CxxFrameHandler3",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "__current_exception",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "__current_exception_context",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__configthreadlocale",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_CxxThrowException",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__close",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__cexit",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__callnewh",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___stdio_common_vswscanf",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___stdio_common_vswprintf_s",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___stdio_common_vswprintf",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__exit",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__errno",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___stdio_common_vfprintf",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__dup2",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__dup",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___std_exception_destroy",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___std_exception_copy",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___p__commode",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___p___argv",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___p___argc",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o___acrt_iob_func",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "wcsstr",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "wcsrchr",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "wcschr",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "longjmp",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_o__crt_atexit",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "__C_specific_handler",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "_local_unwind",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "memcmp",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "memcpy",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-crt-private-l1-1-0.dll",
+      "name": "memmove",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlLookupFunctionEntry",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlVirtualUnwind",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtOpenProcessToken",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlReleaseRelativeName",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlCreateUnicodeStringFromAsciiz",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtClose",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtOpenThreadToken",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtCancelSynchronousIoFile",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlNtStatusToDosError",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtQueryInformationProcess",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlFreeUnicodeString",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtSetInformationProcess",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtQueryVolumeInformationFile",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlFindLeastSignificantBit",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlDosPathNameToNtPathName_U",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtSetInformationFile",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlDosPathNameToRelativeNtPathName_U_WithStatus",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtQueryInformationToken",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtOpenFile",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "NtFsControlFile",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlFreeHeap",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ntdll.dll",
+      "name": "RtlCaptureContext",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-libraryloader-l1-2-0.dll",
+      "name": "LoadLibraryExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-libraryloader-l1-2-0.dll",
+      "name": "GetModuleFileNameA",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-libraryloader-l1-2-0.dll",
+      "name": "GetModuleFileNameW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-libraryloader-l1-2-0.dll",
+      "name": "GetModuleHandleW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-libraryloader-l1-2-0.dll",
+      "name": "GetProcAddress",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-libraryloader-l1-2-0.dll",
+      "name": "GetModuleHandleExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "ReleaseSemaphore",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "CreateSemaphoreExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "InitializeCriticalSection",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "LeaveCriticalSection",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "DeleteCriticalSection",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "AcquireSRWLockShared",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "CreateMutexExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "InitializeCriticalSectionEx",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "ReleaseSRWLockShared",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "EnterCriticalSection",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "OpenSemaphoreW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "WaitForSingleObject",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "AcquireSRWLockExclusive",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "TryAcquireSRWLockExclusive",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "ReleaseSRWLockExclusive",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "ReleaseMutex",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-1-0.dll",
+      "name": "WaitForSingleObjectEx",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l1-1-0.dll",
+      "name": "HeapSize",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l1-1-0.dll",
+      "name": "HeapSetInformation",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l1-1-0.dll",
+      "name": "HeapReAlloc",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l1-1-0.dll",
+      "name": "HeapAlloc",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l1-1-0.dll",
+      "name": "GetProcessHeap",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l1-1-0.dll",
+      "name": "HeapFree",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-errorhandling-l1-1-0.dll",
+      "name": "SetUnhandledExceptionFilter",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-errorhandling-l1-1-0.dll",
+      "name": "SetErrorMode",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-errorhandling-l1-1-0.dll",
+      "name": "UnhandledExceptionFilter",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-errorhandling-l1-1-0.dll",
+      "name": "GetLastError",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-errorhandling-l1-1-0.dll",
+      "name": "SetLastError",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-threadpool-l1-2-0.dll",
+      "name": "CreateThreadpoolTimer",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-threadpool-l1-2-0.dll",
+      "name": "SetThreadpoolTimer",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-threadpool-l1-2-0.dll",
+      "name": "CloseThreadpoolTimer",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-threadpool-l1-2-0.dll",
+      "name": "WaitForThreadpoolTimerCallbacks",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "GetCurrentThreadId",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "OpenThread",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "GetCurrentProcessId",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "GetCurrentProcess",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "GetExitCodeProcess",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "InitializeProcThreadAttributeList",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "ResumeThread",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "UpdateProcThreadAttribute",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "DeleteProcThreadAttributeList",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "GetStartupInfoW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "CreateProcessAsUserW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "CreateProcessW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-0.dll",
+      "name": "TerminateProcess",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-localization-l1-2-0.dll",
+      "name": "GetACP",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-localization-l1-2-0.dll",
+      "name": "GetLocaleInfoW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-localization-l1-2-0.dll",
+      "name": "FormatMessageW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-localization-l1-2-0.dll",
+      "name": "GetThreadLocale",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-localization-l1-2-0.dll",
+      "name": "GetCPInfo",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-localization-l1-2-0.dll",
+      "name": "SetThreadLocale",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-localization-l1-2-0.dll",
+      "name": "GetUserDefaultLCID",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-debug-l1-1-0.dll",
+      "name": "OutputDebugStringW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-debug-l1-1-0.dll",
+      "name": "DebugBreak",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-debug-l1-1-0.dll",
+      "name": "IsDebuggerPresent",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-handle-l1-1-0.dll",
+      "name": "CloseHandle",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-handle-l1-1-0.dll",
+      "name": "DuplicateHandle",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-memory-l1-1-0.dll",
+      "name": "VirtualQuery",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-memory-l1-1-0.dll",
+      "name": "ReadProcessMemory",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-memory-l1-1-0.dll",
+      "name": "VirtualFree",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-memory-l1-1-0.dll",
+      "name": "VirtualAlloc",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l1-1-0.dll",
+      "name": "WriteConsoleW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l1-1-0.dll",
+      "name": "GetConsoleOutputCP",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l1-1-0.dll",
+      "name": "ReadConsoleW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l1-1-0.dll",
+      "name": "GetConsoleMode",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l1-1-0.dll",
+      "name": "SetConsoleMode",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l1-1-0.dll",
+      "name": "SetConsoleCtrlHandler",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetDiskFreeSpaceExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "FindFirstFileExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetFullPathNameW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "FindFirstFileW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "CreateDirectoryW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetFileAttributesExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetDriveTypeW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "FindClose",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "SetFileAttributesW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetVolumeInformationW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "CreateFileW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "ReadFile",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "SetFilePointerEx",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "WriteFile",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetFileSize",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "SetEndOfFile",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetFileType",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "FileTimeToLocalFileTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "DeleteFileW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "SetFileTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetFileAttributesW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "FlushFileBuffers",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "RemoveDirectoryW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "CompareFileTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "FindNextFileW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "GetVolumePathNameW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l1-1-0.dll",
+      "name": "SetFilePointer",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-string-l1-1-0.dll",
+      "name": "MultiByteToWideChar",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-string-l1-1-0.dll",
+      "name": "CompareStringOrdinal",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-string-l1-1-0.dll",
+      "name": "WideCharToMultiByte",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "GetStdHandle",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "GetEnvironmentVariableW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "GetCommandLineW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "GetEnvironmentStringsW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "FreeEnvironmentStringsW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "SetEnvironmentVariableW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "SetEnvironmentStringsW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "SearchPathW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "ExpandEnvironmentStringsW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "SetCurrentDirectoryW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-1-0.dll",
+      "name": "GetCurrentDirectoryW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-1-0.dll",
+      "name": "SetConsoleCursorPosition",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-1-0.dll",
+      "name": "ScrollConsoleScreenBufferW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-1-0.dll",
+      "name": "FillConsoleOutputAttribute",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-1-0.dll",
+      "name": "SetConsoleTextAttribute",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-1-0.dll",
+      "name": "GetConsoleScreenBufferInfo",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-1-0.dll",
+      "name": "FlushConsoleInputBuffer",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-1-0.dll",
+      "name": "FillConsoleOutputCharacterW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-security-base-l1-1-0.dll",
+      "name": "GetSecurityDescriptorOwner",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-security-base-l1-1-0.dll",
+      "name": "GetFileSecurityW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-security-base-l1-1-0.dll",
+      "name": "RevertToSelf",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-sysinfo-l1-1-0.dll",
+      "name": "SetLocalTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-sysinfo-l1-1-0.dll",
+      "name": "GetSystemTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-sysinfo-l1-1-0.dll",
+      "name": "GetLocalTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-sysinfo-l1-1-0.dll",
+      "name": "GetWindowsDirectoryW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-sysinfo-l1-1-0.dll",
+      "name": "GetSystemTimeAsFileTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-sysinfo-l1-1-0.dll",
+      "name": "GetVersion",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-timezone-l1-1-0.dll",
+      "name": "FileTimeToSystemTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-timezone-l1-1-0.dll",
+      "name": "SystemTimeToFileTime",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-datetime-l1-1-0.dll",
+      "name": "GetDateFormatW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-datetime-l1-1-0.dll",
+      "name": "GetTimeFormatW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-systemtopology-l1-1-0.dll",
+      "name": "GetNumaNodeProcessorMaskEx",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-systemtopology-l1-1-0.dll",
+      "name": "GetNumaHighestNodeNumber",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-2-0.dll",
+      "name": "SetConsoleTitleW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l2-2-0.dll",
+      "name": "GetConsoleTitleW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegDeleteKeyExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegQueryValueExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegGetValueW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegEnumKeyExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegCreateKeyExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegDeleteValueW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegCloseKey",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegOpenKeyExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-registry-l1-1-0.dll",
+      "name": "RegSetValueExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processenvironment-l1-2-0.dll",
+      "name": "NeedCurrentDirectoryForExePathW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l2-1-0.dll",
+      "name": "GetFileInformationByHandleEx",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l2-1-0.dll",
+      "name": "MoveFileExW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l2-1-0.dll",
+      "name": "CreateHardLinkW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l2-1-0.dll",
+      "name": "CreateSymbolicLinkW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l2-1-0.dll",
+      "name": "MoveFileWithProgressW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l2-1-0.dll",
+      "name": "GlobalFree",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l2-1-0.dll",
+      "name": "GlobalAlloc",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-heap-l2-1-0.dll",
+      "name": "LocalFree",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-file-l2-1-2.dll",
+      "name": "CopyFileW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-io-l1-1-0.dll",
+      "name": "DeviceIoControl",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-console-l3-2-0.dll",
+      "name": "GetConsoleWindow",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processtopology-l1-1-0.dll",
+      "name": "GetThreadGroupAffinity",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-eventing-provider-l1-1-0.dll",
+      "name": "EventWriteTransfer",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-eventing-provider-l1-1-0.dll",
+      "name": "EventUnregister",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-eventing-provider-l1-1-0.dll",
+      "name": "EventRegister",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-eventing-provider-l1-1-0.dll",
+      "name": "EventSetInformation",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-2-0.dll",
+      "name": "InitOnceComplete",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-synch-l1-2-0.dll",
+      "name": "InitOnceBeginInitialize",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-processthreads-l1-1-1.dll",
+      "name": "IsProcessorFeaturePresent",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-profile-l1-1-0.dll",
+      "name": "QueryPerformanceCounter",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-interlocked-l1-1-0.dll",
+      "name": "InitializeSListHead",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-misc-l1-1-0.dll",
+      "name": "lstrcmpW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-misc-l1-1-0.dll",
+      "name": "lstrcmpiW",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-apiquery-l1-1-0.dll",
+      "name": "ApiSetQueryApiSetPresence",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-delayload-l1-1-1.dll",
+      "name": "ResolveDelayLoadedAPI",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-delayload-l1-1-0.dll",
+      "name": "DelayLoadFailureHook",
+      "delay": false,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-winrt-l1-1-0.dll",
+      "name": "RoUninitialize",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "api-ms-win-core-winrt-l1-1-0.dll",
+      "name": "RoInitialize",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-branding-winbrand-l1-1-0.dll",
+      "name": "BrandingFormatString",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "DoSHChangeNotify",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "ShellExecuteWorker",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "GetVDMCurrentDirectoriesStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "MessageBeepStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "WNetCancelConnection2WStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "WNetAddConnection2WStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "LookupAccountSidWStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "FindFirstStreamWStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "FindNextStreamWStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "SaferWorker",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "WNetGetConnectionWStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "CmdBatNotificationStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-cmd-util-l1-1-0.dll",
+      "name": "QueryFullProcessImageNameWStub",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "ext-ms-win-appmodel-shellexecute-l1-1-0.dll",
+      "name": "ShellExecuteExW",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "Wldp.dll",
+      "name": "#2",
+      "delay": true,
+      "source_registration_candidate": true
+    },
+    {
+      "library": "Wldp.dll",
+      "name": "#10",
+      "delay": true,
+      "source_registration_candidate": true
+    }
+  ]
+}

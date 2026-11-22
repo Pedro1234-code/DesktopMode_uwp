@@ -132,6 +132,7 @@ std::wstring RedactSensitiveText(std::wstring_view input) {
 }  // namespace
 
 void Log::Mirror() {
+  if (!Enabled()) return;
   try {
     winrt::init_apartment(winrt::apartment_type::multi_threaded);
   } catch (...) {
@@ -168,7 +169,13 @@ void Log::Mirror() {
   }
 }
 
-bool Log::Verbose() { return g_verbose; }
+bool Log::Enabled() {
+  wchar_t disabled[2]{};
+  return ::GetEnvironmentVariableW(L"DESKTOPMODE_DISABLE_LOGGING", disabled, 2) != 1 ||
+         disabled[0] != L'1';
+}
+
+bool Log::Verbose() { return Enabled() && g_verbose; }
 
 void Log::Init(std::wstring_view localStatePath) {
   std::lock_guard<std::mutex> lock(g_mutex);
@@ -197,10 +204,11 @@ void Log::Init(std::wstring_view localStatePath) {
 
   const char* banner = "\r\n==== Gecko session start ====\r\n";
   DWORD written = 0;
-  ::WriteFile(g_file, banner, (DWORD)strlen(banner), &written, nullptr);
+  if (Enabled()) ::WriteFile(g_file, banner, (DWORD)strlen(banner), &written, nullptr);
 }
 
 void Log::Write(std::wstring_view line) {
+  if (!Enabled()) return;
   std::wstring stamped = Timestamp() + L"  " + RedactSensitiveText(line);
 
   std::function<void(std::wstring)> handler;
@@ -230,6 +238,7 @@ void Log::Write(std::wstring_view line) {
 }
 
 void Log::WriteFromFault(std::wstring_view line) {
+  if (!Enabled()) return;
   std::wstring stamped = Timestamp() + L"  " + RedactSensitiveText(line);
 
   // try_lock, not lock: if the fault happened while this thread already held
@@ -249,6 +258,7 @@ void Log::WriteFromFault(std::wstring_view line) {
 }
 
 void Log::FlushFromFault() {
+  if (!Enabled()) return;
   if (g_mutex.try_lock()) {
     if (g_file != INVALID_HANDLE_VALUE) {
       ::FlushFileBuffers(g_file);

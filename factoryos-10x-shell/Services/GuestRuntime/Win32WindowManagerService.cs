@@ -81,6 +81,7 @@ namespace factoryos_10x_shell.Services.Win32
         public void Activate(Win32WindowModel window)
         {
             if (window == null || !Windows.Contains(window)) return;
+            if (window.IsActive && window.Visibility == Visibility.Visible) return;
             m_changingWindowState = true;
             foreach (Win32WindowModel item in Windows) item.IsActive = item == window;
             window.Visibility = Visibility.Visible;

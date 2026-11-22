@@ -60,13 +60,17 @@ namespace factoryos_10x_shell.Services.Win32
             {
                 try
                 {
-                    var log = await ApplicationData.Current.LocalFolder.CreateFileAsync(
-                        "Win32Bridge-start-shortcuts.log", CreationCollisionOption.ReplaceExisting);
-                    await FileIO.WriteTextAsync(log, report.ToString());
+                    if (factoryos_10x_shell.Services.Helpers.ShellDiagnostics.IsLoggingEnabled)
+                    {
+                        var log = await ApplicationData.Current.LocalFolder.CreateFileAsync(
+                            "Win32Bridge-start-shortcuts.log", CreationCollisionOption.ReplaceExisting);
+                        if (factoryos_10x_shell.Services.Helpers.ShellDiagnostics.IsLoggingEnabled)
+                            await FileIO.WriteTextAsync(log, report.ToString());
+                    }
                 }
                 catch (Exception exception)
                 {
-                    System.Diagnostics.Debug.WriteLine(exception.Message);
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug(exception.Message);
                 }
             }
         }

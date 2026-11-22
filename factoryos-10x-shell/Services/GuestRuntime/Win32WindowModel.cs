@@ -26,7 +26,14 @@ namespace factoryos_10x_shell.Services.Win32
         public string VirtualExecutablePath { get; set; }
         public string Arguments { get; set; }
         public string WorkingDirectory { get; set; }
-        public string DisplayName => Executable?.DisplayName ?? Executable?.Name ?? "Win32 app";
+        private string m_displayNameOverride;
+        public bool KeepLaunchIcon { get; set; }
+        public string DisplayNameOverride
+        {
+            get => m_displayNameOverride;
+            set { if (m_displayNameOverride == value) return; m_displayNameOverride = value; PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(DisplayName))); }
+        }
+        public string DisplayName => DisplayNameOverride ?? Executable?.DisplayName ?? Executable?.Name ?? "Win32 app";
         public double RestoreLeft { get; set; }
         public double RestoreTop { get; set; }
         public double RestoreWidth { get; set; }

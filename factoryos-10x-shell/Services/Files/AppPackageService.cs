@@ -322,13 +322,15 @@ namespace factoryos_10x_shell.Services.Files
 
         private static async Task LogRegistrationAsync(string message)
         {
-            System.Diagnostics.Debug.WriteLine("App Installer: " + message);
+            if (!factoryos_10x_shell.Services.Helpers.ShellDiagnostics.IsLoggingEnabled) return;
+            factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("App Installer: " + message);
             try
             {
                 var file = await ApplicationData.Current.LocalFolder.CreateFileAsync("AppInstaller-runtime.log", CreationCollisionOption.OpenIfExists);
                 if ((await file.GetBasicPropertiesAsync()).Size > 1024 * 1024)
                     await FileIO.WriteTextAsync(file, string.Empty);
-                await FileIO.AppendTextAsync(file, DateTimeOffset.Now.ToString("O") + " " + message + System.Environment.NewLine);
+                if (factoryos_10x_shell.Services.Helpers.ShellDiagnostics.IsLoggingEnabled)
+                    await FileIO.AppendTextAsync(file, DateTimeOffset.Now.ToString("O") + " " + message + System.Environment.NewLine);
             }
             catch { /* Diagnostics must not change a deployment result. */ }
         }

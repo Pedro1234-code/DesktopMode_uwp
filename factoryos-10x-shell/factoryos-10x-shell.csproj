@@ -191,7 +191,9 @@
     </Compile>
     <Compile Include="Services\Helpers\DevicePortalSettingsService.cs" />
     <Compile Include="Services\Files\AppPackageService.cs" />
-    <Compile Include="Controls\AppInstallerWindow.xaml.cs"><DependentUpon>AppInstallerWindow.xaml</DependentUpon></Compile>
+    <Compile Include="Controls\AppInstallerWindow.xaml.cs">
+      <DependentUpon>AppInstallerWindow.xaml</DependentUpon>
+    </Compile>
     <Compile Include="Services\Files\FileOperationModel.cs" />
     <Compile Include="Services\Files\FileOperationService.cs" />
     <Compile Include="Services\Files\FileTransferService.cs" />
@@ -240,6 +242,14 @@
     <Compile Include="Services\Navigation\DesktopNavigator.cs" />
   </ItemGroup>
   <ItemGroup>
+    <Content Include="Assets\Terminal\fit.js" />
+    <Content Include="Assets\Terminal\terminal.png" />
+    <Content Include="Assets\Terminal\index.html" />
+    <Content Include="Assets\Terminal\LICENSE-fit" />
+    <Content Include="Assets\Terminal\LICENSE-xterm" />
+    <Content Include="Assets\Terminal\terminal.js" />
+    <Content Include="Assets\Terminal\xterm.css" />
+    <Content Include="Assets\Terminal\xterm.js" />
     <Content Include="10x.png" />
     <Content Include="Assets\10x.png" />
     <Content Include="Assets\UpdateReleasesQr.png" />
@@ -337,8 +347,17 @@
     <Content Include="Assets\Firefox\firefox.png" />
     <Content Include="Assets\Firefox\app_mall_512.png" />
     <Content Include="Assets\Notepad\notepad.png" />
+    <Content Include="..\Win32Bridge\GuestApps\cmd\cmd.exe">
+      <Link>GuestRuntimeDefaults\Windows\System32\cmd.exe</Link>
+    </Content>
+    <Content Include="..\Win32Bridge\GuestApps\cmd\en-US\cmd.exe.mui">
+      <Link>GuestRuntimeDefaults\Windows\System32\en-US\cmd.exe.mui</Link>
+    </Content>
     <Content Include="..\Win32Bridge\GuestApps\notepad.exe">
       <Link>GuestRuntimeDefaults\Windows\notepad.exe</Link>
+    </Content>
+    <Content Include="..\Win32Bridge\GuestApps\Staged\GraphicsContracts.exe">
+      <Link>GuestRuntimeDefaults\Windows\GraphicsContracts.exe</Link>
     </Content>
     <Content Include="..\Win32Bridge\GuestApps\pt-BR\notepad.exe.mui">
       <Link>GuestRuntimeDefaults\Windows\pt-BR\notepad.exe.mui</Link>
@@ -382,7 +401,10 @@
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
     </Page>
-    <Page Include="Controls\AppInstallerWindow.xaml"><Generator>MSBuild:Compile</Generator><SubType>Designer</SubType></Page>
+    <Page Include="Controls\AppInstallerWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
+    </Page>
     <Page Include="Controls\FileOperationWindow.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>

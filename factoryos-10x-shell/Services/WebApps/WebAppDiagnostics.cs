@@ -21,6 +21,7 @@ namespace factoryos_10x_shell.Services.WebApps
 
         internal static void Write(WebAppWindowModel window, string stage, string detail = "")
         {
+            if (!factoryos_10x_shell.Services.Helpers.ShellDiagnostics.IsLoggingEnabled) return;
             try
             {
                 string backend = window?.App?.UseStrawfoxWindow == true ? "StrawfoxWindow" :
@@ -28,7 +29,7 @@ namespace factoryos_10x_shell.Services.WebApps
                 string id = window == null ? "none" : RuntimeHelpers.GetHashCode(window).ToString("X8");
                 string line = $"{DateTimeOffset.UtcNow:O} run={Run} t={Clock.ElapsedMilliseconds}ms " +
                     $"thread={System.Environment.CurrentManagedThreadId} window={id} backend={backend} stage={stage} {detail}";
-                Debug.WriteLine("[WebApps] " + line);
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("[WebApps] " + line);
                 lock (Gate)
                 {
                     if (Pending.Count >= 1024) { dropped++; return; }
@@ -58,6 +59,7 @@ namespace factoryos_10x_shell.Services.WebApps
                 }
                 try
                 {
+                    if (!factoryos_10x_shell.Services.Helpers.ShellDiagnostics.IsLoggingEnabled) continue;
                     string path = Path.Combine(ApplicationData.Current.LocalFolder.Path, "WebApps-runtime.log");
                     if (File.Exists(path) && new FileInfo(path).Length >= 2 * 1024 * 1024)
                     {
@@ -69,7 +71,7 @@ namespace factoryos_10x_shell.Services.WebApps
                     if (lost != 0) text += "WebApps diagnostics: dropped=" + lost + System.Environment.NewLine;
                     File.AppendAllText(path, text);
                 }
-                catch (Exception error) { Debug.WriteLine("[WebApps] log write failed: " + error.HResult.ToString("X8")); }
+                catch (Exception error) { factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("[WebApps] log write failed: " + error.HResult.ToString("X8")); }
             }
         }
     }

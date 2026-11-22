@@ -90,6 +90,8 @@ namespace factoryos_10x_shell.Views
         private readonly BitmapImage m_settingsIcon = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
         private readonly BitmapImage m_calculatorIcon = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
         private readonly BitmapImage m_firefoxIcon = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
+        private readonly Dictionary<string, BitmapImage> m_taskViewWebAppIcons = new Dictionary<string, BitmapImage>(StringComparer.Ordinal);
+        private BitmapImage m_taskViewPackageIcon;
 
         private const string FilesWindowIdentity = "CoreShell.Files";
         private const string NotepadWindowIdentity = "CoreShell.Notepad";
@@ -469,19 +471,20 @@ namespace factoryos_10x_shell.Views
 
         private void LogTaskbarStartup(string stage, Exception exception)
         {
+            if (!ShellDiagnostics.IsLoggingEnabled) return;
             while (exception?.InnerException != null)
                 exception = exception.InnerException;
             string detail = exception == null
                 ? "none"
                 : $"{exception.GetType().FullName} HRESULT=0x{exception.HResult:X8}";
             string line = $"{DateTimeOffset.UtcNow:O} {stage}: {detail}";
-            Debug.WriteLine("[ShellStartup] " + line);
+            factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("[ShellStartup] " + line);
             try
             {
                 string path = Path.Combine(ApplicationData.Current.LocalFolder.Path, "Shell-startup.log");
                 _ = Task.Run(() =>
                 {
-                    try { File.AppendAllText(path, line + System.Environment.NewLine); }
+                    try { if (ShellDiagnostics.IsLoggingEnabled) File.AppendAllText(path, line + System.Environment.NewLine); }
                     catch (Exception) { /* Logging must never prevent startup. */ }
                 });
             }
@@ -524,8 +527,8 @@ namespace factoryos_10x_shell.Views
         private bool m_desktopRefreshPending;
         private bool m_desktopRefreshing;
         private const string DesktopIconsVisibleKey = "Desktop.ShowIcons";
-        private const int DesktopTileWidth = 86;
-        private const int DesktopTileHeight = 94;
+        private const int DesktopTileWidth = 75;
+        private const int DesktopTileHeight = 90;
         private const int MaxDesktopSlot = 4096;
         private IReadOnlyList<DesktopIconEntry> m_desktopEntries = Array.Empty<DesktopIconEntry>();
         private readonly ApplicationDataContainer m_desktopPositions = ApplicationData.Current.LocalSettings
@@ -1171,7 +1174,11 @@ namespace factoryos_10x_shell.Views
             catch { }
         }
 
-        private void WebAppsChanged(object sender, EventArgs e) => SynchronizeShellWindows();
+        private void WebAppsChanged(object sender, EventArgs e)
+        {
+            m_taskViewWebAppIcons.Clear();
+            SynchronizeShellWindows();
+        }
 
         private void SynchronizeFileOperationWindows()
         {
@@ -1456,7 +1463,7 @@ namespace factoryos_10x_shell.Views
                     Title = window.App?.Name ?? "Web app",
                     Subtitle = "Web app",
                     FallbackGlyph = "\uE774",
-                    IconSource = CreateImageSource(window.App?.IconUri),
+                    IconSource = GetTaskViewWebAppIcon(window.App?.IconUri),
                     IsActive = window.IsActive && window.Visibility == Visibility.Visible,
                     IsMinimized = window.Visibility != Visibility.Visible
                 });
@@ -1543,7 +1550,8 @@ namespace factoryos_10x_shell.Views
                 descriptors.Add(new ShellWindowDescriptor {
                     Kind = ShellWindowKind.AppInstaller, Identity = installer,
                     Title = "App Installer", Subtitle = installer.PackageTitle, FallbackGlyph = "\uE7B8",
-                    IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png")),
+                    IconSource = m_taskViewPackageIcon ?? (m_taskViewPackageIcon =
+                        new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png"))),
                     IsActive = m_shellWindowCoordinator.IsActive(ShellWindowKind.AppInstaller, installer),
                     IsMinimized = installer.Visibility != Visibility.Visible
                 });
@@ -1585,11 +1593,16 @@ namespace factoryos_10x_shell.Views
             });
         }
 
-        private static ImageSource CreateImageSource(string uri)
+        private BitmapImage GetTaskViewWebAppIcon(string iconUri)
         {
-            return !string.IsNullOrWhiteSpace(uri) && Uri.TryCreate(uri, UriKind.Absolute, out Uri iconUri)
-                ? new BitmapImage(iconUri)
-                : null;
+            if (string.IsNullOrWhiteSpace(iconUri)) return null;
+            if (!m_taskViewWebAppIcons.TryGetValue(iconUri, out var image) &&
+                Uri.TryCreate(iconUri, UriKind.Absolute, out var uri))
+            {
+                image = new BitmapImage { DecodePixelWidth = 96, UriSource = uri };
+                m_taskViewWebAppIcons.Add(iconUri, image);
+            }
+            return image;
         }
 
         private void ApplyDefaultWallpaper()
@@ -1709,8 +1722,8 @@ namespace factoryos_10x_shell.Views
 
         private void MainDesktop_SizeChanged(object sender, SizeChangedEventArgs e)
         {
-            UpdateStartMenuAlignment();
             UpdateWorkspaceBounds();
+            UpdateStartMenuAlignment();
         }
 
         private async void MainDesktop_Loaded(object sender, RoutedEventArgs e)
@@ -1822,12 +1835,37 @@ namespace factoryos_10x_shell.Views
 
         private readonly DispatcherTimer m_taskbarHideTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(600) };
         private bool m_pointerOverTaskbar;
+        private double m_taskbarReservedHeight = 50;
+        private double m_taskbarWorkspaceInset = 50;
+
+        private void UpdateTaskbarGeometry()
+        {
+            double desktopScale = MainPage.CurrentPage?.DesktopScale ?? 1.0;
+            double pixelsPerDip = Math.Max(1, Windows.Graphics.Display.DisplayInformation.GetForCurrentView().RawPixelsPerViewPixel);
+            double height = AppState.Instance.UseWindows11Skin ? 48 : 50;
+            // Scale only the taskbar, including icons and hit targets. Convert the
+            // selected pixel height once, compensating for Xbox and display scaling.
+            m_taskbarReservedHeight = AppState.Instance.TaskbarHeightInPixels / (pixelsPerDip * desktopScale);
+            double presentationScale = m_taskbarReservedHeight / height;
+            TaskbarPresentation.Height = m_taskbarReservedHeight;
+            TaskbarFrame.Height = height;
+            TaskbarFrame.Width = Math.Max(1, MainGrid.ActualWidth / presentationScale);
+
+            // Cover a single physical pixel beneath the taskbar's top stroke.
+            // Separately rounded XAML surfaces otherwise expose the wallpaper.
+            double pixel = 1.0 / (pixelsPerDip * desktopScale);
+            m_taskbarWorkspaceInset = AppState.Instance.TaskbarAutoHide ? 0 : Math.Max(0, m_taskbarReservedHeight - pixel);
+            foreach (var host in new[] { AppInstallerWindowHost, FilesWindowHost, FileOperationWindowHost, NotepadWindowHost, SettingsWindowHost, CalculatorWindowHost, FirefoxWindowHost })
+                host.Margin = new Thickness(0, 0, 0, m_taskbarWorkspaceInset);
+            DesktopSurface.Margin = new Thickness(0, 0, 0, AppState.Instance.TaskbarAutoHide ? 0 : m_taskbarReservedHeight);
+            TaskViewOverlay.Margin = new Thickness(0, 0, 0, m_taskbarWorkspaceInset);
+            StartMenuFrame.Margin = new Thickness(StartMenuFrame.Margin.Left, 10, StartMenuFrame.Margin.Right, m_taskbarReservedHeight + 10);
+            ActionCenterFrame.Margin = new Thickness(0, 10, 8, m_taskbarReservedHeight + 10);
+        }
         private void TaskbarPreferencesChanged()
         {
+            UpdateTaskbarGeometry();
             UpdateStartMenuAlignment();
-            double bottom = AppState.Instance.TaskbarAutoHide ? 0 : 50;
-            foreach (var host in new[] { AppInstallerWindowHost, FilesWindowHost, FileOperationWindowHost, NotepadWindowHost, SettingsWindowHost, CalculatorWindowHost, FirefoxWindowHost })
-                host.Margin = new Thickness(0, 0, 0, bottom);
             m_taskbarHideTimer.Stop();
             SetTaskbarRevealed(!AppState.Instance.TaskbarAutoHide);
             UpdateWorkspaceBounds();
@@ -1836,6 +1874,7 @@ namespace factoryos_10x_shell.Views
         {
             ApplyDefaultWallpaper();
             DesktopRefreshRequested();
+            TaskbarPreferencesChanged();
             UpdateStartMenuAlignment();
             SynchronizeShellWindows();
         }
@@ -1858,8 +1897,8 @@ namespace factoryos_10x_shell.Views
         }
         private void SetTaskbarRevealed(bool visible)
         {
-            TaskbarFrame.Opacity = visible ? 1 : 0;
-            TaskbarFrame.IsHitTestVisible = visible;
+            TaskbarPresentation.Opacity = visible ? 1 : 0;
+            TaskbarPresentation.IsHitTestVisible = visible;
         }
         private void AutoHidePointerMoved(CoreWindow sender, Windows.UI.Core.PointerEventArgs args)
         {
@@ -1869,15 +1908,15 @@ namespace factoryos_10x_shell.Views
             var p = transform.TransformPoint(args.CurrentPoint.Position);
             bool inWidth = p.X >= 0 && p.X <= MainGrid.ActualWidth;
             bool atEdge = inWidth && p.Y >= MainGrid.ActualHeight - 3 && p.Y <= MainGrid.ActualHeight;
-            m_pointerOverTaskbar = inWidth && p.Y >= MainGrid.ActualHeight - 50 && p.Y <= MainGrid.ActualHeight;
+            m_pointerOverTaskbar = inWidth && p.Y >= MainGrid.ActualHeight - m_taskbarReservedHeight && p.Y <= MainGrid.ActualHeight;
             if (atEdge) SetTaskbarRevealed(true);
             if (m_pointerOverTaskbar) m_taskbarHideTimer.Stop();
-            else if (TaskbarFrame.Opacity > 0 && !m_taskbarHideTimer.IsEnabled) m_taskbarHideTimer.Start();
+            else if (TaskbarPresentation.Opacity > 0 && !m_taskbarHideTimer.IsEnabled) m_taskbarHideTimer.Start();
         }
         private void AutoHidePointerExited(CoreWindow sender, Windows.UI.Core.PointerEventArgs args)
         {
             m_pointerOverTaskbar = false;
-            if (AppState.Instance.TaskbarAutoHide && TaskbarFrame.Opacity > 0) m_taskbarHideTimer.Start();
+            if (AppState.Instance.TaskbarAutoHide && TaskbarPresentation.Opacity > 0) m_taskbarHideTimer.Start();
         }
         private void AutoHideTimerTick(object sender, object args)
         {
@@ -1889,6 +1928,7 @@ namespace factoryos_10x_shell.Views
 
         private void UpdateWorkspaceBounds()
         {
+            UpdateTaskbarGeometry();
             SynchronizeFileOperationWindows();
             foreach (var installer in m_installers)
             {
@@ -1901,10 +1941,10 @@ namespace factoryos_10x_shell.Views
             // Xbox desktop scale. Use its measured size rather than physical bounds.
             m_windowManager.SetWorkspaceBounds(
                 WindowHost.ActualWidth,
-                Math.Max(0, WindowHost.ActualHeight - (AppState.Instance.TaskbarAutoHide ? 0 : 50)));
+                Math.Max(0, WindowHost.ActualHeight - m_taskbarWorkspaceInset));
             m_nativeWindowManager.SetWorkspaceBounds(
                 NativeWindowHost.ActualWidth,
-                Math.Max(0, NativeWindowHost.ActualHeight - (AppState.Instance.TaskbarAutoHide ? 0 : 50)));
+                Math.Max(0, NativeWindowHost.ActualHeight - m_taskbarWorkspaceInset));
         }
 
         private void OnPointerPressed(object sender, PointerRoutedEventArgs args)

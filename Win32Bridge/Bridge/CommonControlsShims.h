@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Bridge/CompatibilityCatalog.h"
-#include "Bridge\\MiniGdi.h"
+#include "Bridge\\GDI\\MiniGdi.h"
 
 namespace Win32Bridge
 {
@@ -47,8 +47,15 @@ namespace Bridge
     HWND WINAPI BridgeCreateToolbarEx(HWND parent, DWORD style, UINT identifier, int bitmapCount, HINSTANCE instance, UINT_PTR bitmapId, const void* buttons, int buttonCount, int buttonWidth, int buttonHeight, int bitmapWidth, int bitmapHeight, UINT structureSize);
     HWND WINAPI BridgeCreateStatusWindowW(LONG style, LPCWSTR text, HWND parent, UINT identifier);
     INT_PTR WINAPI BridgePropertySheetW(const void* header);
+    INT_PTR WINAPI BridgePropertySheetA(const void* header);
     HRESULT WINAPI BridgeDllGetVersion(GuestDllVersionInfo* versionInfo);
     HANDLE WINAPI BridgeCreatePropertySheetPageW(const void* page);
+    HANDLE WINAPI BridgeCreatePropertySheetPageA(const void* page);
+    BOOL WINAPI BridgeDestroyPropertySheetPage(HANDLE page);
+    struct GuestPropertyPageDescriptor;
+    class GuestModuleLoader;
+    bool TakeGuestPropertySheetPage(HANDLE page, GuestPropertyPageDescriptor* descriptor, bool consume = true);
+    void ReleaseGuestPropertySheetPages(GuestModuleLoader* owner, bool notify = true);
     ImportResolution ResolveCommonControlsImport(const ImportedSymbol& symbol);
 }
 }

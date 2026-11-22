@@ -197,7 +197,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeLocalUnlock(HLOCAL memory)
     return BridgeGlobalUnlock(reinterpret_cast<HGLOBAL>(memory));
 }
 
-UINT WINAPI Win32Bridge::Bridge::BridgeGetACP() { return 1252; }
+UINT WINAPI Win32Bridge::Bridge::BridgeGetACP() { return GuestAnsiCodePage; }
 
 void WINAPI Win32Bridge::Bridge::BridgeGetStartupInfoW(LPSTARTUPINFOW startupInfo)
 {
@@ -206,6 +206,7 @@ void WINAPI Win32Bridge::Bridge::BridgeGetStartupInfoW(LPSTARTUPINFOW startupInf
     startupInfo->cb = sizeof(*startupInfo);
     startupInfo->dwFlags = 0x00000001u; // STARTF_USESHOWWINDOW
     startupInfo->wShowWindow = SW_SHOWNORMAL;
+    if (auto runtime = CurrentGuestRuntime()) runtime->FillStartupCrtData(*startupInfo);
     SetGuestLastError(ERROR_SUCCESS);
 }
 

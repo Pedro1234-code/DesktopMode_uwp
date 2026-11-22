@@ -23,6 +23,10 @@ namespace Bridge
             leaf.rfind(L"ext-ms-win-", 0) == 0;
         if (!apiSet) return requested;
 
+        if (leaf.rfind(L"ext-ms-win-cmd-util-", 0) == 0) return L"cmdext.dll";
+        if (leaf.rfind(L"ext-ms-win-branding-winbrand-", 0) == 0) return L"winbrand.dll";
+        if (leaf.rfind(L"api-ms-win-core-winrt-", 0) == 0) return L"combase.dll";
+        if (leaf.rfind(L"ext-ms-win-appmodel-shellexecute-", 0) == 0) return L"shell32.dll";
         if (leaf.rfind(L"api-ms-win-crt-", 0) == 0) return L"ucrtbase.dll";
         if (leaf.find(L"-ntuser-") != std::wstring::npos) return L"user32.dll";
         if (leaf.find(L"-gdi-") != std::wstring::npos) return L"gdi32.dll";

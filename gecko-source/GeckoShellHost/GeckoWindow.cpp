@@ -24,6 +24,7 @@ volatile LONG sFaultCount = 0;
 using CaptureFaultStack = USHORT (WINAPI*)(ULONG, ULONG, PVOID*, PULONG);
 CaptureFaultStack sCaptureFaultStack = nullptr;
 LONG WINAPI RecordWindowFault(EXCEPTION_POINTERS* exception) {
+  if (!gecko_w10m::client::Log::Enabled()) return EXCEPTION_CONTINUE_SEARCH;
   if (!exception || !exception->ExceptionRecord ||
       exception->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
     return EXCEPTION_CONTINUE_SEARCH;
@@ -122,7 +123,8 @@ void InitializeWindowFaultDiagnostics() {
       }
       const char start[] = "\r\n=== Web App native diagnostics: first-chance AV; may be handled by Gecko; access 0=read 1=write 8=execute ===\r\n";
       DWORD written = 0;
-      ::WriteFile(sFaultFile, start, sizeof(start) - 1, &written, nullptr);
+      if (gecko_w10m::client::Log::Enabled())
+        ::WriteFile(sFaultFile, start, sizeof(start) - 1, &written, nullptr);
       gecko_w10m::client::Log::Write(L"window fault diagnostics: WebApps-native-exceptions.log enabled (limit 16 per process)");
     } catch (...) {
       if (sFaultFile != INVALID_HANDLE_VALUE) { ::CloseHandle(sFaultFile); sFaultFile = INVALID_HANDLE_VALUE; }

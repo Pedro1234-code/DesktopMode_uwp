@@ -86,6 +86,10 @@ void LogModuleIdentity(const wchar_t* name, HMODULE module) {
 // The UI thread's dispatcher, kept for the launcher callback, which is called
 // from Gecko's threads and has no way to ask for one.
 winrt::Windows::UI::Core::CoreDispatcher gUiDispatcher{nullptr};
+// These cursor ownership flags are read and written on the UI dispatcher.
+bool gBrowserPointerInside = false;
+bool gBrowserCursorOwned = false;
+int32_t gBrowserCursor = 0;
 
 struct CaptureActivationResult {
   HRESULT status;
@@ -1828,6 +1832,9 @@ void EngineView::CursorChanged(int32_t cursor) {
     if (!window) {
       return;
     }
+    gBrowserCursor = cursor;
+    if (!gBrowserPointerInside || gPointerLocked.load()) return;
+    gBrowserCursorOwned = true;
     CoreCursorType type = CoreCursorType::Arrow;
     switch (cursor) {
       case 1: type = CoreCursorType::Wait; break;
@@ -2276,6 +2283,42 @@ winrt::Windows::Foundation::Point EngineView::CoreMousePoint(
   return point;
 }
 
+bool EngineView::IsCoreMouseOverSurface(
+    winrt::Windows::Foundation::Point const& point) const {
+  try {
+    if (!host_ || !inputEnabled_ || !host_.IsHitTestVisible() ||
+        host_.Visibility() != Visibility::Visible) return false;
+    const auto inverse = host_.TransformToVisual(nullptr).Inverse();
+    if (!inverse) return false;
+    const auto local = inverse.TransformPoint(point);
+    if (local.X < 0 || local.Y < 0 ||
+        local.X >= host_.ActualWidth() || local.Y >= host_.ActualHeight()) return false;
+
+    // Bounds alone cannot detect the taskbar or another window covering Gecko.
+    const auto hits = VisualTreeHelper::FindElementsInHostCoordinates(point, nullptr);
+    if (!hits.First().HasCurrent()) return false;
+    auto element = hits.First().Current().as<DependencyObject>();
+    while (element) {
+      if (element == host_) return true;
+      element = VisualTreeHelper::GetParent(element);
+    }
+  } catch (...) {}
+  return false;
+}
+
+void EngineView::UpdateMouseCursorOwner(bool inside) {
+  if (gBrowserPointerInside == inside) return;
+  gBrowserPointerInside = inside;
+  if (inside) {
+    CursorChanged(gBrowserCursor);
+  } else if (gBrowserCursorOwned) {
+    gBrowserCursorOwned = false;
+    if (auto window = winrt::Windows::UI::Core::CoreWindow::GetForCurrentThread())
+      window.PointerCursor(winrt::Windows::UI::Core::CoreCursor(
+          winrt::Windows::UI::Core::CoreCursorType::Arrow, 0));
+  }
+}
+
 void EngineView::WireCoreMouse() {
   using winrt::Windows::Devices::Input::PointerDeviceType;
   using winrt::Windows::UI::Core::CoreWindow;
@@ -2315,6 +2358,9 @@ void EngineView::WireCoreMouse() {
             return;
           }
           if (IsPointInExternalWindow(point.Position())) return;
+          const bool inside = IsCoreMouseOverSurface(point.Position());
+          UpdateMouseCursorOwner(inside);
+          if (!inside && !coreLeftDown_ && !coreMiddleDown_ && !coreRightDown_) return;
           OnMoved(point.PointerId(), CoreMousePoint(point.Position()), true);
         });
 
@@ -2334,6 +2380,14 @@ void EngineView::WireCoreMouse() {
               ToExternalFrameFromWindow(point.Position(), &externalX, &externalY);
           if (!pointerLocked && !external &&
               IsPointInExternalWindow(point.Position())) return;
+          if (!pointerLocked && !external) {
+            const bool inside = IsCoreMouseOverSurface(point.Position());
+            UpdateMouseCursorOwner(inside);
+            if (!inside) {
+              SetInputEnabled(false);
+              return;
+            }
+          }
           if (external) {
             corePointerExternal_ = true;
             lastExternalInputX_ = externalX;
@@ -2426,7 +2480,8 @@ void EngineView::WireCoreMouse() {
                                     point.Position(), &externalX, &externalY)) {
             externalWheel_(externalX, externalY, 0.0,
                            point.Properties().MouseWheelDelta());
-          } else if (!IsPointInExternalWindow(point.Position())) {
+          } else if (!IsPointInExternalWindow(point.Position()) &&
+                     IsCoreMouseOverSurface(point.Position())) {
             OnWheel(CoreMousePoint(point.Position()),
                     point.Properties().MouseWheelDelta());
           }
@@ -2447,6 +2502,7 @@ void EngineView::SetInputEnabled(bool enabled) {
 
   inputEnabled_ = enabled;
   if (!enabled) {
+    UpdateMouseCursorOwner(false);
     ResetGamepadMode();
   }
   if (!enabled && gPointerLocked.load() && exitPointerLock_) {
@@ -3130,6 +3186,7 @@ void EngineView::Start() {
 }
 
 void EngineView::Stop() {
+  UpdateMouseCursorOwner(false);
   ResetGamepadMode();
   gamepadAccelerator_.revoke();
   if (gamepadActivated_.value) {

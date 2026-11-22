@@ -34,6 +34,7 @@ namespace Bridge
         bool valid = false;
         std::wstring error;
         WORD machine = 0;
+        WORD subsystem = 0;
         DWORD entryPointRva = 0;
         std::vector<ImportedSymbol> imports;
         std::vector<ExportedSymbol> exports;

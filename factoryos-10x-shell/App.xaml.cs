@@ -159,7 +159,7 @@ namespace factoryos_10x_shell
                 catch (Exception runtimeError)
                 {
                     ShellDiagnostics.RecordException("Win32 drive preparation", runtimeError);
-                    Debug.WriteLine($"Win32 drive preparation failed: {runtimeError}");
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Win32 drive preparation failed: {runtimeError}");
                 }
             }
             catch (Exception exception)
@@ -168,7 +168,7 @@ namespace factoryos_10x_shell
                 // that cannot be inspected must not delay or terminate Shell
                 // startup.
                 ShellDiagnostics.RecordException("Deferred Shell startup", exception);
-                Debug.WriteLine($"Deferred startup initialization failed: {exception}");
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Deferred startup initialization failed: {exception}");
             }
         }
 
@@ -181,7 +181,7 @@ namespace factoryos_10x_shell
             catch (Exception error)
             {
                 ShellDiagnostics.RecordException("Start Menu package discovery", error);
-                Debug.WriteLine($"Start Menu package discovery failed: {error}");
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Start Menu package discovery failed: {error}");
             }
         }
 
@@ -195,7 +195,7 @@ namespace factoryos_10x_shell
             // or another internal app, so it must not label the reported failure.
             const string diagnosticStage = "Shell XAML operation";
             ShellDiagnostics.RecordException("Unhandled XAML exception", e.Exception);
-            Debug.WriteLine($"Unhandled XAML exception during '{diagnosticStage}': {e.Exception}");
+            factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Unhandled XAML exception during '{diagnosticStage}': {e.Exception}");
 
             Exception exceptionWithContext = new InvalidOperationException(
                 $"Unhandled exception during: {diagnosticStage}. " +
@@ -275,7 +275,7 @@ namespace factoryos_10x_shell
                     try { await HandleWebAppProtocolAsync(protocolArgs.Uri); }
                     catch (Exception exception)
                     {
-                        Debug.WriteLine($"Web App protocol activation failed: {exception.GetType().Name} (0x{exception.HResult:X8})");
+                        factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Web App protocol activation failed: {exception.GetType().Name} (0x{exception.HResult:X8})");
                     }
                     return;
                 }
@@ -443,7 +443,7 @@ namespace factoryos_10x_shell
                     }
                     catch (Exception exception)
                     {
-                        Debug.WriteLine($"Web App icon could not be loaded (0x{exception.HResult:X8}).");
+                        factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Web App icon could not be loaded (0x{exception.HResult:X8}).");
                     }
                 }
             }

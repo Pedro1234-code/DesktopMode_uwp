@@ -18,6 +18,7 @@
 #include "gecko_bootstrap.h"
 
 #include <windows.h>
+#include "../client/Log.h"
 
 #include <string>
 #include <vector>
@@ -381,7 +382,8 @@ extern "C" int gecko_w10m_gecko_run(const wchar_t* installDir,
   SetEngineEnvironment(L"MOZ_LOG", nullptr);
   SetEngineEnvironment(L"MOZ_LOG_FILE", nullptr);
   Log("bootstrap: Gecko component logging stays off for privacy");
-  RedirectStdErrTo(profile + L"\\gecko-stderr.log");
+  if (gecko_w10m::client::Log::Enabled())
+    RedirectStdErrTo(profile + L"\\gecko-stderr.log");
 
   // firefox.exe takes this at the top of main and hands it to Gecko as
   // StartupTimeline::START. We are not firefox.exe, so nobody did -- and

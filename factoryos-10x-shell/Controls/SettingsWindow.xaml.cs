@@ -66,6 +66,7 @@ namespace factoryos_10x_shell.Controls
             Win32SupportToggle.IsOn = Win32WindowManagerService.Instance.IsAppSupportEnabled;
             AutomaticUpdateCheckToggle.IsOn = UpdateCheckService.IsAutomaticCheckEnabled;
             CustomCursorToggle.IsOn = MainPage.IsCustomCursorEnabled;
+            DisableAllLoggingToggle.IsOn = ShellDiagnostics.DisableAllLogging;
             DisableLivePackageTrackingToggle.IsOn = !App.ServiceProvider
                 .GetRequiredService<AppHelper>().IsLivePackageTrackingEnabled;
             CurrentVersionText.Text = UpdateCheckService.CurrentVersion.ToString();
@@ -74,6 +75,7 @@ namespace factoryos_10x_shell.Controls
             ActualThemeChanged += (sender, args) => UpdateDefaultWallpaperPreview();
             TaskbarAutoHideToggle.IsOn = AppState.Instance.TaskbarAutoHide;
             TaskbarAlignmentCombo.SelectedIndex = AppState.Instance.TaskbarAlignLeft ? 1 : 0;
+            TaskbarSizeCombo.SelectedIndex = (int)AppState.Instance.TaskbarSize;
             TaskbarSearchModeCombo.SelectedIndex = (int)AppState.Instance.Windows11TaskbarSearchMode;
             UpdateTaskbarSearchSetting();
             m_initializing = false;
@@ -267,6 +269,12 @@ namespace factoryos_10x_shell.Controls
         {
             if (!m_initializing && TaskbarSearchModeCombo.SelectedIndex >= 0)
                 AppState.Instance.Windows11TaskbarSearchMode = (TaskbarSearchMode)TaskbarSearchModeCombo.SelectedIndex;
+        }
+
+        private void TaskbarSize_Changed(object sender, SelectionChangedEventArgs e)
+        {
+            if (!m_initializing && TaskbarSizeCombo.SelectedIndex >= 0)
+                AppState.Instance.TaskbarSize = (TaskbarSizeMode)TaskbarSizeCombo.SelectedIndex;
         }
 
         private void TaskbarAutoHide_Toggled(object sender, RoutedEventArgs e)
@@ -505,6 +513,11 @@ namespace factoryos_10x_shell.Controls
         private void LauncherSize_Click(object sender, RoutedEventArgs e) => ApplicationData.Current.LocalSettings.Values["CoreShell.LauncherSize"] = (sender as FrameworkElement)?.Tag as string;
         private void BackgroundToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) { AppState.Instance.IsBgChangeButtonVisible = BackgroundToggle.IsOn; ApplicationData.Current.LocalSettings.Values["IsBgChangeButtonVisible"] = BackgroundToggle.IsOn; } }
         private void CustomCursorToggle_Toggled(object sender, RoutedEventArgs e) { if (!m_initializing) MainPage.SetCustomCursorEnabled(CustomCursorToggle.IsOn); }
+        private void DisableAllLoggingToggle_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!m_initializing) ShellDiagnostics.DisableAllLogging = DisableAllLoggingToggle.IsOn;
+        }
+
         private void DisableLivePackageTrackingToggle_Toggled(object sender, RoutedEventArgs e)
         {
             if (!m_initializing)

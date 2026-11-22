@@ -1,4 +1,4 @@
-﻿using CommunityToolkit.Mvvm.ComponentModel;
+using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using factoryos_10x_shell.Library.Models.InternalData;
 using factoryos_10x_shell.Library.Services.Helpers;
@@ -83,6 +83,16 @@ namespace factoryos_10x_shell.Library.ViewModels
             firefoxIcon.IconName = "Strawfox";
             firefoxIcon.IconGlyph = null;
             firefoxIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
+
+            var terminalIcon = m_appHelper.StartIcons.FirstOrDefault(app => app.AppId == "CoreShell.Terminal");
+            if (terminalIcon == null)
+            {
+                terminalIcon = new StartIconModel { AppId = "CoreShell.Terminal", IconName = "Terminal" };
+                m_appHelper.StartIcons.Add(terminalIcon);
+            }
+            terminalIcon.IconName = "Terminal";
+            terminalIcon.IconGlyph = null;
+            terminalIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Terminal/terminal.png"));
 
             AppsListGridHeight = 310;
             AppsListToggleContent = "Show all";

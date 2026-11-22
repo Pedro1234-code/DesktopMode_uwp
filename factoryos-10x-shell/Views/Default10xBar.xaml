@@ -6,7 +6,6 @@
     xmlns:local="using:factoryos_10x_shell.Views"
     xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
     xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
-    MaxHeight="50"
     mc:Ignorable="d">
 
     <Page.Resources>
@@ -16,7 +15,7 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="Button">
-                        <Grid Background="Transparent" Margin="2,3">
+                        <Grid Background="Transparent" Margin="2,4">
                             <VisualStateManager.VisualStateGroups>
                                 <VisualStateGroup x:Name="CommonStates">
                                     <VisualState x:Name="Normal" />
@@ -199,9 +198,9 @@
         </Style>
 
         <Style x:Key="Windows11LaunchButtonStyle" TargetType="Button">
-            <Setter Property="Width" Value="48" />
-            <Setter Property="Height" Value="42" />
-            <Setter Property="CornerRadius" Value="6" />
+            <Setter Property="Width" Value="44" />
+            <Setter Property="Height" Value="48" />
+            <Setter Property="CornerRadius" Value="4" />
             <Setter Property="Padding" Value="0" />
             <Setter Property="Template">
                 <Setter.Value>
@@ -501,7 +500,7 @@
             HorizontalAlignment="Right"
             Orientation="Horizontal">
 
-            <Button x:Name="Windows11QuickSettingsButton" Visibility="Collapsed" Height="42" MinWidth="58"
+            <Button x:Name="Windows11QuickSettingsButton" Visibility="Collapsed" Height="40" MinWidth="58" VerticalAlignment="Center"
                     CornerRadius="6" Background="Transparent" BorderThickness="0" Padding="7,0"
                     ToolTipService.ToolTip="Quick settings"
                     Command="{x:Bind Mode=OneWay, Path=ViewModel.ActionCenterButtonClickedCommand}">

@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -13,9 +14,61 @@ namespace factoryos_10x_shell.Services.Helpers
 {
     internal static class ShellDiagnostics
     {
+        private const string DisableLoggingKey = "CoreShell.DisableAllLogging";
+        private static int s_loggingDisabled;
+        private static IntPtr s_savedStdOut, s_savedStdError;
+
+        [DllImport("api-ms-win-core-processenvironment-l1-1-0.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool SetEnvironmentVariableW(string name, string value);
+        [DllImport("api-ms-win-core-processenvironment-l1-1-0.dll")]
+        private static extern IntPtr GetStdHandle(int handle);
+        [DllImport("api-ms-win-core-processenvironment-l1-1-0.dll", SetLastError = true)]
+        private static extern bool SetStdHandle(int handle, IntPtr value);
+
+        internal static bool IsLoggingEnabled => Volatile.Read(ref s_loggingDisabled) == 0;
+
+        internal static bool DisableAllLogging
+        {
+            get => !IsLoggingEnabled;
+            set
+            {
+                ApplicationData.Current.LocalSettings.Values[DisableLoggingKey] = value;
+                ApplyLoggingPreference(value);
+            }
+        }
+
+        private static void ApplyLoggingPreference(bool disabled)
+        {
+            // Native hosts and xul read the process environment directly.
+            if (!SetEnvironmentVariableW("DESKTOPMODE_DISABLE_LOGGING", disabled ? "1" : null))
+                throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
+            bool wasDisabled = Interlocked.Exchange(ref s_loggingDisabled, disabled ? 1 : 0) != 0;
+            if (disabled && !wasDisabled)
+            {
+                s_savedStdOut = GetStdHandle(-11);
+                s_savedStdError = GetStdHandle(-12);
+                SetStdHandle(-11, IntPtr.Zero);
+                SetStdHandle(-12, IntPtr.Zero);
+            }
+            else if (!disabled && wasDisabled)
+            {
+                SetStdHandle(-11, s_savedStdOut);
+                SetStdHandle(-12, s_savedStdError);
+            }
+        }
+
+        [Conditional("DEBUG")]
+        internal static void WriteDebug(string message)
+        {
+            if (IsLoggingEnabled) Debug.WriteLine(message);
+        }
+
         private const long MaxLogBytes = 512 * 1024;
+        private const long MaxHangLogBytes = 32 * 1024;
         private static readonly object WriteLock = new object();
+        private static readonly object HangWriteLock = new object();
         private static string s_path;
+        private static string s_hangPath;
         private static string s_windowState = "Desktop not initialized";
         private static string s_pendingCheckpoint;
         private static int s_writerRunning;
@@ -24,7 +77,12 @@ namespace factoryos_10x_shell.Services.Helpers
         {
             try
             {
-                s_path = Path.Combine(ApplicationData.Current.LocalFolder.Path, "Shell-diagnostics.log");
+                bool disabled = ApplicationData.Current.LocalSettings.Values.TryGetValue(DisableLoggingKey, out object saved) &&
+                    saved is bool value && value;
+                ApplyLoggingPreference(disabled);
+                string logDirectory = ApplicationData.Current.LocalFolder.Path;
+                s_path = Path.Combine(logDirectory, "Shell-diagnostics.log");
+                s_hangPath = Path.Combine(logDirectory, "Shell-ui-hang.log");
                 var version = Package.Current.Id.Version;
                 Append($"Session started. Package={version.Major}.{version.Minor}.{version.Build}.{version.Revision}; " +
                     $"device={AnalyticsInfo.VersionInfo.DeviceFamily}; OS={AnalyticsInfo.VersionInfo.DeviceFamilyVersion}");
@@ -59,10 +117,23 @@ namespace factoryos_10x_shell.Services.Helpers
             });
         }
 
-        internal static void RecordCheckpoint(string stage) => Append(stage);
+        internal static void RecordCheckpoint(string stage)
+        {
+            if (!IsLoggingEnabled) return;
+            DateTimeOffset timestamp = DateTimeOffset.Now;
+            _ = Task.Run(() => Append(s_path, WriteLock, MaxLogBytes, stage, timestamp));
+        }
+
+        internal static void RecordUiHang(long elapsedMilliseconds, string lastOperation)
+        {
+            Append(s_hangPath, HangWriteLock, MaxHangLogBytes,
+                $"UI dispatcher not responding; elapsed={elapsedMilliseconds} ms; " +
+                $"lastCompletedOperation={lastOperation}; {Volatile.Read(ref s_windowState)}");
+        }
 
         internal static void RecordException(string source, Exception error)
         {
+            if (!IsLoggingEnabled) return;
             try
             {
                 var details = new StringBuilder(source)
@@ -87,21 +158,24 @@ namespace factoryos_10x_shell.Services.Helpers
             catch (Exception) { }
         }
 
-        private static void Append(string entry)
+        private static void Append(string entry) => Append(s_path, WriteLock, MaxLogBytes, entry);
+
+        private static void Append(string path, object writeLock, long maxBytes, string entry, DateTimeOffset? timestamp = null)
         {
-            if (s_path == null) return;
+            if (path == null || !IsLoggingEnabled) return;
             try
             {
-                lock (WriteLock)
+                lock (writeLock)
                 {
-                    var file = new FileInfo(s_path);
-                    if (file.Exists && file.Length >= MaxLogBytes)
+                    if (!IsLoggingEnabled) return;
+                    var file = new FileInfo(path);
+                    if (file.Exists && file.Length >= maxBytes)
                     {
-                        string previous = s_path + ".previous";
+                        string previous = path + ".previous";
                         File.Delete(previous);
-                        File.Move(s_path, previous);
+                        File.Move(path, previous);
                     }
-                    File.AppendAllText(s_path, $"{DateTimeOffset.Now:O} {entry}{System.Environment.NewLine}");
+                    File.AppendAllText(path, $"{timestamp ?? DateTimeOffset.Now:O} {entry}{System.Environment.NewLine}");
                 }
             }
             catch (Exception) { } // Keep the original error path intact.

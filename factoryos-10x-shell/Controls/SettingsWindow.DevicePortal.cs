@@ -59,7 +59,7 @@ namespace factoryos_10x_shell.Controls
                 catch (OperationCanceledException) when (load.IsCancellationRequested) { }
                 catch (Exception error)
                 {
-                    System.Diagnostics.Debug.WriteLine("Settings Device Portal HRESULT: " + error.HResult);
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("Settings Device Portal HRESULT: " + error.HResult);
                     if (!load.IsCancellationRequested)
                     {
                         m_portalStatus = "Xbox Device Portal is unavailable.";

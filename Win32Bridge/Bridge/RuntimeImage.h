@@ -25,6 +25,7 @@ namespace Bridge
         bool FinalizeProtections(const MappedPeImage& image, std::wstring* error);
         bool HasStaticTls() const;
         bool NotifyTls(DWORD reason, std::wstring* error) const;
+        void ReleaseThreadTls() const;
         void Release();
 
     private:

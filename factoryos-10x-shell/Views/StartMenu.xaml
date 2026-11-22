@@ -172,7 +172,6 @@
                         Padding="0"
                         HorizontalAlignment="Center"
                         ItemContainerStyle="{StaticResource AppsListGridItemStyle}"
-                        ItemsSource="{x:Bind FilteredApps}"
                         ReorderMode="Enabled"
                         ScrollViewer.HorizontalScrollMode="Disabled"
                         ScrollViewer.VerticalScrollBarVisibility="Disabled"
@@ -223,7 +222,7 @@
                             <TextBlock Margin="0,12,0,0" FontWeight="SemiBold" Text="Web apps" />
                             <Button x:Name="InstallWebAppButton" Width="85" Height="24" Margin="0,0,8,0" Padding="0" Click="InstallWebAppButton_Click" Content="Install app" CornerRadius="10" FontSize="13" />
 
-                            <GridView Margin="0,8,0,12" HorizontalAlignment="Left" ItemsSource="{x:Bind FilteredWebApps}">
+                            <GridView x:Name="WebAppListGrid" Margin="0,8,0,12" HorizontalAlignment="Left">
                                 <GridView.ItemTemplate>
                                     <DataTemplate>
                                         <Button Width="90" Height="90" Click="WebAppButton_Click" Style="{StaticResource AppIconBackgroundStyle}">

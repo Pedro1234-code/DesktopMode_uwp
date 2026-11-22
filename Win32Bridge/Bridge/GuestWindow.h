@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Bridge\\GuestMessageQueue.h"
-#include "Bridge\\MiniGdi.h"
+#include "Bridge\\GDI\\MiniGdi.h"
 #include "Bridge\\GuestWin32Abi.h"
 
 #include <agile.h>
@@ -21,6 +21,8 @@
 #include <unordered_map>
 #include <vector>
 
+struct IDXGISwapChain;
+
 namespace Win32Bridge
 {
 namespace Bridge
@@ -28,6 +30,12 @@ namespace Bridge
     struct GuestPresentationState;
     struct GuestInputCallbackState;
     struct GuestTimerState;
+
+    struct GuestSwapChainBinding
+    {
+        std::function<HRESULT(UINT*, UINT*)> clientSize;
+        std::function<void()> detach;
+    };
 
     // Per-guest USER32 environment. Windows and classes are bridge-owned
     // handles; a guest never obtains a host HWND or desktop window.
@@ -46,6 +54,7 @@ namespace Bridge
         void Deactivate();
         void SetInputEnabled(bool enabled) { m_inputEnabled.store(enabled); }
         void SetInitialWindowSizeHandler(std::function<void(int, int)> handler);
+        HRESULT BindGuestSwapChain(HWND window, IDXGISwapChain* chain, GuestSwapChainBinding* binding);
 
         ATOM RegisterGuestClass(const GuestAbi::WndClassExW* windowClass, DWORD* win32Error);
         ATOM RegisterGuestClass(const GuestAbi::WndClassW* windowClass, DWORD* win32Error);
@@ -149,6 +158,7 @@ namespace Bridge
         DWORD GuestInSendMessageState() const;
         DWORD GetGuestWindowThreadId(HWND window, DWORD* win32Error) const;
         void PostGuestQuitMessage(int exitCode);
+        void InterruptGuestThreadMessages(DWORD threadId, bool threadExited);
         GuestGetMessageResult GetGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum);
         bool WaitForGuestMessage(DWORD milliseconds = INFINITE);
         BOOL PeekGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum, UINT removeFlags);

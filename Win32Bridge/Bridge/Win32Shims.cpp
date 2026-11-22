@@ -1,20 +1,25 @@
 #include "pch.h"
 #include "Bridge/DialogResources.h"
+#include "Bridge/RuntimeDiagnostics.h"
 #include "Bridge/ApiSet.h"
 #include "Bridge/GuestResources.h"
 #include "Bridge\\Win32Shims.h"
-#include "Bridge\\Gdi32Shims.h"
+#include "Bridge\\GDI\\Gdi32Shims.h"
 #include "Bridge/Advapi32Shims.h"
 #include "Bridge/CryptoShims.h"
 #include "Bridge/CommonControlsShims.h"
 #include "Bridge/Comdlg32Shims.h"
 #include "Bridge/OleShims.h"
 #include "Bridge/MprShims.h"
-#include "Bridge/MsvcrtShims.h"
+#include "Bridge/CRT/MsvcrtShims.h"
 #include "Bridge/Shell32Shims.h"
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge\\User32Shims.h"
 #include "Bridge/VersionShims.h"
+#include "Bridge/ExportAliases.h"
+#include "Bridge/MemoryStreams.h"
+#include "Bridge/WindowsCodecs.h"
+#include "Bridge/DirectX/GraphicsShims.h"
 
 using namespace Win32Bridge::Bridge;
 
@@ -619,11 +624,17 @@ ImportResolution ResolveAuxiliaryImport(const ImportedSymbol& symbol)
     return resolution;
 }
 
-ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
+#include "Bridge/OptionalContracts.inl"
+
+static ImportResolution ResolveRuntimeImportDirect(const ImportedSymbol& symbol)
 {
     ImportedSymbol canonical = symbol;
     canonical.library = ApiSetHostLibrary(symbol.library);
     auto resolution = CompatibilityCatalog::Resolve(canonical);
+    const auto optionalResolution = ResolveOptionalContractImport(canonical);
+    if (optionalResolution.targetAddress != 0) return optionalResolution;
+    const auto nativeResolution = ResolveNativeGuestImport(canonical);
+    if (nativeResolution.targetAddress != 0) return nativeResolution;
     const auto versionResolution = ResolveVersionImport(canonical);
     if (versionResolution.targetAddress != 0) return versionResolution;
     if (_wcsicmp(canonical.library.c_str(), L"kernel32.dll") == 0 ||
@@ -640,6 +651,12 @@ ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
     if (commonControlsResolution.targetAddress != 0) return commonControlsResolution;
     const auto commonDialogResolution = ResolveComdlg32Import(canonical);
     if (commonDialogResolution.targetAddress != 0) return commonDialogResolution;
+    const auto streamResolution = ResolveMemoryStreamImport(canonical);
+    if (streamResolution.targetAddress != 0) return streamResolution;
+    const auto codecsResolution = ResolveWindowsCodecsImport(canonical);
+    if (codecsResolution.targetAddress != 0) return codecsResolution;
+    const auto graphicsResolution = ResolveGraphicsImport(canonical);
+    if (graphicsResolution.targetAddress != 0) return graphicsResolution;
     const auto oleResolution = ResolveOleImport(canonical);
     if (oleResolution.targetAddress != 0) return oleResolution;
     const auto mprResolution = ResolveMprImport(canonical);
@@ -684,6 +701,43 @@ ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
     {
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetKeyState);
     }
+    return resolution;
+}
+
+ImportResolution ResolveRuntimeImport(const ImportedSymbol& symbol)
+{
+    ImportedSymbol current = symbol;
+    current.library = ApiSetHostLibrary(current.library);
+    auto resolution = ResolveRuntimeImportDirect(current);
+    if (resolution.targetAddress != 0) return resolution;
+
+    std::vector<ImportedSymbol> visited;
+    ImportedSymbol redirected;
+    while (ExportAliases::Redirect(current, &redirected))
+    {
+        if (visited.size() >= 32) break;
+        visited.push_back(current);
+        redirected.library = ApiSetHostLibrary(redirected.library);
+        const auto repeated = std::find_if(visited.begin(), visited.end(),
+            [&redirected](const ImportedSymbol& previous)
+            {
+                return _wcsicmp(previous.library.c_str(), redirected.library.c_str()) == 0 &&
+                    previous.importedByOrdinal == redirected.importedByOrdinal &&
+                    (redirected.importedByOrdinal ? previous.ordinal == redirected.ordinal
+                                                 : previous.name == redirected.name);
+            });
+        if (repeated != visited.end()) break;
+        current = redirected;
+        auto resolved = ResolveRuntimeImportDirect(current);
+        if (resolved.targetAddress != 0)
+        {
+            resolved.note = L"ReactOS export alias -> " + current.library + L"!" +
+                (current.importedByOrdinal ? L"#" + std::to_wstring(current.ordinal) : current.name) + L".";
+            return resolved;
+        }
+    }
+    // Preserve guest-DLL fallback and the original missing-import diagnosis
+    // when metadata describes an export that has no runtime implementation.
     return resolution;
 }
 }

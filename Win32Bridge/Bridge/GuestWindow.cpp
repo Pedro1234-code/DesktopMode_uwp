@@ -1,4 +1,6 @@
 #include "pch.h"
+#include "Bridge/CRT/CrtExceptions.h"
+#include "Bridge/GuestKernel.h"
 #include "Bridge\\CommonControlsShims.h"
 #include "Bridge\\ActivationContext.h"
 #include "Bridge\\DialogResources.h"
@@ -7,9 +9,12 @@
 #include "Bridge\\MouseInput.h"
 #include "Bridge\\User32Shims.h"
 #include "Bridge/GuestMetrics.h"
+#include "Bridge/GDI/Gdi32Shims.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <wrl.h>
+#include <dxgi.h>
+#include <windows.ui.xaml.media.dxinterop.h>
 #include <windows.system.threading.h>
 
 #include <algorithm>
@@ -144,8 +149,7 @@ namespace
     {
         __try
         {
-            invocation(context);
-            return ERROR_SUCCESS;
+            return InvokeCrtFunction<void>(nullptr, invocation, context) ? ERROR_SUCCESS : CrtGuestTerminationCode;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -272,7 +276,10 @@ namespace
 
         __try
         {
-            return procedure(window, message, wParam, lParam);
+            LRESULT result = 0;
+            if (!InvokeCrtFunction(&result, procedure, window, message, wParam, lParam))
+            { if (exceptionCode) *exceptionCode = CrtGuestTerminationCode; }
+            return result;
         }
         __except (GetExceptionCode() == GuestExitException
             ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
@@ -292,7 +299,7 @@ namespace
         if (!procedure) return;
         __try
         {
-            procedure(window, message, data, result);
+            InvokeCrtFunction<void>(nullptr, procedure, window, message, data, result);
         }
         __except (GetExceptionCode() == GuestExitException
             ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
@@ -2035,6 +2042,10 @@ struct GuestPresentationState final
     std::mutex lock;
     Platform::Agile<CoreDispatcher^> dispatcher;
     Platform::Agile<Image^> image;
+    Platform::Agile<Panel^> surfaceHost;
+    Platform::Agile<SwapChainPanel^> swapChainPanel;
+    HWND swapChainWindow = nullptr;
+    std::uint64_t swapChainGeneration = 0;
     Platform::Agile<WriteableBitmap^> bitmap;
     std::shared_ptr<std::vector<MiniGdi::Color>> pixels;
     int width = 0;
@@ -2049,6 +2060,66 @@ struct GuestPresentationState final
     bool active = false;
     bool presentQueued = false;
 };
+
+namespace
+{
+    HRESULT UpdateSwapChainPanel(const std::shared_ptr<GuestPresentationState>& presentation,
+        std::uint64_t generation, IDXGISwapChain* chain)
+    {
+        {
+            std::lock_guard<std::mutex> guard(presentation->lock);
+            if (generation != presentation->swapChainGeneration) return DXGI_ERROR_INVALID_CALL;
+        }
+        auto panel = presentation->swapChainPanel.Get();
+        if (!panel)
+        {
+            if (!chain) return S_OK;
+            auto host = presentation->surfaceHost.Get();
+            if (!host) return DXGI_ERROR_UNSUPPORTED;
+            panel = ref new SwapChainPanel();
+            panel->Visibility = Visibility::Collapsed;
+            panel->IsHitTestVisible = false;
+            host->Children->Append(panel);
+            presentation->swapChainPanel = Platform::Agile<SwapChainPanel^>(panel);
+        }
+        ComPtr<ISwapChainPanelNative> nativePanel;
+        auto result = reinterpret_cast<IInspectable*>(panel)->QueryInterface(IID_PPV_ARGS(&nativePanel));
+        if (FAILED(result)) return result;
+        result = nativePanel->SetSwapChain(chain);
+        if (SUCCEEDED(result))
+        {
+            auto image = presentation->image.Get();
+            if (image) image->Visibility = chain ? Visibility::Collapsed : Visibility::Visible;
+            panel->Visibility = chain ? Visibility::Visible : Visibility::Collapsed;
+        }
+        return result;
+    }
+
+    void DetachSwapChainPanel(const std::shared_ptr<GuestPresentationState>& presentation,
+        HWND window = nullptr, std::uint64_t expected = 0)
+    {
+        if (!presentation) return;
+        std::uint64_t generation;
+        {
+            std::lock_guard<std::mutex> guard(presentation->lock);
+            if (!presentation->swapChainWindow || (window && presentation->swapChainWindow != window) ||
+                (expected && presentation->swapChainGeneration != expected)) return;
+            presentation->swapChainWindow = nullptr;
+            generation = ++presentation->swapChainGeneration;
+        }
+        try
+        {
+            auto dispatcher = presentation->dispatcher.Get();
+            if (!dispatcher) return;
+            if (dispatcher->HasThreadAccess) UpdateSwapChainPanel(presentation, generation, nullptr);
+            else dispatcher->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler([presentation, generation]()
+            {
+                try { UpdateSwapChainPanel(presentation, generation, nullptr); } catch (...) {}
+            }));
+        }
+        catch (...) {}
+    }
+}
 
 struct GuestInputCallbackState final
 {
@@ -2235,6 +2306,7 @@ namespace
         }
 
         bool frameUploaded = false;
+        bool swapChainVisible = false;
         std::wstring uploadFailure;
         if (pixels && width > 0 && height > 0 && !pixels->empty())
         {
@@ -2255,8 +2327,13 @@ namespace
                 }
                 if (currentFrame)
                 {
-                    image = presentation->image.Get();
-                    bitmap = presentation->bitmap.Get();
+                    auto panel = presentation->swapChainPanel.Get();
+                    swapChainVisible = panel && panel->Visibility == Visibility::Visible;
+                    if (!swapChainVisible)
+                    {
+                        image = presentation->image.Get();
+                        bitmap = presentation->bitmap.Get();
+                    }
                 }
                 if (image)
                 {
@@ -2301,7 +2378,7 @@ namespace
                         uploadFailure = L"the bitmap pixel-buffer query failed";
                     }
                 }
-                else uploadFailure = L"the XAML image was unavailable";
+                else if (!swapChainVisible) uploadFailure = L"the XAML image was unavailable";
             }
             catch (Exception^ error)
             {
@@ -2327,7 +2404,7 @@ namespace
         {
             RuntimeDiagnostics::Record(L"FRAME UPLOAD: WriteableBitmap updated.");
         }
-        else
+        else if (!swapChainVisible)
         {
             RuntimeDiagnostics::Record(L"FRAME UPLOAD FAILED: " + uploadFailure + L".");
         }
@@ -2694,6 +2771,7 @@ struct GuestWindowManager::SentMessageRecord final
     LRESULT result = 0;
     bool completed = false;
     bool cancelled = false;
+    bool dispatching = false;
 };
 
 GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHost)
@@ -2727,6 +2805,7 @@ GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHos
     m_presentation = std::make_shared<GuestPresentationState>();
     m_presentation->dispatcher = Platform::Agile<CoreDispatcher^>(coreWindow->Dispatcher);
     m_presentation->image = Platform::Agile<Image^>(image);
+    m_presentation->surfaceHost = Platform::Agile<Panel^>(surfaceHost);
     m_inputCallbacks = std::make_shared<GuestInputCallbackState>();
     m_inputCallbacks->owner = this;
     const auto callbacks = m_inputCallbacks;
@@ -2960,6 +3039,7 @@ void GuestWindowManager::Activate()
 void GuestWindowManager::Deactivate()
 {
     m_active.store(false);
+    DetachSwapChainPanel(m_presentation);
     MouseInput().ResetKeyState();
     {
         std::lock_guard<std::mutex> guard(m_popupMenuLock);
@@ -3416,10 +3496,12 @@ HWND GuestWindowManager::CreateGuestWindow(
     const bool defaultTopLevelX = overlapped && x == GuestAbi::CwUseDefault;
     const bool defaultTopLevelY = overlapped && y == GuestAbi::CwUseDefault;
     window->viewportWidthBound = overlapped && width == GuestAbi::CwUseDefault;
-    window->viewportHeightBound = overlapped && height == GuestAbi::CwUseDefault;
+    // An overlapped window with CW_USEDEFAULT width requests both dimensions.
+    const int requestedHeight = window->viewportWidthBound ? GuestAbi::CwUseDefault : height;
+    window->viewportHeightBound = overlapped && requestedHeight == GuestAbi::CwUseDefault;
     const int initialWindowWidth = DefaultExtent(width,
         overlapped ? (std::max)(1, m_viewportWidth.load()) : 0);
-    const int initialWindowHeight = DefaultExtent(height,
+    const int initialWindowHeight = DefaultExtent(requestedHeight,
         overlapped ? (std::max)(1, m_viewportHeight.load()) : 0);
     window->bounds.left = defaultTopLevelX && initialWindowWidth < m_viewportWidth.load()
         ? (m_viewportWidth.load() - initialWindowWidth) / 2
@@ -4308,6 +4390,7 @@ BOOL GuestWindowManager::DestroyGuestWindow(HWND window, DWORD* win32Error)
         owner = record->owner;
         record->destroyed = true;
     }
+    DetachSwapChainPanel(m_presentation, window);
 
     // USER32 tears down child HWNDs before their parent. Snapshot first so
     // re-entrant guest destruction cannot invalidate the iteration, then use
@@ -4432,11 +4515,14 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
         // Its parent is composed into the same guest desktop and hit-testing
         // selects the child under the pointer.
         CallWindowProcedure(record, GuestAbi::WmShowWindow, TRUE, 0);
-        if (enabled && effectivelyVisible)
+        // Visibility alone does not move keyboard focus to a child control.
+        // SW_SHOWNOACTIVATE, SW_SHOWMINNOACTIVE and SW_SHOWNA also preserve
+        // activation when the requested window is top-level.
+        const bool activate = command != 4 && command != 7 && command != 8;
+        if (!parent && enabled && effectivelyVisible && activate)
         {
             DWORD ignored = ERROR_SUCCESS;
-            if (!parent) SetGuestForegroundWindow(window, false, &ignored);
-            else SetGuestFocus(window, &ignored);
+            SetGuestForegroundWindow(window, false, &ignored);
         }
         PostGuestMessage(window, GuestAbi::WmSize, GuestAbi::SizeRestored,
             GuestAbi::MakeMouseLParam(static_cast<WORD>(width), static_cast<WORD>(height)), nullptr);
@@ -4456,10 +4542,12 @@ BOOL GuestWindowManager::ShowGuestWindow(HWND window, int command, DWORD* win32E
     }
     else if (!show && wasVisible)
     {
+        // WM_SHOWWINDOW lets dialogs save their focused child before the
+        // explicit hide transition clears focus/activation for the subtree.
+        CallWindowProcedure(record, GuestAbi::WmShowWindow, FALSE, 0);
         ClearGuestCaptureForSubtree(window);
         ClearGuestFocusForSubtree(window);
         ClearGuestForegroundForSubtree(window);
-        CallWindowProcedure(record, GuestAbi::WmShowWindow, FALSE, 0);
         if (parent)
         {
             RECT childBounds{};
@@ -4495,6 +4583,69 @@ BOOL GuestWindowManager::GetGuestClientRect(HWND window, LPRECT rect, DWORD* win
     rect->bottom = (std::max)(0L, record->clientArea.bottom - record->clientArea.top);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
+}
+
+HRESULT GuestWindowManager::BindGuestSwapChain(HWND window, IDXGISwapChain* chain, GuestSwapChainBinding* binding)
+{
+    const auto record = FindWindow(window);
+    const auto presentation = m_presentation;
+    if (!record || !presentation || !chain || !binding) return DXGI_ERROR_INVALID_CALL;
+
+    std::uint64_t generation;
+    {
+        std::lock_guard<std::mutex> windowGuard(record->lock);
+        if (record->destroyed || record->parent) return DXGI_ERROR_INVALID_CALL;
+        std::lock_guard<std::mutex> guard(presentation->lock);
+        if (!presentation->active || presentation->swapChainWindow) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
+        presentation->swapChainWindow = window;
+        generation = ++presentation->swapChainGeneration;
+    }
+
+    HRESULT result = E_FAIL;
+    try
+    {
+        GuestSwapChainBinding candidate;
+        const std::weak_ptr<WindowRecord> weakWindow = record;
+        candidate.clientSize = [weakWindow](UINT* width, UINT* height) -> HRESULT
+        {
+            const auto target = weakWindow.lock();
+            if (!target) return DXGI_ERROR_INVALID_CALL;
+            std::lock_guard<std::mutex> guard(target->lock);
+            if (target->destroyed) return DXGI_ERROR_INVALID_CALL;
+            *width = static_cast<UINT>((std::max)(1L, target->clientArea.right - target->clientArea.left));
+            *height = static_cast<UINT>((std::max)(1L, target->clientArea.bottom - target->clientArea.top));
+            return S_OK;
+        };
+        candidate.detach = [presentation, window, generation]() { DetachSwapChainPanel(presentation, window, generation); };
+
+        if (const auto dispatcher = presentation->dispatcher.Get())
+        {
+            if (dispatcher->HasThreadAccess) result = UpdateSwapChainPanel(presentation, generation, chain);
+            else
+            {
+                const ComPtr<IDXGISwapChain> retained = chain;
+                const auto status = std::make_shared<HRESULT>(E_FAIL);
+                concurrency::create_task(dispatcher->RunAsync(CoreDispatcherPriority::Normal,
+                    ref new DispatchedHandler([presentation, generation, retained, status]()
+                {
+                    try { *status = UpdateSwapChainPanel(presentation, generation, retained.Get()); }
+                    catch (Platform::Exception^ error) { *status = error->HResult; }
+                    catch (...) { *status = E_FAIL; }
+                }))).get();
+                result = *status;
+            }
+        }
+        if (SUCCEEDED(result))
+        {
+            *binding = std::move(candidate);
+            return result;
+        }
+    }
+    catch (Platform::Exception^ error) { result = error->HResult; }
+    catch (const std::bad_alloc&) { result = E_OUTOFMEMORY; }
+    catch (...) { result = E_FAIL; }
+    DetachSwapChainPanel(presentation, window, generation);
+    return result;
 }
 
 BOOL GuestWindowManager::SetGuestWindowMenuBar(HWND window, BOOL visible, DWORD* win32Error)
@@ -4772,7 +4923,12 @@ BOOL GuestWindowManager::SetGuestForegroundWindow(
         }
     }
     ReorderGuestWindow(active, nullptr);
-    SetGuestFocus(window, nullptr);
+    // Activation callbacks (and WM_SHOWWINDOW) may already have chosen an
+    // edit/button in this window. Do not replace that valid descendant focus
+    // with the frame itself. An explicit child request still focuses it.
+    const HWND focused = GetGuestFocus(nullptr);
+    if (window != active || !focused || !IsGuestWindowDescendantOrSelf(focused, active))
+        SetGuestFocus(window, nullptr);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return TRUE;
 }
@@ -4835,6 +4991,7 @@ void GuestWindowManager::DestroyGuestWindowsForProcess(
 
     for (const auto& victim : victims)
     {
+        DetachSwapChainPanel(m_presentation, victim->handle);
         CancelGuestTimersForWindow(victim->handle);
         if (const auto queue = MessageQueueForThread(victim->threadId, false))
             queue->ClearForWindow(victim->handle);
@@ -5420,7 +5577,7 @@ HWND GuestWindowManager::SetGuestFocus(HWND window, DWORD* win32Error)
                 return nullptr;
             }
         }
-        if (!IsGuestWindowVisibleInternal(window) || !IsGuestWindowEnabledInternal(window))
+        if (!IsGuestWindowEnabledInternal(window))
         {
             SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
             return nullptr;
@@ -5464,7 +5621,7 @@ HWND GuestWindowManager::GetGuestFocus(DWORD* win32Error)
         std::lock_guard<std::mutex> guard(record->lock);
         usable = !record->destroyed;
     }
-    if (!usable || !IsGuestWindowVisibleInternal(focus) || !IsGuestWindowEnabledInternal(focus))
+    if (!usable || !IsGuestWindowEnabledInternal(focus))
     {
         ULONG_PTR expected = reinterpret_cast<ULONG_PTR>(focus);
         m_focusWindow.compare_exchange_strong(expected, 0);
@@ -7267,19 +7424,21 @@ BOOL GuestWindowManager::SetGuestWindowPos(
     if (becameVisible)
     {
         CallWindowProcedure(record, GuestAbi::WmShowWindow, TRUE, 0);
-        if ((flags & GuestSwpNoActivate) == 0 && enabled)
+        if (!parent && (flags & GuestSwpNoActivate) == 0 && enabled &&
+            IsGuestWindowVisibleInternal(window))
         {
             DWORD ignored = ERROR_SUCCESS;
-            if (!parent) SetGuestForegroundWindow(window, false, &ignored);
-            else SetGuestFocus(window, &ignored);
+            SetGuestForegroundWindow(window, false, &ignored);
         }
     }
     else if (becameHidden)
     {
+        // WM_SHOWWINDOW lets dialogs save their focused child before the
+        // explicit hide transition clears focus/activation for the subtree.
+        CallWindowProcedure(record, GuestAbi::WmShowWindow, FALSE, 0);
         ClearGuestCaptureForSubtree(window);
         ClearGuestFocusForSubtree(window);
         ClearGuestForegroundForSubtree(window);
-        CallWindowProcedure(record, GuestAbi::WmShowWindow, FALSE, 0);
     }
 
     if (move || changedSize)
@@ -7767,13 +7926,17 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         case BuiltinControlKind::Button:
             switch (style & GuestAbi::BsTypeMask)
             {
+            case 0: case 8: return Button | UndefPushButton; // BS_PUSHBUTTON / BS_USERBUTTON
             case 1: return Button | DefPushButton; // BS_DEFPUSHBUTTON
-            case 4: case 9: return Button | RadioButton | WantArrows;
+            case 4: case 9: return Button | RadioButton;
             case GroupBoxButtonStyle: return Static;
-            default: return Button | UndefPushButton;
+            default: return Button; // Checkbox/three-state/owner-draw are not pushbuttons.
             }
         case BuiltinControlKind::Edit:
+            return WantChars | WantArrows | 0x0008u | // DLGC_HASSETSEL
+                ((style & GuestAbi::EsMultiline) ? 0x0004u : 0u); // DLGC_WANTALLKEYS
         case BuiltinControlKind::ComboBox:
+            return WantChars | WantArrows;
         case BuiltinControlKind::IpAddress:
         case BuiltinControlKind::HotKey:
             return WantChars;
@@ -7829,7 +7992,6 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         constexpr DWORD AutoCheckBox = 0x00000003u;
         constexpr DWORD AutoThreeState = 0x00000006u;
         constexpr DWORD AutoRadio = 0x00000009u;
-        constexpr DWORD WindowGroup = 0x00020000u;
         HWND handle = nullptr;
         HWND parent = nullptr;
         DWORD type = 0;
@@ -7845,48 +8007,20 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
         if (type == AutoRadio && parent)
         {
-            const auto siblings = SnapshotGuestWindows(parent, false);
-            const auto current = std::find(siblings.begin(), siblings.end(), handle);
-            if (current != siblings.end())
+            // Native auto-radio behavior uses dialog groups, which can cross
+            // control-parent containers and include manual radio buttons.
+            // BM_SETCHECK also maintains WS_TABSTOP for the selected radio.
+            const size_t maximum = SnapshotGuestWindows(parent, true).size() + 1;
+            std::vector<HWND> visited;
+            HWND sibling = handle;
+            while (sibling && visited.size() < maximum &&
+                std::find(visited.begin(), visited.end(), sibling) == visited.end())
             {
-                size_t begin = static_cast<size_t>(current - siblings.begin());
-                while (begin > 0)
-                {
-                    const auto candidate = FindWindow(siblings[begin]);
-                    if (!candidate) break;
-                    std::lock_guard<std::mutex> guard(candidate->lock);
-                    if ((candidate->style & WindowGroup) != 0) break;
-                    --begin;
-                }
-                size_t end = static_cast<size_t>(current - siblings.begin()) + 1;
-                while (end < siblings.size())
-                {
-                    const auto candidate = FindWindow(siblings[end]);
-                    if (!candidate) break;
-                    std::lock_guard<std::mutex> guard(candidate->lock);
-                    if ((candidate->style & WindowGroup) != 0) break;
-                    ++end;
-                }
-                for (size_t index = begin; index < end; ++index)
-                {
-                    if (siblings[index] == handle) continue;
-                    const auto candidate = FindWindow(siblings[index]);
-                    if (!candidate) continue;
-                    bool changed = false;
-                    HWND candidateHandle = nullptr;
-                    {
-                        std::lock_guard<std::mutex> guard(candidate->lock);
-                        if (candidate->windowClass &&
-                            candidate->windowClass->builtinKind == BuiltinControlKind::Button &&
-                            (candidate->style & GuestAbi::BsTypeMask) == AutoRadio)
-                        {
-                            changed = candidate->buttonCheck != 0;
-                            candidate->buttonCheck = 0;
-                            candidateHandle = candidate->handle;
-                        }
-                    }
-                    if (changed) InvalidateGuestRect(candidateHandle, nullptr, TRUE, nullptr);
-                }
+                visited.push_back(sibling);
+                const LRESULT code = SendGuestMessage(sibling, 0x0087u, 0, 0, nullptr);
+                if ((code & (0x2000u | 0x0040u)) == (0x2000u | 0x0040u))
+                    SendGuestMessage(sibling, 0x00f1u, sibling == handle ? 1 : 0, 0, nullptr);
+                sibling = FindNextGuestDialogGroupItem(parent, sibling, FALSE);
             }
         }
         invalidate();
@@ -13617,6 +13751,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     const bool selected = index < listViewItemStates.size() &&
                         (listViewItemStates[index] & ListViewStateSelected) != 0;
                     const bool editingLabel = static_cast<int>(index) == listViewEditItem;
+                    ScopedGuestGdiState itemPaintState(dc);
                     const RECT itemBounds{ 1, rowTop, (std::max)(1, width - 1),
                         rowTop + listViewRowHeight };
                     const UINT customItemState = (selected ? 0x0001u : 0u) |
@@ -13642,27 +13777,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             continue;
                         }
                     }
-                    if (selected)
-                    {
-                        MiniGdi::FillRect(
-                            *surface,
-                            MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + listViewRowHeight },
-                            ColorFromGuestColorRef(customItemBackground));
-                        m_gdi.SetTextColor(guestDc,
-                            ColorFromGuestColorRef(customItemText), nullptr);
-                    }
-                    else
-                    {
-                        // Separate text-background color is a real ListView
-                        // setting; respecting it avoids white text artefacts
-                        // when an application switches views or high-contrast colors.
-                        MiniGdi::FillRect(
-                            *surface,
-                            MiniGdi::Rect{ 1, rowTop, (std::max)(1, width - 1), rowTop + listViewRowHeight },
-                            ColorFromGuestColorRef(customItemBackground));
-                        m_gdi.SetTextColor(guestDc,
-                            ColorFromGuestColorRef(customItemText), nullptr);
-                    }
+                    MiniGdi::Region rowClip;
+                    m_gdi.GetClipRegion(guestDc, &rowClip);
+                    if (customItemBackground != 0xffffffffu)
+                        for (const auto& dirty : MiniGdi::IntersectRegion(rowClip, MiniGdi::RectRegion(
+                            { itemBounds.left, itemBounds.top, itemBounds.right, itemBounds.bottom })).rectangles)
+                            MiniGdi::FillRect(*surface, dirty, ColorFromGuestColorRef(customItemBackground));
+                    m_gdi.SetTextColor(guestDc, ColorFromGuestColorRef(customItemText), nullptr);
                     if (editingLabel)
                     {
                         const int firstColumnWidth = !listDisplayColumns.empty() &&
@@ -13793,6 +13914,11 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         const RECT subItemBounds{ cellLeft, rowTop,
                             (std::min)(width, cellLeft + cellWidth),
                             rowTop + listViewRowHeight };
+                        ScopedGuestGdiState cellPaintState(dc);
+                        MiniGdi::Region cellClip;
+                        if (m_gdi.GetClipRegion(guestDc, &cellClip))
+                            m_gdi.SetClipRegion(guestDc, MiniGdi::IntersectRegion(cellClip, MiniGdi::RectRegion(
+                                { subItemBounds.left, subItemBounds.top, subItemBounds.right, subItemBounds.bottom })));
                         DWORD customSubItemMode = CustomDrawDoDefault;
                         COLORREF customSubItemText = customItemText;
                         COLORREF customSubItemBackground = customItemBackground;
@@ -13809,13 +13935,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             surface = m_gdi.GetSurface(guestDc);
                             if (!surface) break;
                         }
-                        if (customSubItemNotified &&
-                            (customSubItemMode & CustomDrawSkipDefault) == 0)
+                        if ((customSubItemMode & CustomDrawSkipDefault) == 0)
                         {
-                            MiniGdi::FillRect(*surface,
-                                MiniGdi::Rect{ subItemBounds.left, subItemBounds.top,
-                                    subItemBounds.right, subItemBounds.bottom },
-                                ColorFromGuestColorRef(customSubItemBackground));
+                            m_gdi.GetClipRegion(guestDc, &cellClip);
+                            if (customSubItemBackground != 0xffffffffu)
+                                for (const auto& dirty : MiniGdi::IntersectRegion(cellClip, MiniGdi::RectRegion(
+                                    { subItemBounds.left, subItemBounds.top, subItemBounds.right, subItemBounds.bottom })).rectangles)
+                                    MiniGdi::FillRect(*surface, dirty, ColorFromGuestColorRef(customSubItemBackground));
                             m_gdi.SetTextColor(guestDc,
                                 ColorFromGuestColorRef(customSubItemText), nullptr);
                         }
@@ -13862,15 +13988,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         }
                         if ((customSubItemMode & CustomDrawSkipDefault) == 0)
                         {
-                            const size_t visibleCellCharacters = static_cast<size_t>((std::max)(0,
-                                (cellWidth - textInset - 2) / controlTextWidth));
-                            const size_t cellCharacters = (std::min)(cellText->size(), visibleCellCharacters);
-                            m_gdi.TextOutW(
-                                guestDc,
-                                MiniGdi::Point{ cellLeft + textInset, rowTop },
-                                cellText->data(),
-                                cellCharacters,
-                                nullptr);
+                            RECT label{ cellLeft + textInset, rowTop,
+                                (std::max<LONG>)(static_cast<LONG>(cellLeft + textInset), subItemBounds.right - 2), subItemBounds.bottom };
+                            // DrawText uses the selected font's actual metrics and
+                            // clips/ellipsizes proportional text inside the column.
+                            BridgeDrawTextW(dc, const_cast<LPWSTR>(cellText->data()),
+                                static_cast<int>(cellText->size()), &label,
+                                0x0020u | 0x0004u | 0x0800u | 0x8000u);
                         }
                         if ((customSubItemMode & CustomDrawNotifyPostPaint) != 0)
                         {
@@ -13969,7 +14093,15 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         {
             {
                 std::lock_guard<std::mutex> guard(window->lock);
-                window->buttonCheck = static_cast<UINT>((std::min)(wParam, static_cast<WPARAM>(2)));
+                const DWORD type = window->style & GuestAbi::BsTypeMask;
+                const WPARAM maximum = (type == 5 || type == 6) ? 2 :
+                    (type == 2 || type == 3 || type == 4 || type == 9) ? 1 : 0;
+                window->buttonCheck = static_cast<UINT>((std::min)(wParam, maximum));
+                if (type == 4 || type == 9)
+                {
+                    if (window->buttonCheck) window->style |= 0x00010000u; // WS_TABSTOP
+                    else window->style &= ~0x00010000u;
+                }
             }
             invalidate();
             return 0;
@@ -14001,14 +14133,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             if (lParam) invalidate();
             return 0;
         }
-        case 0x00f5: // BM_CLICK
-            activateButton();
-            notifyParent(GuestAbi::BnClicked);
+        case 0x00f5: // BM_CLICK simulates the ordinary button input path.
+            SendGuestMessage(window->handle, GuestAbi::WmLButtonDown, 1, 0, nullptr);
+            if (IsGuestWindow(window->handle)) SendGuestMessage(window->handle, GuestAbi::WmLButtonUp, 0, 0, nullptr);
             return 0;
         case GuestAbi::WmLButtonDown:
         {
             HWND handle = nullptr;
-            bool enabled = false;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
                 if (window->destroyed)
@@ -14016,12 +14147,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     return 0;
                 }
                 handle = window->handle;
-                enabled = window->enabled;
             }
-            if (!enabled)
-            {
-                return 0;
-            }
+            // Physical input is filtered by the input router. Explicit
+            // SendMessage/BM_CLICK follows the native control procedure even
+            // for a disabled button (SetFocus may independently fail).
             SetGuestFocus(handle, nullptr);
             SetGuestCapture(handle, nullptr);
             bool changed = false;
@@ -15923,6 +16052,11 @@ void GuestWindowManager::DispatchSentMessageToken(ULONG_PTR token)
         sent = found->second;
     }
     {
+        std::lock_guard<std::mutex> guard(sent->lock);
+        if (sent->completed || sent->cancelled) return;
+        sent->dispatching = true;
+    }
+    {
         std::lock_guard<std::mutex> guard(m_inSendStateLock);
         m_inSendState[BridgeGetCurrentThreadId()].push_back(sent->sendState);
     }
@@ -16355,10 +16489,40 @@ void GuestWindowManager::PostGuestQuitMessage(int exitCode)
         queue->PostQuit(exitCode);
 }
 
+void GuestWindowManager::InterruptGuestThreadMessages(DWORD threadId, bool threadExited)
+{
+    if (const auto queue = MessageQueueForThread(threadId, false))
+    {
+        queue->Close();
+        queue->Clear();
+    }
+    std::lock_guard<std::mutex> guard(m_sentMessagesLock);
+    for (auto item = m_sentMessages.begin(); item != m_sentMessages.end();)
+    {
+        const auto sent = item->second;
+        if (sent->targetThread == threadId)
+        {
+            std::lock_guard<std::mutex> sentGuard(sent->lock);
+            // An active WNDPROC can still be using the sender's stack data.
+            // Leave that send intact until dispatch finishes or its thread exits.
+            if (!sent->completed && (!sent->dispatching || threadExited))
+            {
+                sent->cancelled = true;
+                sent->completed = true;
+                item = m_sentMessages.erase(item);
+                sent->completedChanged.notify_all();
+                continue;
+            }
+        }
+        ++item;
+    }
+}
+
 GuestGetMessageResult GuestWindowManager::GetGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum)
 {
     const auto queue = MessageQueueForThread(BridgeGetCurrentThreadId(), true);
-    if (!queue) return GuestGetMessageResult::Error;
+    const auto kernel = CurrentGuestKernelContext();
+    if (!queue || (kernel && kernel->IsStopping())) return GuestGetMessageResult::Error;
     for (;;)
     {
         const GuestGetMessageResult result = queue->Get(message, filter, minimum, maximum);
@@ -16376,7 +16540,8 @@ GuestGetMessageResult GuestWindowManager::GetGuestMessage(GuestAbi::Message* mes
 bool GuestWindowManager::WaitForGuestMessage(DWORD milliseconds)
 {
     const auto queue = MessageQueueForThread(BridgeGetCurrentThreadId(), true);
-    return queue && queue->WaitForMessage(milliseconds);
+    const auto kernel = CurrentGuestKernelContext();
+    return queue && (!kernel || !kernel->IsStopping()) && queue->WaitForMessage(milliseconds);
 }
 
 BOOL GuestWindowManager::PeekGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum, UINT removeFlags)

@@ -1,11 +1,16 @@
 #include "pch.h"
+#include "Bridge/CRT/CrtExceptions.h"
+#include "Bridge/ActivationContext.h"
+#include "Bridge/GuestModule.h"
+#include "Bridge/CommonControlsShims.h"
 #include "Bridge/DialogResources.h"
 #include "Bridge/GuestMetrics.h"
+#include "Bridge/GDI/DirectWriteText.h"
 
 #include "Bridge/GuestResources.h"
 #include "Bridge/GuestStorage.h"
 #include "Bridge/GuestWindow.h"
-#include "Bridge/Gdi32Shims.h"
+#include "Bridge/GDI/Gdi32Shims.h"
 #include "Bridge/Kernel32Shims.h"
 #include "Bridge/RuntimeDiagnostics.h"
 #include "Bridge/User32Shims.h"
@@ -298,8 +303,8 @@ namespace
     {
         HWND window = nullptr;
         HWND owner = nullptr;
+        HWND savedFocus = nullptr;
         std::vector<HWND> controls;
-        std::vector<HWND> tabControls;
         UINT defaultButton = IDOK;
         HFONT font = nullptr;
         int baseUnitX = GuestMetrics::TextWidth;
@@ -319,6 +324,7 @@ namespace
     constexpr UINT TabGetCurrentSelection = 0x130b;
     constexpr UINT TabSetCurrentSelection = 0x130c;
     constexpr UINT TabInsertItemW = 0x133e;
+    constexpr UINT TabAdjustPageRect = 0x1328;
     constexpr UINT TabNotifySelectionChange = static_cast<UINT>(-551);
     constexpr int PropertyNotifySetActive = -200;
     constexpr int PropertyNotifyKillActive = -201;
@@ -335,9 +341,17 @@ namespace
         std::wstring title;
         std::vector<std::pair<std::wstring, std::wstring>> fields;
         HWND window = nullptr;
+        bool dirty = false;
+        DialogTemplate content;
+        std::shared_ptr<void> lifetime;
+        HANDLE pageHandle = nullptr;
+        DWORD flags = 0;
+        HANDLE activation = nullptr;
+        bool (*prepareCreate)(void*) = nullptr;
+        void (*release)(void*) = nullptr;
     };
 
-    struct PropertySheetRuntime final
+    struct PropertySheetRuntime final : std::enable_shared_from_this<PropertySheetRuntime>
     {
         HWND window = nullptr;
         HWND parent = nullptr;
@@ -345,8 +359,45 @@ namespace
         std::vector<PropertyPageRuntime> pages;
         UINT selected = 0;
         bool dirty = false;
+        GuestModuleLoader* owner = nullptr;
+        bool modeless = false, finished = false, destroying = false;
+        unsigned notificationDepth = 0;
+        bool selecting = false;
+        bool tabSelectionValidated = false;
+        bool layoutReady = false, layingOut = false;
+        SIZE layoutClient{};
+        RECT layoutTab{};
+        std::vector<std::pair<HWND, RECT>> layoutButtons;
+        INT_PTR result = 0;
+        int (CALLBACK* callback)(HWND, UINT, LPARAM) = nullptr;
+        ~PropertySheetRuntime()
+        {
+            for (auto page = pages.rbegin(); page != pages.rend(); ++page)
+                if (page->release && page->lifetime) page->release(page->lifetime.get());
+        }
     };
 
+    std::mutex g_propertySheetsLock;
+    std::unordered_map<ULONG_PTR, std::shared_ptr<PropertySheetRuntime>> g_propertySheets;
+    std::shared_ptr<PropertySheetRuntime> FindPropertySheet(HWND window)
+    {
+        std::lock_guard<std::mutex> guard(g_propertySheetsLock);
+        const auto found = g_propertySheets.find(reinterpret_cast<ULONG_PTR>(window));
+        return found == g_propertySheets.end() ? nullptr : found->second;
+    }
+    struct PropertyNotificationScope
+    {
+        PropertySheetRuntime* sheet;
+        explicit PropertyNotificationScope(PropertySheetRuntime* value) : sheet(value) { ++sheet->notificationDepth; }
+        ~PropertyNotificationScope() { --sheet->notificationDepth; }
+    };
+    struct PropertyActivationScope
+    {
+        ULONG_PTR cookie = 0; bool active = false;
+        explicit PropertyActivationScope(HANDLE context)
+        { if (context && context != INVALID_HANDLE_VALUE) active = BridgeActivateActCtx(context, &cookie) != FALSE; }
+        ~PropertyActivationScope() { if (active) BridgeDeactivateActCtx(0, cookie); }
+    };
     struct PropertySheetNotification final
     {
         struct Header final
@@ -505,20 +556,22 @@ namespace
 
     DialogBaseUnits BaseUnitsFor(const DialogTemplate& dialog)
     {
-        if (!dialog.font.present || dialog.font.pointSize == 0) return {};
-
-        // Windows derives dialog units from the selected template font. The
-        // MiniGDI backend is deterministic, so derive the same pair from the
-        // requested point height instead of consulting a host XAML font.
-        DialogBaseUnits units;
-        units.y = (std::max)(GuestMetrics::TextWidth,
-            ScaleDialogUnit(static_cast<int>(dialog.font.pointSize),
-                GuestMetrics::LogicalDpi, 72) + GuestMetrics::DialogExternalLeading);
-        units.x = (std::max)(GuestMetrics::ControlHorizontalPadding,
-            (units.y * 7 + GuestMetrics::TextWidth) / GuestMetrics::TextHeight);
-        return units;
+        if (!dialog.font.present || !dialog.font.pointSize) return {};
+        MiniGdi::Font font;
+        font.height = -ScaleDialogUnit(dialog.font.pointSize, GuestMetrics::LogicalDpi, 72);
+        font.weight = dialog.font.weight;
+        font.italic = dialog.font.italic != 0;
+        font.charSet = dialog.font.characterSet;
+        if (!dialog.font.face.ordinal && !dialog.font.face.text.empty())
+            wcsncpy_s(font.faceName, dialog.font.face.text.c_str(), _TRUNCATE);
+        constexpr wchar_t alphabet[] = L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        MiniGdi::Size extent{};
+        MiniGdi::FontMetrics metrics{};
+        if (DirectWriteText::Measure(font, alphabet, 52, &extent, &metrics))
+            return { (std::max)(1, (extent.width / 26 + 1) / 2), (std::max)(1, metrics.height) };
+        const auto fallback = MiniGdi::FontCellSize(font);
+        return { (std::max)(1, fallback.width), (std::max)(1, fallback.height) };
     }
-
     int PixelsX(short units, const DialogBaseUnits& base)
     {
         return ScaleDialogUnit(static_cast<int>(units), base.x, 4);
@@ -560,41 +613,148 @@ namespace
         return false;
     }
 
+    struct DialogTabItem
+    {
+        HWND window;
+        bool eligible;
+    };
+
+    void CollectDialogTabItems(GuestWindowManager* manager, HWND parent,
+        std::vector<DialogTabItem>* items, bool ancestorsEnabled = true, unsigned depth = 0)
+    {
+        if (depth >= 128) return;
+        // Child Z order is also dialog tab order. Read current styles rather
+        // than remembering only the controls enabled when the template ran.
+        for (const HWND child : manager->SnapshotGuestWindows(parent, false))
+        {
+            if (!manager->IsGuestWindow(child)) continue;
+            const DWORD style = static_cast<DWORD>(manager->GetGuestWindowLongPtr(child, GWL_STYLE, nullptr));
+            const DWORD extended = static_cast<DWORD>(manager->GetGuestWindowLongPtr(child, GWL_EXSTYLE, nullptr));
+            const bool enabled = ancestorsEnabled && (style & WS_VISIBLE) && !(style & WS_DISABLED);
+            const bool container = (extended & WS_EX_CONTROLPARENT) != 0;
+            items->push_back({ child, enabled && !container && (style & WS_TABSTOP) != 0 });
+            if (container) CollectDialogTabItems(manager, child, items, enabled, depth + 1);
+        }
+    }
+
+    HWND NextDialogTabItem(GuestWindowManager* manager, HWND dialog, HWND current, bool previous)
+    {
+        if (!manager || !manager->IsGuestWindow(dialog)) return nullptr;
+        if (current == dialog) current = nullptr;
+        if (current && !manager->IsGuestChild(dialog, current)) return nullptr;
+        // Native GetNextDlgTabItem(NULL, previous=TRUE) does not wrap.
+        if (!current && previous) return nullptr;
+        std::vector<DialogTabItem> items;
+        CollectDialogTabItems(manager, dialog, &items);
+        if (items.empty()) return current;
+        auto found = items.end();
+        for (HWND anchor = current; anchor && anchor != dialog; anchor = manager->GetGuestParent(anchor, nullptr))
+        {
+            found = std::find_if(items.begin(), items.end(), [anchor](const DialogTabItem& item) { return item.window == anchor; });
+            if (found != items.end()) break;
+        }
+        size_t index = found == items.end() ? (previous ? 0 : items.size() - 1)
+            : static_cast<size_t>(found - items.begin());
+        for (size_t attempts = 0; attempts < items.size(); ++attempts)
+        {
+            index = previous ? (index + items.size() - 1) % items.size() : (index + 1) % items.size();
+            if (items[index].eligible) return items[index].window;
+        }
+        return current;
+    }
+
+    struct DialogGroupItem
+    {
+        HWND window;
+        DWORD style;
+    };
+
+    void CollectDialogGroupItems(GuestWindowManager* manager, HWND parent,
+        std::vector<DialogGroupItem>* items, unsigned depth = 0)
+    {
+        if (depth >= 128) return;
+        for (const HWND child : manager->SnapshotGuestWindows(parent, false))
+        {
+            if (!manager->IsGuestWindow(child)) continue;
+            const DWORD style = static_cast<DWORD>(manager->GetGuestWindowLongPtr(child, GWL_STYLE, nullptr));
+            const DWORD extended = static_cast<DWORD>(manager->GetGuestWindowLongPtr(child, GWL_EXSTYLE, nullptr));
+            if ((extended & WS_EX_CONTROLPARENT) && (style & (WS_VISIBLE | WS_DISABLED)) == WS_VISIBLE)
+            {
+                const size_t before = items->size();
+                CollectDialogGroupItems(manager, child, items, depth + 1);
+                if (items->size() != before) continue;
+            }
+            items->push_back({ child, style });
+        }
+    }
+
+    HWND NextDialogGroupItem(GuestWindowManager* manager, HWND dialog, HWND current, bool previous)
+    {
+        if (!manager || !manager->IsGuestWindow(dialog)) return nullptr;
+        if (current == dialog) current = nullptr;
+        if (!current && previous) return nullptr;
+        if (current && !manager->IsGuestChild(dialog, current)) return nullptr;
+        if (!current)
+        {
+            const auto children = manager->SnapshotGuestWindows(dialog, false);
+            if (children.empty()) return nullptr;
+            current = children.front();
+            const DWORD style = static_cast<DWORD>(manager->GetGuestWindowLongPtr(current, GWL_STYLE, nullptr));
+            if ((style & (WS_VISIBLE | WS_DISABLED)) == WS_VISIBLE) return current;
+        }
+        std::vector<DialogGroupItem> items;
+        CollectDialogGroupItems(manager, dialog, &items);
+        if (items.empty()) return current;
+        size_t index = items.size();
+        for (HWND anchor = current; anchor && anchor != dialog; anchor = manager->GetGuestParent(anchor, nullptr))
+        {
+            for (size_t candidate = 0; candidate < items.size(); ++candidate)
+                if (items[candidate].window == anchor) { index = candidate; break; }
+            if (index != items.size()) break;
+        }
+        // A control-parent can be a caller's anchor even though traversal
+        // substitutes its children. Its next sibling follows that subtree.
+        if (index == items.size())
+            for (size_t candidate = 0; candidate < items.size(); ++candidate)
+                if (manager->IsGuestChild(current, items[candidate].window)) index = candidate;
+        if (index == items.size()) return current;
+
+        const size_t count = items.size();
+        size_t begin = 0;
+        bool marked = false;
+        for (size_t distance = 0; distance < count; ++distance)
+        {
+            const size_t candidate = (index + count - distance) % count;
+            if (items[candidate].style & WS_GROUP) { begin = candidate; marked = true; break; }
+        }
+        size_t length = count;
+        if (marked)
+            for (size_t distance = 1; distance < count; ++distance)
+                if (items[(begin + distance) % count].style & WS_GROUP) { length = distance; break; }
+        const size_t offset = (index + count - begin) % count;
+        for (size_t distance = 1; distance <= length; ++distance)
+        {
+            const size_t next = previous ? (offset + length - distance) % length : (offset + distance) % length;
+            const auto& candidate = items[(begin + next) % count];
+            if ((candidate.style & (WS_VISIBLE | WS_DISABLED)) == WS_VISIBLE) return candidate.window;
+        }
+        return current;
+    }
+
+    bool FocusDialogControl(const std::shared_ptr<DialogWindowState>& state,
+        GuestWindowManager* manager, HWND control);
+
     bool FocusNextDialogControl(
         const std::shared_ptr<DialogWindowState>& state,
         GuestWindowManager* manager,
         HWND current,
         bool previous)
     {
-        if (!state || !manager || state->tabControls.empty()) return false;
-        const auto found = std::find(
-            state->tabControls.begin(), state->tabControls.end(), current);
-        size_t index = found == state->tabControls.end()
-            ? (previous ? state->tabControls.size() - 1 : 0)
-            : static_cast<size_t>(found - state->tabControls.begin());
-        if (found != state->tabControls.end())
-        {
-            index = previous
-                ? (index + state->tabControls.size() - 1) % state->tabControls.size()
-                : (index + 1) % state->tabControls.size();
-        }
-        for (size_t attempts = 0; attempts < state->tabControls.size(); ++attempts)
-        {
-            const HWND candidate = state->tabControls[index];
-            DWORD visibleError = ERROR_SUCCESS;
-            DWORD enabledError = ERROR_SUCCESS;
-            if (manager->IsGuestWindow(candidate) &&
-                manager->IsGuestWindowVisible(candidate, &visibleError) &&
-                manager->IsGuestWindowEnabled(candidate, &enabledError))
-            {
-                manager->SetGuestFocus(candidate, nullptr);
-                return true;
-            }
-            index = previous
-                ? (index + state->tabControls.size() - 1) % state->tabControls.size()
-                : (index + 1) % state->tabControls.size();
-        }
-        return false;
+        if (!state || !manager) return false;
+        if (!current || !manager->IsGuestChild(state->window, current)) current = nullptr;
+        const HWND next = NextDialogTabItem(manager, state->window, current, previous);
+        if (!next) return false;
+        return FocusDialogControl(state, manager, next);
     }
 
     bool DialogControlHasMnemonic(
@@ -620,24 +780,108 @@ namespace
         return false;
     }
 
+    HWND FindDialogDefaultButton(GuestWindowManager* manager, HWND parent, unsigned depth = 0)
+    {
+        if (!manager || depth >= 128) return nullptr;
+        for (const HWND child : manager->SnapshotGuestWindows(parent, false))
+        {
+            if (manager->SendGuestMessage(child, 0x0087u, 0, 0, nullptr) & 0x0010u) return child; // DLGC_DEFPUSHBUTTON
+            const DWORD style = static_cast<DWORD>(manager->GetGuestWindowLongPtr(child, GWL_STYLE, nullptr));
+            const DWORD extended = static_cast<DWORD>(manager->GetGuestWindowLongPtr(child, GWL_EXSTYLE, nullptr));
+            if ((extended & WS_EX_CONTROLPARENT) && (style & (WS_VISIBLE | WS_DISABLED)) == WS_VISIBLE)
+                if (const HWND found = FindDialogDefaultButton(manager, child, depth + 1)) return found;
+        }
+        return nullptr;
+    }
+
+    void UpdateDialogDefaultVisual(const std::shared_ptr<DialogWindowState>& state,
+        GuestWindowManager* manager, HWND focused)
+    {
+        if (!state || !manager || !manager->IsGuestWindow(state->window)) return;
+        HWND button = focused;
+        LRESULT code = button ? manager->SendGuestMessage(button, 0x0087u, 0, 0, nullptr) : 0;
+        if (!(code & (0x0010u | 0x0020u))) // Only pushbuttons acquire the default border.
+        {
+            button = manager->GetGuestDlgItem(state->window, static_cast<int>(state->defaultButton), nullptr);
+            code = button ? manager->SendGuestMessage(button, 0x0087u, 0, 0, nullptr) : 0;
+        }
+        const HWND previous = FindDialogDefaultButton(manager, state->window);
+        if (previous && previous != button)
+            manager->SendGuestMessage(previous, BM_SETSTYLE, BS_PUSHBUTTON, TRUE, nullptr);
+        if (button && (code & 0x0020u))
+            manager->SendGuestMessage(button, BM_SETSTYLE, BS_DEFPUSHBUTTON, TRUE, nullptr);
+    }
+
     void SetDialogDefaultButton(
         const std::shared_ptr<DialogWindowState>& state,
         GuestWindowManager* manager, UINT identifier)
     {
         if (!state || !manager) return;
-        const UINT previous = state->defaultButton;
+        // DM_SETDEFID stores the logical ID independently of the temporary
+        // border on a focused pushbutton. It must not turn checkboxes into
+        // pushbuttons just because they share DLGC_BUTTON.
         state->defaultButton = identifier;
-        if (previous && previous != identifier)
+        const HWND button = manager->GetGuestDlgItem(state->window, static_cast<int>(identifier), nullptr);
+        const LRESULT code = button ? manager->SendGuestMessage(button, 0x0087u, 0, 0, nullptr) : 0;
+        if (button && !(code & (0x0020u | 0x2000u))) return;
+        const HWND previous = FindDialogDefaultButton(manager, state->window);
+        if (previous && previous != button)
+            manager->SendGuestMessage(previous, BM_SETSTYLE, BS_PUSHBUTTON, TRUE, nullptr);
+        if (button && (code & 0x0020u))
+            manager->SendGuestMessage(button, BM_SETSTYLE, BS_DEFPUSHBUTTON, TRUE, nullptr);
+    }
+
+    bool FocusDialogControl(const std::shared_ptr<DialogWindowState>& state,
+        GuestWindowManager* manager, HWND control)
+    {
+        if (!state || !manager || !control || !manager->IsGuestChild(state->window, control)) return false;
+        const LRESULT code = manager->SendGuestMessage(control, 0x0087u, 0, 0, nullptr);
+        if (code & 0x0008u) // DLGC_HASSETSEL
+            manager->SendGuestMessage(control, EM_SETSEL, 0, -1, nullptr);
+        DWORD error = ERROR_SUCCESS;
+        manager->SetGuestFocus(control, &error);
+        if (error != ERROR_SUCCESS) return false;
+        // WM_SETFOCUS/WM_KILLFOCUS can redirect focus or destroy the target.
+        const HWND actual = manager->GetGuestFocus(nullptr);
+        if (actual && manager->IsGuestChild(state->window, actual))
+            UpdateDialogDefaultVisual(state, manager, actual);
+        return true;
+    }
+
+    void SaveDialogFocus(const std::shared_ptr<DialogWindowState>& state, GuestWindowManager* manager)
+    {
+        if (!state || !manager) return;
+        const HWND focused = manager->GetGuestFocus(nullptr);
+        if (focused && manager->IsGuestChild(state->window, focused)) state->savedFocus = focused;
+    }
+
+    void RestoreDialogFocus(const std::shared_ptr<DialogWindowState>& state,
+        GuestWindowManager* manager, bool justActivate)
+    {
+        if (!state || !manager) return;
+        HWND control = state->savedFocus;
+        if (!control || !manager->IsGuestChild(state->window, control) ||
+            !manager->IsGuestWindowEnabled(control, nullptr))
         {
-            HWND oldButton = manager->GetGuestDlgItem(state->window,
-                static_cast<int>(previous), nullptr);
-            if (oldButton) manager->SendGuestMessage(oldButton, BM_SETSTYLE,
-                BS_PUSHBUTTON, TRUE, nullptr);
+            if (justActivate) return;
+            control = NextDialogTabItem(manager, state->window, nullptr, false);
+            if (!control) control = NextDialogGroupItem(manager, state->window, nullptr, false);
         }
-        HWND newButton = manager->GetGuestDlgItem(state->window,
-            static_cast<int>(identifier), nullptr);
-        if (newButton) manager->SendGuestMessage(newButton, BM_SETSTYLE,
-            BS_DEFPUSHBUTTON, TRUE, nullptr);
+        state->savedFocus = nullptr;
+        if (!control || control == state->window) return;
+        if (justActivate) manager->SetGuestFocus(control, nullptr);
+        else FocusDialogControl(state, manager, control);
+    }
+
+    HWND FindDialogControlById(GuestWindowManager* manager, HWND parent, UINT identifier, unsigned depth = 0)
+    {
+        if (!manager || depth >= 128) return nullptr;
+        for (const HWND child : manager->SnapshotGuestWindows(parent, false))
+        {
+            if (static_cast<UINT_PTR>(manager->GetGuestWindowLongPtr(child, GWLP_ID, nullptr)) == identifier) return child;
+            if (const HWND found = FindDialogControlById(manager, child, identifier, depth + 1)) return found;
+        }
+        return nullptr;
     }
 
     int CaptureDialogException(
@@ -670,7 +914,10 @@ namespace
         if (!procedure) return FALSE;
         __try
         {
-            return procedure(window, message, wParam, lParam);
+            INT_PTR result = FALSE;
+            if (!InvokeCrtFunction(&result, procedure, window, message, wParam, lParam))
+            { if (exceptionCode) *exceptionCode = CrtGuestTerminationCode; }
+            return result;
         }
         __except (CaptureDialogException(
             GetExceptionInformation(), exceptionCode, exceptionAddress))
@@ -687,9 +934,29 @@ namespace
             (message >= WM_CTLCOLORMSGBOX && message <= WM_CTLCOLORSTATIC);
     }
 
+    struct DialogDestructionScope
+    {
+        HWND window;
+        ~DialogDestructionScope()
+        {
+            if (!window) return;
+            std::shared_ptr<DialogWindowState> removed;
+            {
+                std::lock_guard<std::mutex> guard(g_dialogWindowsLock);
+                const auto found = g_dialogWindows.find(reinterpret_cast<ULONG_PTR>(window));
+                if (found != g_dialogWindows.end())
+                { removed = found->second; g_dialogWindows.erase(found); }
+            }
+            if (removed && removed->font) BridgeDeleteObject(removed->font);
+        }
+    };
+
     LRESULT CALLBACK DialogWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (message == WM_NCCREATE) return TRUE;
+        // Cleanup must also run when the application's DLGPROC reports
+        // WM_NCDESTROY handled; keep its state available during the callback.
+        DialogDestructionScope cleanup{ message == WM_NCDESTROY ? window : nullptr };
         GuestWindowManager* manager = CurrentGuestWindowManager();
         if (!manager) return 0;
 
@@ -722,6 +989,16 @@ namespace
         const auto state = FindDialogState(window);
         switch (message)
         {
+        case WM_SHOWWINDOW:
+            if (!wParam) SaveDialogFocus(state, manager);
+            break;
+        case WM_ACTIVATE:
+            if (LOWORD(wParam)) RestoreDialogFocus(state, manager, true);
+            else SaveDialogFocus(state, manager);
+            return 0;
+        case WM_SETFOCUS:
+            RestoreDialogFocus(state, manager, false);
+            return 0;
         case WM_ERASEBKGND:
         {
             const auto dc = reinterpret_cast<HDC>(wParam);
@@ -737,16 +1014,15 @@ namespace
             if (EndGuestResourceDialog(window, IDCANCEL)) return 0;
             break;
         case WM_NEXTDLGCTL:
-            if (state && !state->tabControls.empty())
+            if (state)
             {
                 if (lParam)
                 {
                     const HWND requested = reinterpret_cast<HWND>(wParam);
                     DWORD ignored = ERROR_SUCCESS;
                     if (requested && manager->IsGuestChild(state->window, requested) &&
-                        manager->IsGuestWindowVisible(requested, &ignored) &&
                         manager->IsGuestWindowEnabled(requested, &ignored))
-                        manager->SetGuestFocus(requested, &ignored);
+                        FocusDialogControl(state, manager, requested);
                 }
                 else
                 {
@@ -758,7 +1034,13 @@ namespace
             }
             break;
         case DialogGetDefaultId:
-            return state ? DialogDefaultIdMarker | (state->defaultButton & 0xffffu) : 0;
+            if (state)
+            {
+                if (state->defaultButton) return DialogDefaultIdMarker | (state->defaultButton & 0xffffu);
+                if (const HWND button = FindDialogDefaultButton(manager, window))
+                    return DialogDefaultIdMarker | (manager->GetGuestWindowLongPtr(button, GWLP_ID, nullptr) & 0xffffu);
+            }
+            return 0;
         case DialogSetDefaultId:
             if (state)
             {
@@ -772,21 +1054,20 @@ namespace
         }
 
         const LRESULT result = manager->DefaultGuestWindowProcedure(window, message, wParam, lParam);
-        if (message == WM_NCDESTROY)
-        {
-            std::shared_ptr<DialogWindowState> removed;
-            {
-                std::lock_guard<std::mutex> guard(g_dialogWindowsLock);
-                const auto found = g_dialogWindows.find(reinterpret_cast<ULONG_PTR>(window));
-                if (found != g_dialogWindows.end())
-                {
-                    removed = found->second;
-                    g_dialogWindows.erase(found);
-                }
-            }
-            if (removed && removed->font) BridgeDeleteObject(removed->font);
-        }
         return result;
+    }
+
+    void CollectDialogMnemonicControls(GuestWindowManager* manager, HWND parent,
+        std::vector<HWND>* controls, unsigned depth = 0)
+    {
+        if (depth >= 128) return;
+        for (const HWND child : manager->SnapshotGuestWindows(parent, false))
+        {
+            const DWORD style = static_cast<DWORD>(manager->GetGuestWindowLongPtr(child, GWL_STYLE, nullptr));
+            if ((style & (WS_VISIBLE | WS_DISABLED)) != WS_VISIBLE) continue;
+            controls->push_back(child);
+            CollectDialogMnemonicControls(manager, child, controls, depth + 1);
+        }
     }
 
     bool IsDialogControlMessage(
@@ -796,138 +1077,126 @@ namespace
         if (!state) return false;
         GuestWindowManager* manager = CurrentGuestWindowManager();
         if (!manager) return false;
-
-        const bool keyDown = message.message == WM_KEYDOWN ||
-            message.message == WM_SYSKEYDOWN;
-        const bool character = message.message == WM_CHAR ||
-            message.message == WM_SYSCHAR;
+        const bool keyDown = message.message == WM_KEYDOWN;
+        const bool character = message.message == WM_CHAR || message.message == WM_SYSCHAR;
         if (!keyDown && !character) return false;
 
-        constexpr LRESULT WantArrows = 0x0001;
-        constexpr LRESULT WantTab = 0x0002;
-        constexpr LRESULT WantAllKeys = 0x0004;
-        constexpr LRESULT WantChars = 0x0080;
-        constexpr LRESULT DefPushButton = 0x0010;
-        constexpr LRESULT UndefPushButton = 0x0020;
-        constexpr LRESULT RadioButton = 0x0040;
-        constexpr LRESULT Button = 0x2000;
+        constexpr LRESULT WantArrows = 0x0001, WantTab = 0x0002, WantAllKeys = 0x0004;
+        constexpr LRESULT WantChars = 0x0080, DefPushButton = 0x0010;
+        constexpr LRESULT Static = 0x0100, RadioButton = 0x0040, Button = 0x2000;
         constexpr UINT GetDialogCode = 0x0087;
-
-        DWORD ignored = ERROR_SUCCESS;
-        HWND focused = manager->GetGuestFocus(&ignored);
-        if (!focused || (focused != state->window &&
-            !manager->IsGuestChild(state->window, focused)))
-            focused = message.hwnd;
-
-        LRESULT dialogCode = 0;
-        if (focused && focused != state->window)
-        {
-            dialogCode = manager->SendGuestMessage(focused, GetDialogCode,
-                message.wParam,
-                reinterpret_cast<LPARAM>(const_cast<GuestAbi::Message*>(&message)),
-                nullptr);
-        }
-
+        // Query the actual MSG recipient. Focus can have changed since a
+        // message was queued, or the caller may be testing a synthetic MSG.
+        const HWND recipient = message.hwnd;
+        const LRESULT dialogCode = recipient ? manager->SendGuestMessage(recipient, GetDialogCode,
+            message.wParam, reinterpret_cast<LPARAM>(const_cast<GuestAbi::Message*>(&message)), nullptr) : 0;
         if ((keyDown && (dialogCode & WantAllKeys)) ||
-            (character && (dialogCode & (WantAllKeys | WantChars))))
-            return false;
+            (message.message == WM_CHAR && (dialogCode & (WantAllKeys | WantChars)))) return false;
+        if (message.message == WM_CHAR && message.wParam == VK_TAB && (dialogCode & WantTab)) return false;
 
-        if (keyDown && message.wParam == VK_TAB &&
-            !(dialogCode & WantTab) && !state->tabControls.empty())
+        if (keyDown && message.wParam == VK_TAB && !(dialogCode & WantTab))
         {
-            return FocusNextDialogControl(
-                state, manager, focused, BridgeGetKeyState(VK_SHIFT) < 0);
-        }
-        if (keyDown && message.wParam == VK_ESCAPE)
-        {
-            manager->SendGuestMessage(state->window, WM_COMMAND,
-                MAKEWPARAM(IDCANCEL, BN_CLICKED), 0, nullptr);
+            // Sending the message lets the guest DLGPROC intercept navigation.
+            const bool previous = BridgeGetKeyState(VK_SHIFT) < 0;
+            if (FindDialogState(state->window)) manager->SendGuestMessage(state->window, WM_NEXTDLGCTL, previous, 0, nullptr);
+            else FocusNextDialogControl(state, manager, manager->GetGuestFocus(nullptr), previous);
             return true;
         }
-        if (keyDown && message.wParam == VK_RETURN)
+        if (keyDown && (message.wParam == VK_ESCAPE || message.wParam == VK_CANCEL))
         {
-            if (focused && (dialogCode & (Button | DefPushButton | UndefPushButton)))
+            const HWND cancel = manager->GetGuestDlgItem(state->window, IDCANCEL, nullptr);
+            manager->SendGuestMessage(state->window, WM_COMMAND, MAKEWPARAM(IDCANCEL, BN_CLICKED),
+                reinterpret_cast<LPARAM>(cancel), nullptr);
+            return true;
+        }
+        if (keyDown && (message.wParam == VK_RETURN || message.wParam == VK_EXECUTE))
+        {
+            const HWND focused = manager->GetGuestFocus(nullptr);
+            UINT identifier = IDOK;
+            HWND button = nullptr;
+            if (focused && manager->IsGuestChild(state->window, focused) &&
+                (manager->SendGuestMessage(focused, GetDialogCode, 0, 0, nullptr) & DefPushButton))
             {
-                manager->SendGuestMessage(focused, BM_CLICK, 0, 0, nullptr);
-                return true;
+                button = focused;
+                identifier = static_cast<UINT>(manager->GetGuestWindowLongPtr(button, GWLP_ID, nullptr));
             }
-            const HWND button = manager->GetGuestDlgItem(
-                state->window, static_cast<int>(state->defaultButton), nullptr);
-            if (button && manager->IsGuestWindowEnabled(button, &ignored))
-                manager->SendGuestMessage(button, BM_CLICK, 0, 0, nullptr);
             else
-                manager->SendGuestMessage(state->window, WM_COMMAND,
-                    MAKEWPARAM(state->defaultButton, BN_CLICKED), 0, nullptr);
+            {
+                const LRESULT defaultId = manager->SendGuestMessage(state->window, DialogGetDefaultId, 0, 0, nullptr);
+                if ((defaultId & 0xffff0000u) == DialogDefaultIdMarker) identifier = LOWORD(defaultId);
+                button = FindDialogControlById(manager, state->window, identifier);
+            }
+            // Enter generates WM_COMMAND for the default. BM_CLICK would
+            // incorrectly toggle a checkbox/radio and disabled defaults must
+            // consume Enter without falling back to a second command.
+            if (!button || manager->IsGuestWindowEnabled(button, nullptr))
+                manager->SendGuestMessage(state->window, WM_COMMAND, MAKEWPARAM(identifier, BN_CLICKED),
+                    reinterpret_cast<LPARAM>(button), nullptr);
             return true;
         }
-
         if (keyDown && (message.wParam == VK_LEFT || message.wParam == VK_UP ||
-            message.wParam == VK_RIGHT || message.wParam == VK_DOWN) &&
-            (dialogCode & RadioButton))
+            message.wParam == VK_RIGHT || message.wParam == VK_DOWN) && !(dialogCode & WantArrows))
         {
-            const auto current = std::find(
-                state->controls.begin(), state->controls.end(), focused);
-            if (current != state->controls.end())
+            const bool previous = message.wParam == VK_LEFT || message.wParam == VK_UP;
+            HWND next = NextDialogGroupItem(manager, state->window, recipient, previous);
+            std::vector<HWND> visited;
+            LRESULT code = 0;
+            const size_t maximum = manager->SnapshotGuestWindows(state->window, true).size() + 1;
+            while (next && visited.size() < maximum && std::find(visited.begin(), visited.end(), next) == visited.end())
             {
-                size_t index = static_cast<size_t>(current - state->controls.begin());
-                size_t begin = index;
-                while (begin > 0)
-                {
-                    DWORD styleError = ERROR_SUCCESS;
-                    if (manager->GetGuestWindowLongPtr(
-                        state->controls[begin], GWL_STYLE, &styleError) & WS_GROUP)
-                        break;
-                    --begin;
-                }
-                size_t end = index + 1;
-                while (end < state->controls.size())
-                {
-                    DWORD styleError = ERROR_SUCCESS;
-                    if (manager->GetGuestWindowLongPtr(
-                        state->controls[end], GWL_STYLE, &styleError) & WS_GROUP)
-                        break;
-                    ++end;
-                }
-                const bool backwards = message.wParam == VK_LEFT || message.wParam == VK_UP;
-                for (size_t attempt = 0; attempt < end - begin; ++attempt)
-                {
-                    index = backwards
-                        ? (index == begin ? end - 1 : index - 1)
-                        : (index + 1 == end ? begin : index + 1);
-                    const HWND candidate = state->controls[index];
-                    const LRESULT code = manager->SendGuestMessage(
-                        candidate, GetDialogCode, 0, 0, nullptr);
-                    if ((code & RadioButton) && manager->IsGuestWindowVisible(candidate, &ignored) &&
-                        manager->IsGuestWindowEnabled(candidate, &ignored))
-                    {
-                        manager->SetGuestFocus(candidate, &ignored);
-                        manager->SendGuestMessage(candidate, BM_CLICK, 0, 0, nullptr);
-                        return true;
-                    }
-                }
+                visited.push_back(next);
+                code = manager->SendGuestMessage(next, GetDialogCode, message.wParam,
+                    reinterpret_cast<LPARAM>(const_cast<GuestAbi::Message*>(&message)), nullptr);
+                if (!(code & Static)) break;
+                next = NextDialogGroupItem(manager, state->window, next, previous);
             }
-        }
-
-        if (character && message.wParam && message.wParam != L' ')
-        {
-            const wchar_t mnemonic = static_cast<wchar_t>(message.wParam);
-            for (const HWND control : state->controls)
+            if (!next || (code & Static)) return true;
+            if ((code & (RadioButton | Button)) == (RadioButton | Button))
             {
-                if (!manager->IsGuestWindowVisible(control, &ignored) ||
-                    !manager->IsGuestWindowEnabled(control, &ignored) ||
-                    !DialogControlHasMnemonic(manager, control, mnemonic))
-                    continue;
-                manager->SetGuestFocus(control, &ignored);
-                const LRESULT code = manager->SendGuestMessage(
-                    control, GetDialogCode, 0, 0, nullptr);
-                if (code & Button)
+                FocusDialogControl(state, manager, next);
+                const DWORD style = static_cast<DWORD>(manager->GetGuestWindowLongPtr(next, GWL_STYLE, nullptr));
+                if ((style & ButtonTypeMask) == 9 && manager->SendGuestMessage(next, BM_GETCHECK, 0, 0, nullptr) != BST_CHECKED)
+                    manager->SendGuestMessage(next, BM_CLICK, 1, 0, nullptr);
+            }
+            else if (FindDialogState(state->window)) manager->SendGuestMessage(state->window, WM_NEXTDLGCTL, reinterpret_cast<WPARAM>(next), TRUE, nullptr);
+            else FocusDialogControl(state, manager, next);
+            return true;
+        }
+        if (character && message.wParam)
+        {
+            std::vector<HWND> controls;
+            CollectDialogMnemonicControls(manager, state->window, &controls);
+            const auto found = std::find(controls.begin(), controls.end(), recipient);
+            const size_t start = found == controls.end() ? 0 : static_cast<size_t>(found - controls.begin());
+            for (size_t offset = 0; offset < controls.size(); ++offset)
+            {
+                const HWND control = controls[(start + offset) % controls.size()];
+                const LRESULT code = manager->SendGuestMessage(control, GetDialogCode, 0, 0, nullptr);
+                if (!(code & (Static | Button)) ||
+                    !DialogControlHasMnemonic(manager, control, static_cast<wchar_t>(message.wParam))) continue;
+                if (code & Static) FocusNextDialogControl(state, manager, control, false);
+                else
+                {
+                    FocusDialogControl(state, manager, control);
                     manager->SendGuestMessage(control, BM_CLICK, 0, 0, nullptr);
-                else if (code & 0x0100) // DLGC_STATIC: mnemonic targets the next tab stop.
-                    FocusNextDialogControl(state, manager, control, false);
+                }
                 return true;
             }
         }
         return false;
+    }
+
+    void InitializeDialogFocus(const std::shared_ptr<DialogWindowState>& state,
+        GuestWindowManager* manager, DWORD style, LRESULT requested)
+    {
+        if (!requested || !manager->IsGuestWindow(state->window) ||
+            ((style & 0x00000400u) && !(style & WS_VISIBLE))) return; // DS_CONTROL
+        // WM_INITDIALOG can add, disable, hide or reorder controls. Its TRUE
+        // return requests a fresh search, not the pre-callback HWND.
+        HWND control = NextDialogTabItem(manager, state->window, nullptr, false);
+        if (!control) control = NextDialogGroupItem(manager, state->window, nullptr, false);
+        if (control) FocusDialogControl(state, manager, control);
+        else if (!(style & WS_CHILD)) manager->SetGuestFocus(state->window, nullptr);
     }
 
     INT_PTR RunGuestDialog(
@@ -1062,7 +1331,6 @@ namespace
             if (menu) BridgeSetMenu(root, menu);
         }
 
-        HWND initialFocus = nullptr;
         for (const auto& item : dialog.items)
         {
             const std::wstring itemTitle = item.title.ordinal ? L"" : item.title.text;
@@ -1096,18 +1364,6 @@ namespace
                 manager->SendGuestMessage(child, WM_SETFONT,
                     reinterpret_cast<WPARAM>(runtime->font), FALSE, nullptr);
             }
-            if (!initialFocus && (itemStyle & DialogVisibleStyle) != 0 &&
-                (itemStyle & DialogDisabledStyle) == 0 &&
-                (itemStyle & DialogTabStopStyle) != 0)
-            {
-                initialFocus = child;
-            }
-            if ((itemStyle & DialogVisibleStyle) != 0 &&
-                (itemStyle & DialogDisabledStyle) == 0 &&
-                (itemStyle & DialogTabStopStyle) != 0)
-            {
-                runtime->tabControls.push_back(child);
-            }
             if (_wcsicmp(ClassNameFor(item.windowClass), L"button") == 0 &&
                 (itemStyle & ButtonTypeMask) == ButtonDefaultPush)
             {
@@ -1115,10 +1371,13 @@ namespace
             }
         }
 
+        HWND initialFocus = NextDialogTabItem(manager, root, nullptr, false);
+        if (!initialFocus) initialFocus = NextDialogGroupItem(manager, root, nullptr, false);
         if (!runModal)
         {
             const LRESULT initializeFocus = manager->SendGuestMessage(root, WM_INITDIALOG,
                 reinterpret_cast<WPARAM>(initialFocus), initParameter, &error);
+            InitializeDialogFocus(runtime, manager, dialog.style, initializeFocus);
             if (manager->IsGuestWindow(root))
             {
                 manager->UpdateGuestWindow(root, nullptr);
@@ -1129,9 +1388,13 @@ namespace
                 if ((dialog.style & DialogVisibleStyle) != 0)
                 {
                     manager->ShowGuestWindow(root, SW_SHOW, &error);
-                    if (initializeFocus != FALSE && initialFocus)
-                        manager->SetGuestFocus(initialFocus, nullptr);
                 }
+            }
+            if (!manager->IsGuestWindow(root))
+            {
+                if (createdWindow) *createdWindow = nullptr;
+                BridgeSetLastError(ERROR_CANNOT_MAKE);
+                return -1;
             }
             if (createdWindow) *createdWindow = root;
             RuntimeDiagnostics::Record(L"DIALOG: instantiated modeless dialog with " +
@@ -1156,6 +1419,7 @@ namespace
 
         const LRESULT initializeFocus = manager->SendGuestMessage(root, WM_INITDIALOG,
             reinterpret_cast<WPARAM>(initialFocus), initParameter, &error);
+        if (!modal.ended) InitializeDialogFocus(runtime, manager, dialog.style, initializeFocus);
         if (!modal.ended && manager->IsGuestWindow(root))
         {
             // Resource dialogs are assembled hidden. Paint their complete
@@ -1172,11 +1436,6 @@ namespace
                 }
             }
             manager->ShowGuestWindow(root, SW_SHOW, &error);
-            // SetFocus rejects effectively hidden descendants, as Win32 does.
-            // Apply the dialog manager's requested initial control only after
-            // the dialog itself has become visible.
-            if (initializeFocus != FALSE && initialFocus)
-                manager->SetGuestFocus(initialFocus, nullptr);
         }
 
         RuntimeDiagnostics::Record(L"DIALOG: instantiated " +
@@ -1317,24 +1576,123 @@ namespace
         return true;
     }
 
+    bool InvokePropertySheetCallback(int(CALLBACK* callback)(HWND, UINT, LPARAM), HWND window, UINT message, LPARAM parameter)
+    {
+        __try { int ignored = 0; return InvokeCrtFunction(&ignored, callback, window, message, parameter); }
+        __except(EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+    bool PreparePropertySheetTemplate(int(CALLBACK* callback)(HWND, UINT, LPARAM), DialogTemplate* dialog)
+    {
+        if (!callback) return true;
+        if (dialog->items.size() > 0xffff) return false;
+        std::vector<BYTE> bytes;
+        const auto append = [&bytes](auto value)
+        {
+            const auto source = reinterpret_cast<const BYTE*>(&value);
+            bytes.insert(bytes.end(), source, source + sizeof(value));
+        };
+        const auto value = [&append](const DialogValue& text)
+        {
+            if (text.ordinal) { append(WORD(0xffff)); append(text.id); }
+            else { for (wchar_t character : text.text) append(static_cast<WORD>(character)); append(WORD(0)); }
+        };
+        // Use an extended template to preserve each font attribute. Callbacks
+        // must inspect the 0xffff signature, as they do for native templates.
+        append(WORD(1)); append(WORD(0xffff)); append(dialog->helpId); append(dialog->extendedStyle);
+        append(dialog->font.present ? dialog->style | DialogSetFont : dialog->style & ~DialogSetFont);
+        append(static_cast<WORD>(dialog->items.size()));
+        append(dialog->x); append(dialog->y); append(dialog->width); append(dialog->height);
+        value(dialog->menu); value(dialog->windowClass); value(dialog->title);
+        if (dialog->font.present)
+        {
+            append(dialog->font.pointSize); append(dialog->font.weight);
+            append(static_cast<WORD>(dialog->font.italic | (static_cast<WORD>(dialog->font.characterSet) << 8)));
+            value(dialog->font.face);
+        }
+        for (const auto& item : dialog->items)
+        {
+            while (bytes.size() & 3) bytes.push_back(0);
+            append(item.helpId); append(item.extendedStyle); append(item.style);
+            append(item.x); append(item.y); append(item.width); append(item.height); append(item.id);
+            value(item.windowClass); value(item.title);
+            if (item.creationData.size() > 0xffff - sizeof(WORD)) return false;
+            append(static_cast<WORD>(item.creationData.empty() ? 0 : item.creationData.size() + sizeof(WORD)));
+            bytes.insert(bytes.end(), item.creationData.begin(), item.creationData.end());
+        }
+        if (!InvokePropertySheetCallback(callback, nullptr, 2, reinterpret_cast<LPARAM>(bytes.data()))) return false; // PSCB_PRECREATE
+        DialogTemplate modified;
+        if (!ParseDialog(bytes.data(), bytes.size(), &modified)) return false;
+        *dialog = std::move(modified); return true;
+    }
+    bool ParseIndirectPropertyTemplate(const void* data, DialogTemplate* dialog)
+    {
+        if (!data || !dialog) return false;
+        MEMORY_BASIC_INFORMATION memory{};
+        if (::VirtualQuery(data, &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT ||
+            (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD))) return false;
+        const auto begin = reinterpret_cast<ULONG_PTR>(data);
+        const auto end = reinterpret_cast<ULONG_PTR>(memory.BaseAddress) + memory.RegionSize;
+        if (begin >= end) return false;
+        return ParseDialog(static_cast<const BYTE*>(data), (std::min)(static_cast<size_t>(end - begin), size_t(1024 * 1024)), dialog);
+    }
+    bool InitializePropertyPage(const GuestPropertyPageDescriptor& source, UINT index, PropertyPageRuntime* page)
+    {
+        if (!page) return false;
+        page->instance = source.instance; page->templateName = source.templateName;
+        page->procedure = source.dialogProcedure; page->initParameter = source.initParameter;
+        page->lifetime = source.lifetime; page->pageHandle = source.pageHandle; page->flags = source.pageFlags;
+        page->activation = source.activationContext; page->prepareCreate = source.prepareCreate; page->release = source.release;
+        if (source.fields && source.fieldCount)
+        {
+            for (UINT field = 0; field < source.fieldCount; ++field)
+                page->fields.emplace_back(source.fields[field].name ? source.fields[field].name : L"",
+                    source.fields[field].value ? source.fields[field].value : L"");
+            if (!BuildPropertyFieldsDialog(*page, &page->content)) return false;
+        }
+        else
+        {
+            PropertyActivationScope activation(page->activation);
+            const bool parsed = source.templateData ? ParseIndirectPropertyTemplate(source.templateData, &page->content) :
+                ParseDialogResource(source.instance, source.templateName, &page->content);
+            if (!parsed) { BridgeSetLastError(ERROR_RESOURCE_DATA_NOT_FOUND); return false; }
+        }
+        if (source.title && *source.title) page->title = source.title;
+        else if (!page->content.title.ordinal && !page->content.title.text.empty()) page->title = page->content.title.text;
+        else page->title = L"Page " + std::to_wstring(index + 1);
+        return true;
+    }
+    INT_PTR PropertyPageIdentifier(const PropertyPageRuntime& page)
+    {
+        const auto id = reinterpret_cast<ULONG_PTR>(page.templateName);
+        return id && id <= 0xffff ? static_cast<INT_PTR>(id) : -1;
+    }
+    int PropertyPageIndex(PropertySheetRuntime* sheet, HANDLE handle)
+    {
+        if (!handle) return -1;
+        for (size_t index = 0; index < sheet->pages.size(); ++index)
+            if (sheet->pages[index].pageHandle == handle) return static_cast<int>(index);
+        return -1;
+    }
+    void FinishPropertySheet(PropertySheetRuntime* sheet, INT_PTR result)
+    {
+        sheet->finished = true; sheet->result = result;
+        if (!sheet->modeless) EndGuestResourceDialog(sheet->window, result);
+    }
     HWND CreatePropertyPageWindow(PropertySheetRuntime* sheet, UINT index)
     {
         if (!sheet || index >= sheet->pages.size()) return nullptr;
         PropertyPageRuntime& page = sheet->pages[index];
         if (page.window) return page.window;
 
-        DialogTemplate dialog;
-        if (!page.fields.empty())
-        {
-            if (!BuildPropertyFieldsDialog(page, &dialog)) return nullptr;
-        }
-        else if (!ParseDialogResource(page.instance, page.templateName, &dialog))
-        {
-            return nullptr;
-        }
+        PropertyNotificationScope notification(sheet);
+        PropertyActivationScope activation(page.activation);
+        if (page.prepareCreate && !page.prepareCreate(page.lifetime.get())) return nullptr;
+        DialogTemplate dialog = page.content;
         dialog.style |= DialogChildStyle;
-        dialog.style &= ~(DialogPopupStyle | DialogCaptionStyle |
-            DialogSystemMenuStyle | DialogCenterStyle);
+        dialog.style |= 0x00000400u | DialogTabStopStyle; // DS_CONTROL / WS_TABSTOP
+        dialog.extendedStyle |= 0x00010000u; // WS_EX_CONTROLPARENT
+        dialog.style &= ~(DialogPopupStyle | DialogCaptionStyle | DialogModalFrameStyle |
+            DialogSystemMenuStyle | DialogCenterStyle | DialogVisibleStyle | DialogDisabledStyle | 0x00040000u);
         dialog.x = 0;
         dialog.y = 0;
         dialog.title = DialogValue{};
@@ -1355,14 +1713,14 @@ namespace
 
         GuestWindowManager* manager = CurrentGuestWindowManager();
         RECT pageRect{};
-        if (manager && manager->GetGuestWindowRect(window, &pageRect, nullptr))
+        if (manager && sheet->tabControl && manager->GetGuestClientRect(sheet->tabControl, &pageRect, nullptr))
         {
-            manager->SetGuestWindowPos(
-                window, nullptr, 12, 42,
+            manager->SendGuestMessage(sheet->tabControl, TabAdjustPageRect, FALSE,
+                reinterpret_cast<LPARAM>(&pageRect), nullptr);
+            BridgeMapWindowPoints(sheet->tabControl, sheet->window, reinterpret_cast<POINT*>(&pageRect), 2);
+            manager->SetGuestWindowPos(window, nullptr, pageRect.left, pageRect.top,
                 (std::max)(1L, pageRect.right - pageRect.left),
-                (std::max)(1L, pageRect.bottom - pageRect.top),
-                SWP_NOZORDER | SWP_NOACTIVATE,
-                nullptr);
+                (std::max)(1L, pageRect.bottom - pageRect.top), SWP_NOZORDER | SWP_NOACTIVATE, nullptr);
         }
         return window;
     }
@@ -1378,6 +1736,7 @@ namespace
         const HWND page = sheet->pages[index].window;
         if (!manager || !page || !manager->IsGuestWindow(page)) return 0;
 
+        PropertyNotificationScope notificationScope(sheet);
         PropertySheetNotification notification;
         notification.header.hwndFrom = sheet->window;
         notification.header.idFrom = 0;
@@ -1399,72 +1758,399 @@ namespace
         if (apply) manager->EnableGuestWindow(apply, dirty ? TRUE : FALSE, nullptr);
     }
 
-    bool SelectPropertyPage(PropertySheetRuntime* sheet, UINT index, bool initial)
+    bool PositionPropertyPage(PropertySheetRuntime* sheet, HWND page)
     {
-        if (!sheet || index >= sheet->pages.size()) return false;
-        GuestWindowManager* manager = CurrentGuestWindowManager();
-        if (!manager) return false;
-
-        if (!initial && sheet->selected < sheet->pages.size())
-        {
-            if (NotifyPropertyPage(sheet, sheet->selected, PropertyNotifyKillActive) != 0)
-            {
-                if (sheet->tabControl)
-                    manager->SendGuestMessage(
-                        sheet->tabControl, TabSetCurrentSelection,
-                        sheet->selected, 0, nullptr);
-                return false;
-            }
-            const HWND previous = sheet->pages[sheet->selected].window;
-            if (previous) manager->ShowGuestWindow(previous, SW_HIDE, nullptr);
-        }
-
-        const HWND page = CreatePropertyPageWindow(sheet, index);
-        if (!page) return false;
-        sheet->selected = index;
-        if (sheet->tabControl)
-            manager->SendGuestMessage(
-                sheet->tabControl, TabSetCurrentSelection, index, 0, nullptr);
-        manager->ShowGuestWindow(page, SW_SHOW, nullptr);
-        NotifyPropertyPage(sheet, index, PropertyNotifySetActive);
-        return true;
+        auto manager = CurrentGuestWindowManager();
+        RECT area{};
+        if (!manager || !sheet->tabControl || !manager->GetGuestClientRect(sheet->tabControl, &area, nullptr)) return false;
+        manager->SendGuestMessage(sheet->tabControl, TabAdjustPageRect, FALSE, reinterpret_cast<LPARAM>(&area), nullptr);
+        BridgeMapWindowPoints(sheet->tabControl, sheet->window, reinterpret_cast<POINT*>(&area), 2);
+        // Bring the page to the front: its controls precede the tab/footer in
+        // dialog navigation. Recompute on every selection, as comctl32 does.
+        return manager->SetGuestWindowPos(page, nullptr, area.left, area.top,
+            (std::max)(1L, area.right - area.left), (std::max)(1L, area.bottom - area.top),
+            SWP_NOACTIVATE, nullptr) != FALSE;
     }
 
+    void CapturePropertySheetLayout(PropertySheetRuntime* sheet)
+    {
+        auto manager = CurrentGuestWindowManager();
+        RECT client{};
+        if (!manager || !manager->GetGuestClientRect(sheet->window, &client, nullptr) ||
+            !sheet->tabControl || !manager->GetGuestWindowRect(sheet->tabControl, &sheet->layoutTab, nullptr)) return;
+        BridgeMapWindowPoints(nullptr, sheet->window, reinterpret_cast<POINT*>(&sheet->layoutTab), 2);
+        sheet->layoutClient = SIZE{ client.right - client.left, client.bottom - client.top };
+        sheet->layoutButtons.clear();
+        const int identifiers[] = { IDOK, IDCANCEL, PropertyApplyId, 9 };
+        for (const int identifier : identifiers)
+        {
+            const HWND button = manager->GetGuestDlgItem(sheet->window, identifier, nullptr);
+            RECT area{};
+            if (!button || !manager->GetGuestWindowRect(button, &area, nullptr)) continue;
+            BridgeMapWindowPoints(nullptr, sheet->window, reinterpret_cast<POINT*>(&area), 2);
+            sheet->layoutButtons.emplace_back(button, area);
+        }
+        sheet->layoutReady = true;
+    }
+
+    void LayoutPropertySheet(PropertySheetRuntime* sheet)
+    {
+        auto manager = CurrentGuestWindowManager();
+        RECT client{};
+        if (!manager || !sheet->layoutReady || sheet->layingOut || sheet->destroying ||
+            !manager->GetGuestClientRect(sheet->window, &client, nullptr)) return;
+        struct LayoutScope
+        {
+            bool& flag;
+            explicit LayoutScope(bool& value) : flag(value) { flag = true; }
+            ~LayoutScope() { flag = false; }
+        } layout(sheet->layingOut);
+        PropertyNotificationScope operation(sheet);
+        const LONG dx = client.right - client.left - sheet->layoutClient.cx;
+        const LONG dy = client.bottom - client.top - sheet->layoutClient.cy;
+        const RECT& tab = sheet->layoutTab;
+        manager->SetGuestWindowPos(sheet->tabControl, nullptr, tab.left, tab.top,
+            (std::max)(1L, tab.right - tab.left + dx), (std::max)(1L, tab.bottom - tab.top + dy),
+            SWP_NOZORDER | SWP_NOACTIVATE, nullptr);
+        if (sheet->destroying) return;
+        for (const auto& button : sheet->layoutButtons)
+        {
+            const RECT& area = button.second;
+            if (manager->IsGuestWindow(button.first))
+                manager->SetGuestWindowPos(button.first, nullptr, area.left + dx, area.top + dy,
+                    area.right - area.left, area.bottom - area.top, SWP_NOZORDER | SWP_NOACTIVATE, nullptr);
+            if (sheet->destroying) return;
+        }
+        // Hidden pages keep their Z order; only the active page is raised.
+        // Work from HWNDs so callbacks cannot invalidate an element reference.
+        for (UINT index = 0; index < sheet->pages.size(); ++index)
+        {
+            const HWND page = sheet->pages[index].window;
+            if (page && manager->IsGuestWindow(page))
+            {
+                RECT area{};
+                if (manager->GetGuestClientRect(sheet->tabControl, &area, nullptr))
+                {
+                    manager->SendGuestMessage(sheet->tabControl, TabAdjustPageRect, FALSE, reinterpret_cast<LPARAM>(&area), nullptr);
+                    BridgeMapWindowPoints(sheet->tabControl, sheet->window, reinterpret_cast<POINT*>(&area), 2);
+                    manager->SetGuestWindowPos(page, nullptr, area.left, area.top,
+                        (std::max)(1L, area.right - area.left), (std::max)(1L, area.bottom - area.top),
+                        SWP_NOZORDER | SWP_NOACTIVATE, nullptr);
+                }
+            }
+            if (sheet->destroying) return;
+        }
+    }
+
+    void FocusPropertyPage(PropertySheetRuntime* sheet)
+    {
+        auto manager = CurrentGuestWindowManager();
+        if (!manager || sheet->destroying || sheet->finished || sheet->selected >= sheet->pages.size()) return;
+        const HWND page = sheet->pages[sheet->selected].window;
+        const HWND first = NextDialogTabItem(manager, page, nullptr, false);
+        HWND target = first;
+        if (first)
+        {
+            const HWND requested = reinterpret_cast<HWND>(NotifyPropertyPage(sheet, sheet->selected, -213)); // PSN_QUERYINITIALFOCUS
+            if (sheet->destroying || sheet->finished) return;
+            if (requested && manager->IsGuestChild(page, requested) &&
+                manager->IsGuestWindowVisible(requested, nullptr) && manager->IsGuestWindowEnabled(requested, nullptr))
+                target = requested;
+        }
+        if (!target) target = sheet->tabControl;
+        if (target && manager->IsGuestWindow(target))
+            manager->SendGuestMessage(sheet->window, WM_NEXTDLGCTL, reinterpret_cast<WPARAM>(target), TRUE, nullptr);
+    }
+
+    bool SelectPropertyPage(PropertySheetRuntime* sheet, UINT index, bool initial, bool validatePrevious = true)
+    {
+        if (!sheet || sheet->selecting || sheet->destroying || sheet->finished || index >= sheet->pages.size()) return false;
+        auto manager = CurrentGuestWindowManager();
+        if (!manager) return false;
+        struct SelectionScope
+        {
+            bool& selecting;
+            explicit SelectionScope(bool& value) : selecting(value) { selecting = true; }
+            ~SelectionScope() { selecting = false; }
+        } selection(sheet->selecting);
+        PropertyNotificationScope transition(sheet);
+        const UINT previousIndex = sheet->selected;
+        const auto restoreTab = [&]()
+        {
+            if (!sheet->destroying && sheet->tabControl)
+                manager->SendGuestMessage(sheet->tabControl, TabSetCurrentSelection, previousIndex, 0, nullptr);
+        };
+        if (!initial && index == previousIndex) return true;
+        if (!initial && validatePrevious && NotifyPropertyPage(sheet, previousIndex, PropertyNotifyKillActive) != 0)
+        { restoreTab(); return false; }
+        if (sheet->destroying || sheet->finished) return false;
+        const int direction = !initial && index < previousIndex ? -1 : 1;
+        std::vector<bool> visited(sheet->pages.size(), false);
+        HWND page = nullptr;
+        bool accepted = false;
+        while (index < sheet->pages.size() && !visited[index])
+        {
+            visited[index] = true;
+            page = CreatePropertyPageWindow(sheet, index);
+            if (!page || sheet->destroying || sheet->finished) break;
+            PositionPropertyPage(sheet, page);
+            const LRESULT result = NotifyPropertyPage(sheet, index, PropertyNotifySetActive);
+            if (sheet->destroying || sheet->finished || !manager->IsGuestWindow(page)) break;
+            if (result == 0) { accepted = true; break; }
+            // -1 skips this page; another nonzero result redirects by template
+            // resource ID. Bound the walk so circular redirects cannot hang UI.
+            if (result == -1)
+            {
+                if (direction < 0 && index == 0) break;
+                index = direction < 0 ? index - 1 : index + 1;
+            }
+            else
+            {
+                const auto found = std::find_if(sheet->pages.begin(), sheet->pages.end(), [result](const PropertyPageRuntime& candidate)
+                { return PropertyPageIdentifier(candidate) == result; });
+                if (found == sheet->pages.end()) break;
+                index = static_cast<UINT>(found - sheet->pages.begin());
+            }
+        }
+        if (!accepted) { restoreTab(); return false; }
+        if (!initial && previousIndex < sheet->pages.size())
+        {
+            const HWND previous = sheet->pages[previousIndex].window;
+            if (previous && previous != page) manager->ShowGuestWindow(previous, SW_HIDE, nullptr);
+        }
+        sheet->selected = index;
+        if (sheet->tabControl)
+            manager->SendGuestMessage(sheet->tabControl, TabSetCurrentSelection, index, 0, nullptr);
+        manager->ShowGuestWindow(page, SW_SHOW, nullptr);
+        if (const auto help = manager->GetGuestDlgItem(sheet->window, 9, nullptr))
+            manager->EnableGuestWindow(help, (sheet->pages[index].flags & 0x20u) ? TRUE : FALSE, nullptr);
+        FocusPropertyPage(sheet);
+        return !sheet->destroying;
+    }
     bool ApplyPropertyPages(PropertySheetRuntime* sheet, bool closeAfterApply)
     {
-        if (!sheet || sheet->selected >= sheet->pages.size()) return false;
+        if (!sheet || sheet->notificationDepth || sheet->selecting || sheet->finished || sheet->destroying || sheet->selected >= sheet->pages.size()) return false;
+        PropertyNotificationScope operation(sheet);
         if (NotifyPropertyPage(sheet, sheet->selected, PropertyNotifyKillActive) != 0)
             return false;
+        if (sheet->destroying || sheet->finished) return false;
         for (UINT index = 0; index < sheet->pages.size(); ++index)
         {
             if (sheet->pages[index].window)
             {
                 const LRESULT result =
-                    NotifyPropertyPage(sheet, index, PropertyNotifyApply);
+                    NotifyPropertyPage(sheet, index, PropertyNotifyApply, closeAfterApply ? TRUE : FALSE);
+                if (sheet->destroying || sheet->finished) return false;
                 if (result != 0)
                 {
                     if (result == 1) // PSNRET_INVALID
-                        SelectPropertyPage(sheet, index, index == sheet->selected);
+                        SelectPropertyPage(sheet, index, index == sheet->selected, false);
                     return false;
                 }
             }
         }
+        for (auto& page : sheet->pages) page.dirty = false;
         SetPropertySheetDirty(sheet, false);
-        if (closeAfterApply) EndGuestResourceDialog(sheet->window, IDOK);
+        if (!closeAfterApply)
+        {
+            NotifyPropertyPage(sheet, sheet->selected, PropertyNotifySetActive);
+            FocusPropertyPage(sheet);
+        }
+        if (closeAfterApply) FinishPropertySheet(sheet, sheet->result ? sheet->result : IDOK);
         return true;
     }
 
-    void CancelPropertySheet(PropertySheetRuntime* sheet)
+    void CancelPropertySheet(PropertySheetRuntime* sheet, bool fromCloseButton = false)
     {
-        if (!sheet || sheet->selected >= sheet->pages.size()) return;
+        if (!sheet || sheet->notificationDepth || sheet->selecting || sheet->finished || sheet->destroying || sheet->selected >= sheet->pages.size()) return;
+        PropertyNotificationScope operation(sheet);
         if (NotifyPropertyPage(sheet, sheet->selected, PropertyNotifyQueryCancel) != 0)
             return;
+        if (sheet->destroying || sheet->finished) return;
         for (UINT index = 0; index < sheet->pages.size(); ++index)
         {
             if (sheet->pages[index].window)
-                NotifyPropertyPage(sheet, index, PropertyNotifyReset, FALSE);
+                NotifyPropertyPage(sheet, index, PropertyNotifyReset, fromCloseButton ? TRUE : FALSE);
+            if (sheet->destroying || sheet->finished) return;
         }
-        EndGuestResourceDialog(sheet->window, IDCANCEL);
+        FinishPropertySheet(sheet, 0);
+    }
+
+    bool InsertPropertyPage(PropertySheetRuntime* sheet, UINT index, HANDLE handle)
+    {
+        auto manager = CurrentGuestWindowManager();
+        if (!manager || sheet->notificationDepth || sheet->destroying || sheet->finished || index > sheet->pages.size()) return false;
+        PropertyNotificationScope mutation(sheet);
+        GuestPropertyPageDescriptor source;
+        if (!TakeGuestPropertySheetPage(handle, &source, false)) return false;
+        PropertyPageRuntime page;
+        if (!InitializePropertyPage(source, index, &page)) return false;
+        const bool empty = sheet->pages.empty();
+        sheet->pages.insert(sheet->pages.begin() + index, std::move(page));
+        PropertyTabItemW item; item.mask = 1; item.text = const_cast<LPWSTR>(sheet->pages[index].title.c_str());
+        if (sheet->tabControl && manager->SendGuestMessage(sheet->tabControl, TabInsertItemW, index, reinterpret_cast<LPARAM>(&item), nullptr) < 0)
+        { sheet->pages.erase(sheet->pages.begin() + index); return false; }
+        GuestPropertyPageDescriptor consumed;
+        if (!TakeGuestPropertySheetPage(handle, &consumed))
+        {
+            if (sheet->tabControl) manager->SendGuestMessage(sheet->tabControl, 0x1308u, index, 0, nullptr);
+            sheet->pages.erase(sheet->pages.begin() + index); return false;
+        }
+        if (!empty && index <= sheet->selected) ++sheet->selected;
+        if (sheet->tabControl) manager->SendGuestMessage(sheet->tabControl, TabSetCurrentSelection, sheet->selected, 0, nullptr);
+        if (empty) return SelectPropertyPage(sheet, 0, true);
+        if (sheet->pages[index].flags & 0x400u) CreatePropertyPageWindow(sheet, index);
+        return true;
+    }
+    bool RemovePropertyPage(PropertySheetRuntime* sheet, UINT index)
+    {
+        auto manager = CurrentGuestWindowManager();
+        if (!manager || sheet->notificationDepth || sheet->destroying || index >= sheet->pages.size()) return false;
+        PropertyNotificationScope mutation(sheet);
+        if (index == sheet->selected && sheet->pages.size() > 1)
+        {
+            const UINT replacement = index ? index - 1 : index + 1;
+            if (!SelectPropertyPage(sheet, replacement, false)) return false;
+        }
+        PropertyPageRuntime removed = std::move(sheet->pages[index]);
+        if (removed.window && manager->IsGuestWindow(removed.window)) manager->DestroyGuestWindow(removed.window, nullptr);
+        sheet->pages.erase(sheet->pages.begin() + index);
+        if (sheet->selected > index) --sheet->selected;
+        if (sheet->tabControl)
+        {
+            manager->SendGuestMessage(sheet->tabControl, 0x1308u, index, 0, nullptr); // TCM_DELETEITEM
+            if (!sheet->pages.empty()) manager->SendGuestMessage(sheet->tabControl, TabSetCurrentSelection, sheet->selected, 0, nullptr);
+        }
+        if (removed.release && removed.lifetime) removed.release(removed.lifetime.get());
+        if (sheet->pages.empty()) FinishPropertySheet(sheet, 0);
+        else SetPropertySheetDirty(sheet, std::any_of(sheet->pages.begin(), sheet->pages.end(), [](const PropertyPageRuntime& page) { return page.dirty; }));
+        return true;
+    }
+    // A sheet is a DLGPROC, not a WNDPROC. Preserve the handled flag
+    // separately: zero and -1 are meaningful PSM results too.
+    LRESULT DispatchPropertySheetControlMessage(PropertySheetRuntime* sheet,
+        HWND dialog, UINT message, WPARAM wParam, LPARAM lParam, bool* handled)
+    {
+        *handled = true;
+        if (sheet->notificationDepth && (message == PropertySheetSetCurrent ||
+            message == WM_USER + 114 || message == PropertySheetApply || message == PropertySheetPressButton))
+            return FALSE;
+        if (message == WM_USER + 102) // PSM_REMOVEPAGE
+        {
+            const int index = lParam ? PropertyPageIndex(sheet, reinterpret_cast<HANDLE>(lParam)) : static_cast<int>(wParam);
+            return index >= 0 && RemovePropertyPage(sheet, static_cast<UINT>(index)) ? TRUE : FALSE;
+        }
+        if (message == WM_USER + 103 || message == WM_USER + 119) // PSM_ADDPAGE / INSERTPAGE
+        {
+            int index = message == WM_USER + 103 ? static_cast<int>(sheet->pages.size()) : static_cast<int>(wParam);
+            if (message == WM_USER + 119 && wParam == static_cast<WPARAM>(-1)) index = static_cast<int>(sheet->pages.size());
+            else if (message == WM_USER + 119 && wParam > sheet->pages.size()) index = PropertyPageIndex(sheet, reinterpret_cast<HANDLE>(wParam));
+            return index >= 0 && InsertPropertyPage(sheet, static_cast<UINT>(index), reinterpret_cast<HANDLE>(lParam)) ? TRUE : FALSE;
+        }
+        if (message == WM_USER + 114) // PSM_SETCURSELID
+        {
+            for (UINT index = 0; index < sheet->pages.size(); ++index)
+                if (PropertyPageIdentifier(sheet->pages[index]) == lParam) return SelectPropertyPage(sheet, index, false) ? TRUE : FALSE;
+            return FALSE;
+        }
+        if (message == WM_USER + 129) // PSM_HWNDTOINDEX
+        {
+            for (UINT index = 0; index < sheet->pages.size(); ++index)
+                if (wParam && sheet->pages[index].window == reinterpret_cast<HWND>(wParam)) return index;
+            return -1;
+        }
+        if (message == WM_USER + 130) // PSM_INDEXTOHWND: do not instantiate a lazy page.
+            return wParam < sheet->pages.size() ? reinterpret_cast<LRESULT>(sheet->pages[wParam].window) : 0;
+        if (message == WM_USER + 131) return PropertyPageIndex(sheet, reinterpret_cast<HANDLE>(lParam));
+        if (message == WM_USER + 132) return wParam < sheet->pages.size() ? reinterpret_cast<LRESULT>(sheet->pages[wParam].pageHandle) : 0;
+        if (message == WM_USER + 133)
+        {
+            for (UINT index = 0; index < sheet->pages.size(); ++index)
+                if (PropertyPageIdentifier(sheet->pages[index]) == lParam) return index;
+            return -1;
+        }
+        if (message == WM_USER + 134) return wParam < sheet->pages.size() ? PropertyPageIdentifier(sheet->pages[wParam]) : -1;
+        if (message == WM_USER + 135) return sheet->result; // PSM_GETRESULT
+        if (message == WM_USER + 117) return HandleGuestDialogMessage(dialog, reinterpret_cast<const MSG*>(lParam));
+        if (message == WM_USER + 105 || message == WM_USER + 106)
+        { sheet->result = message == WM_USER + 105 ? 2 : 3; return 0; }
+        if (message == WM_USER + 107) // PSM_CANCELTOCLOSE
+        {
+            if (auto manager = CurrentGuestWindowManager())
+            {
+                if (const auto cancel = manager->GetGuestDlgItem(dialog, IDCANCEL, nullptr)) manager->EnableGuestWindow(cancel, FALSE, nullptr);
+                if (const auto ok = manager->GetGuestDlgItem(dialog, IDOK, nullptr)) manager->SetGuestWindowText(ok, L"Close", nullptr);
+            }
+            return 0;
+        }
+        if (message == WM_USER + 111) // PSM_SETTITLEA
+        {
+            const auto text = reinterpret_cast<LPCSTR>(lParam);
+            if (!text) return BridgeSetWindowTextW(dialog, L"");
+            const int count = BridgeMultiByteToWideChar(CP_ACP, 0, text, -1, nullptr, 0);
+            if (count <= 0) return FALSE;
+            std::vector<wchar_t> wide(static_cast<size_t>(count));
+            if (BridgeMultiByteToWideChar(CP_ACP, 0, text, -1, wide.data(), count) != count) return FALSE;
+            return BridgeSetWindowTextW(dialog, wide.data());
+        }
+        if (message == WM_USER + 120) // PSM_SETTITLEW
+        {
+            if (auto manager = CurrentGuestWindowManager()) return manager->SetGuestWindowText(dialog, reinterpret_cast<LPCWSTR>(lParam), nullptr);
+            return FALSE;
+        }
+        if (message == PropertySheetChanged || message == PropertySheetUnchanged)
+        {
+            const HWND changed = reinterpret_cast<HWND>(wParam);
+            for (auto& page : sheet->pages)
+                if (page.window == changed) page.dirty = message == PropertySheetChanged;
+            const bool dirty = std::any_of(sheet->pages.begin(), sheet->pages.end(),
+                [](const PropertyPageRuntime& page) { return page.dirty; });
+            SetPropertySheetDirty(sheet, dirty);
+            return TRUE;
+        }
+        if (message == PropertySheetSetCurrent)
+        {
+            const int index = lParam ? PropertyPageIndex(sheet, reinterpret_cast<HANDLE>(lParam)) : static_cast<int>(wParam);
+            return index >= 0 && SelectPropertyPage(sheet, static_cast<UINT>(index), false) ? TRUE : FALSE;
+        }
+        if (message == PropertySheetApply)
+        {
+            return ApplyPropertyPages(sheet, false) ? TRUE : FALSE;
+        }
+        if (message == PropertySheetGetCurrentPage)
+        {
+            return !sheet->finished && sheet->selected < sheet->pages.size() ? reinterpret_cast<LRESULT>(sheet->pages[sheet->selected].window) : 0;
+        }
+        if (message == PropertySheetGetTabControl)
+        {
+            return reinterpret_cast<LRESULT>(sheet->tabControl);
+        }
+        if (message == PropertySheetQuerySiblings)
+        {
+            GuestWindowManager* manager = CurrentGuestWindowManager();
+            if (!manager) return 0;
+            std::vector<HWND> windows;
+            for (const auto& page : sheet->pages) if (page.window) windows.push_back(page.window);
+            for (const auto window : windows)
+            {
+                if (!manager->IsGuestWindow(window)) continue;
+                const LRESULT result = manager->SendGuestMessage(window, PropertySheetQuerySiblings, wParam, lParam, nullptr);
+                if (result) return result;
+            }
+            return 0;
+        }
+        if (message == PropertySheetPressButton)
+        {
+            // PSBTN_OK=3, PSBTN_APPLYNOW=4, PSBTN_CANCEL=5.
+            const UINT button = static_cast<UINT>(wParam);
+            if (button == 3) ApplyPropertyPages(sheet, true);
+            else if (button == 4) ApplyPropertyPages(sheet, false);
+            else if (button == 5) CancelPropertySheet(sheet);
+            else if (button == 6) NotifyPropertyPage(sheet, sheet->selected, -205);
+            return TRUE;
+        }
+        *handled = false;
+        return 0;
     }
 
     INT_PTR CALLBACK PropertySheetDialogProcedure(
@@ -1473,14 +2159,15 @@ namespace
         WPARAM wParam,
         LPARAM lParam)
     {
-        PropertySheetRuntime* sheet = reinterpret_cast<PropertySheetRuntime*>(
-            BridgeGetWindowLongPtrW(dialog, GWLP_USERDATA));
+        auto retained = FindPropertySheet(dialog);
+        PropertySheetRuntime* sheet = retained.get();
         if (message == WM_INITDIALOG)
         {
             sheet = reinterpret_cast<PropertySheetRuntime*>(lParam);
             if (!sheet) return FALSE;
             sheet->window = dialog;
-            BridgeSetWindowLongPtrW(dialog, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(sheet));
+            retained = sheet->shared_from_this();
+            { std::lock_guard<std::mutex> guard(g_propertySheetsLock); g_propertySheets[reinterpret_cast<ULONG_PTR>(dialog)] = retained; }
             GuestWindowManager* manager = CurrentGuestWindowManager();
             sheet->tabControl = manager
                 ? manager->GetGuestDlgItem(dialog, PropertyTabId, nullptr)
@@ -1497,10 +2184,33 @@ namespace
                         reinterpret_cast<LPARAM>(&item), nullptr);
                 }
             }
+            CapturePropertySheetLayout(sheet);
             SetPropertySheetDirty(sheet, false);
-            return SelectPropertyPage(sheet, sheet->selected, true) ? TRUE : FALSE;
+            for (UINT index = 0; index < sheet->pages.size(); ++index)
+                if (sheet->pages[index].flags & 0x00000400u) CreatePropertyPageWindow(sheet, index); // PSP_PREMATURE
+            bool selected = SelectPropertyPage(sheet, sheet->selected, true);
+            for (UINT index = 0; !selected && index < sheet->pages.size(); ++index)
+                if (index != sheet->selected) selected = SelectPropertyPage(sheet, index, true);
+            if (!selected)
+            {
+                if (sheet->modeless && manager) manager->DestroyGuestWindow(dialog, nullptr);
+                else FinishPropertySheet(sheet, -1);
+                return FALSE;
+            }
+            if (sheet->callback && !sheet->destroying)
+            {
+                InvokePropertySheetCallback(sheet->callback, dialog, 1, 0); // PSCB_INITIALIZED
+            }
+            // Selection already chose the page control, including while the
+            // sheet is hidden. Do not replace it with the outer tab HWND.
+            return FALSE;
         }
         if (!sheet) return FALSE;
+        if (message == WM_SIZE && wParam != SIZE_MINIMIZED)
+        {
+            LayoutPropertySheet(sheet);
+            return FALSE;
+        }
 
         if (message == WM_COMMAND)
         {
@@ -1515,6 +2225,7 @@ namespace
                 CancelPropertySheet(sheet);
                 return TRUE;
             }
+            if (command == 9) { NotifyPropertyPage(sheet, sheet->selected, -205); return TRUE; } // PSN_HELP
             if (command == PropertyApplyId)
             {
                 ApplyPropertyPages(sheet, false);
@@ -1523,12 +2234,22 @@ namespace
         }
         if (message == WM_CLOSE)
         {
-            CancelPropertySheet(sheet);
+            CancelPropertySheet(sheet, true);
             return TRUE;
         }
         if (message == WM_NOTIFY && lParam)
         {
             const auto header = reinterpret_cast<const PropertySheetNotification::Header*>(lParam);
+            if (header->hwndFrom == sheet->tabControl && header->code == static_cast<UINT>(-552)) // TCN_SELCHANGING
+            {
+                const bool allowed = !sheet->notificationDepth && !sheet->selecting &&
+                    !sheet->destroying && !sheet->finished &&
+                    NotifyPropertyPage(sheet, sheet->selected, PropertyNotifyKillActive) == 0;
+                sheet->tabSelectionValidated = allowed && !sheet->destroying && !sheet->finished;
+                if (auto manager = CurrentGuestWindowManager())
+                    manager->SetGuestWindowLongPtr(dialog, DialogMessageResultOffset, sheet->tabSelectionValidated ? FALSE : TRUE, nullptr);
+                return TRUE;
+            }
             if (header->hwndFrom == sheet->tabControl &&
                 header->code == TabNotifySelectionChange)
             {
@@ -1537,61 +2258,25 @@ namespace
                     ? manager->SendGuestMessage(
                         sheet->tabControl, TabGetCurrentSelection, 0, 0, nullptr)
                     : -1;
-                if (selected >= 0) SelectPropertyPage(sheet, static_cast<UINT>(selected), false);
+                const bool validate = !sheet->tabSelectionValidated;
+                sheet->tabSelectionValidated = false;
+                if (selected >= 0) SelectPropertyPage(sheet, static_cast<UINT>(selected), false, validate);
                 return TRUE;
             }
         }
-        if (message == PropertySheetChanged)
+        bool handled = false;
+        const LRESULT result = DispatchPropertySheetControlMessage(
+            sheet, dialog, message, wParam, lParam, &handled);
+        if (handled)
         {
-            SetPropertySheetDirty(sheet, true);
-            return TRUE;
-        }
-        if (message == PropertySheetUnchanged)
-        {
-            SetPropertySheetDirty(sheet, false);
-            return TRUE;
-        }
-        if (message == PropertySheetSetCurrent)
-        {
-            return SelectPropertyPage(sheet, static_cast<UINT>(wParam), false) ? TRUE : FALSE;
-        }
-        if (message == PropertySheetApply)
-        {
-            return ApplyPropertyPages(sheet, false) ? TRUE : FALSE;
-        }
-        if (message == PropertySheetGetCurrentPage)
-        {
-            return reinterpret_cast<LRESULT>(sheet->pages[sheet->selected].window);
-        }
-        if (message == PropertySheetGetTabControl)
-        {
-            return reinterpret_cast<LRESULT>(sheet->tabControl);
-        }
-        if (message == PropertySheetQuerySiblings)
-        {
-            GuestWindowManager* manager = CurrentGuestWindowManager();
-            if (!manager) return 0;
-            for (const auto& page : sheet->pages)
-            {
-                if (!page.window) continue;
-                const LRESULT result = manager->SendGuestMessage(
-                    page.window, PropertySheetQuerySiblings, wParam, lParam, nullptr);
-                if (result) return result;
-            }
-            return 0;
-        }
-        if (message == PropertySheetPressButton)
-        {
-            // PSBTN_OK=3, PSBTN_APPLYNOW=4, PSBTN_CANCEL=5.
-            const UINT button = static_cast<UINT>(wParam);
-            if (button == 3) ApplyPropertyPages(sheet, true);
-            else if (button == 4) ApplyPropertyPages(sheet, false);
-            else if (button == 5) CancelPropertySheet(sheet);
+            if (auto manager = CurrentGuestWindowManager())
+                manager->SetGuestWindowLongPtr(dialog, DialogMessageResultOffset, result, nullptr);
             return TRUE;
         }
         if (message == WM_NCDESTROY)
         {
-            BridgeSetWindowLongPtrW(dialog, GWLP_USERDATA, 0);
+            sheet->destroying = true;
+            { std::lock_guard<std::mutex> guard(g_propertySheetsLock); g_propertySheets.erase(reinterpret_cast<ULONG_PTR>(dialog)); }
         }
         return FALSE;
     }
@@ -2308,8 +2993,11 @@ namespace
         if (exceptionCode) *exceptionCode = ERROR_SUCCESS;
         __try
         {
-            return runtime->descriptor.callback(runtime->window, notification,
-                wParam, lParam, runtime->descriptor.callbackData);
+            HRESULT result = E_FAIL;
+            if (!InvokeCrtFunction(&result, runtime->descriptor.callback, runtime->window,
+                notification, wParam, lParam, runtime->descriptor.callbackData))
+            { if (exceptionCode) *exceptionCode = CrtGuestTerminationCode; }
+            return result;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -2642,67 +3330,38 @@ INT_PTR Win32Bridge::Bridge::ShowGuestPropertySheet(
         return -1;
     }
 
-    PropertySheetRuntime runtime;
-    runtime.parent = descriptor.parent;
-    runtime.selected = (std::min)(descriptor.startPage, descriptor.pageCount - 1);
-
-    short maximumWidth = 1;
-    short maximumHeight = 1;
+    auto runtime = std::make_shared<PropertySheetRuntime>();
+    runtime->parent = descriptor.parent; runtime->owner = CurrentGuestModuleLoader();
+    runtime->modeless = (descriptor.flags & 0x00000400u) != 0;
+    runtime->callback = descriptor.callback;
+    runtime->selected = (std::min)(descriptor.startPage, descriptor.pageCount - 1);
+    int maximumWidth = 1, maximumHeight = 1;
+    DialogFont sheetFont;
+    runtime->pages.reserve(descriptor.pageCount);
     for (UINT index = 0; index < descriptor.pageCount; ++index)
     {
-        const GuestPropertyPageDescriptor& source = descriptor.pages[index];
-        const bool resourcePage = source.templateName && source.dialogProcedure;
-        const bool fieldPage = source.fields && source.fieldCount != 0;
-        if (!resourcePage && !fieldPage)
-        {
-            BridgeSetLastError(ERROR_INVALID_DATA);
-            return -1;
-        }
-
-        DialogTemplate pageTemplate;
         PropertyPageRuntime page;
-        page.instance = source.instance;
-        page.templateName = source.templateName;
-        page.procedure = source.dialogProcedure;
-        page.initParameter = source.initParameter;
-        if (fieldPage)
-        {
-            page.fields.reserve(source.fieldCount);
-            for (UINT fieldIndex = 0; fieldIndex < source.fieldCount; ++fieldIndex)
-            {
-                page.fields.emplace_back(
-                    source.fields[fieldIndex].name ? source.fields[fieldIndex].name : L"",
-                    source.fields[fieldIndex].value ? source.fields[fieldIndex].value : L"");
-            }
-            if (!BuildPropertyFieldsDialog(page, &pageTemplate))
-            {
-                BridgeSetLastError(ERROR_INVALID_DATA);
-                return -1;
-            }
-        }
-        else if (!ParseDialogResource(source.instance, source.templateName, &pageTemplate))
-        {
-            BridgeSetLastError(ERROR_RESOURCE_DATA_NOT_FOUND);
-            return -1;
-        }
-
-        if (source.title && *source.title)
-            page.title = source.title;
-        else if (!pageTemplate.title.ordinal && !pageTemplate.title.text.empty())
-            page.title = pageTemplate.title.text;
-        else
-            page.title = L"Page " + std::to_wstring(index + 1);
-        runtime.pages.push_back(std::move(page));
-        maximumWidth = (std::max)(maximumWidth, pageTemplate.width);
-        maximumHeight = (std::max)(maximumHeight, pageTemplate.height);
+        if (!InitializePropertyPage(descriptor.pages[index], index, &page)) return -1;
+        const auto units = BaseUnitsFor(page.content);
+        maximumWidth = (std::max)(maximumWidth, PixelsX(page.content.width, units));
+        maximumHeight = (std::max)(maximumHeight, PixelsY(page.content.height, units));
+        if (!index) sheetFont = page.content.font;
+        runtime->pages.push_back(std::move(page));
     }
+
+    DialogTemplate sizing;
+    sizing.font = sheetFont;
+    const auto sheetUnits = BaseUnitsFor(sizing);
+    maximumWidth = static_cast<int>((static_cast<long long>(maximumWidth) * 4 + sheetUnits.x - 1) / sheetUnits.x);
+    maximumHeight = static_cast<int>((static_cast<long long>(maximumHeight) * 8 + sheetUnits.y - 1) / sheetUnits.y);
 
     DialogTemplate host;
     host.style = DialogPopupStyle | DialogCaptionStyle | DialogSystemMenuStyle |
         DialogModalFrameStyle | DialogCenterStyle | DialogSetFont;
-    const int footerWidth = (descriptor.flags & 0x00000080u) == 0
-        ? 6 + 3 * 46 + 2 * 4 + 6
-        : 6 + 2 * 46 + 4 + 6;
+    const bool hasHelp = (descriptor.flags & 0x00000200u) != 0 ||
+        std::any_of(runtime->pages.begin(), runtime->pages.end(), [](const PropertyPageRuntime& page) { return (page.flags & 0x20u) != 0; });
+    const int buttonCount = ((descriptor.flags & 0x00000080u) ? 2 : 3) + (hasHelp ? 1 : 0);
+    const int footerWidth = 12 + buttonCount * 46 + (buttonCount - 1) * 4;
     host.width = static_cast<short>((std::min)(32767,
         (std::max)(footerWidth, static_cast<int>(maximumWidth) + 12)));
     host.height = static_cast<short>((std::min)(32767,
@@ -2710,10 +3369,7 @@ INT_PTR Win32Bridge::Bridge::ShowGuestPropertySheet(
     host.title.text = descriptor.caption && *descriptor.caption
         ? descriptor.caption
         : L"Properties";
-    host.font.present = true;
-    host.font.pointSize = 9;
-    host.font.weight = FW_NORMAL;
-    host.font.face.text = L"Segoe UI";
+    host.font = sheetFont;
 
     DialogItem tab;
     tab.style = DialogChildStyle | DialogVisibleStyle | DialogTabStopStyle;
@@ -2728,6 +3384,11 @@ INT_PTR Win32Bridge::Bridge::ShowGuestPropertySheet(
     const short buttonY = static_cast<short>(host.height - 22);
     const short buttonWidth = 46;
     short buttonX = static_cast<short>(host.width - 6 - buttonWidth);
+    if (hasHelp)
+    {
+        host.items.push_back(PropertySheetButton(9, buttonX, buttonY, buttonWidth, L"Help"));
+        buttonX = static_cast<short>(buttonX - buttonWidth - 4);
+    }
     host.items.push_back(PropertySheetButton(IDCANCEL, buttonX, buttonY, buttonWidth, L"Cancel"));
     buttonX = static_cast<short>(buttonX - buttonWidth - 4);
     if ((descriptor.flags & 0x00000080u) == 0) // PSH_NOAPPLYNOW
@@ -2740,15 +3401,33 @@ INT_PTR Win32Bridge::Bridge::ShowGuestPropertySheet(
 
     RuntimeDiagnostics::Record(
         L"PROPERTYSHEET HOST: creating " + std::to_wstring(descriptor.pageCount) +
-        L" page(s), starting at " + std::to_wstring(runtime.selected) + L".");
-    return RunGuestDialog(
+        L" page(s), starting at " + std::to_wstring(runtime->selected) + L".");
+    if (!PreparePropertySheetTemplate(runtime->callback, &host)) { BridgeSetLastError(ERROR_INVALID_DATA); return -1; }
+    HWND modelessWindow = nullptr;
+    if (runtime->modeless) host.style |= DialogVisibleStyle;
+    const INT_PTR result = RunGuestDialog(
         descriptor.instance,
         host,
         descriptor.parent,
         &PropertySheetDialogProcedure,
-        reinterpret_cast<LPARAM>(&runtime));
+        reinterpret_cast<LPARAM>(runtime.get()), !runtime->modeless, &modelessWindow);
+    return runtime->modeless && result != -1 ? reinterpret_cast<INT_PTR>(modelessWindow) : result;
 }
 
+void Win32Bridge::Bridge::ResetGuestPropertySheetsForCurrentProcess()
+{
+    const auto owner = CurrentGuestModuleLoader();
+    std::vector<std::shared_ptr<PropertySheetRuntime>> removed;
+    {
+        std::lock_guard<std::mutex> guard(g_propertySheetsLock);
+        for (auto item = g_propertySheets.begin(); item != g_propertySheets.end(); )
+        {
+            if (item->second->owner == owner)
+            { removed.push_back(item->second); item = g_propertySheets.erase(item); }
+            else ++item;
+        }
+    }
+}
 bool Win32Bridge::Bridge::ShowGuestFileDialog(
     const GuestFileDialogDescriptor& descriptor,
     std::wstring* selectedPath,
@@ -3186,19 +3865,50 @@ HRESULT Win32Bridge::Bridge::ShowGuestTaskDialog(
     return S_OK;
 }
 
+HWND Win32Bridge::Bridge::FindNextGuestDialogGroupItem(HWND dialog, HWND current, BOOL previous)
+{
+    return NextDialogGroupItem(CurrentGuestWindowManager(), dialog, current, previous != FALSE);
+}
+
+HWND Win32Bridge::Bridge::FindNextGuestDialogTabItem(HWND dialog, HWND current, BOOL previous)
+{
+    return NextDialogTabItem(CurrentGuestWindowManager(), dialog, current, previous != FALSE);
+}
+
 BOOL Win32Bridge::Bridge::HandleGuestDialogMessage(HWND dialog, const MSG* message)
 {
     if (!dialog || !message) return FALSE;
-    const auto state = FindDialogState(dialog);
-    if (!state) return FALSE;
     GuestWindowManager* manager = CurrentGuestWindowManager();
-    if (!IsDialogDescendant(manager, dialog, message->hwnd)) return FALSE;
+    if (!manager || !manager->IsGuestWindow(dialog) || !IsDialogDescendant(manager, dialog, message->hwnd)) return FALSE;
+    // DS_CONTROL pages delegate navigation to the containing dialog, while
+    // ordinary modeless custom window classes also support IsDialogMessage.
+    HWND destination = dialog;
+    for (unsigned depth = 0; depth < 128; ++depth)
+    {
+        if (!(manager->GetGuestWindowLongPtr(destination, GWL_EXSTYLE, nullptr) & WS_EX_CONTROLPARENT)) break;
+        const HWND parent = manager->GetGuestParent(destination, nullptr);
+        if (!parent || !FindDialogState(parent)) break;
+        destination = parent;
+    }
+    auto state = FindDialogState(destination);
+    if (!state)
+    {
+        state = std::make_shared<DialogWindowState>();
+        state->window = destination;
+        const LRESULT result = manager->SendGuestMessage(destination, DialogGetDefaultId, 0, 0, nullptr);
+        state->defaultButton = (result & 0xffff0000u) == DialogDefaultIdMarker ? LOWORD(result) : 0;
+    }
     GuestAbi::Message translated{};
     translated.hwnd = message->hwnd;
     translated.message = message->message;
     translated.wParam = message->wParam;
     translated.lParam = message->lParam;
-    return IsDialogControlMessage(state, translated) ? TRUE : FALSE;
+    translated.time = message->time;
+    translated.pt = message->pt;
+    if (IsDialogControlMessage(state, translated)) return TRUE;
+    manager->TranslateGuestMessage(&translated);
+    manager->DispatchGuestMessage(&translated, nullptr);
+    return TRUE;
 }
 
 BOOL Win32Bridge::Bridge::MapGuestDialogRect(HWND dialog, LPRECT rect)

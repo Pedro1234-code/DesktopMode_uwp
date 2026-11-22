@@ -1,5 +1,6 @@
 #pragma once
 
+#include <windows.h>
 #include <algorithm>
 #include <chrono>
 #include <unordered_map>
@@ -19,8 +20,16 @@ namespace Bridge
     class RuntimeDiagnostics final
     {
     public:
+        static bool Enabled()
+        {
+            wchar_t disabled[2]{};
+            return ::GetEnvironmentVariableW(L"DESKTOPMODE_DISABLE_LOGGING", disabled, 2) != 1 ||
+                disabled[0] != L'1';
+        }
+
         static void Reset(const std::wstring& title)
         {
+            if (!Enabled()) return;
             State& state = Instance();
             std::lock_guard<std::mutex> guard(state.lock);
             state.lines.clear();
@@ -38,6 +47,7 @@ namespace Bridge
         // Keys are bridge identifiers, never guest document contents.
         static void RecordChanged(const std::wstring& key, const std::wstring& line)
         {
+            if (!Enabled()) return;
             State& state = Instance();
             {
                 std::lock_guard<std::mutex> guard(state.lock);
@@ -56,6 +66,7 @@ namespace Bridge
 
         static void Record(const std::wstring& line)
         {
+            if (!Enabled()) return;
             if (line.empty())
             {
                 return;
@@ -103,6 +114,7 @@ namespace Bridge
 
         static std::wstring Snapshot()
         {
+            if (!Enabled()) return {};
             State& state = Instance();
             std::lock_guard<std::mutex> guard(state.lock);
             std::wstring report;

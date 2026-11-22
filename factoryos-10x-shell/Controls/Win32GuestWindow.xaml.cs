@@ -12,6 +12,7 @@ using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Input;
 using Windows.UI.Xaml.Media;
 using Win32Bridge;
+using Newtonsoft.Json.Linq;
 
 namespace factoryos_10x_shell.Controls
 {
@@ -38,6 +39,91 @@ namespace factoryos_10x_shell.Controls
         private bool m_pointerInsideRuntime;
         private bool m_runtimeCursorSuppressionApplied;
         private DispatcherTimer m_logTimer;
+        private WebView m_terminal;
+        private DispatcherTimer m_terminalTimer;
+        private bool m_terminalReady, m_terminalBusy, m_terminalFinished;
+        private string m_terminalPending = string.Empty;
+        private readonly System.Collections.Generic.Queue<string> m_terminalInput = new System.Collections.Generic.Queue<string>();
+
+        private void InitializeTerminal()
+        {
+            m_terminal = new WebView(WebViewExecutionMode.SeparateThread);
+            m_terminal.ScriptNotify += Terminal_ScriptNotify;
+            m_terminal.NavigationCompleted += Terminal_NavigationCompleted;
+            RuntimeClientArea.Children.Insert(1, m_terminal);
+            m_terminalTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(33) };
+            m_terminalTimer.Tick += Terminal_Tick;
+            m_terminalTimer.Start();
+            m_terminal.Navigate(new Uri("ms-appx-web:///Assets/Terminal/index.html"));
+            UpdateRuntimeInput();
+        }
+
+        private void Terminal_NavigationCompleted(WebView sender, WebViewNavigationCompletedEventArgs args)
+        {
+            if (!args.IsSuccess && !m_closed)
+            {
+                StatusPanel.Visibility = Visibility.Visible;
+                RuntimeProgress.IsActive = false;
+                m_window.Status = "Terminal navigation failed: " + args.WebErrorStatus;
+            }
+        }
+
+        private void Terminal_ScriptNotify(object sender, NotifyEventArgs args)
+        {
+            if (m_closed) return;
+            try
+            {
+                var message = JObject.Parse(args.Value);
+                if ((bool?)message["ready"] == true) m_terminalReady = true;
+                if (message["input"] != null && !m_terminalFinished && m_window.IsActive && !m_windowManager.IsInputSuppressed)
+                    m_terminalInput.Enqueue((string)message["input"]);
+                int cols = (int?)message["cols"] ?? 0, rows = (int?)message["rows"] ?? 0;
+                if (cols > 0 && rows > 0) m_session.SetConsoleSize((uint)cols, (uint)rows);
+            }
+            catch (Exception error)
+            { factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("Terminal message: " + error.Message); }
+        }
+
+        private async void Terminal_Tick(object sender, object args)
+        { await PumpTerminalAsync(); }
+
+        private async Task PumpTerminalAsync()
+        {
+            if (!m_terminalReady || m_terminalBusy || m_closed || m_terminal == null) return;
+            m_terminalBusy = true;
+            try
+            {
+                while (!m_terminalFinished && m_terminalInput.Count > 0 && m_session.FeedConsoleInput(m_terminalInput.Peek()))
+                    m_terminalInput.Dequeue();
+                m_terminalPending += m_session.DrainConsoleOutput();
+                if (m_terminalPending.Length != 0)
+                {
+                    string batch = m_terminalPending;
+                    await m_terminal.InvokeScriptAsync("bridgeOutput", new[] { batch });
+                    m_terminalPending = m_terminalPending.Substring(batch.Length);
+                }
+                if (m_closed || m_terminal == null) return;
+                await m_terminal.InvokeScriptAsync("bridgeMode", new[] { m_session.ConsoleInputMode().ToString() });
+                if (m_closed || m_terminal == null) return;
+                await m_terminal.InvokeScriptAsync("bridgeEnabled", new[] {
+                    (!m_terminalFinished && m_window.IsActive && !m_windowManager.IsInputSuppressed) ? "true" : "false" });
+            }
+            catch (Exception error)
+            { factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("Terminal transport: " + error.Message); }
+            finally { m_terminalBusy = false; }
+        }
+
+        private void StopTerminal()
+        {
+            if (m_terminalTimer != null) { m_terminalTimer.Stop(); m_terminalTimer.Tick -= Terminal_Tick; m_terminalTimer = null; }
+            if (m_terminal != null)
+            {
+                m_terminal.ScriptNotify -= Terminal_ScriptNotify;
+                m_terminal.NavigationCompleted -= Terminal_NavigationCompleted;
+                m_terminal.Navigate(new Uri("about:blank"));
+                RuntimeClientArea.Children.Remove(m_terminal); m_terminal = null;
+            }
+        }
 
         public Win32GuestWindow()
         {
@@ -113,14 +199,15 @@ namespace factoryos_10x_shell.Controls
                 }
 
                 StatusPanel.Visibility = Visibility.Collapsed;
+                if (m_session.IsConsoleApplication) InitializeTerminal();
                 try
                 {
                     var icon = m_session.LoadExecutableIcon();
-                    if (icon != null) m_window.IconSource = icon;
+                    if (icon != null && !m_window.KeepLaunchIcon) m_window.IconSource = icon;
                 }
                 catch (Exception exception)
                 {
-                    System.Diagnostics.Debug.WriteLine("Win32 icon unavailable: " + exception.Message);
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("Win32 icon unavailable: " + exception.Message);
                 }
                 m_window.Status = "Desktop app";
                 stage = "running the executable";
@@ -129,9 +216,19 @@ namespace factoryos_10x_shell.Controls
                 if (m_closed) return;
                 if (exitCode == -1 && !string.IsNullOrWhiteSpace(m_session.LastError))
                 {
+                    m_terminalFinished = true;
                     StatusPanel.Visibility = Visibility.Visible;
                     RuntimeProgress.IsActive = false;
                     m_window.Status = m_session.LastError;
+                    return;
+                }
+                if (m_terminal != null)
+                {
+                    m_terminalPending += m_session.DrainConsoleOutput();
+                    m_terminalPending += "\r\n[Process exited: " + exitCode + "]\r\n";
+                    m_terminalFinished = true;
+                    m_window.Status = "Process exited: " + exitCode;
+                    await PumpTerminalAsync();
                     return;
                 }
                 m_windowManager.Close(m_window);
@@ -142,6 +239,7 @@ namespace factoryos_10x_shell.Controls
                 StatusPanel.Visibility = Visibility.Visible;
                 RuntimeProgress.IsActive = false;
                 StopLogTimer();
+                m_terminalFinished = true;
                 m_window.Status = $"Runtime error while {stage}: {exception.Message} (0x{exception.HResult:X8})";
             }
         }
@@ -207,7 +305,7 @@ namespace factoryos_10x_shell.Controls
 
         private void UpdateRuntimeCursorSuppression()
         {
-            bool shouldSuppress = m_pointerInsideRuntime && !m_closed && m_window != null &&
+            bool shouldSuppress = m_terminal == null && m_pointerInsideRuntime && !m_closed && m_window != null &&
                 m_window.Visibility == Visibility.Visible && !m_windowManager.IsInputSuppressed;
             if (shouldSuppress == m_runtimeCursorSuppressionApplied) return;
 
@@ -236,7 +334,7 @@ namespace factoryos_10x_shell.Controls
 
         private void UpdateRuntimeInput()
         {
-            m_session?.SetInputEnabled(m_window != null && m_window.IsActive &&
+            m_session?.SetInputEnabled(m_terminal == null && m_window != null && m_window.IsActive &&
                 m_window.Visibility == Visibility.Visible && !m_windowManager.IsInputSuppressed);
         }
 
@@ -331,6 +429,7 @@ namespace factoryos_10x_shell.Controls
             m_closed = true;
             ReleaseRuntimeCursorSuppression();
             StopLogTimer();
+            StopTerminal();
             m_session?.Close();
             m_windowManager.Close(m_window);
         }
@@ -340,6 +439,7 @@ namespace factoryos_10x_shell.Controls
             m_closed = true;
             ReleaseRuntimeCursorSuppression();
             StopLogTimer();
+            StopTerminal();
             if (m_mouseInput != null) m_mouseInput.InputChanged -= MouseInput_InputChanged;
             m_windowManager.InputStateChanged -= WindowManager_InputStateChanged;
             if (m_window != null) m_window.PropertyChanged -= Window_PropertyChanged;

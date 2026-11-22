@@ -465,14 +465,14 @@ namespace factoryos_10x_shell.Controls
             // Detach callbacks first: native cleanup must not leave this view
             // consuming CoreWindow input if a WinRT call fails during teardown.
             try { SetInactive(); }
-            catch (Exception error) { System.Diagnostics.Debug.WriteLine("Strawfox input cleanup: " + error.HResult.ToString("X8")); }
+            catch (Exception error) { factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("Strawfox input cleanup: " + error.HResult.ToString("X8")); }
             finally
             {
                 active = wantsText = characterPending = false;
                 SetNativeCursor(false);
             }
             try { session?.Close(); }
-            catch (Exception error) { System.Diagnostics.Debug.WriteLine("Strawfox session cleanup: " + error.HResult.ToString("X8")); }
+            catch (Exception error) { factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("Strawfox session cleanup: " + error.HResult.ToString("X8")); }
             session = null;
             Children.Clear();
             Log("dispose-complete", "inputDetached=" + !hooked);

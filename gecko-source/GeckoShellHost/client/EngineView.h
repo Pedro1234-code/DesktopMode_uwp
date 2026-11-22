@@ -176,6 +176,8 @@ class EngineView {
       unsigned long long now);
   winrt::Windows::Foundation::Point CoreMousePoint(
       winrt::Windows::Foundation::Point const& point) const;
+  bool IsCoreMouseOverSurface(winrt::Windows::Foundation::Point const& point) const;
+  void UpdateMouseCursorOwner(bool inside);
   bool ToFrame(winrt::Windows::Foundation::Point const& point, int32_t* x,
                int32_t* y) const;
   bool ToExternalFrameFromWindow(

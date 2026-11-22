@@ -15,10 +15,33 @@
   <PropertyGroup><IncludePath>$(ProjectDir)..\..;$(IncludePath)</IncludePath></PropertyGroup>
   <ItemDefinitionGroup>
     <ClCompile><WarningLevel>Level4</WarningLevel><ConformanceMode>true</ConformanceMode><RuntimeLibrary>MultiThreaded</RuntimeLibrary></ClCompile>
-    <Link><SubSystem>Console</SubSystem></Link>
+    <Link><SubSystem>Console</SubSystem><AdditionalDependencies>oleaut32.lib;dwrite.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="BridgeTests.cpp" />
+    <ClInclude Include="CrtHeapFixtures.h" />
+    <ClInclude Include="CrtThreadStateFixtures.h" />
+    <ClInclude Include="CrtLocaleFixtures.h" />
+    <ClInclude Include="CrtHeapAdapterFixtures.h" />
+    <ClInclude Include="ConsoleFixtures.h" />
+    <ClInclude Include="ConsoleBufferFixtures.h" />
+    <ClInclude Include="PipeFixtures.h" />
+    <ClInclude Include="CrtFileFixtures.h" />
+    <ClInclude Include="CrtStdioFixtures.h" />
+    <ClInclude Include="CrtStreamFixtures.h" />
+    <ClInclude Include="CrtFormattingFixtures.h" />
+    <ClInclude Include="CrtScanningFixtures.h" />
+    <ClInclude Include="CrtExceptionFixtures.h" />
+    <ClInclude Include="CrtExceptionPolicyFixtures.h" />
+    <ClInclude Include="CrtRttiFixtures.h" />
+    <ClInclude Include="X64UnwindFixtures.h" />
+    <ClInclude Include="CrtExceptionPtrFixtures.h" />
+    <ClCompile Include="BridgeTests.cpp"><ExceptionHandling>Sync</ExceptionHandling></ClCompile>
+    <ClCompile Include="..\..\Bridge\CRT\CrtExceptions.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader><ExceptionHandling>Sync</ExceptionHandling></ClCompile>
+    <ClCompile Include="..\..\Bridge\CRT\CrtScanning.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
+    <ClCompile Include="..\..\Bridge\CRT\CrtFormatting.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
+    <ClCompile Include="..\..\Bridge\GDI\MiniGdi.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
+    <ClCompile Include="..\..\Bridge\GDI\DirectWriteText.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
+    <ClCompile Include="..\..\Bridge\MemoryStreams.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="..\..\Bridge\CompatibilityCatalog.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="..\..\Bridge\ImportBinder.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="..\..\Bridge\PeImage.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>

@@ -6,7 +6,7 @@
  /* File created by MIDL compiler version 8.01.0628 */
 /* at Tue Jan 19 00:14:07 2038
  */
-/* Compiler settings for C:\Users\fcvin\AppData\Local\Temp\DesktopMode.Gecko.idl-a46d9067:
+/* Compiler settings for C:\Users\fcvin\AppData\Local\Temp\DesktopMode.Gecko.idl-12232a37:
     Oicf, W1, Zp8, env=Win64 (32b run), target_arch=AMD64 8.01.0628 
     protocol : all , ms_ext, c_ext, robust
     error checks: allocation ref bounds_check enum stub_data 

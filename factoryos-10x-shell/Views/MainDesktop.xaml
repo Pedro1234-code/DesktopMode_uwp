@@ -42,7 +42,7 @@
                       KeyDown="DesktopIcons_KeyDown" AutomationProperties.Name="Desktop">
                 <GridView.ItemsPanel>
                     <ItemsPanelTemplate>
-                        <ItemsWrapGrid Orientation="Vertical" ItemWidth="86" ItemHeight="94" />
+                        <ItemsWrapGrid Orientation="Vertical" ItemWidth="75" ItemHeight="90" />
                     </ItemsPanelTemplate>
                 </GridView.ItemsPanel>
                 <GridView.ItemContainerStyle>
@@ -99,7 +99,7 @@
                                     <MenuFlyoutItem Text="Delete" Click="DesktopItemDelete_Click" />
                                 </MenuFlyout>
                             </Grid.ContextFlyout>
-                            <StackPanel Margin="4,7,4,0" Spacing="3" VerticalAlignment="Top">
+                            <StackPanel Margin="3,3,3,0" Spacing="3" VerticalAlignment="Top">
                                 <Grid Width="48" Height="48" HorizontalAlignment="Center">
                                     <Image Source="{Binding Icon}" Stretch="Uniform" />
                                     <FontIcon Glyph="&#xE8A7;" FontSize="12" Foreground="White" HorizontalAlignment="Left"
@@ -107,9 +107,9 @@
                                 </Grid>
                                 <Grid>
                                     <TextBlock Text="{Binding Name}" Foreground="#E0000000" Margin="1,1,0,0" FontSize="12"
-                                               TextAlignment="Center" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxLines="2" />
+                                               TextAlignment="Center" TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxLines="2" LineHeight="16" LineStackingStrategy="BlockLineHeight" />
                                     <TextBlock Text="{Binding Name}" Foreground="White" FontSize="12" TextAlignment="Center"
-                                               TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxLines="2" />
+                                               TextWrapping="Wrap" TextTrimming="CharacterEllipsis" MaxLines="2" LineHeight="16" LineStackingStrategy="BlockLineHeight" />
                                 </Grid>
                             </StackPanel>
                         </Grid>
@@ -321,11 +321,10 @@
                 <TranslateTransform x:Name="ActionCenterTransform" Y="800" />
             </Frame.RenderTransform>
         </Frame>
-        <Frame
-            x:Name="TaskbarFrame"
-            Canvas.ZIndex="30"
-            MaxHeight="50"
-            VerticalAlignment="Bottom" />
+        <Viewbox x:Name="TaskbarPresentation" Canvas.ZIndex="30" Height="50"
+                 VerticalAlignment="Bottom" Stretch="Fill">
+            <Frame x:Name="TaskbarFrame" Width="1280" Height="50" />
+        </Viewbox>
         <Button
             x:Name="BgChangebutton"
             Width="40"

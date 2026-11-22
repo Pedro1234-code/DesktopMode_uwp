@@ -1,5 +1,4 @@
 using System;
-using System.Collections.ObjectModel;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.Linq;
@@ -15,6 +14,7 @@ using Windows.System;
 using Windows.UI.Core;
 using Windows.UI.Xaml;
 using Windows.UI.Xaml.Controls;
+using Windows.UI.Xaml.Controls.Primitives;
 using Windows.UI.Xaml.Input;
 using Windows.UI.Xaml.Media;
 using Windows.UI.Xaml.Media.Imaging;
@@ -129,12 +129,13 @@ namespace factoryos_10x_shell.Controls
 
         private static void LogFileDrag(string detail)
         {
-            System.Diagnostics.Debug.WriteLine("[FilesDrag] " + detail);
+            if (!ShellDiagnostics.IsLoggingEnabled) return;
+            factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("[FilesDrag] " + detail);
             try
             {
                 string path = System.IO.Path.Combine(ApplicationData.Current.LocalFolder.Path, "Files-drag-drop.log");
                 string line = DateTimeOffset.Now.ToString("O") + " " + detail + System.Environment.NewLine;
-                _ = Task.Run(() => { try { System.IO.File.AppendAllText(path, line); } catch (Exception) { } });
+                _ = Task.Run(() => { try { if (ShellDiagnostics.IsLoggingEnabled) System.IO.File.AppendAllText(path, line); } catch (Exception) { } });
             }
             catch (Exception) { }
         }
@@ -156,8 +157,11 @@ namespace factoryos_10x_shell.Controls
         private bool m_cutPasteInProgress;
         private int m_clipboardRevision;
         private FileEntry m_contextEntry;
-        private readonly ObservableCollection<FileEntry> m_items = new ObservableCollection<FileEntry>();
-        private readonly List<FileEntry> m_allItems = new List<FileEntry>();
+        private IReadOnlyList<FileEntry> m_items = Array.Empty<FileEntry>();
+        private IReadOnlyList<FileEntry> m_allItems = Array.Empty<FileEntry>();
+        private readonly SemaphoreSlim m_thumbnailSlots = new SemaphoreSlim(3, 3);
+        private readonly Dictionary<string, ImageSource> m_listingIcons = new Dictionary<string, ImageSource>(StringComparer.Ordinal);
+        private static readonly string[] FileSizeUnits = { "B", "KB", "MB", "GB", "TB" };
         private bool m_dragging;
         private UIElement m_dragSurface;
         private bool m_resizing;
@@ -738,9 +742,9 @@ namespace factoryos_10x_shell.Controls
                     m_activeTab.TabItem.Header = displayName;
             }
             PathText.Text = displayName;
+            m_allItems = Array.Empty<FileEntry>();
+            PublishItems(m_allItems);
             if (!preserveSearch) SearchBox.Text = string.Empty;
-            m_items.Clear();
-            m_allItems.Clear();
             try
             {
                 string path = folder.Path;
@@ -748,15 +752,14 @@ namespace factoryos_10x_shell.Controls
                     .OrderBy(item => !item.IsDirectory)
                     .ThenBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToList());
                 if (loadRevision != m_folderLoadRevision || !ReferenceEquals(targetTab, m_activeTab)) return;
-                var icons = new Dictionary<string, ImageSource>(StringComparer.OrdinalIgnoreCase);
                 var loadedItems = nativeItems != null
-                    ? nativeItems.Select(item => CreateNativeFileEntry(folder, item, icons)).ToList()
-                    : await ReadBrokeredFolderAsync(folder);
+                    ? nativeItems.Select(item => CreateNativeFileEntry(folder, item)).ToList()
+                    : await ReadBrokeredFolderAsync(folder, loadRevision);
 
                 // A slower storage provider must not overwrite the contents after the
                 // user has already changed to another tab or navigated somewhere else.
                 if (loadRevision != m_folderLoadRevision || !ReferenceEquals(targetTab, m_activeTab)) return;
-                m_allItems.AddRange(loadedItems);
+                m_allItems = loadedItems;
                 ApplyFilter();
             }
             catch (Exception)
@@ -771,16 +774,23 @@ namespace factoryos_10x_shell.Controls
             }
         }
 
-        private static FileEntry CreateNativeFileEntry(StorageFolder parent, NativeFolderListing.Entry item,
-            Dictionary<string, ImageSource> icons)
+        private ImageSource GetListingIcon(bool directory, string extension)
         {
-            string extension = System.IO.Path.GetExtension(item.Name);
-            string iconUri = !item.IsDirectory && IsPackageExtension(extension)
+            string uri = !directory && IsPackageExtension(extension)
                 ? "ms-appx:///Assets/Files/FluentIcons/Package.png"
                 : "ms-appx:///Assets/Files/Windows11Icons/" +
-                    (item.IsDirectory ? "folders/folder.ico" : GetExtensionIconPath(extension));
-            if (!icons.TryGetValue(iconUri, out var icon))
-                icons.Add(iconUri, icon = new BitmapImage(new Uri(iconUri)));
+                    (directory ? "folders/folder.ico" : GetExtensionIconPath(extension));
+            if (!m_listingIcons.TryGetValue(uri, out var icon))
+            {
+                icon = new BitmapImage(new Uri(uri));
+                m_listingIcons.Add(uri, icon);
+            }
+            return icon;
+        }
+
+        private FileEntry CreateNativeFileEntry(StorageFolder parent, NativeFolderListing.Entry item)
+        {
+            string extension = System.IO.Path.GetExtension(item.Name);
             return new FileEntry
             {
                 Parent = parent,
@@ -789,7 +799,7 @@ namespace factoryos_10x_shell.Controls
                 Kind = item.IsDirectory ? "Folder" : string.IsNullOrEmpty(extension) ? "File" : extension.Substring(1).ToUpperInvariant() + " file",
                 SizeText = item.IsDirectory ? string.Empty : FormatSize(item.Size),
                 DateModifiedText = FormatDate(item.DateModified),
-                FallbackIcon = icon
+                FallbackIcon = GetListingIcon(item.IsDirectory, extension)
             };
         }
 
@@ -802,30 +812,33 @@ namespace factoryos_10x_shell.Controls
             }
         }
 
-        private static async Task<List<FileEntry>> ReadBrokeredFolderAsync(StorageFolder folder)
+        private async Task<List<FileEntry>> ReadBrokeredFolderAsync(StorageFolder folder, int loadRevision)
         {
-            var loadedItems = new List<FileEntry>();
-            foreach (StorageFolder child in await folder.GetFoldersAsync())
+            var folders = await folder.GetFoldersAsync();
+            var loadedItems = new List<FileEntry>(folders.Count);
+            if (loadRevision != m_folderLoadRevision) return loadedItems;
+
+            foreach (StorageFolder child in folders)
                 loadedItems.Add(new FileEntry
                 {
                     Name = child.Name,
                     Kind = "Folder",
-                    FallbackIcon = CreatePackagedIcon("folders/folder.ico"),
+                    FallbackIcon = GetListingIcon(true, null),
                     Folder = child,
                     DateModifiedText = FormatDate(child.DateCreated)
                 });
             foreach (StorageFile child in await folder.GetFilesAsync())
             {
+                if (loadRevision != m_folderLoadRevision) break;
                 BasicProperties properties = await child.GetBasicPropertiesAsync();
+                if (loadRevision != m_folderLoadRevision) break;
                 var entry = new FileEntry
                 {
                     Name = child.Name,
                     Kind = string.IsNullOrWhiteSpace(child.DisplayType) ? child.FileType : child.DisplayType,
                     SizeText = FormatSize(properties.Size),
                     DateModifiedText = FormatDate(properties.DateModified),
-                    FallbackIcon = AppPackageService.IsPackage(child)
-                        ? new BitmapImage(new Uri("ms-appx:///Assets/Files/FluentIcons/Package.png"))
-                        : CreatePackagedIcon(GetFileIconPath(child)),
+                    FallbackIcon = GetListingIcon(false, child.FileType),
                     File = child
                 };
                 loadedItems.Add(entry);
@@ -918,20 +931,30 @@ namespace factoryos_10x_shell.Controls
 
         private void ItemsList_ContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs e)
         {
-            if (!e.InRecycleQueue && e.Phase == 0 && e.Item is FileEntry entry && !entry.IsDirectory &&
-                !entry.ThumbnailRequested && !IsPackageExtension(entry.Extension) &&
-                !string.Equals(entry.Extension, ".exe", StringComparison.OrdinalIgnoreCase))
+            if (e.InRecycleQueue || !(e.Item is FileEntry entry) || entry.IsDirectory ||
+                entry.ThumbnailRequested || IsPackageExtension(entry.Extension) ||
+                string.Equals(entry.Extension, ".exe", StringComparison.OrdinalIgnoreCase)) return;
+
+            if (e.Phase == 0)
             {
-                entry.ThumbnailRequested = true;
-                _ = LoadItemThumbnailAsync(entry);
+                e.RegisterUpdateCallback(ItemsList_ContainerContentChanging);
+                return;
             }
+
+            _ = LoadItemThumbnailAsync(entry, e.ItemContainer, m_folderLoadRevision);
         }
 
-        private static async Task LoadItemThumbnailAsync(FileEntry entry)
+        private async Task LoadItemThumbnailAsync(FileEntry entry, SelectorItem container, int folderRevision)
         {
+            await m_thumbnailSlots.WaitAsync();
             try
             {
-                if (!(await entry.ResolveAsync() is StorageFile file)) return;
+                if (folderRevision != m_folderLoadRevision || entry.ThumbnailRequested ||
+                    !ReferenceEquals(ItemsList.ItemFromContainer(container), entry)) return;
+
+                entry.ThumbnailRequested = true;
+                if (!(await entry.ResolveAsync() is StorageFile file) ||
+                    folderRevision != m_folderLoadRevision) return;
                 using (StorageItemThumbnail thumbnail = await file.GetThumbnailAsync(
                     ThumbnailMode.SingleItem,
                     64,
@@ -948,6 +971,10 @@ namespace factoryos_10x_shell.Controls
             {
                 // Some providers do not expose thumbnails. Keep the packaged Windows
                 // 11 icon as the fallback in that case.
+            }
+            finally
+            {
+                m_thumbnailSlots.Release();
             }
         }
 
@@ -967,12 +994,15 @@ namespace factoryos_10x_shell.Controls
         private void ApplyFilter()
         {
             string query = SearchBox?.Text?.Trim() ?? string.Empty;
-            m_items.Clear();
-            foreach (FileEntry item in m_allItems.Where(item =>
-                query.Length == 0 || item.Name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0))
-            {
-                m_items.Add(item);
-            }
+            PublishItems(query.Length == 0 ? m_allItems : m_allItems.Where(item =>
+                item.Name.IndexOf(query, StringComparison.OrdinalIgnoreCase) >= 0).ToList());
+        }
+
+        private void PublishItems(IReadOnlyList<FileEntry> items)
+        {
+            if (ReferenceEquals(m_items, items)) return;
+            m_items = items;
+            ItemsList.ItemsSource = items;
             UpdateStatus();
         }
 
@@ -992,15 +1022,14 @@ namespace factoryos_10x_shell.Controls
 
         private static string FormatSize(ulong bytes)
         {
-            string[] units = { "B", "KB", "MB", "GB", "TB" };
             double value = bytes;
             int unit = 0;
-            while (value >= 1024 && unit < units.Length - 1)
+            while (value >= 1024 && unit < FileSizeUnits.Length - 1)
             {
                 value /= 1024;
                 unit++;
             }
-            return unit == 0 ? bytes + " B" : value.ToString(value >= 10 ? "0" : "0.0") + " " + units[unit];
+            return unit == 0 ? bytes + " B" : value.ToString(value >= 10 ? "0" : "0.0") + " " + FileSizeUnits[unit];
         }
 
         internal static string GetFileIconPath(StorageFile file) => GetExtensionIconPath(file?.FileType);

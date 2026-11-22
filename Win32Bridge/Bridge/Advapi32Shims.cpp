@@ -2,6 +2,7 @@
 #include "Bridge/Advapi32Shims.h"
 #include "Bridge/GuestRegistry.h"
 #include "Bridge/GuestKernel.h"
+#include "Bridge/Kernel32Shims.h"
 
 #include <string>
 #include <atomic>
@@ -55,7 +56,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeIsTextUnicode(
 {
     if (!buffer || byteCount < 0)
     {
-        ::SetLastError(ERROR_INVALID_PARAMETER);
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     if (byteCount < static_cast<int>(sizeof(wchar_t))) return FALSE;
@@ -76,7 +77,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeIsTextUnicode(
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenSCManagerW(LPCWSTR, LPCWSTR, DWORD)
 {
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0x76000001));
 }
 
@@ -86,19 +87,19 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenServiceW(
     if (manager != reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0x76000001)) ||
         !serviceName || !*serviceName)
     {
-        ::SetLastError(ERROR_INVALID_PARAMETER);
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
     // The sandbox has no host SCM services. Report absence rather than exposing
     // or fabricating control over services outside the guest environment.
-    ::SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
+    BridgeSetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
     return nullptr;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeCloseServiceHandle(HANDLE handle)
 {
-    if (!handle) { ::SetLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    ::SetLastError(ERROR_SUCCESS);
+    if (!handle) { BridgeSetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
@@ -106,7 +107,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeQueryServiceConfigW(
     HANDLE, PVOID, DWORD, LPDWORD requiredSize)
 {
     if (requiredSize) *requiredSize = 0;
-    ::SetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
+    BridgeSetLastError(ERROR_SERVICE_DOES_NOT_EXIST);
     return FALSE;
 }
 
@@ -317,33 +318,35 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeLookupPrivilegeValueW(LPCWSTR, LPCWSTR na
 {
     if (!name || !value)
     {
-        ::SetLastError(ERROR_INVALID_PARAMETER);
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     // Privileges are scoped to the guest only.  The deterministic LUID lets
     // callers build TOKEN_PRIVILEGES structures without obtaining a host token.
     value->LowPart = 1;
     value->HighPart = 0;
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
-BOOL WINAPI Win32Bridge::Bridge::BridgeOpenProcessToken(HANDLE, DWORD, PHANDLE token)
+BOOL WINAPI Win32Bridge::Bridge::BridgeOpenProcessToken(HANDLE process, DWORD, PHANDLE token)
 {
     if (!token || !CurrentGuestKernelContext())
     {
-        ::SetLastError(ERROR_INVALID_PARAMETER);
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    DWORD error = ERROR_SUCCESS;
-    HANDLE guestToken = CurrentGuestKernelContext()->CreateEvent(false, false, nullptr, &error);
+    DWORD error = ERROR_SUCCESS, code = 0;
+    if (process != BridgeGetCurrentProcess() && !CurrentGuestKernelContext()->GetExitCode(process, true, &code, &error))
+    { BridgeSetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    HANDLE guestToken = CurrentGuestKernelContext()->CreateToken(&error);
     if (!guestToken)
     {
-        ::SetLastError(error);
+        BridgeSetLastError(error);
         return FALSE;
     }
     *token = guestToken;
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
@@ -351,10 +354,10 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeAdjustTokenPrivileges(HANDLE token, BOOL,
 {
     if (!CurrentGuestKernelContext() || !token)
     {
-        ::SetLastError(ERROR_INVALID_HANDLE);
+        BridgeSetLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
@@ -362,18 +365,18 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetFileSecurityW(LPCWSTR fileName, SECURI
 {
     if (!fileName || !requiredLength)
     {
-        ::SetLastError(ERROR_INVALID_PARAMETER);
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     const DWORD required = sizeof(SECURITY_DESCRIPTOR);
     *requiredLength = required;
     if (!descriptor || descriptorLength < required)
     {
-        ::SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        BridgeSetLastError(ERROR_INSUFFICIENT_BUFFER);
         return FALSE;
     }
     ZeroMemory(descriptor, required);
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
@@ -381,12 +384,12 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeSetFileSecurityW(LPCWSTR fileName, SECURI
 {
     if (!fileName)
     {
-        ::SetLastError(ERROR_INVALID_PARAMETER);
+        BridgeSetLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
     // ACLs cannot escape the LocalFolder sandbox.  A successful no-op matches
     // the effective guest model: every guest file is owned by this app.
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
@@ -399,11 +402,11 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetUserNameW(LPWSTR buffer, LPDWORD chara
 {
     static const wchar_t user[] = L"Win32Bridge";
     const DWORD required = static_cast<DWORD>(_countof(user));
-    if (!characters) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-    if (!buffer || *characters < required) { *characters = required; ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    if (!characters) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (!buffer || *characters < required) { *characters = required; BridgeSetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
     memcpy(buffer, user, required * sizeof(wchar_t));
     *characters = required - 1;
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
@@ -411,7 +414,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeLookupAccountNameW(LPCWSTR, LPCWSTR, PSID
 {
     if (sidSize) *sidSize = 0;
     if (domainSize) *domainSize = 0;
-    ::SetLastError(ERROR_NONE_MAPPED);
+    BridgeSetLastError(ERROR_NONE_MAPPED);
     return FALSE;
 }
 
@@ -469,16 +472,16 @@ BOOL WINAPI BridgeAllocateAndInitializeSid(PSID_IDENTIFIER_AUTHORITY authority,
     BYTE count, DWORD s0, DWORD s1, DWORD s2, DWORD s3, DWORD s4, DWORD s5,
     DWORD s6, DWORD s7, PSID* result)
 {
-    if (!authority || !result || count > 8) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (!authority || !result || count > 8) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     const size_t bytes = 8 + static_cast<size_t>(count) * sizeof(DWORD);
     BYTE* memory = static_cast<BYTE*>(malloc(bytes));
-    if (!memory) { ::SetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+    if (!memory) { BridgeSetLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
     memory[0] = SID_REVISION; memory[1] = count;
     memcpy(memory + 2, authority->Value, 6);
     const DWORD values[8] = { s0, s1, s2, s3, s4, s5, s6, s7 };
     memcpy(memory + 8, values, static_cast<size_t>(count) * sizeof(DWORD));
     *result = memory;
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
@@ -497,33 +500,57 @@ PDWORD WINAPI BridgeGetSidSubAuthority(PSID sid, DWORD index)
 
 BOOL WINAPI BridgeCheckTokenMembership(HANDLE, PSID sid, PBOOL member)
 {
-    if (!sid || !member) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (!sid || !member) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     // The sandboxed guest has ordinary user membership, never host
     // administrator authority. World and authenticated-user checks succeed.
     *member = TRUE;
-    ::SetLastError(ERROR_SUCCESS);
+    BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
-BOOL WINAPI BridgeGetTokenInformation(HANDLE token, TOKEN_INFORMATION_CLASS informationClass,
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetTokenInformation(HANDLE token, TOKEN_INFORMATION_CLASS informationClass,
     LPVOID information, DWORD length, PDWORD required)
 {
-    if (!token || !required) { ::SetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (!required) { BridgeSetLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (!CurrentGuestKernelContext() || !CurrentGuestKernelContext()->IsToken(token)) { BridgeSetLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    if (informationClass == TokenUser || informationClass == TokenOwner)
+    {
+        struct VirtualSid { BYTE revision, count, authority[6]; DWORD sub[5]; };
+        static const VirtualSid sid{1,5,{0,0,0,0,0,5},{21,0,0,0,1000}};
+        const DWORD header = informationClass == TokenUser ? sizeof(TOKEN_USER) : sizeof(TOKEN_OWNER);
+        *required = header + sizeof(sid);
+        if (!information || length < *required) { BridgeSetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        auto embedded = static_cast<BYTE*>(information) + header;
+        memcpy(embedded,&sid,sizeof(sid));
+        if (informationClass == TokenUser) { auto user=static_cast<TOKEN_USER*>(information); user->User.Sid=embedded; user->User.Attributes=0; }
+        else static_cast<TOKEN_OWNER*>(information)->Owner=embedded;
+        BridgeSetLastError(0); return TRUE;
+    }
+    if (informationClass == TokenType || informationClass == TokenSessionId)
+    {
+        *required=sizeof(DWORD);if(!information||length<*required){BridgeSetLastError(ERROR_INSUFFICIENT_BUFFER);return FALSE;}
+        *static_cast<DWORD*>(information)=informationClass==TokenType?static_cast<DWORD>(TokenPrimary):0;BridgeSetLastError(0);return TRUE;
+    }
+    if (informationClass == TokenPrivileges)
+    {
+        *required=sizeof(DWORD);if(!information||length<*required){BridgeSetLastError(ERROR_INSUFFICIENT_BUFFER);return FALSE;}
+        *static_cast<DWORD*>(information)=0;BridgeSetLastError(0);return TRUE;
+    }
     if (informationClass == TokenElevation)
     {
         *required = sizeof(TOKEN_ELEVATION);
-        if (!information || length < *required) { ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        if (!information || length < *required) { BridgeSetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
         static_cast<TOKEN_ELEVATION*>(information)->TokenIsElevated = FALSE;
         return TRUE;
     }
     if (informationClass == TokenElevationType)
     {
         *required = sizeof(TOKEN_ELEVATION_TYPE);
-        if (!information || length < *required) { ::SetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+        if (!information || length < *required) { BridgeSetLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
         *static_cast<TOKEN_ELEVATION_TYPE*>(information) = TokenElevationTypeDefault;
         return TRUE;
     }
-    ::SetLastError(ERROR_NOT_SUPPORTED);
+    BridgeSetLastError(ERROR_NOT_SUPPORTED);
     return FALSE;
 }
 

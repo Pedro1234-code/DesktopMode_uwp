@@ -4,6 +4,7 @@
 
 #include <windows.h>
 #include <string>
+#include <vector>
 
 namespace Win32Bridge
 {
@@ -32,6 +33,8 @@ namespace Bridge
     // Paths are canonical guest paths; no host filesystem identity escapes.
     void NotifyGuestDirectoryChange(
         const std::wstring& path, DWORD action, DWORD changeFilter);
+    class GuestKernelContext;
+    void CancelGuestFileIo(const void* fileDescription, const GuestKernelContext* owner);
     void NotifyGuestDirectoryRename(
         const std::wstring& oldPath, const std::wstring& newPath,
         DWORD changeFilter);
@@ -40,6 +43,8 @@ namespace Bridge
     // the host FLS implementation, which would invoke them from ntdll after
     // those scopes have already gone away.
     void InvokeGuestFlsCallbacksForCurrentThread();
+    void WakeGuestAlertableWaits();
+    HANDLE WINAPI BridgeCreateFileA(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
     HANDLE WINAPI BridgeCreateFileW(
         LPCWSTR fileName,
         DWORD desiredAccess,
@@ -93,6 +98,8 @@ namespace Bridge
     PEXCEPTION_ROUTINE WINAPI BridgeRtlVirtualUnwind(DWORD handlerType, DWORD64 imageBase, DWORD64 controlPc, PRUNTIME_FUNCTION functionEntry, PCONTEXT contextRecord, PVOID* handlerData, PDWORD64 establisherFrame, PKNONVOLATILE_CONTEXT_POINTERS contextPointers);
     void WINAPI BridgeRtlCaptureContext(PCONTEXT contextRecord);
     HANDLE WINAPI BridgeOpenProcess(DWORD desiredAccess, BOOL inheritHandle, DWORD processId);
+    DWORD WINAPI BridgeGetProcessId(HANDLE process);
+    DWORD WINAPI BridgeGetThreadId(HANDLE thread);
     HANDLE WINAPI BridgeCreateToolhelp32Snapshot(DWORD flags, DWORD processId);
     BOOL WINAPI BridgeProcess32FirstW(HANDLE snapshot, LPVOID entry);
     BOOL WINAPI BridgeProcess32NextW(HANDLE snapshot, LPVOID entry);
@@ -227,6 +234,22 @@ namespace Bridge
     void WINAPI BridgeGetStartupInfoA(LPSTARTUPINFOA startupInfo);
     HANDLE WINAPI BridgeGetStdHandle(DWORD standardHandle);
     BOOL WINAPI BridgeGetConsoleMode(HANDLE console, LPDWORD mode);
+    BOOL WINAPI BridgeSetConsoleMode(HANDLE console, DWORD mode);
+    BOOL WINAPI BridgeCreatePipe(PHANDLE, PHANDLE, LPSECURITY_ATTRIBUTES, DWORD);
+    BOOL WINAPI BridgePeekNamedPipe(HANDLE, LPVOID, DWORD, LPDWORD, LPDWORD, LPDWORD);
+    BOOL WINAPI BridgeGetHandleInformation(HANDLE, LPDWORD);
+    BOOL WINAPI BridgeSetHandleInformation(HANDLE, DWORD, DWORD);
+    BOOL WINAPI BridgeDuplicateHandle(HANDLE, HANDLE, HANDLE, LPHANDLE, DWORD, BOOL, DWORD);
+    BOOL WINAPI BridgeAllocConsole();
+    BOOL WINAPI BridgeFreeConsole();
+    BOOL WINAPI BridgeReadConsoleW(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
+    BOOL WINAPI BridgeReadConsoleA(HANDLE, LPVOID, DWORD, LPDWORD, LPVOID);
+    BOOL WINAPI BridgeWriteConsoleW(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID);
+    BOOL WINAPI BridgeWriteConsoleA(HANDLE, const VOID*, DWORD, LPDWORD, LPVOID);
+    UINT WINAPI BridgeGetConsoleCP();
+    UINT WINAPI BridgeGetConsoleOutputCP();
+    BOOL WINAPI BridgeSetConsoleCP(UINT);
+    BOOL WINAPI BridgeSetConsoleOutputCP(UINT);
     BOOL WINAPI BridgeSetPriorityClass(HANDLE process, DWORD priorityClass);
     BOOL WINAPI BridgeSetProcessAffinityMask(HANDLE process, DWORD_PTR processMask);
     DWORD_PTR WINAPI BridgeSetThreadAffinityMask(HANDLE thread, DWORD_PTR threadMask);
@@ -244,6 +267,16 @@ namespace Bridge
     FARPROC WINAPI BridgeGetProcAddress(HMODULE module, LPCSTR nameOrOrdinal);
     BOOL WINAPI BridgeFreeLibrary(HMODULE module);
     BOOL WINAPI BridgeDisableThreadLibraryCalls(HMODULE module);
+    DWORD WINAPI BridgeGetEnvironmentVariableW(LPCWSTR name, LPWSTR buffer, DWORD length);
+    DWORD WINAPI BridgeGetEnvironmentVariableA(LPCSTR name, LPSTR buffer, DWORD length);
+    BOOL WINAPI BridgeSetEnvironmentVariableW(LPCWSTR name, LPCWSTR value);
+    BOOL WINAPI BridgeSetEnvironmentVariableA(LPCSTR name, LPCSTR value);
+    LPWCH WINAPI BridgeGetEnvironmentStringsW();
+    LPCH WINAPI BridgeGetEnvironmentStringsA();
+    BOOL WINAPI BridgeFreeEnvironmentStringsW(LPWCH environment);
+    BOOL WINAPI BridgeFreeEnvironmentStringsA(LPCH environment);
+    DWORD WINAPI BridgeExpandEnvironmentStringsA(LPCSTR source, LPSTR buffer, DWORD length);
+    std::vector<std::wstring> GetGuestInitialEnvironment();
     LPWSTR WINAPI BridgeGetCommandLineW();
     void WINAPI BridgeOutputDebugStringW(LPCWSTR message);
     BOOL WINAPI BridgeIsDebuggerPresent();
@@ -268,9 +301,15 @@ namespace Bridge
         LPCWSTR name);
     BOOL WINAPI BridgeReleaseSemaphore(HANDLE semaphoreHandle, LONG releaseCount, LPLONG previousCount);
     DWORD WINAPI BridgeWaitForSingleObject(HANDLE object, DWORD milliseconds);
+    DWORD WINAPI BridgeSignalObjectAndWait(HANDLE signal, HANDLE wait, DWORD milliseconds, BOOL alertable);
     DWORD WINAPI BridgeWaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL waitAll, DWORD milliseconds);
+    DWORD WINAPI BridgeWaitForSingleObjectEx(HANDLE object, DWORD milliseconds, BOOL alertable);
+    DWORD WINAPI BridgeWaitForMultipleObjectsEx(DWORD count, const HANDLE* handles, BOOL waitAll, DWORD milliseconds, BOOL alertable);
+    bool CaptureGuestWaitHandles(DWORD count, const HANDLE* handles, HANDLE* copy);
+    DWORD WINAPI BridgeSleepEx(DWORD milliseconds, BOOL alertable);
     void WINAPI BridgeSleep(DWORD milliseconds);
 
     ImportResolution ResolveKernel32Import(const ImportedSymbol& symbol);
+    ImportResolution ResolveNativeGuestImport(const ImportedSymbol& symbol);
 }
 }

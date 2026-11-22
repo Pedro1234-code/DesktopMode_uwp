@@ -1,4 +1,6 @@
 #include "Bridge\\RuntimeImage.h"
+#include "Bridge/CRT/CrtExceptions.h"
+#include "Bridge/X64UnwindValidation.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -49,8 +51,7 @@ namespace
     {
         __try
         {
-            callback(module, reason, nullptr);
-            return true;
+            return InvokeCrtFunction<void>(nullptr, callback, module, reason, static_cast<LPVOID>(nullptr));
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -85,6 +86,12 @@ bool RuntimeImage::Reserve(size_t size, ULONGLONG preferredBase, RuntimeImage* i
         return false;
     }
 
+    if (!RegisterCrtGuestImage(memory, size))
+    {
+        VirtualFree(memory, 0, MEM_RELEASE);
+        SetError(error, L"Could not register the guest image for C++ exception metadata.");
+        return false;
+    }
     image->m_base = static_cast<BYTE*>(memory);
     image->m_size = size;
     return true;
@@ -270,7 +277,9 @@ bool RuntimeImage::RegisterUnwindMetadata(std::wstring* error)
     DWORD entryCount = directory.Size / sizeof(RUNTIME_FUNCTION);
     while (entryCount != 0)
     {
-        const RUNTIME_FUNCTION& tail = table[entryCount - 1];
+        RUNTIME_FUNCTION tail{};
+        if (!ReadGuestUnwindBytes(m_base, m_size, static_cast<size_t>(directory.VirtualAddress) + (entryCount - 1) * sizeof(tail), &tail, sizeof(tail)))
+        { SetError(error, L"The PE exception directory is not readable."); return false; }
         if (tail.BeginAddress != 0 || tail.EndAddress != 0 || tail.UnwindData != 0)
             break;
         --entryCount;
@@ -278,18 +287,21 @@ bool RuntimeImage::RegisterUnwindMetadata(std::wstring* error)
     DWORD previousBegin = 0;
     for (DWORD index = 0; index < entryCount; ++index)
     {
-        const RUNTIME_FUNCTION& function = table[index];
+        RUNTIME_FUNCTION function{};
+        if (!ReadGuestUnwindBytes(m_base, m_size, static_cast<size_t>(directory.VirtualAddress) + index * sizeof(function), &function, sizeof(function)))
+        { SetError(error, L"The PE exception directory is not readable."); return false; }
         if (function.BeginAddress >= function.EndAddress ||
             function.EndAddress > m_size ||
-            function.UnwindData >= m_size ||
-            (index != 0 && function.BeginAddress < previousBegin))
+            !ValidateGuestX64Unwind(m_base, m_size, function) ||
+            (index != 0 && function.BeginAddress <= previousBegin))
         {
             SetError(error, L"The PE exception directory contains an invalid runtime function.");
             return false;
         }
         previousBegin = function.BeginAddress;
     }
-    if (entryCount == 0 || !RtlAddFunctionTable(table, entryCount, reinterpret_cast<DWORD64>(m_base)))
+    if (entryCount == 0) return true;
+    if (!RtlAddFunctionTable(table, entryCount, reinterpret_cast<DWORD64>(m_base)))
     {
         SetError(error, L"RtlAddFunctionTable failed for the mapped guest image.");
         return false;
@@ -298,6 +310,14 @@ bool RuntimeImage::RegisterUnwindMetadata(std::wstring* error)
     m_functionTable = table;
     m_functionEntryCount = entryCount;
     return true;
+}
+
+void RuntimeImage::ReleaseThreadTls() const
+{
+    if (m_tlsIndex == TLS_OUT_OF_INDEXES) return;
+    void* block = TlsGetValue(m_tlsIndex);
+    if (block) HeapFree(GetProcessHeap(), 0, block);
+    TlsSetValue(m_tlsIndex, nullptr);
 }
 
 bool RuntimeImage::NotifyTls(DWORD reason, std::wstring* error) const
@@ -423,19 +443,15 @@ bool RuntimeImage::NotifyTls(DWORD reason, std::wstring* error) const
 
     const auto abandonAttachStorage = [this, &attachedThreadStorage]()
     {
-        if (!attachedThreadStorage || m_tlsIndex == TLS_OUT_OF_INDEXES) return;
-        void* block = TlsGetValue(m_tlsIndex);
-        if (block) HeapFree(GetProcessHeap(), 0, block);
-        TlsSetValue(m_tlsIndex, nullptr);
+        if (!attachedThreadStorage) return;
+        ReleaseThreadTls();
         attachedThreadStorage = false;
     };
 
     const auto releaseThreadStorage = [this, reason]()
     {
         if (m_tlsIndex == TLS_OUT_OF_INDEXES) return;
-        void* block = TlsGetValue(m_tlsIndex);
-        if (block) HeapFree(GetProcessHeap(), 0, block);
-        TlsSetValue(m_tlsIndex, nullptr);
+        ReleaseThreadTls();
         if (reason == DLL_PROCESS_DETACH)
         {
             TlsFree(m_tlsIndex);
@@ -520,9 +536,7 @@ void RuntimeImage::Release()
 {
     if (m_tlsIndex != TLS_OUT_OF_INDEXES)
     {
-        void* block = TlsGetValue(m_tlsIndex);
-        if (block) HeapFree(GetProcessHeap(), 0, block);
-        TlsSetValue(m_tlsIndex, nullptr);
+        ReleaseThreadTls();
         TlsFree(m_tlsIndex);
         m_tlsIndex = TLS_OUT_OF_INDEXES;
     }
@@ -534,6 +548,7 @@ void RuntimeImage::Release()
     }
     if (m_base)
     {
+        UnregisterCrtGuestImage(m_base);
         VirtualFree(m_base, 0, MEM_RELEASE);
         m_base = nullptr;
         m_size = 0;

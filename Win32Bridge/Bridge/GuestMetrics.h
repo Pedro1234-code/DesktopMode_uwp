@@ -1,6 +1,6 @@
 #pragma once
 
-#include "Bridge/MiniGdi.h"
+#include "Bridge/GDI/MiniGdi.h"
 
 #include <atomic>
 

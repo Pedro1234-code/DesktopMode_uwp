@@ -62,6 +62,7 @@ class Log {
   // cannot ask Gecko -- so a change takes effect at the next launch. Off by
   // default: the browser then writes what a crash needs and little else.
   static bool Verbose();
+  static bool Enabled();
 };
 
 }  // namespace gecko_w10m::client

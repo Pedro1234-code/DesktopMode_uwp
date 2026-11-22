@@ -46,7 +46,10 @@ namespace factoryos_10x_shell.Services.Helpers
         private readonly Dictionary<string, string> m_appUriByAumid;
         private readonly SemaphoreSlim m_appsReloadGate = new SemaphoreSlim(1, 1);
         private readonly object m_packageRefreshLock = new object();
-        private static readonly SemaphoreSlim s_startMenuLogGate = new SemaphoreSlim(1, 1);
+        private const int StartMenuLogQueueLimit = 1024;
+        private readonly Queue<string> m_startMenuLogQueue = new Queue<string>();
+        private bool m_startMenuLogWriterRunning;
+        private int m_startMenuLogDropped;
         private PackageCatalog m_packageCatalog;
         private CancellationTokenSource m_packageRefreshDebounce;
         private CancellationTokenSource m_iconMaterializationCancellation;
@@ -143,7 +146,7 @@ namespace factoryos_10x_shell.Services.Helpers
             {
                 // Package enumeration still works even on editions where the
                 // live catalog is unavailable.
-                Debug.WriteLine("PackageCatalog => Open: " + ex.Message);
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("PackageCatalog => Open: " + ex.Message);
                 LogStartMenuRefresh($"PackageCatalog open failed: {ex.GetType().Name}: {ex.Message}");
             }
         }
@@ -242,30 +245,63 @@ namespace factoryos_10x_shell.Services.Helpers
 
         private void LogStartMenuRefresh(string message)
         {
+            if (!ShellDiagnostics.IsLoggingEnabled) return;
             string line = $"{DateTimeOffset.Now:O} [thread={System.Environment.CurrentManagedThreadId}; ui={m_dispatcherQueue?.HasThreadAccess == true}] {message}";
-            Debug.WriteLine("[StartMenuApps] " + line);
-
-            // File I/O is serialized on worker threads. Diagnostics must never add
-            // synchronous storage work to the UI path being measured.
-            _ = Task.Run(async () =>
+            lock (m_startMenuLogQueue)
             {
-                await s_startMenuLogGate.WaitAsync().ConfigureAwait(false);
+                if (m_startMenuLogQueue.Count >= StartMenuLogQueueLimit)
+                {
+                    m_startMenuLogQueue.Dequeue();
+                    m_startMenuLogDropped++;
+                }
+                m_startMenuLogQueue.Enqueue(line);
+                if (m_startMenuLogWriterRunning) return;
+                m_startMenuLogWriterRunning = true;
+            }
+            _ = Task.Run(WriteStartMenuLog);
+        }
+
+        private void WriteStartMenuLog()
+        {
+            while (true)
+            {
+                string[] lines;
+                int dropped;
+                lock (m_startMenuLogQueue)
+                {
+                    if (m_startMenuLogQueue.Count == 0)
+                    {
+                        m_startMenuLogWriterRunning = false;
+                        return;
+                    }
+                    lines = m_startMenuLogQueue.ToArray();
+                    m_startMenuLogQueue.Clear();
+                    dropped = m_startMenuLogDropped;
+                    m_startMenuLogDropped = 0;
+                }
+
                 try
                 {
+                    if (!ShellDiagnostics.IsLoggingEnabled) continue;
                     var file = new FileInfo(m_startMenuLogPath);
                     if (file.Exists && file.Length > 2 * 1024 * 1024)
                         File.WriteAllText(m_startMenuLogPath, "Log rotated at " + DateTimeOffset.Now.ToString("O") + System.Environment.NewLine);
-                    File.AppendAllText(m_startMenuLogPath, line + System.Environment.NewLine, Encoding.UTF8);
+
+                    using (var writer = new StreamWriter(m_startMenuLogPath, append: true, encoding: Encoding.UTF8))
+                    {
+                        if (dropped > 0) writer.WriteLine($"{DateTimeOffset.Now:O} Dropped {dropped} queued log lines.");
+                        foreach (string line in lines)
+                        {
+                            factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("[StartMenuApps] " + line);
+                            writer.WriteLine(line);
+                        }
+                    }
                 }
-                catch
+                catch (Exception)
                 {
-                    // Diagnostics are optional and must not affect the Shell.
+                    // Keep diagnostics from affecting the Shell when storage is unavailable.
                 }
-                finally
-                {
-                    s_startMenuLogGate.Release();
-                }
-            });
+            }
         }
 
         private static string GetPackageLogName(Package package)
@@ -366,12 +402,12 @@ namespace factoryos_10x_shell.Services.Helpers
                 }
                 else
                 {
-                    Debug.WriteLine($"[ERRO] AppUserModelId inválido: {appUserModelId}");
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"[ERRO] AppUserModelId inválido: {appUserModelId}");
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[ERRO] Falha ao construir AUMID: {ex.Message}");
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"[ERRO] Falha ao construir AUMID: {ex.Message}");
             }
 
             return new StartIconModel
@@ -405,6 +441,7 @@ namespace factoryos_10x_shell.Services.Helpers
                 // Files is a CoreShell window, not an installed UWP package. It has
                 // no AppListEntry to recover, so restore its pin directly.
                 if (string.Equals(appId, "CoreShell.Files", StringComparison.OrdinalIgnoreCase) ||
+                    string.Equals(appId, "CoreShell.Terminal", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ||
                     string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ||
@@ -415,7 +452,10 @@ namespace factoryos_10x_shell.Services.Helpers
                         AppId = appId,
                         // This is the integrated browser, not a Firefox package entry.
                         // Keep its Start name stable even for pins saved before the rename.
-                        IconName = string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase)
+                        IconSource = string.Equals(appId, "CoreShell.Terminal", StringComparison.OrdinalIgnoreCase)
+                            ? new BitmapImage(new Uri("ms-appx:///Assets/Terminal/terminal.png")) : null,
+                        IconName = string.Equals(appId, "CoreShell.Terminal", StringComparison.OrdinalIgnoreCase)
+                            ? "Terminal" : string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase)
                             ? "Strawfox"
                             : string.IsNullOrWhiteSpace(iconName)
                             ? (string.Equals(appId, "CoreShell.Notepad", StringComparison.OrdinalIgnoreCase) ? "Notepad" : string.Equals(appId, "CoreShell.Settings", StringComparison.OrdinalIgnoreCase) ? "Settings" : string.Equals(appId, "CoreShell.Calculator", StringComparison.OrdinalIgnoreCase) ? "Calculator" : string.Equals(appId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase) ? "Strawfox" : "Files")
@@ -469,7 +509,7 @@ namespace factoryos_10x_shell.Services.Helpers
                 }
             });
 
-            Debug.WriteLine($"[INFO] Loaded pinned apps count: {loaded.Count}");
+            factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"[INFO] Loaded pinned apps count: {loaded.Count}");
         }
 
 
@@ -585,7 +625,7 @@ namespace factoryos_10x_shell.Services.Helpers
                     {
                         result.FailedPackageCount++;
                         string packageName = GetPackageLogName(package);
-                        Debug.WriteLine($"Error enumerating package {packageName}: {ex.Message}");
+                        factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Error enumerating package {packageName}: {ex.Message}");
                         LogStartMenuRefresh($"Package failed: {packageName}; elapsed={packageClock.ElapsedMilliseconds} ms; error={ex.GetType().Name}: {ex.Message}");
                         if (!result.Packages.Any(item => item.FullName == package.Id.FullName))
                         {
@@ -789,7 +829,7 @@ namespace factoryos_10x_shell.Services.Helpers
                     {
                         discovery.FailedPackageCount++;
                         string packageName = GetPackageLogName(discoveredPackage.Package);
-                        Debug.WriteLine($"Error accessing logo for package {packageName}: {ex.Message}");
+                        factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"Error accessing logo for package {packageName}: {ex.Message}");
                         LogStartMenuRefresh($"Package logo failed: {packageName}; error={ex.GetType().Name}: {ex.Message}");
                     }
                 }
@@ -844,7 +884,7 @@ namespace factoryos_10x_shell.Services.Helpers
             }
             catch (Exception ex)
             {
-                Debug.WriteLine("LoadApps => Get: " + ex.Message);
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("LoadApps => Get: " + ex.Message);
                 LogStartMenuRefresh($"Reload failed: {ex.GetType().Name}: {ex.Message}");
             }
             finally
@@ -900,7 +940,7 @@ namespace factoryos_10x_shell.Services.Helpers
                 }
                 catch
                 {
-                    Debug.WriteLine($"[AppDisplayInfo] Failed to convert AUMID");
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"[AppDisplayInfo] Failed to convert AUMID");
                 }
             }
 
@@ -945,6 +985,35 @@ namespace factoryos_10x_shell.Services.Helpers
             if (model == null)
                 return false;
 
+            if (string.Equals(model.AppId, "CoreShell.Terminal", StringComparison.OrdinalIgnoreCase))
+            {
+                var manager = factoryos_10x_shell.Services.Win32.Win32WindowManagerService.Instance;
+                if (!manager.IsAppSupportEnabled)
+                {
+                    await new Windows.UI.Popups.MessageDialog("Enable Windows app support in Settings to open the guest terminal.", "Terminal").ShowAsync();
+                    return false;
+                }
+                try
+                {
+                    var root = await new Win32Bridge.RuntimeHost().EnsureDriveRootAsync();
+                    var windows = await root.GetFolderAsync("Windows");
+                    var system32 = await windows.GetFolderAsync("System32");
+                    var executable = await system32.GetFileAsync("cmd.exe");
+                    var icon = model.IconSource ?? new BitmapImage(new Uri("ms-appx:///Assets/Terminal/terminal.png"));
+                    var window = manager.Open(executable, system32, icon, @"C:\Windows\System32\cmd.exe", string.Empty, @"C:\");
+                    if (window == null) return false;
+                    window.DisplayNameOverride = "Terminal";
+                    window.KeepLaunchIcon = true;
+                    return true;
+                }
+                catch (Exception error)
+                {
+                    ShellDiagnostics.WriteDebug("Terminal launch: " + error);
+                    await new Windows.UI.Popups.MessageDialog("Could not open the guest CMD: " + error.Message, "Terminal").ShowAsync();
+                    return false;
+                }
+            }
+
             // Edge's package activation/protocol path is unreliable on Xbox. A web
             // URL is routed by the shell to the system's default browser (Edge).
             if (IsMicrosoftEdge(model))
@@ -961,7 +1030,7 @@ namespace factoryos_10x_shell.Services.Helpers
                 }
                 catch (Exception ex)
                 {
-                    Debug.WriteLine($"[AppUri] Launch failed for {appUri}: {ex.Message}");
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"[AppUri] Launch failed for {appUri}: {ex.Message}");
                     if (IsXboxDevice())
                         return false;
                 }
@@ -1027,7 +1096,7 @@ namespace factoryos_10x_shell.Services.Helpers
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"[AppUri] Could not read protocol for {package.Id.Name}: {ex.Message}");
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug($"[AppUri] Could not read protocol for {package.Id.Name}: {ex.Message}");
             }
 
             return null;

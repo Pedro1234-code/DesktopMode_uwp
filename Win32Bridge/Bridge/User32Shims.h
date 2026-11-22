@@ -2,7 +2,7 @@
 
 #include "Bridge\\CompatibilityCatalog.h"
 #include "Bridge\\GuestWin32Abi.h"
-#include "Bridge\\MiniGdi.h"
+#include "Bridge\\GDI\\MiniGdi.h"
 
 #include <windows.h>
 
@@ -87,6 +87,8 @@ namespace Bridge
     int WINAPI BridgeGetWindowTextW(HWND window, LPWSTR buffer, int count);
     int WINAPI BridgeGetWindowTextLengthW(HWND window);
     HWND WINAPI BridgeGetDlgItem(HWND parent, int identifier);
+    HWND WINAPI BridgeGetNextDlgTabItem(HWND dialog, HWND current, BOOL previous);
+    HWND WINAPI BridgeGetNextDlgGroupItem(HWND dialog, HWND current, BOOL previous);
     int WINAPI BridgeGetDlgCtrlID(HWND window);
     BOOL WINAPI BridgeSetDlgItemTextW(HWND parent, int identifier, LPCWSTR text);
     UINT WINAPI BridgeGetDlgItemTextW(HWND parent, int identifier, LPWSTR buffer, int count);

@@ -1,4 +1,5 @@
 #include "Bridge\\GuestRuntime.h"
+#include "Bridge/CRT/CrtExceptions.h"
 #include "Bridge/ActivationContext.h"
 #include "Bridge/CommonControlsShims.h"
 #include "Bridge/DialogResources.h"
@@ -102,6 +103,7 @@ namespace
             static_cast<unsigned long long>(argument2),
             static_cast<unsigned long long>(argument3),
             static_cast<unsigned long long>(argument4));
+        if (!RuntimeDiagnostics::Enabled()) return EXCEPTION_CONTINUE_SEARCH;
         ::OutputDebugStringW(message);
         const HANDLE log = g_nativeExceptionLog.load();
         if (log != INVALID_HANDLE_VALUE && log != nullptr)
@@ -118,6 +120,7 @@ namespace
     {
         explicit NativeExceptionTraceScope(const std::wstring& logPath)
         {
+            if (!RuntimeDiagnostics::Enabled()) return;
             if (!logPath.empty())
             {
                 CREATEFILE2_EXTENDED_PARAMETERS parameters{};
@@ -367,8 +370,8 @@ namespace
         bool completed = false;
         __try
         {
-            *exitCode = entryPoint();
-            completed = true;
+            completed = InvokeCrtFunction(exitCode, entryPoint);
+            if (!completed) ::RaiseException(CrtGuestTerminationCode, EXCEPTION_NONCONTINUABLE, 0, nullptr);
         }
         __except (CaptureGuestException(GetExceptionInformation(), exception)) {}
         g_guestExitTarget = previousTarget;
@@ -408,8 +411,8 @@ namespace
         bool completed = false;
         __try
         {
-            *exitCode = startAddress(parameter);
-            completed = true;
+            completed = InvokeCrtFunction(exitCode, startAddress, parameter);
+            if (!completed) ::RaiseException(CrtGuestTerminationCode, EXCEPTION_NONCONTINUABLE, 0, nullptr);
         }
         __except (CaptureGuestException(GetExceptionInformation(), exception)) {}
         g_guestExitTarget = previousTarget;
@@ -419,15 +422,44 @@ namespace
     }
 }
 
+struct GuestRuntime::WorkerLease final
+{
+    WorkerLease(GuestRuntime* owner, DWORD threadId) : runtime(owner), id(threadId) {}
+
+    ~WorkerLease()
+    {
+        if (!registered) return;
+        runtime->m_windows->InterruptGuestThreadMessages(id, true);
+        std::lock_guard<std::mutex> guard(runtime->m_threadLock);
+        if (ran) runtime->m_lastWorkerExitCode = exitCode;
+        runtime->m_workerThreads.erase(id);
+        runtime->m_threadsChanged.notify_all();
+    }
+
+    GuestRuntime* runtime;
+    DWORD id;
+    DWORD exitCode = ERROR_PROCESS_ABORTED;
+    bool registered = false;
+    bool ran = false;
+};
+
 bool Win32Bridge::Bridge::RequestGuestExit(DWORD exitCode, bool threadExit)
 {
     if (!g_guestExitTarget)
         return false;
 
+    if (!threadExit && g_currentGuestRuntime)
+        g_currentGuestRuntime->RequestProcessExit(exitCode);
     g_guestExitCode = exitCode;
     g_guestThreadExit = threadExit;
     longjmp(*g_guestExitTarget, 1);
     return true;
+}
+
+void Win32Bridge::Bridge::ExitGuestThreadOnShutdown()
+{
+    const auto kernel = CurrentGuestKernelContext();
+    if (kernel && kernel->IsStopping()) RequestGuestExit(ERROR_OPERATION_ABORTED, true);
 }
 
 bool GuestRuntime::SetResourceSatellite(
@@ -460,11 +492,25 @@ bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportR
 {
     RuntimeDiagnostics::Record(L"PREPARE: inspecting main PE (" + std::to_wstring(fileSize) + L" bytes).");
     m_ready = false;
+    m_stopRequested.store(false);
+    {
+        std::lock_guard<std::mutex> guard(m_threadLock);
+        m_threadsMayRun = false;
+        m_processExitRequested = false;
+        m_processExitCode = 0;
+        m_lastWorkerExitCode = 0;
+    }
     m_runtime.Release();
     m_metadata = PeImageInfo{};
     m_mapped = MappedPeImage{};
     m_bindings = BindingReport{};
+    std::atomic_store(&m_consoleTransport, std::shared_ptr<GuestKernelContext>{});
     m_kernel.reset();
+    m_initialKernel.reset();
+    m_mainThreadCompleted = {};
+    m_initialConsole.reset(); m_initialPipes.reset(); m_hasInitialStandardHandles = false;
+    m_startupCrtData.clear();
+    m_detachedConsole = m_createConsole = false;
     m_modules.reset();
     m_registry.reset();
     m_resolver = resolver;
@@ -516,7 +562,7 @@ bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportR
     return true;
 }
 
-bool GuestRuntime::Run(int* exitCode, std::wstring* error)
+bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<void()>& bindingObserver)
 {
     if (!m_ready || !exitCode)
     {
@@ -544,17 +590,61 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
 
     // Kernel objects are per invocation, just like the current guest storage
     // and window scopes.  They must not survive a later run of the same image.
-    m_kernel = std::make_shared<GuestKernelContext>();
-    m_modules = std::make_shared<GuestModuleLoader>(
-        m_storage,
-        m_resolver,
-        m_moduleSourceFolder.Get());
+    try
+    {
+        m_kernel = m_initialKernel ? std::move(m_initialKernel) : std::make_shared<GuestKernelContext>();
+        if (m_initialConsole) m_kernel->Console().Inherit(*m_initialConsole);
+        if (m_initialPipes) { m_kernel->Pipes().Adopt(*m_initialPipes); m_initialPipes.reset(); }
+        if (!m_detachedConsole && !m_kernel->Console().IsAttached() &&
+            (m_createConsole || m_metadata.subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI))
+        {
+            DWORD consoleError = ERROR_SUCCESS;
+            if (!m_kernel->Console().Allocate(BridgeGetOEMCP(), &consoleError))
+            { if (error) *error = L"Could not allocate guest console: " + std::to_wstring(consoleError); return false; }
+        }
+        if (m_hasInitialStandardHandles)
+            for (size_t index = 0; index < m_initialStandardHandles.size(); ++index)
+            {
+                DWORD ignored = ERROR_SUCCESS;
+                m_kernel->Console().SetStandard(static_cast<DWORD>(-10 - static_cast<int>(index)), m_initialStandardHandles[index], &ignored);
+            }
+    }
+    catch (const std::bad_alloc&)
+    { if (error) *error = L"Not enough memory for guest console/stdio."; return false; }
+
+    m_kernel->Console().SetSize(m_consoleColumns.load(), m_consoleRows.load());
+    std::atomic_store(&m_consoleTransport, m_kernel);
+    if (m_stopRequested.load()) { m_kernel->BeginShutdown(); SetError(error,L"Guest startup was canceled."); return false; }
+    try
+    {
+        auto inherited = DecodeCrtStartupFiles(m_startupCrtData);
+        for (auto& file : inherited)
+        {
+            if (!file.IsInheritable()) continue;
+            DWORD flags = 0, status = ERROR_SUCCESS;
+            BYTE type = 0;
+            bool owns = m_kernel->Pipes().Flags(file.handle, &flags, 0, false, &status);
+            if (owns) type = CrtStartupFile::Pipe;
+            else if ((owns = m_kernel->Console().Flags(file.handle, &flags, 0, false, &status)))
+                type = CrtStartupFile::Device;
+            else if (m_storage)
+                owns = m_storage->FileHandleFlags(file.handle, &flags, 0, false, &status);
+            if (!owns || !(flags & 1u)) file = {};
+            else file.flags = static_cast<BYTE>((file.flags & (CrtStartupFile::Open | CrtStartupFile::Text |
+                CrtStartupFile::Append | CrtStartupFile::Eof)) | type);
+        }
+        m_startupCrtData = EncodeCrtStartupFiles(inherited);
+        m_modules = std::make_shared<GuestModuleLoader>(m_storage, m_resolver,
+            m_moduleSourceFolder.Get(), m_kernel, inherited);
+    }
+    catch (const std::bad_alloc&)
+    { SetError(error, L"Not enough memory for guest CRT startup files."); return false; }
     if (!m_registry)
     {
         m_registry = std::make_shared<GuestRegistryContext>(m_storage);
     }
     GuestKernelScope kernelScope(m_kernel.get());
-    GuestModuleScope moduleScope(m_modules.get());
+    GuestModuleScope moduleScope(m_modules.get(), true);
     GuestRegistryScope registryScope(m_registry.get());
     GuestResourceHandleScope resourceHandleScope;
     GuestResourceScope resourceScope(
@@ -570,116 +660,185 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
             ? L"\"" + m_storage->ModulePath() + L"\""
             : m_commandLine,
         m_processId,
-        m_mainThreadId);
-    if (m_storage && !m_storage->EnsureLayout(error))
+        m_mainThreadId ? m_mainThreadId : g_nextGuestProcessId.fetch_add(1));
+    DWORD mainThreadError = 0;
+    const DWORD mainThreadId = BridgeGetCurrentThreadId();
+    GuestKernelContext::Completion mainThread;
+    if (!m_kernel->CreateCompletionObject(mainThreadId, false, &mainThread, nullptr, &mainThreadError))
+    { SetError(error, L"Could not register the guest main thread."); return false; }
     {
-        m_kernel->CloseAll();
-        m_modules->ReleaseAll();
-        RuntimeDiagnostics::Record(L"RUN FAILED: virtual drive layout could not be ensured.");
-        return false;
+        std::lock_guard<std::mutex> guard(m_threadLock);
+        m_runningMainThreadId = mainThreadId;
+        m_threadsMayRun = false;
     }
-    DWORD registryError = ERROR_SUCCESS;
-    if (!m_registry->Initialize(&registryError))
+    DWORD mainThreadExitCode = ERROR_PROCESS_ABORTED;
+    const auto finishMainThread = [&]()
     {
-        m_kernel->CloseAll();
-        m_modules->ReleaseAll();
-        SetError(error, L"Could not initialize the guest registry (" +
-            std::to_wstring(registryError) + L").");
-        RuntimeDiagnostics::Record(L"RUN FAILED: guest registry initialization error " +
-            std::to_wstring(registryError) + L".");
-        return false;
-    }
-    if (m_storage)
-    {
-        DWORD storageError = ERROR_SUCCESS;
-        if (!m_storage->ResetCurrentDirectory(&storageError))
-        {
-            m_kernel->CloseAll();
-            m_modules->ReleaseAll();
-            SetError(error, L"Could not reset the guest current directory (" + std::to_wstring(storageError) + L").");
-            RuntimeDiagnostics::Record(L"RUN FAILED: guest current-directory reset error " + std::to_wstring(storageError) + L".");
-            return false;
-        }
-        if (!m_initialCurrentDirectory.empty() &&
-            !m_storage->SetCurrentDirectory(m_initialCurrentDirectory.c_str(), &storageError))
-        {
-            m_kernel->CloseAll();
-            m_modules->ReleaseAll();
-            SetError(error, L"Could not set the child current directory (" +
-                std::to_wstring(storageError) + L").");
-            RuntimeDiagnostics::Record(L"RUN FAILED: child current-directory error " +
-                std::to_wstring(storageError) + L".");
-            return false;
-        }
-    }
-
-    const ImportResolver fullResolver = [this](const ImportedSymbol& symbol)
-    {
-        return m_modules->ResolveImport(symbol);
+        mainThread.Finish(mainThreadExitCode);
+        if (m_mainThreadCompleted) m_mainThreadCompleted(mainThreadExitCode);
     };
-    BindingReport finalBindings;
-    std::wstring bindingError;
-    if (!ImportBinder::Bind(
-            &m_mapped, m_metadata, fullResolver, &finalBindings, &bindingError) ||
-        finalBindings.unresolved != 0)
+    bool mainTlsAttached = false;
+    bool cleaned = false;
+    const auto cleanupGuest = [&]()
     {
-        if (m_storage) m_storage->CloseAll();
-        m_kernel->CloseAll();
+        if (cleaned) return;
+        RequestStop();
+        // The main thread may have left a synchronous window call while
+        // exiting. Its callers must be released before we drain the workers.
+        if (m_windows) m_windows->InterruptGuestThreadMessages(mainThreadId, true);
+        m_kernel->Timers().StopAll();
+        WaitForWorkers();
+        cleaned = true;
+        {
+            std::lock_guard<std::mutex> guard(m_threadLock);
+            m_runningMainThreadId = 0;
+            if (m_processExitRequested) mainThreadExitCode = m_processExitCode;
+        }
+        // TLS and DLL detach callbacks may still perform file or kernel I/O.
+        // Release code before closing the resources those callbacks can use.
+        if (mainTlsAttached)
+        {
+            std::wstring ignored;
+            if (!m_runtime.NotifyTls(DLL_PROCESS_DETACH, &ignored) && !ignored.empty())
+                RuntimeDiagnostics::Record(L"TLS: main-image process detach failed: " + ignored);
+            mainTlsAttached = false;
+        }
+        // Process exit does not send page callbacks into an already departing
+        // EXE/DLL. Release page references while its memory/activation data is
+        // still mapped. Keep the copied PSP data alive through DLL detach, so
+        // a DLL can still destroy its modeless window during teardown.
+        ReleaseGuestPropertySheetPages(m_modules.get(), false);
         m_modules->ReleaseAll();
-        m_bindings = std::move(finalBindings);
-        SetError(error, bindingError.empty()
-            ? std::to_wstring(m_bindings.unresolved) +
-                L" guest imports remain unresolved after DLL loading."
-            : bindingError);
-        RuntimeDiagnostics::Record(
-            L"RUN FAILED: final import binding left " +
-            std::to_wstring(m_bindings.unresolved) + L" unresolved imports.");
-        return false;
-    }
-    m_bindings = std::move(finalBindings);
-    if (!m_runtime.CopyFrom(m_mapped, &bindingError) ||
-        !m_runtime.FinalizeProtections(m_mapped, &bindingError))
-    {
+        ResetGuestPropertySheetsForCurrentProcess();
+        m_modules->Stdio().CloseAll(true, !m_modules->CrtState().suppressStdioFlush.load());
+        m_modules->CrtFiles().CloseAll();
         if (m_storage) m_storage->CloseAll();
+        kernelScope.AbandonOwnedMutexes();
+        finishMainThread();
         m_kernel->CloseAll();
-        m_modules->ReleaseAll();
-        SetError(error, bindingError);
-        RuntimeDiagnostics::Record(
-            L"RUN FAILED: final image copy or page protections: " + bindingError);
-        return false;
-    }
-    RuntimeDiagnostics::Record(
-        L"RUN: final import binding completed; " +
-        std::to_wstring(m_bindings.bound) + L" regular imports bound, " +
-        std::to_wstring(m_bindings.deferred) + L" delay imports retained.");
-
-    std::wstring tlsError;
-    if (!m_runtime.NotifyTls(DLL_PROCESS_ATTACH, &tlsError))
-    {
-        if (m_storage) m_storage->CloseAll();
-        m_kernel->CloseAll();
-        m_modules->ReleaseAll();
-        SetError(error, L"The main image TLS process-attach notification failed: " + tlsError);
-        RuntimeDiagnostics::Record(L"RUN FAILED: main-image TLS process attach: " + tlsError);
-        return false;
-    }
-    bool mainTlsAttached = true;
-    const auto detachMainTls = [&]()
-    {
-        if (!mainTlsAttached) return;
-        std::wstring ignored;
-        if (!m_runtime.NotifyTls(DLL_PROCESS_DETACH, &ignored) && !ignored.empty())
-            RuntimeDiagnostics::Record(L"TLS: main-image process detach failed: " + ignored);
-        mainTlsAttached = false;
     };
-
-    using GuestEntryPoint = int(WINAPI*)();
-    const auto entryPoint = reinterpret_cast<GuestEntryPoint>(m_runtime.Base() + m_mapped.entryPointRva);
     try
     {
+        if (m_stopRequested.load())
+        {
+            cleanupGuest();
+            SetError(error, L"Guest startup was canceled.");
+            return false;
+        }
+        try
+        {
+            m_modules->Environment().Initialize(m_hasInitialEnvironment ? m_initialEnvironment : GetGuestInitialEnvironment());
+            m_modules->CrtState().Initialize(BridgeGetCommandLineW(), m_modules->Environment().Snapshot(),
+                m_storage ? m_storage->ModulePath() : std::wstring());
+        }
+        catch (const std::bad_alloc&)
+        {
+            cleanupGuest();
+            SetError(error, L"Could not allocate the guest CRT startup state.");
+            RuntimeDiagnostics::Record(L"RUN FAILED: guest CRT startup allocation.");
+            return false;
+        }
+        if (m_storage && !m_storage->EnsureLayout(error))
+        {
+            cleanupGuest();
+            RuntimeDiagnostics::Record(L"RUN FAILED: virtual drive layout could not be ensured.");
+            return false;
+        }
+        DWORD registryError = ERROR_SUCCESS;
+        if (!m_registry->Initialize(&registryError))
+        {
+            cleanupGuest();
+            SetError(error, L"Could not initialize the guest registry (" +
+                std::to_wstring(registryError) + L").");
+            RuntimeDiagnostics::Record(L"RUN FAILED: guest registry initialization error " +
+                std::to_wstring(registryError) + L".");
+            return false;
+        }
+        if (m_storage)
+        {
+            DWORD storageError = ERROR_SUCCESS;
+            if (!m_storage->ResetCurrentDirectory(&storageError))
+            {
+                cleanupGuest();
+                SetError(error, L"Could not reset the guest current directory (" + std::to_wstring(storageError) + L").");
+                RuntimeDiagnostics::Record(L"RUN FAILED: guest current-directory reset error " + std::to_wstring(storageError) + L".");
+                return false;
+            }
+            if (!m_initialCurrentDirectory.empty() &&
+                !m_storage->SetCurrentDirectory(m_initialCurrentDirectory.c_str(), &storageError))
+            {
+                cleanupGuest();
+                SetError(error, L"Could not set the child current directory (" +
+                    std::to_wstring(storageError) + L").");
+                RuntimeDiagnostics::Record(L"RUN FAILED: child current-directory error " +
+                    std::to_wstring(storageError) + L".");
+                return false;
+            }
+        }
+
+        const ImportResolver fullResolver = [this](const ImportedSymbol& symbol)
+        {
+            return m_modules->ResolveImport(symbol);
+        };
+        BindingReport finalBindings;
+        std::wstring bindingError;
+        if (!ImportBinder::Bind(
+                &m_mapped, m_metadata, fullResolver, &finalBindings, &bindingError) ||
+            finalBindings.unresolved != 0)
+        {
+            cleanupGuest();
+            m_bindings = std::move(finalBindings);
+            // Diagnostics must not change guest loading or exception behavior.
+            try { if (bindingObserver) bindingObserver(); } catch (...) { }
+            SetError(error, bindingError.empty()
+                ? std::to_wstring(m_bindings.unresolved) +
+                    L" guest imports remain unresolved after DLL loading."
+                : bindingError);
+            RuntimeDiagnostics::Record(
+                L"RUN FAILED: final import binding left " +
+                std::to_wstring(m_bindings.unresolved) + L" unresolved imports.");
+            return false;
+        }
+        m_bindings = std::move(finalBindings);
+        // Diagnostics must not change guest loading or exception behavior.
+        try { if (bindingObserver) bindingObserver(); } catch (...) { }
+        if (!m_runtime.CopyFrom(m_mapped, &bindingError) ||
+            !m_runtime.FinalizeProtections(m_mapped, &bindingError))
+        {
+            cleanupGuest();
+            SetError(error, bindingError);
+            RuntimeDiagnostics::Record(
+                L"RUN FAILED: final image copy or page protections: " + bindingError);
+            return false;
+        }
+        RuntimeDiagnostics::Record(
+            L"RUN: final import binding completed; " +
+            std::to_wstring(m_bindings.bound) + L" regular imports bound, " +
+            std::to_wstring(m_bindings.deferred) + L" delay imports retained.");
+
+        std::wstring tlsError;
+        if (!m_runtime.NotifyTls(DLL_PROCESS_ATTACH, &tlsError))
+        {
+            cleanupGuest();
+            SetError(error, L"The main image TLS process-attach notification failed: " + tlsError);
+            RuntimeDiagnostics::Record(L"RUN FAILED: main-image TLS process attach: " + tlsError);
+            return false;
+        }
+        mainTlsAttached = true;
+        {
+            std::lock_guard<std::mutex> guard(m_threadLock);
+            m_threadsMayRun = true;
+            m_threadsChanged.notify_all();
+        }
+
+        using GuestEntryPoint = int(WINAPI*)();
+        const auto entryPoint = reinterpret_cast<GuestEntryPoint>(m_runtime.Base() + m_mapped.entryPointRva);
         RuntimeDiagnostics::Record(L"RUN: entering guest entry point.");
         GuestExceptionDetails guestException;
-        if (!InvokeGuestEntryPoint(entryPoint, exitCode, &guestException))
+        const bool entered = !m_stopRequested.load();
+        if (!entered)
+            *exitCode = ERROR_OPERATION_ABORTED;
+        else if (!InvokeGuestEntryPoint(entryPoint, exitCode, &guestException))
         {
             if (guestException.requestedExit)
             {
@@ -693,13 +852,8 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
                     m_runtime.Size(),
                     m_storage ? m_storage->ModulePath() : std::wstring(),
                     m_modules.get());
-                if (m_storage)
-                {
-                    m_storage->CloseAll();
-                }
-                m_kernel->CloseAll();
-                m_modules->ReleaseAll();
-                detachMainTls();
+                cleanupGuest();
+
                 SetError(error, L"The guest raised a structured exception: " +
                     exceptionDescription + L".");
                 RuntimeDiagnostics::Record(L"RUN FAILED: guest structured exception " +
@@ -707,26 +861,32 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
                 return false;
             }
         }
-        InvokeGuestFlsCallbacksForCurrentThread();
-        if (m_storage)
+        if (!guestException.threadExit || !m_stopRequested.load())
+            InvokeGuestFlsCallbacksForCurrentThread();
+        mainThreadExitCode = static_cast<DWORD>(*exitCode);
+        if (guestException.threadExit && !m_stopRequested.load())
         {
-            m_storage->CloseAll();
+            if (m_windows) m_windows->InterruptGuestThreadMessages(mainThreadId, true);
+            kernelScope.AbandonOwnedMutexes();
+            finishMainThread();
+            std::unique_lock<std::mutex> guard(m_threadLock);
+            const bool workersOutlivedMain = !m_workerThreads.empty();
+            m_threadsChanged.wait(guard, [&]() { return m_workerThreads.empty(); });
+            if (workersOutlivedMain) *exitCode = static_cast<int>(m_lastWorkerExitCode);
         }
-        m_kernel->CloseAll();
-        m_modules->ReleaseAll();
-        detachMainTls();
+        cleanupGuest();
+        {
+            std::lock_guard<std::mutex> guard(m_threadLock);
+            if (m_processExitRequested) *exitCode = static_cast<int>(m_processExitCode);
+        }
+
         RuntimeDiagnostics::Record(L"RUN: guest returned exit code " + std::to_wstring(*exitCode) + L".");
         return true;
     }
     catch (Platform::Exception^ exception)
     {
-        if (m_storage)
-        {
-            m_storage->CloseAll();
-        }
-        m_kernel->CloseAll();
-        m_modules->ReleaseAll();
-        detachMainTls();
+        cleanupGuest();
+
         SetError(error, L"The guest raised an unhandled WinRT exception.");
         RuntimeDiagnostics::Record(L"RUN FAILED: guest raised a WinRT exception; HRESULT " +
             std::to_wstring(static_cast<unsigned long>(exception->HResult)) + L".");
@@ -734,13 +894,8 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error)
     }
     catch (...)
     {
-        if (m_storage)
-        {
-            m_storage->CloseAll();
-        }
-        m_kernel->CloseAll();
-        m_modules->ReleaseAll();
-        detachMainTls();
+        cleanupGuest();
+
         SetError(error, L"The guest raised an unhandled C++ exception.");
         RuntimeDiagnostics::Record(L"RUN FAILED: guest raised an unhandled C++ exception.");
         return false;
@@ -752,7 +907,10 @@ bool GuestRuntime::LaunchChildProcess(
     LPCWSTR commandLine,
     LPCWSTR currentDirectory,
     LPPROCESS_INFORMATION processInformation,
-    DWORD* win32Error)
+    DWORD* win32Error,
+    const std::vector<std::wstring>* environment, DWORD creationFlags, bool inheritHandles,
+    const HANDLE* standardHandles, const std::vector<BYTE>& startupCrtData,
+    bool inheritProcessHandle, bool inheritThreadHandle)
 {
     if (!processInformation || !executableName || !*executableName ||
         !m_modules || !m_kernel || !m_storage || !m_windows)
@@ -761,6 +919,38 @@ bool GuestRuntime::LaunchChildProcess(
         return false;
     }
     ZeroMemory(processInformation, sizeof(*processInformation));
+    const bool shareConsole = !(creationFlags & (0x00000008u | 0x00000010u | 0x08000000u));
+    std::array<HANDLE,3> inheritedStandard{};
+    bool useStandard = standardHandles != nullptr;
+    for (size_t index = 0; index < inheritedStandard.size(); ++index)
+    {
+        DWORD status = ERROR_SUCCESS;
+        inheritedStandard[index] = standardHandles ? standardHandles[index] :
+            shareConsole ? m_kernel->Console().GetStandard(static_cast<DWORD>(-10 - static_cast<int>(index)), &status) : nullptr;
+        const HANDLE value = inheritedStandard[index];
+        if (!value || value == INVALID_HANDLE_VALUE) continue;
+        useStandard = true;
+        // An implicit std slot may contain a value that wasn't inherited.
+        // Only explicitly supplied STARTF_USESTDHANDLES are validated here.
+        if (!standardHandles) continue;
+        DWORD flags = 0;
+        if (m_kernel->Pipes().Owns(value))
+        {
+            m_kernel->Pipes().Flags(value, &flags, 0, false, &status);
+            if (!inheritHandles || !(flags & 1u)) { if (win32Error) *win32Error = ERROR_INVALID_HANDLE; return false; }
+        }
+        else if (m_kernel->Console().Owns(value))
+        {
+            m_kernel->Console().Flags(value, &flags, 0, false, &status);
+            if (!shareConsole || !inheritHandles || !(flags & 1u))
+            { if (win32Error) *win32Error = ERROR_NOT_SUPPORTED; return false; }
+        }
+        else
+        {
+            if (!m_storage->FileHandleFlags(value, &flags, 0, false, &status) || !inheritHandles || !(flags & 1u))
+            { if (win32Error) *win32Error = status != ERROR_SUCCESS ? status : ERROR_INVALID_HANDLE; return false; }
+        }
+    }
 
     std::vector<BYTE> bytes;
     std::wstring logicalPath;
@@ -788,6 +978,8 @@ bool GuestRuntime::LaunchChildProcess(
         if (win32Error) *win32Error = ERROR_NOT_ENOUGH_MEMORY;
         return false;
     }
+    if (inheritHandles && !childStorage->InheritFiles(*m_storage, &errorCode))
+    { if (win32Error) *win32Error = errorCode; return false; }
     child->SetStorageContext(childStorage);
     // The registry is machine/user state, not process-private state. Sharing
     // one synchronized logical context also prevents two cooperative guests
@@ -795,7 +987,7 @@ bool GuestRuntime::LaunchChildProcess(
     child->SetWindowManager(m_windows);
     child->SetModuleSourceFolder(m_modules->ModuleSourceFolder());
     child->SetCommandLine(commandLine ? commandLine : executableName);
-    child->SetInitialCurrentDirectory(currentDirectory ? currentDirectory : L"");
+    child->SetInitialCurrentDirectory(currentDirectory ? std::wstring(currentDirectory) : m_storage->CurrentDirectory());
     child->SetSharedWindowManager(true);
 
     std::wstring prepareError;
@@ -807,18 +999,46 @@ bool GuestRuntime::LaunchChildProcess(
         return false;
     }
     child->SetRegistryContext(m_registry);
+    try
+    {
+        child->SetInitialEnvironment(environment ? *environment : m_modules->Environment().Snapshot());
+        if (inheritHandles)
+        {
+            child->m_startupCrtData = startupCrtData;
+            child->m_initialKernel = std::make_shared<GuestKernelContext>();
+            if (!child->m_initialKernel->InheritHandles(*m_kernel, &errorCode))
+            { if (win32Error) *win32Error = errorCode; return false; }
+        }
+        child->m_initialPipes = std::make_shared<GuestPipeContext>();
+        if (inheritHandles) child->m_initialPipes->Inherit(m_kernel->Pipes());
+        child->m_initialStandardHandles = inheritedStandard;
+        child->m_hasInitialStandardHandles = useStandard;
+        child->m_detachedConsole = (creationFlags & 0x00000008u) != 0; // DETACHED_PROCESS
+        child->m_createConsole = (creationFlags & 0x00000010u) != 0; // CREATE_NEW_CONSOLE
+        if (!(creationFlags & (0x00000008u | 0x00000010u | 0x08000000u)))
+        {
+            child->m_initialConsole = std::make_shared<GuestConsoleContext>();
+            child->m_initialConsole->Inherit(m_kernel->Console(), inheritHandles);
+        }
+    }
+    catch (const std::bad_alloc&)
+    {
+        if (win32Error) *win32Error = ERROR_NOT_ENOUGH_MEMORY;
+        return false;
+    }
 
     const std::shared_ptr<GuestKernelContext> completionKernel = m_kernel;
     const DWORD processId = g_nextGuestProcessId.fetch_add(1);
     const DWORD threadId = g_nextGuestProcessId.fetch_add(1);
-    HANDLE processHandle = completionKernel->CreateCompletionObject(processId, true, &errorCode);
-    if (!processHandle)
+    GuestKernelContext::Completion processCompletion, threadCompletion;
+    HANDLE processHandle = nullptr;
+    if (!completionKernel->CreateCompletionObject(processId, true, &processCompletion, &processHandle, &errorCode, inheritProcessHandle))
     {
         if (win32Error) *win32Error = errorCode;
         return false;
     }
-    HANDLE threadHandle = completionKernel->CreateCompletionObject(threadId, false, &errorCode);
-    if (!threadHandle)
+    HANDLE threadHandle = nullptr;
+    if (!completionKernel->CreateCompletionObject(threadId, false, &threadCompletion, &threadHandle, &errorCode, inheritThreadHandle))
     {
         completionKernel->CloseHandle(processHandle, nullptr);
         if (win32Error) *win32Error = errorCode;
@@ -840,19 +1060,21 @@ bool GuestRuntime::LaunchChildProcess(
     const HWND previousFocus = childWindows->GetGuestFocus(&activationError);
     try
     {
-        std::thread([child, completionKernel, childWindows, processHandle, threadHandle,
+        child->m_mainThreadCompleted = [threadCompletion](DWORD code) { threadCompletion.Finish(code); };
+        std::thread([child, childWindows, processCompletion, threadCompletion,
             processId, logicalPath, previousForeground, previousFocus]()
         {
             int exitCode = static_cast<int>(ERROR_PROCESS_ABORTED);
             std::wstring childError;
-            const bool completed = child->Run(&exitCode, &childError);
-            childWindows->DestroyGuestWindowsForProcess(
-                processId, previousForeground, previousFocus);
+            bool completed = false;
+            try { completed = child->Run(&exitCode, &childError); }
+            catch (...) { }
+            try { childWindows->DestroyGuestWindowsForProcess(processId, previousForeground, previousFocus); }
+            catch (...) { }
             const DWORD reportedExitCode = completed
                 ? static_cast<DWORD>(exitCode) : ERROR_PROCESS_ABORTED;
-            DWORD ignored = ERROR_SUCCESS;
-            completionKernel->CompleteObject(threadHandle, reportedExitCode, &ignored);
-            completionKernel->CompleteObject(processHandle, reportedExitCode, &ignored);
+            threadCompletion.Finish(reportedExitCode);
+            processCompletion.Finish(reportedExitCode);
             RuntimeDiagnostics::Record(
                 completed
                     ? L"PROCESS: child returned from " + logicalPath +
@@ -860,7 +1082,7 @@ bool GuestRuntime::LaunchChildProcess(
                     : L"PROCESS FAILED: child stopped in " + logicalPath + L": " + childError);
         }).detach();
     }
-    catch (const std::system_error&)
+    catch (const std::exception&)
     {
         completionKernel->CloseHandle(threadHandle, nullptr);
         completionKernel->CloseHandle(processHandle, nullptr);
@@ -878,7 +1100,7 @@ HANDLE GuestRuntime::LaunchThread(
     LPVOID parameter,
     DWORD creationFlags,
     LPDWORD threadId,
-    DWORD* win32Error)
+    DWORD* win32Error, bool inheritHandle)
 {
     if (threadId) *threadId = 0;
     if (!startAddress || !m_kernel || !m_modules || !m_registry ||
@@ -896,109 +1118,160 @@ HANDLE GuestRuntime::LaunchThread(
 
     const DWORD assignedThreadId = g_nextGuestProcessId.fetch_add(1);
     DWORD errorCode = ERROR_SUCCESS;
-    HANDLE completion = m_kernel->CreateCompletionObject(
-        assignedThreadId, false, &errorCode);
-    if (!completion)
-    {
-        if (win32Error) *win32Error = errorCode;
-        return nullptr;
-    }
-
-    const std::shared_ptr<GuestKernelContext> kernel = m_kernel;
-    const std::shared_ptr<GuestModuleLoader> modules = m_modules;
-    const std::shared_ptr<GuestRegistryContext> registry = m_registry;
-    const std::shared_ptr<GuestStorageContext> storage = m_storage;
-    const std::shared_ptr<GuestWindowManager> windows = m_windows;
-    const BYTE* imageBase = m_runtime.Base();
-    const size_t imageSize = m_runtime.Size();
-    const BYTE* resourceSatelliteBase = m_resourceSatellite.bytes.empty()
-        ? nullptr : m_resourceSatellite.bytes.data();
-    const size_t resourceSatelliteSize = m_resourceSatellite.bytes.size();
-    const std::wstring commandLine = m_commandLine.empty() && m_storage
-        ? L"\"" + m_storage->ModulePath() + L"\""
-        : m_commandLine;
-    const DWORD processId = m_processId;
-    GuestRuntime* const runtime = this;
-
+    GuestKernelContext::Completion threadCompletion;
+    HANDLE completion = nullptr;
     try
     {
+        const auto lease = std::make_shared<WorkerLease>(this, assignedThreadId);
+        {
+            std::lock_guard<std::mutex> guard(m_threadLock);
+            if (!m_runningMainThreadId || m_stopRequested.load())
+            {
+                if (win32Error) *win32Error = ERROR_OPERATION_ABORTED;
+                return nullptr;
+            }
+            m_workerThreads.insert(assignedThreadId);
+            lease->registered = true;
+        }
+        if (!m_kernel->CreateCompletionObject(assignedThreadId, false, &threadCompletion, &completion, &errorCode, inheritHandle))
+        {
+            if (win32Error) *win32Error = errorCode;
+            return nullptr;
+        }
+
+        const auto kernel = m_kernel;
+        const auto modules = m_modules;
+        const auto registry = m_registry;
+        const auto storage = m_storage;
+        const auto windows = m_windows;
+        const BYTE* imageBase = m_runtime.Base();
+        const size_t imageSize = m_runtime.Size();
+        const BYTE* resourceSatelliteBase = m_resourceSatellite.bytes.empty()
+            ? nullptr : m_resourceSatellite.bytes.data();
+        const size_t resourceSatelliteSize = m_resourceSatellite.bytes.size();
+        const std::wstring commandLine = m_commandLine.empty() && storage
+            ? L"\"" + storage->ModulePath() + L"\""
+            : m_commandLine;
+        const DWORD processId = m_processId;
+        GuestRuntime* const runtime = this;
+
         std::thread([
-            kernel, modules, registry, storage, windows,
+            lease, kernel, modules, registry, storage, windows,
             imageBase, imageSize, resourceSatelliteBase, resourceSatelliteSize,
             commandLine, processId, assignedThreadId, runtime,
-            completion, startAddress, parameter]()
+            threadCompletion, startAddress, parameter]()
         {
-            const HRESULT apartment = RoInitialize(RO_INIT_MULTITHREADED);
-            GuestKernelScope kernelScope(kernel.get());
-            GuestModuleScope moduleScope(modules.get());
-            GuestRegistryScope registryScope(registry.get());
-            GuestResourceScope resourceScope(
-                imageBase, imageSize, resourceSatelliteBase, resourceSatelliteSize);
-            GuestStorageScope storageScope(storage.get());
-            GuestActivationContextScope activationContextScope;
-            GuestWindowScope windowScope(windows.get(), false);
-            CurrentGuestRuntimeScope runtimeScope(runtime);
-            GuestCommandLineScope commandLineScope(commandLine, processId, assignedThreadId);
-
-            DWORD exitCode = 0;
-            GuestExceptionDetails exception;
-            std::wstring tlsError;
-            bool modulesThreadAttached =
-                modules->NotifyThread(DLL_THREAD_ATTACH, &tlsError);
-            bool mainThreadAttached = modulesThreadAttached &&
-                runtime->m_runtime.NotifyTls(DLL_THREAD_ATTACH, &tlsError);
-            if (!mainThreadAttached)
+            bool canRun;
             {
-                exitCode = ERROR_DLL_INIT_FAILED;
-                RuntimeDiagnostics::Record(
-                    L"THREAD FAILED: TLS/DLL thread attach notification: " + tlsError);
-            }
-            else if (!InvokeGuestThreadEntry(
-                startAddress, parameter, &exitCode, &exception))
-            {
-                if (exception.requestedExit)
+                std::unique_lock<std::mutex> guard(runtime->m_threadLock);
+                runtime->m_threadsChanged.wait(guard, [&]()
                 {
-                    exitCode = exception.requestedExitCode;
-                }
-                else
+                    return runtime->m_threadsMayRun || runtime->m_stopRequested.load();
+                });
+                canRun = !runtime->m_stopRequested.load();
+            }
+            DWORD exitCode = ERROR_OPERATION_ABORTED;
+            if (canRun)
+            {
+                const HRESULT apartment = RoInitialize(RO_INIT_MULTITHREADED);
+                try
                 {
                     exitCode = ERROR_PROCESS_ABORTED;
-                    const std::wstring exceptionDescription = DescribeGuestException(
-                        exception,
-                        imageBase,
-                        imageSize,
-                        storage ? storage->ModulePath() : std::wstring(),
-                        modules.get());
-                    RuntimeDiagnostics::Record(
-                        L"THREAD FAILED: guest structured exception " +
-                        exceptionDescription + L".");
+                    GuestKernelScope kernelScope(kernel.get());
+                    GuestModuleScope moduleScope(modules.get(), true);
+                    GuestRegistryScope registryScope(registry.get());
+                    GuestResourceScope resourceScope(
+                        imageBase, imageSize, resourceSatelliteBase, resourceSatelliteSize);
+                    GuestStorageScope storageScope(storage.get());
+                    GuestActivationContextScope activationContextScope;
+                    GuestWindowScope windowScope(windows.get(), false);
+                    CurrentGuestRuntimeScope runtimeScope(runtime);
+                    GuestCommandLineScope commandLineScope(commandLine, processId, assignedThreadId);
+
+                    GuestExceptionDetails exception;
+                    std::wstring tlsError;
+                    bool modulesThreadAttached =
+                        modules->NotifyThread(DLL_THREAD_ATTACH, &tlsError);
+                    bool mainThreadAttached = modulesThreadAttached &&
+                        runtime->m_runtime.NotifyTls(DLL_THREAD_ATTACH, &tlsError);
+                    if (kernel->IsStopping())
+                        exitCode = ERROR_OPERATION_ABORTED;
+                    else if (!mainThreadAttached)
+                    {
+                        exitCode = ERROR_DLL_INIT_FAILED;
+                        RuntimeDiagnostics::Record(
+                            L"THREAD FAILED: TLS/DLL thread attach notification: " + tlsError);
+                    }
+                    else if (!InvokeGuestThreadEntry(
+                        startAddress, parameter, &exitCode, &exception))
+                    {
+                        if (exception.requestedExit)
+                        {
+                            exitCode = exception.requestedExitCode;
+                        }
+                        else
+                        {
+                            exitCode = ERROR_PROCESS_ABORTED;
+                            const std::wstring exceptionDescription = DescribeGuestException(
+                                exception,
+                                imageBase,
+                                imageSize,
+                                storage ? storage->ModulePath() : std::wstring(),
+                                modules.get());
+                            RuntimeDiagnostics::Record(
+                                L"THREAD FAILED: guest structured exception " +
+                                exceptionDescription + L".");
+                        }
+                    }
+                    if (!kernel->IsStopping())
+                    {
+                        InvokeGuestFlsCallbacksForCurrentThread();
+                        if (modulesThreadAttached)
+                        {
+                            std::wstring detachError;
+                            if (!modules->NotifyThread(DLL_THREAD_DETACH, &detachError) && !detachError.empty())
+                                RuntimeDiagnostics::Record(L"THREAD: DLL thread detach failed: " + detachError);
+                        }
+                        if (mainThreadAttached)
+                        {
+                            std::wstring detachError;
+                            if (!runtime->m_runtime.NotifyTls(DLL_THREAD_DETACH, &detachError) && !detachError.empty())
+                                RuntimeDiagnostics::Record(L"THREAD: main-image TLS thread detach failed: " + detachError);
+                        }
+                    }
                 }
+                catch (...)
+                {
+                    exitCode = ERROR_PROCESS_ABORTED;
+                }
+                // Release allocated TLS even if process shutdown suppressed the
+                // callbacks or a notification failed partway through.
+                modules->ReleaseThreadTls();
+                runtime->m_runtime.ReleaseThreadTls();
+                if (SUCCEEDED(apartment)) RoUninitialize();
             }
-            InvokeGuestFlsCallbacksForCurrentThread();
-            if (modulesThreadAttached)
+            if (kernel->IsStopping())
             {
-                std::wstring detachError;
-                if (!modules->NotifyThread(DLL_THREAD_DETACH, &detachError) && !detachError.empty())
-                    RuntimeDiagnostics::Record(L"THREAD: DLL thread detach failed: " + detachError);
+                std::lock_guard<std::mutex> guard(runtime->m_threadLock);
+                if (runtime->m_processExitRequested) exitCode = runtime->m_processExitCode;
             }
-            if (mainThreadAttached)
-            {
-                std::wstring detachError;
-                if (!runtime->m_runtime.NotifyTls(DLL_THREAD_DETACH, &detachError) && !detachError.empty())
-                    RuntimeDiagnostics::Record(L"THREAD: main-image TLS thread detach failed: " + detachError);
-            }
-            DWORD ignored = ERROR_SUCCESS;
-            kernel->CompleteObject(completion, exitCode, &ignored);
-            RuntimeDiagnostics::Record(
-                L"THREAD: guest thread " + std::to_wstring(assignedThreadId) +
-                L" completed with exit code " + std::to_wstring(exitCode) + L".");
-            if (SUCCEEDED(apartment)) RoUninitialize();
+            lease->exitCode = exitCode;
+            lease->ran = true;
+            threadCompletion.Finish(exitCode);
         }).detach();
+    }
+    catch (const std::bad_alloc&)
+    {
+        errorCode = ERROR_NOT_ENOUGH_MEMORY;
     }
     catch (const std::system_error&)
     {
-        m_kernel->CloseHandle(completion, nullptr);
-        if (win32Error) *win32Error = ERROR_NOT_ENOUGH_MEMORY;
+        errorCode = ERROR_NOT_ENOUGH_MEMORY;
+    }
+    if (errorCode != ERROR_SUCCESS)
+    {
+        if (completion) m_kernel->CloseHandle(completion, nullptr);
+        if (win32Error) *win32Error = errorCode;
         return nullptr;
     }
 
@@ -1012,4 +1285,55 @@ HANDLE GuestRuntime::LaunchThread(
 GuestRuntime* Win32Bridge::Bridge::CurrentGuestRuntime()
 {
     return g_currentGuestRuntime;
+}
+
+bool Win32Bridge::Bridge::GuestRuntime::FeedConsoleInput(const std::wstring& text, bool eof)
+{ auto kernel = std::atomic_load(&m_consoleTransport); return kernel && kernel->Console().FeedInput(text, eof); }
+std::wstring Win32Bridge::Bridge::GuestRuntime::DrainConsoleOutput()
+{ auto kernel = std::atomic_load(&m_consoleTransport); return kernel ? kernel->Console().DrainOutput() : std::wstring(); }
+unsigned Win32Bridge::Bridge::GuestRuntime::ConsoleInputMode()
+{
+    auto kernel = std::atomic_load(&m_consoleTransport); if (!kernel) return 7;
+    DWORD error = 0, mode = 7;
+    const HANDLE input = kernel->Console().GetStandard(static_cast<DWORD>(-10), &error);
+    kernel->Console().Mode(input, &mode, false, &error); return mode;
+}
+
+void Win32Bridge::Bridge::GuestRuntime::SetConsoleSize(unsigned columns, unsigned rows)
+{
+    if (!columns || !rows || columns > 32767 || rows > 32767) return;
+    m_consoleColumns.store(columns); m_consoleRows.store(rows);
+    auto kernel = std::atomic_load(&m_consoleTransport);
+    if (kernel) kernel->Console().SetSize(columns, rows);
+}
+
+void GuestRuntime::RequestProcessExit(DWORD exitCode)
+{
+    {
+        std::lock_guard<std::mutex> guard(m_threadLock);
+        if (!m_processExitRequested)
+        {
+            m_processExitRequested = true;
+            m_processExitCode = exitCode;
+        }
+    }
+    RequestStop();
+}
+
+void GuestRuntime::RequestStop()
+{
+    m_stopRequested.store(true);
+    if (const auto kernel = std::atomic_load(&m_consoleTransport)) kernel->BeginShutdown();
+    WakeGuestAlertableWaits();
+    std::lock_guard<std::mutex> guard(m_threadLock);
+    m_threadsChanged.notify_all();
+    if (!m_windows) return;
+    if (m_runningMainThreadId) m_windows->InterruptGuestThreadMessages(m_runningMainThreadId, false);
+    for (const DWORD threadId : m_workerThreads) m_windows->InterruptGuestThreadMessages(threadId, false);
+}
+
+void GuestRuntime::WaitForWorkers()
+{
+    std::unique_lock<std::mutex> guard(m_threadLock);
+    m_threadsChanged.wait(guard, [&]() { return m_workerThreads.empty(); });
 }

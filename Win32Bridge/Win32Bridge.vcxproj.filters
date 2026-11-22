@@ -1,4 +1,4 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
+<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <None Include="Win32Bridge.def" />
@@ -7,6 +7,9 @@
     <Filter Include="Bridge">
       <UniqueIdentifier>{6D6B260B-86C6-4503-8501-F8F3967C7E9D}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Bridge\CRT"><UniqueIdentifier>{F4E5E8EC-9069-495C-9A9B-5EFC7FEF5F8D}</UniqueIdentifier></Filter>
+    <Filter Include="Bridge\DirectX"><UniqueIdentifier>{2E3901F1-A2C1-4823-BC10-E6D843640755}</UniqueIdentifier></Filter>
+    <Filter Include="Bridge\GDI"><UniqueIdentifier>{5D50E8E6-57F3-477E-AB47-E2F9F6D529D8}</UniqueIdentifier></Filter>
     <Filter Include="Common">
       <UniqueIdentifier>4fc5183e-e778-46d3-b30c-012b98d294a9</UniqueIdentifier>
     </Filter>
@@ -14,16 +17,30 @@
       <UniqueIdentifier>f252954d-63a7-4198-b832-98b5d8715de6</UniqueIdentifier>
       <Extensions>bmp;fbx;gif;jpg;jpeg;tga;tiff;tif;png</Extensions>
     </Filter>
+    <ClInclude Include="Bridge\CRT\CrtMultibyteData.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtRestartableConversion.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\GuestCodePages.h"><Filter>Bridge</Filter></ClInclude>
     <ClInclude Include="Bridge\CompatibilityCatalog.h">
       <Filter>Bridge</Filter>
     </ClInclude>
     <ClInclude Include="Bridge\ApiSet.h">
       <Filter>Bridge</Filter>
     </ClInclude>
-    <ClInclude Include="Bridge\Gdi32Shims.h">
+    <ClInclude Include="Bridge\GDI\Gdi32Shims.h"><Filter>Bridge\GDI</Filter></ClInclude>
+    <ClInclude Include="Bridge\GuestConsole.h" />
+    <ClInclude Include="Bridge\GuestPipes.h" />
+    <ClInclude Include="Bridge\PipeShims.inl" />
+    <ClInclude Include="Bridge\ConsoleShims.inl" />
+    <ClInclude Include="Bridge\GuestKernel.h">
       <Filter>Bridge</Filter>
     </ClInclude>
-    <ClInclude Include="Bridge\GuestKernel.h">
+    <ClInclude Include="Bridge\GuestIoCompletionPort.h">
+      <Filter>Bridge</Filter>
+    </ClInclude>
+    <ClInclude Include="Bridge\IoCompletionShims.inl">
+      <Filter>Bridge</Filter>
+    </ClInclude>
+    <ClInclude Include="Bridge\OverlappedDiskIo.inl">
       <Filter>Bridge</Filter>
     </ClInclude>
     <ClInclude Include="Bridge\GuestMessageQueue.h">
@@ -47,12 +64,8 @@
     <ClInclude Include="Bridge\MouseInput.h">
       <Filter>Bridge</Filter>
     </ClInclude>
-    <ClInclude Include="Bridge\MiniGdi.h">
-      <Filter>Bridge</Filter>
-    </ClInclude>
-    <ClInclude Include="Bridge\DirectWriteText.h">
-      <Filter>Bridge</Filter>
-    </ClInclude>
+    <ClInclude Include="Bridge\GDI\MiniGdi.h"><Filter>Bridge\GDI</Filter></ClInclude>
+    <ClInclude Include="Bridge\GDI\DirectWriteText.h"><Filter>Bridge\GDI</Filter></ClInclude>
     <ClInclude Include="Bridge\PeImage.h">
       <Filter>Bridge</Filter>
     </ClInclude>
@@ -85,12 +98,14 @@
     </ClInclude>
     <ClCompile Include="RuntimeHost.cpp" />
     <ClCompile Include="RuntimeSession.cpp" />
+    <ClCompile Include="Bridge\CRT\CrtFileIo.cpp"><Filter>Bridge\CRT</Filter></ClCompile>
+    <ClCompile Include="Bridge\CRT\CrtExceptions.cpp"><Filter>Bridge\CRT</Filter></ClCompile>
+    <ClCompile Include="Bridge\CRT\CrtScanning.cpp"><Filter>Bridge\CRT</Filter></ClCompile>
+    <ClCompile Include="Bridge\CRT\CrtFormatting.cpp"><Filter>Bridge\CRT</Filter></ClCompile>
     <ClCompile Include="Bridge\CompatibilityCatalog.cpp">
       <Filter>Bridge</Filter>
     </ClCompile>
-    <ClCompile Include="Bridge\Gdi32Shims.cpp">
-      <Filter>Bridge</Filter>
-    </ClCompile>
+    <ClCompile Include="Bridge\GDI\Gdi32Shims.cpp"><Filter>Bridge\GDI</Filter></ClCompile>
     <ClCompile Include="Bridge\GuestKernel.cpp">
       <Filter>Bridge</Filter>
     </ClCompile>
@@ -115,12 +130,8 @@
     <ClCompile Include="Bridge\MouseInput.cpp">
       <Filter>Bridge</Filter>
     </ClCompile>
-    <ClCompile Include="Bridge\MiniGdi.cpp">
-      <Filter>Bridge</Filter>
-    </ClCompile>
-    <ClCompile Include="Bridge\DirectWriteText.cpp">
-      <Filter>Bridge</Filter>
-    </ClCompile>
+    <ClCompile Include="Bridge\GDI\MiniGdi.cpp"><Filter>Bridge\GDI</Filter></ClCompile>
+    <ClCompile Include="Bridge\GDI\DirectWriteText.cpp"><Filter>Bridge\GDI</Filter></ClCompile>
     <ClCompile Include="Bridge\PeImage.cpp">
       <Filter>Bridge</Filter>
     </ClCompile>
@@ -153,9 +164,13 @@
     <ClCompile Include="Bridge\DialogResources.cpp" />
     <ClCompile Include="Bridge\GuestRegistry.cpp" />
     <ClCompile Include="Bridge\GuestResources.cpp" />
-    <ClCompile Include="Bridge\MsvcrtShims.cpp" />
+    <ClCompile Include="Bridge\CRT\MsvcrtShims.cpp"><Filter>Bridge\CRT</Filter></ClCompile>
     <ClCompile Include="Bridge\MprShims.cpp" />
     <ClCompile Include="Bridge\OleShims.cpp" />
+    <ClCompile Include="Bridge\MemoryStreams.cpp" />
+    <ClCompile Include="Bridge\FileStreams.cpp" />
+    <ClCompile Include="Bridge\WindowsCodecs.cpp" />
+    <ClCompile Include="Bridge\DirectX\GraphicsShims.cpp"><Filter>Bridge\DirectX</Filter></ClCompile>
     <ClCompile Include="Bridge\Shell32Shims.cpp" />
     <ClCompile Include="Bridge\GuestModule.cpp" />
     <ClCompile Include="pch.cpp" />
@@ -164,16 +179,55 @@
     <ClInclude Include="pch.h" />
     <ClInclude Include="Bridge\Advapi32Shims.h" />
     <ClInclude Include="Bridge\CommonControlsShims.h" />
+    <ClInclude Include="Bridge\PropertySheetShims.inl" />
     <ClInclude Include="Bridge\Comdlg32Shims.h" />
     <ClInclude Include="Bridge\FileDialogCom.inl" />
     <ClInclude Include="Bridge\DialogResources.h" />
     <ClInclude Include="Bridge\GuestRegistry.h" />
     <ClInclude Include="Bridge\GuestResources.h" />
-    <ClInclude Include="Bridge\MsvcrtShims.h" />
+    <ClInclude Include="Bridge\CRT\MsvcrtShims.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtData.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtProcessState.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtFileDescriptors.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtStartupFiles.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtStdio.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtFormatting.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtScanning.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtExceptions.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtStreamScanning.inl"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtStdioScanInput.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtScanningShims.inl"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtFormattingShims.inl"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtStdioMode.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtStdioShims.inl"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtTextEncoding.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtFileIo.h"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtFileShims.inl"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtSpawnShims.inl"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\ProcessEnvironment.h" />
+    <ClInclude Include="Bridge\EnvironmentShims.inl" />
+    <ClInclude Include="Bridge\CRT\CrtStartup.inl"><Filter>Bridge\CRT</Filter></ClInclude>
+    <ClInclude Include="Bridge\CRT\CrtDataExports.inl"><Filter>Bridge\CRT</Filter></ClInclude>
     <ClInclude Include="Bridge\MprShims.h" />
     <ClInclude Include="Bridge\OleShims.h" />
+    <ClInclude Include="Bridge\AutomationData.h" />
+    <ClInclude Include="Bridge\AutomationExports.inl" />
+    <ClInclude Include="Bridge\ComIdentifiers.h" />
+    <ClInclude Include="Bridge\OleActivation.inl" />
+    <ClInclude Include="Bridge\MemoryStreams.h" />
+    <ClInclude Include="Bridge\FileStreams.h" />
+    <ClInclude Include="Bridge\WindowsCodecs.h" />
+    <ClInclude Include="Bridge\DirectX\GraphicsShims.h"><Filter>Bridge\DirectX</Filter></ClInclude>
+    <ClInclude Include="Bridge\DirectX\GraphicsDevice.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
+    <ClInclude Include="Bridge\DirectX\GraphicsD3D11Context.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
+    <ClInclude Include="Bridge\DirectX\GraphicsD3D11Texture.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
+    <ClInclude Include="Bridge\DirectX\GraphicsD3D12.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
+    <ClInclude Include="Bridge\DirectX\GraphicsD3D12Factory.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
     <ClInclude Include="Bridge\Shell32Shims.h" />
     <ClInclude Include="Bridge\ShellLinkReader.h" />
     <ClInclude Include="Bridge\GuestModule.h" />
+    <ClInclude Include="Bridge\ExportAliases.h" />
+    <ClInclude Include="Bridge\GeneratedExportAliases.inl" />
+    <ClInclude Include="Bridge\GDI\RasterGraphics.h"><Filter>Bridge\GDI</Filter></ClInclude>
   </ItemGroup>
 </Project>

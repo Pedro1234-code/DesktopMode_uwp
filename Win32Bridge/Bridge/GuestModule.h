@@ -2,6 +2,11 @@
 
 #include "Bridge/GuestStorage.h"
 #include "Bridge/ImportBinder.h"
+#include "Bridge/CRT/CrtProcessState.h"
+#include "Bridge/CRT/CrtFileIo.h"
+#include "Bridge/CRT/CrtStdio.h"
+#include "Bridge/CRT/CrtExceptions.h"
+#include "Bridge/ProcessEnvironment.h"
 #include "Bridge/RuntimeImage.h"
 
 #include <memory>
@@ -27,7 +32,9 @@ namespace Bridge
         GuestModuleLoader(
             std::shared_ptr<GuestStorageContext> storage,
             ImportResolver resolver,
-            Windows::Storage::StorageFolder^ moduleSourceFolder);
+            Windows::Storage::StorageFolder^ moduleSourceFolder,
+            std::shared_ptr<GuestKernelContext> kernel = {},
+            const std::vector<CrtStartupFile>& inherited = {});
         ~GuestModuleLoader();
 
         bool LoadLibrary(
@@ -36,7 +43,8 @@ namespace Bridge
             DWORD* win32Error,
             DWORD searchFlags = 0,
             DWORD loadBehaviorFlags = 0);
-        ImportResolution ResolveImport(const ImportedSymbol& symbol, DWORD searchFlags = 0);
+        ImportResolution ResolveImport(const ImportedSymbol& symbol, DWORD searchFlags = 0,
+            DWORD* win32Error = nullptr);
         bool GetModuleHandle(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error) const;
         bool GetModuleHandleFromAddress(
             ULONG_PTR address, HMODULE* module, DWORD* win32Error) const;
@@ -52,12 +60,18 @@ namespace Bridge
         bool FreeLibrary(HMODULE module, DWORD* win32Error);
         bool DisableThreadNotifications(HMODULE module, DWORD* win32Error);
         bool NotifyThread(DWORD reason, std::wstring* error);
+        void ReleaseThreadTls();
         void ReleaseAll();
         bool ReadExecutableBytes(
             LPCWSTR requestedName,
             std::vector<BYTE>* bytes,
             std::wstring* logicalPath,
             DWORD* win32Error) const;
+        ProcessEnvironment& Environment() { return m_environment; }
+        CrtStdio& Stdio() { return m_stdio; }
+        CrtFileDescriptors& CrtFiles() { return m_crtFiles; }
+        CrtProcessState& CrtState() { return m_crtState; }
+        CrtThreadExceptionState* ExceptionThreadState(bool freshThread);
         std::shared_ptr<GuestStorageContext> StorageContext() const { return m_storage; }
         Windows::Storage::StorageFolder^ ModuleSourceFolder() const
         {
@@ -67,6 +81,9 @@ namespace Bridge
     private:
         struct Module;
         struct ModuleCandidate;
+
+        ImportResolution ResolveModuleImport(const ImportedSymbol& symbol,
+            const std::shared_ptr<Module>& importer, DWORD searchFlags, DWORD* win32Error);
 
         bool BuildCandidates(
             LPCWSTR requestedName,
@@ -86,7 +103,13 @@ namespace Bridge
             std::wstring* error) const;
         void ReleaseModuleDependencies(const std::shared_ptr<Module>& module);
 
+        ProcessEnvironment m_environment;
+        CrtProcessState m_crtState;
         std::shared_ptr<GuestStorageContext> m_storage;
+        CrtFileDescriptors m_crtFiles;
+        CrtStdio m_stdio;
+        std::mutex m_exceptionThreadLock;
+        std::unordered_map<DWORD, std::unique_ptr<CrtThreadExceptionState>> m_exceptionThreads;
         ImportResolver m_resolver;
         Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
         // The native loader serializes mapping, import snapping and entry-point
@@ -97,6 +120,7 @@ namespace Bridge
         mutable std::mutex m_lock;
         std::vector<std::shared_ptr<Module>> m_modules;
         std::unordered_map<std::wstring, HMODULE> m_importModules;
+        std::vector<ImportedSymbol> m_resolvingImports;
         std::vector<std::pair<ULONG_PTR, std::wstring>> m_userDllDirectories;
         std::wstring m_legacyDllDirectory;
         bool m_legacyDllDirectorySpecified = false;
@@ -109,13 +133,14 @@ namespace Bridge
     class GuestModuleScope final
     {
     public:
-        explicit GuestModuleScope(GuestModuleLoader* loader);
+        explicit GuestModuleScope(GuestModuleLoader* loader, bool freshThread = false);
         ~GuestModuleScope();
         GuestModuleScope(const GuestModuleScope&) = delete;
         GuestModuleScope& operator=(const GuestModuleScope&) = delete;
 
     private:
         GuestModuleLoader* m_previous;
+        CrtThreadExceptionState* m_previousExceptions = nullptr;
     };
 }
 }

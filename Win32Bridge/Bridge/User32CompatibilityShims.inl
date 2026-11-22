@@ -1290,41 +1290,7 @@ BOOL WINAPI BridgeSetMenuItemBitmaps(HMENU menu, UINT item, UINT flags, HBITMAP 
     return BridgeSetMenuItemInfoW(menu, item, (flags & MF_BYPOSITION) != 0, &info);
 }
 
-int WINAPI BridgeFrameRect(HDC dc, const RECT* rect, HBRUSH brush)
-{
-    if (!rect) return 0;
-    RECT edge{ rect->left, rect->top, rect->right, rect->top + 1 };
-    BridgeFillRect(dc, &edge, brush);
-    edge = { rect->left, rect->bottom - 1, rect->right, rect->bottom };
-    BridgeFillRect(dc, &edge, brush);
-    edge = { rect->left, rect->top + 1, rect->left + 1, rect->bottom - 1 };
-    BridgeFillRect(dc, &edge, brush);
-    edge = { rect->right - 1, rect->top + 1, rect->right, rect->bottom - 1 };
-    BridgeFillRect(dc, &edge, brush);
-    return 1;
-}
-
-BOOL WINAPI BridgeDrawFocusRect(HDC dc, const RECT* rect)
-{
-    return BridgeFrameRect(dc, rect, BridgeGetSysColorBrush(COLOR_WINDOWTEXT)) != 0;
-}
-
-BOOL WINAPI BridgeDrawEdge(HDC dc, LPRECT rect, UINT edge, UINT flags)
-{
-    if (!rect) return FALSE;
-    const int result = BridgeFrameRect(dc, rect, BridgeGetSysColorBrush(
-        (edge & (BDR_SUNKENOUTER | BDR_SUNKENINNER)) ? COLOR_BTNSHADOW : COLOR_BTNHIGHLIGHT));
-    if ((flags & BF_ADJUST) != 0)
-    {
-        ++rect->left; ++rect->top; --rect->right; --rect->bottom;
-    }
-    return result != 0;
-}
-
-BOOL WINAPI BridgeDrawFrameControl(HDC dc, LPRECT rect, UINT, UINT)
-{
-    return BridgeDrawEdge(dc, rect, EDGE_RAISED, BF_RECT);
-}
+#include "Bridge/ClassicControlShims.inl"
 
 int WINAPI BridgeToAscii(UINT virtualKey, UINT, const BYTE* state, LPWORD characters, UINT)
 {

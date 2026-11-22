@@ -131,7 +131,7 @@ namespace factoryos_10x_shell.Controls
                 }
                 catch (Exception refreshError)
                 {
-                    System.Diagnostics.Debug.WriteLine("App Installer: Start Menu refresh failed: 0x" + refreshError.HResult.ToString("X8"));
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("App Installer: Start Menu refresh failed: 0x" + refreshError.HResult.ToString("X8"));
                     Status.Text += " The Start Menu app list could not be refreshed.";
                 }
             }

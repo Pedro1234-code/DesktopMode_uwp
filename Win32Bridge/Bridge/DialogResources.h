@@ -4,12 +4,15 @@
 
 #include <string>
 #include <vector>
+#include <memory>
 
 namespace Win32Bridge
 {
 namespace Bridge
 {
     void ResetGuestDialogState();
+    HWND FindNextGuestDialogTabItem(HWND dialog, HWND current, BOOL previous);
+    HWND FindNextGuestDialogGroupItem(HWND dialog, HWND current, BOOL previous);
 
     constexpr UINT GuestFileDialogNameId = 0x5204;
     constexpr UINT GuestFileDialogFilterId = 0x5205;
@@ -71,6 +74,13 @@ namespace Bridge
         LPCWSTR title = nullptr;
         const GuestPropertyFieldDescriptor* fields = nullptr;
         UINT fieldCount = 0;
+        const void* templateData = nullptr;
+        HANDLE pageHandle = nullptr;
+        DWORD pageFlags = 0;
+        HANDLE activationContext = nullptr;
+        std::shared_ptr<void> lifetime;
+        bool (*prepareCreate)(void*) = nullptr;
+        void (*release)(void*) = nullptr;
     };
 
     struct GuestPropertySheetDescriptor
@@ -82,6 +92,7 @@ namespace Bridge
         UINT pageCount = 0;
         UINT startPage = 0;
         DWORD flags = 0;
+        int (CALLBACK* callback)(HWND, UINT, LPARAM) = nullptr;
     };
 
     struct GuestTaskDialogButtonDescriptor
@@ -121,6 +132,7 @@ namespace Bridge
         DWORD stylesToAdd, DWORD stylesToRemove, LPCWSTR titleOverride,
         bool modal = true, HWND* createdWindow = nullptr);
     INT_PTR ShowGuestPropertySheet(const GuestPropertySheetDescriptor& descriptor);
+    void ResetGuestPropertySheetsForCurrentProcess();
     bool ShowGuestFileDialog(const GuestFileDialogDescriptor& descriptor,
         std::wstring* selectedPath, DWORD* selectedFilterIndex,
         std::vector<std::wstring>* selectedPaths = nullptr);

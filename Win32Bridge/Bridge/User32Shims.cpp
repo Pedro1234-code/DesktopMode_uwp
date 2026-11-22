@@ -1,14 +1,17 @@
 #include "pch.h"
+#include "Bridge/CRT/CrtExceptions.h"
 #include "Bridge\\User32Shims.h"
 #include "Bridge\\Win32Shims.h"
 
 #include "Bridge\\GuestWindow.h"
-#include "Bridge\\Gdi32Shims.h"
+#include "Bridge\\GDI\\Gdi32Shims.h"
 #include "Bridge\\Kernel32Shims.h"
-#include "Bridge\\MiniGdi.h"
+#include "Bridge\\GDI\\MiniGdi.h"
 #include "Bridge/GuestMetrics.h"
 #include "Bridge/GuestResources.h"
 #include "Bridge/GuestStorage.h"
+#include "Bridge/GuestRuntime.h"
+#include "Bridge/GuestKernel.h"
 #include "Bridge/DialogResources.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
@@ -18,6 +21,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <cmath>
+#include <cstdlib>
 #include <cwchar>
 #include <cwctype>
 #include <limits>
@@ -156,7 +161,10 @@ namespace
         }
         __try
         {
-            return procedure(window, message, wParam, lParam);
+            LRESULT result = 0;
+            if (!InvokeCrtFunction(&result, procedure, window, message, wParam, lParam))
+            { if (exceptionCode) *exceptionCode = CrtGuestTerminationCode; }
+            return result;
         }
         __except (GetExceptionCode() == GuestExitException
             ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
@@ -179,7 +187,10 @@ namespace
         if (exceptionCode) *exceptionCode = ERROR_SUCCESS;
         __try
         {
-            return procedure(code, wParam, lParam);
+            LRESULT result = 0;
+            if (!InvokeCrtFunction(&result, procedure, code, wParam, lParam))
+            { if (exceptionCode) *exceptionCode = CrtGuestTerminationCode; }
+            return result;
         }
         __except (GetExceptionCode() == GuestExitException
             ? EXCEPTION_CONTINUE_SEARCH : EXCEPTION_EXECUTE_HANDLER)
@@ -2507,6 +2518,16 @@ HWND WINAPI Win32Bridge::Bridge::BridgeGetDlgItem(HWND parent, int identifier)
     return result;
 }
 
+HWND WINAPI Win32Bridge::Bridge::BridgeGetNextDlgGroupItem(HWND dialog, HWND current, BOOL previous)
+{
+    return FindNextGuestDialogGroupItem(dialog, current, previous);
+}
+
+HWND WINAPI Win32Bridge::Bridge::BridgeGetNextDlgTabItem(HWND dialog, HWND current, BOOL previous)
+{
+    return FindNextGuestDialogTabItem(dialog, current, previous);
+}
+
 int WINAPI Win32Bridge::Bridge::BridgeGetDlgCtrlID(HWND window)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
@@ -2930,7 +2951,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetMessageW(
         return static_cast<BOOL>(-1);
     }
 
-    switch (manager->GetGuestMessage(message, window, minimumMessage, maximumMessage))
+    const auto result = manager->GetGuestMessage(message, window, minimumMessage, maximumMessage);
+    ExitGuestThreadOnShutdown();
+    switch (result)
     {
     case GuestGetMessageResult::Message:
         DispatchGuestHook(WH_GETMESSAGE, HC_ACTION, PM_REMOVE,
@@ -2964,6 +2987,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgePeekMessageW(
         return FALSE;
     }
 
+    ExitGuestThreadOnShutdown();
     const BOOL result = manager->PeekGuestMessage(message, window, minimumMessage, maximumMessage, removeMessage);
     if (result)
     {
@@ -3933,7 +3957,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWaitMessage()
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager) return FALSE;
-    if (!manager->WaitForGuestMessage(INFINITE)) return FALSE;
+    const bool ready = manager->WaitForGuestMessage(INFINITE);
+    ExitGuestThreadOnShutdown();
+    if (!ready) return FALSE;
     BridgeSetLastError(ERROR_SUCCESS);
     return TRUE;
 }
@@ -3950,24 +3976,41 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeMsgWaitForMultipleObjectsEx(
     }
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager) return WAIT_FAILED;
+    const bool waitAll = (flags & MWMO_WAITALL) != 0;
+    std::array<HANDLE, MAXIMUM_WAIT_OBJECTS> captured;
+    if (count)
+    {
+        if (!CaptureGuestWaitHandles(count, handles, captured.data())) return WAIT_FAILED;
+        auto kernel = CurrentGuestKernelContext();
+        DWORD error = ERROR_INVALID_HANDLE;
+        if (!kernel || !kernel->ValidateWaitHandles(count, captured.data(), waitAll, &error))
+        { BridgeSetLastError(error); return WAIT_FAILED; }
+    }
     const ULONGLONG started = GetTickCount64();
     for (;;)
     {
+        if ((flags & MWMO_ALERTABLE) && BridgeSleepEx(0, TRUE) == WAIT_IO_COMPLETION)
+            return WAIT_IO_COMPLETION;
         GuestAbi::Message message{};
         const bool inputReady = wakeMask != 0 &&
             manager->PeekGuestMessage(&message, nullptr, 0, 0, 0) != FALSE;
-        const bool waitAll = (flags & MWMO_WAITALL) != 0;
-        DWORD objectResult = WAIT_TIMEOUT;
-        if (count != 0)
-            objectResult = BridgeWaitForMultipleObjects(count, handles, waitAll ? TRUE : FALSE, 0);
-        const bool objectsReady = count == 0 || objectResult != WAIT_TIMEOUT;
         if (waitAll)
         {
-            if (inputReady && objectsReady) return WAIT_OBJECT_0;
+            // Handle state may only be consumed when the queue is ready too.
+            if (inputReady)
+            {
+                if (!count) return WAIT_OBJECT_0;
+                const DWORD result = BridgeWaitForMultipleObjects(count, captured.data(), TRUE, 0);
+                if (result != WAIT_TIMEOUT) return result;
+            }
         }
         else
         {
-            if (objectResult != WAIT_TIMEOUT) return objectResult;
+            if (count)
+            {
+                const DWORD result = BridgeWaitForMultipleObjects(count, captured.data(), FALSE, 0);
+                if (result != WAIT_TIMEOUT) return result;
+            }
             if (inputReady) return WAIT_OBJECT_0 + count;
         }
         if (milliseconds == 0) return WAIT_TIMEOUT;
@@ -4656,6 +4699,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeIsDialogMessageW(
     native.message = copy.message;
     native.wParam = copy.wParam;
     native.lParam = copy.lParam;
+    native.time = copy.time;
+    native.pt = copy.pt;
     return HandleGuestDialogMessage(dialog, &native);
 }
 
@@ -4773,6 +4818,10 @@ ImportResolution Win32Bridge::Bridge::ResolveUser32Import(const ImportedSymbol& 
     // nested-block compiler limit. Export names are mutually exclusive.
     if (_wcsicmp(symbol.name.c_str(), L"getdlgitem") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDlgItem);
+    else if (_wcsicmp(symbol.name.c_str(), L"getnextdlggroupitem") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetNextDlgGroupItem);
+    else if (_wcsicmp(symbol.name.c_str(), L"getnextdlgtabitem") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetNextDlgTabItem);
     else if (_wcsicmp(symbol.name.c_str(), L"getdlgctrlid") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetDlgCtrlID);
     else if (_wcsicmp(symbol.name.c_str(), L"setdlgitemtextw") == 0)

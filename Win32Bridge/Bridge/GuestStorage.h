@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Bridge\\VirtualPath.h"
+#include "Bridge/GuestKernel.h"
 
 #include <agile.h>
 #include <windows.h>
@@ -15,15 +16,38 @@
 #include <unordered_set>
 #include <vector>
 
+namespace Concurrency { class cancellation_token; }
+
 namespace Win32Bridge
 {
 namespace Bridge
 {
+    class GuestIoCompletionPort;
+    struct GuestIoCompletionBinding;
+
     // One storage environment belongs to one running guest.  It owns opaque
     // guest HANDLE values and maps virtual C: paths onto LocalFolder\drive_c.
     class GuestStorageContext final
     {
+        struct FileRecord;
+        struct FileRangeState;
+
     public:
+        class DiskFile final
+        {
+        public:
+            bool IsOverlapped() const;
+            bool IsAppendOnly() const;
+            DWORD ValidateAccess(bool writing) const;
+            DWORD ValidateLockAccess() const;
+            const void* Identity() const { return m_record.get(); }
+
+        private:
+            friend class GuestStorageContext;
+            std::shared_ptr<FileRecord> m_record;
+            const GuestStorageContext* m_owner = nullptr;
+        };
+
         GuestStorageContext(
             Windows::Storage::StorageFolder^ localFolder,
             const std::wstring& modulePath,
@@ -31,6 +55,8 @@ namespace Bridge
             Windows::Storage::StorageFolder^ externalFolder = nullptr);
         ~GuestStorageContext();
 
+        // Bound individual WinRT buffers; callers can stream larger requests.
+        static constexpr DWORD MaximumTransferSize() { return 16u * 1024u * 1024u; }
         bool EnsureLayout(std::wstring* error);
 
         bool CreateFile(
@@ -44,11 +70,27 @@ namespace Bridge
             DWORD* win32Error);
         bool ReadFile(HANDLE guestHandle, void* buffer, DWORD bytesToRead, DWORD* bytesRead, DWORD* win32Error);
         bool ReadFileAt(HANDLE guestHandle, void* buffer, DWORD bytesToRead,
-            ULONGLONG offset, DWORD* bytesRead, DWORD* win32Error);
+            ULONGLONG offset, DWORD* bytesRead, DWORD* win32Error, bool mappedIo = false);
         bool WriteFile(HANDLE guestHandle, const void* buffer, DWORD bytesToWrite, DWORD* bytesWritten, DWORD* win32Error);
         bool WriteFileAt(HANDLE guestHandle, const void* buffer, DWORD bytesToWrite,
-            ULONGLONG offset, DWORD* bytesWritten, DWORD* win32Error);
+            ULONGLONG offset, DWORD* bytesWritten, DWORD* win32Error, bool mappedIo = false);
         bool CloseFile(HANDLE guestHandle, DWORD* win32Error);
+        bool OwnsFile(HANDLE guestHandle) const;
+        DWORD FileDataAccess(HANDLE guestHandle) const;
+        std::shared_ptr<const void> RetainFileDescription(HANDLE file) const;
+        DiskFile CaptureDiskFile(HANDLE file) const;
+        GuestKernelContext::FileSignal LookupFileSignal(HANDLE file) const;
+        static constexpr ULONGLONG UseCurrentFilePosition = ~1ull;
+        static DWORD TransferDiskFile(const DiskFile& file, bool writing, ULONGLONG offset, BYTE* buffer,
+            DWORD length, DWORD& transferred, const Concurrency::cancellation_token& cancellation,
+            bool updateFilePosition = false, ULONG lockKey = 0);
+        bool BindIoCompletionPort(HANDLE file, const std::shared_ptr<GuestIoCompletionPort>& port,
+            ULONG_PTR key, DWORD* win32Error);
+        bool SetIoCompletionModes(HANDLE file, UCHAR modes, DWORD* win32Error);
+        GuestIoCompletionBinding IoCompletionBinding(HANDLE file) const;
+        bool FileHandleFlags(HANDLE guestHandle, DWORD* flags, DWORD mask, bool set, DWORD* win32Error);
+        bool DuplicateFile(HANDLE source, bool inherit, HANDLE* duplicate, DWORD* win32Error);
+        bool InheritFiles(const GuestStorageContext& parent, DWORD* win32Error);
         bool GetFileSize(HANDLE guestHandle, LARGE_INTEGER* fileSize, DWORD* win32Error);
         bool SetFilePointer(HANDLE guestHandle, LARGE_INTEGER distance, LARGE_INTEGER* newPosition, DWORD moveMethod, DWORD* win32Error);
         bool SetEndOfFile(HANDLE guestHandle, DWORD* win32Error);
@@ -56,9 +98,12 @@ namespace Bridge
         bool GetFilePath(HANDLE guestHandle, std::wstring* path, DWORD* win32Error) const;
         bool IsDirectoryHandle(HANDLE guestHandle, DWORD* win32Error) const;
         bool LockFileRange(HANDLE guestHandle, ULONGLONG offset, ULONGLONG length,
-            bool exclusive, bool failImmediately, DWORD* win32Error);
+            bool exclusive, bool failImmediately, DWORD* win32Error, ULONG key = 0);
+        static DWORD LockDiskRange(const DiskFile& file, ULONGLONG offset, ULONGLONG length,
+            bool exclusive, bool failImmediately, ULONG key, const Concurrency::cancellation_token& cancellation,
+            HANDLE callerHandle = nullptr);
         bool UnlockFileRange(HANDLE guestHandle, ULONGLONG offset, ULONGLONG length,
-            DWORD* win32Error);
+            DWORD* win32Error, ULONG key = 0);
 
         // Internal module loading uses the same virtual filesystem as guest
         // CreateFile calls. It never exposes a host path to a PE.
@@ -92,7 +137,11 @@ namespace Bridge
         void CloseAll();
 
     private:
-        struct FileRecord;
+        struct SharedFiles;
+        void ReleaseFileRanges(const std::shared_ptr<FileRecord>& record);
+        static std::shared_ptr<SharedFiles> AcquireFileNamespace(Windows::Storage::StorageFolder^ root);
+        bool RegisterFileLocked(const std::shared_ptr<FileRecord>& record, DWORD flags, HANDLE* value, DWORD* error);
+        bool CloseDescription(const std::shared_ptr<FileRecord>& record, DWORD* error);
         struct FindRecord;
 
         bool Resolve(LPCWSTR path, GuestPath* resolved, DWORD* win32Error) const;
@@ -117,6 +166,7 @@ namespace Bridge
             const GuestPath& path,
             DWORD desiredAccess,
             DWORD shareMode,
+            DWORD flags,
             HANDLE* guestHandle,
             DWORD* win32Error);
         bool AddFile(
@@ -126,7 +176,7 @@ namespace Bridge
             const std::wstring& canonicalPath,
             DWORD desiredAccess,
             DWORD shareMode,
-            bool deleteOnClose,
+            DWORD flags,
             HANDLE* guestHandle,
             DWORD* win32Error);
         bool AddDirectory(
@@ -134,6 +184,7 @@ namespace Bridge
             const std::wstring& canonicalPath,
             DWORD desiredAccess,
             DWORD shareMode,
+            DWORD flags,
             HANDLE* guestHandle,
             DWORD* win32Error);
         bool AddFind(
@@ -160,6 +211,7 @@ namespace Bridge
         static constexpr ULONG_PTR FirstHandleToken = 0x10000;
         static constexpr ULONG_PTR FirstReservedHandleToken = 0x40000000;
 
+        std::shared_ptr<SharedFiles> m_sharedFiles;
         Platform::Agile<Windows::Storage::StorageFolder^> m_localFolder;
         Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
         Platform::Agile<Windows::Storage::StorageFolder^> m_externalFolder;
@@ -168,13 +220,11 @@ namespace Bridge
         std::wstring m_moduleDirectory;
         size_t m_moduleDirectoryComponentCount = 0;
         std::wstring m_initialCurrentDirectory;
-        mutable std::mutex m_handlesLock;
+        std::mutex& m_handlesLock;
         std::unordered_map<ULONG_PTR, std::shared_ptr<FileRecord>> m_files;
-        struct ByteRangeLock { ULONG_PTR owner; ULONGLONG offset; ULONGLONG length; bool exclusive; };
-        std::unordered_map<std::wstring, std::vector<ByteRangeLock>> m_byteRangeLocks;
-        std::unordered_set<std::wstring> m_deletePending;
+        std::unordered_map<ULONG_PTR, DWORD> m_fileFlags;
+        std::unordered_set<std::wstring>& m_deletePending;
         std::unordered_map<ULONG_PTR, std::shared_ptr<FindRecord>> m_finds;
-        ULONG_PTR m_nextHandle = FirstHandleToken;
         mutable std::mutex m_metadataLock;
         std::unordered_map<std::wstring, DWORD> m_attributeOverrides;
         std::unordered_set<std::wstring> m_lowerLayerTombstones;

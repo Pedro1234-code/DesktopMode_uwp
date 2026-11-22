@@ -1,4 +1,5 @@
 using Windows.ApplicationModel.Core;
+using Windows.Devices.Input;
 using Windows.UI.ViewManagement;
 using Windows.UI;
 using Windows.UI.Xaml.Controls;
@@ -6,9 +7,11 @@ using Windows.UI.Xaml.Input;
 using factoryos_10x_shell.Controls;
 using System;
 using Windows.Foundation;
+using Windows.Graphics.Display;
 using Windows.UI.Core;
 using Windows.UI.Xaml;
 using Windows.UI.Input;
+using Windows.UI.Input.Preview.Injection;
 using Windows.UI.Xaml.Media;
 using factoryos_10x_shell.Library.Services.Managers;
 using Microsoft.Extensions.DependencyInjection;
@@ -16,6 +19,7 @@ using factoryos_10x_shell.Library.Services.Navigation;
 using factoryos_10x_shell.Views;
 using Windows.System;
 using Windows.System.Profile;
+using Windows.System.Threading;
 using System.Diagnostics;
 using System.IO;
 using System.Text;
@@ -35,9 +39,11 @@ namespace factoryos_10x_shell
         // Xbox UWP's TV-oriented logical scale makes the current shell overly large.
         // Render an expanded logical canvas at this scale to retain full-screen coverage.
         private const double XboxDesktopScale = 0.70;
-        // The supplied XL cursor is rendered at the standard Windows pointer size.
-        // Its hotspot is (0, 0).
+        internal double DesktopScale => m_useXboxDesktopScale ? XboxDesktopScale : 1.0;
         private const double MouseCursorPixelSize = 16.0;
+        private const int CursorAbsoluteGraceMilliseconds = 32;
+        private const int CursorMoveConfirmationMilliseconds = 100;
+        private const int CursorActivationMilliseconds = 200;
         private const string CustomCursorEnabledSettingKey = "CoreShell.CustomCursorEnabled";
 
         private readonly IStartManagerService m_startManager;
@@ -52,15 +58,32 @@ namespace factoryos_10x_shell
         private readonly CoreCursor m_resizeNeSwCursor;
         private readonly CoreCursor m_resizeHorizontalCursor;
         private readonly CoreCursor m_resizeVerticalCursor;
-        private CoreCursor m_visibleSystemCursor;
+        private CoreCursor m_appliedCursor;
+        private MouseDevice m_cursorMouseDevice;
+        private InputInjector m_cursorInjector;
+        private InjectedInputMouseInfo[] m_cursorMovePacket;
+        private bool m_customCursorActive;
+        private bool m_customCursorPresented;
+        private long m_cursorActivationDeadline;
+        private bool m_customCursorReady;
+        private bool m_customCursorBlocked;
+        private bool m_cursorFramePending;
+        private bool m_cursorPositionDirty;
+        private bool m_cursorMoveAwaitingConfirmation;
+        private long m_lastCursorAbsoluteMoveAt;
+        private long m_cursorMoveDeadline;
+        private Point m_cursorPosition;
+        private Point m_cursorActivationOrigin;
+        private Point m_cursorMoveOrigin;
+        private double m_rawCursorDeltaX;
+        private double m_rawCursorDeltaY;
         private Controls.WindowResizeCorner? m_hoveredResizeCorner;
+        private DependencyObject m_lastResizePointerSource;
         private readonly bool m_useXboxDesktopScale;
-        private bool m_isNativeMouseCursorHidden;
         private int m_popupCursorRequests;
         private bool m_hasOpenXamlPopup;
         private bool m_isWindowActive = true;
-        private bool m_hasMouseInput;
-        private bool m_customCursorEnabled = true;
+        private bool m_customCursorEnabled = false;
         private bool m_altTabHeld;
         private bool m_desktopInitialized;
         private readonly DispatcherTimer m_popupCursorTimer;
@@ -69,6 +92,9 @@ namespace factoryos_10x_shell
         private static readonly SemaphoreSlim s_uiStutterLogGate = new SemaphoreSlim(1, 1);
         private readonly string m_uiStutterLogPath;
         private long m_lastUiResponsivenessTick;
+        private ThreadPoolTimer m_uiHangTimer;
+        private long m_uiHangMonitoringStartedAt;
+        private long m_lastReportedUiHangTick = -1;
         private long m_lastUiStutterLog;
         private int m_lastGen0Collections;
         private int m_lastGen1Collections;
@@ -108,13 +134,8 @@ namespace factoryos_10x_shell
             m_resizeVerticalCursor = new CoreCursor(CoreCursorType.SizeNorthSouth, 0);
             ContentRoot.AddHandler(UIElement.PointerMovedEvent,
                 new PointerEventHandler(ContentRoot_PointerMoved), true);
-            if (Windows.Storage.ApplicationData.Current.LocalSettings.Values.TryGetValue(
-                    CustomCursorEnabledSettingKey, out object customCursorEnabled) &&
-                customCursorEnabled is bool enabled)
-            {
-                m_customCursorEnabled = enabled;
-            }
-
+            // Temporarily disable the custom cursor for existing installations too.
+            Windows.Storage.ApplicationData.Current.LocalSettings.Values[CustomCursorEnabledSettingKey] = false;
 
             // Titlebar
             var coreTitleBar = CoreApplication.GetCurrentView().TitleBar;
@@ -131,11 +152,10 @@ namespace factoryos_10x_shell
             Window.Current.CoreWindow.KeyDown += CoreWindow_KeyDown;
             Window.Current.CoreWindow.Dispatcher.AcceleratorKeyActivated += Dispatcher_AcceleratorKeyActivated;
             m_mouseInput.Attach(Window.Current.CoreWindow);
-            m_mouseInput.InputChanged += MouseInput_InputChanged;
 
             Loaded += MainPage_Loaded;
+            Unloaded += MainPage_Unloaded;
             Window.Current.SizeChanged += Window_SizeChanged;
-            Window.Current.Activated += Window_Activated;
             // GetOpenPopups walks the XAML popup tree. Doing that from
             // CompositionTarget.Rendering stalled the UI thread every frame,
             // even while the Shell was otherwise idle. The custom cursor only
@@ -168,8 +188,7 @@ namespace factoryos_10x_shell
         private void UiResponsivenessTimer_Tick(object sender, object e)
         {
             long now = m_uiResponsivenessClock.ElapsedMilliseconds;
-            long elapsed = now - m_lastUiResponsivenessTick;
-            m_lastUiResponsivenessTick = now;
+            long elapsed = now - Interlocked.Exchange(ref m_lastUiResponsivenessTick, now);
             int gen0 = GC.CollectionCount(0);
             int gen1 = GC.CollectionCount(1);
             int gen2 = GC.CollectionCount(2);
@@ -179,6 +198,8 @@ namespace factoryos_10x_shell
             m_lastGen0Collections = gen0;
             m_lastGen1Collections = gen1;
             m_lastGen2Collections = gen2;
+
+            if (!ShellDiagnostics.IsLoggingEnabled) return;
 
             // Xbox commonly coalesces this 100 ms timer onto four 30 Hz frames
             // (about 133 ms); that is timer quantization, not a UI stall. Keep
@@ -207,7 +228,7 @@ namespace factoryos_10x_shell
                 $"{Math.Max(0, now - m_lastMouseInputAt)} ms ago; " +
                 $"lastOperation={m_lastUiOperation}({m_lastUiOperationDuration} ms) " +
                 $"{Math.Max(0, now - m_lastUiOperationAt)} ms ago";
-            Debug.WriteLine("[ShellStutter] " + line);
+            factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("[ShellStutter] " + line);
             _ = AppendUiStutterLogAsync(line);
         }
 
@@ -221,24 +242,27 @@ namespace factoryos_10x_shell
 
         private void RecordUiOperationCore(string operation, long elapsedMilliseconds)
         {
-            m_lastUiOperation = operation ?? "unknown";
+            if (!ShellDiagnostics.IsLoggingEnabled) return;
+            Volatile.Write(ref m_lastUiOperation, operation ?? "unknown");
             m_lastUiOperationDuration = elapsedMilliseconds;
             m_lastUiOperationAt = m_uiResponsivenessClock.ElapsedMilliseconds;
             if (elapsedMilliseconds < 16) return;
 
             string line = $"{DateTimeOffset.Now:O} Slow UI operation: " +
                 $"name={m_lastUiOperation}; elapsed={elapsedMilliseconds} ms";
-            Debug.WriteLine("[ShellStutter] " + line);
+            factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("[ShellStutter] " + line);
             _ = AppendUiStutterLogAsync(line);
         }
 
         private async Task AppendUiStutterLogAsync(string line)
         {
+            if (!ShellDiagnostics.IsLoggingEnabled) return;
             await Task.Run(async () =>
             {
                 await s_uiStutterLogGate.WaitAsync().ConfigureAwait(false);
                 try
                 {
+                    if (!ShellDiagnostics.IsLoggingEnabled) return;
                     var file = new FileInfo(m_uiStutterLogPath);
                     if (file.Exists && file.Length > 1024 * 1024)
                         File.WriteAllText(m_uiStutterLogPath,
@@ -258,6 +282,21 @@ namespace factoryos_10x_shell
 
         private void MainPage_Loaded(object sender, RoutedEventArgs e)
         {
+            CurrentPage = this;
+            try
+            {
+                m_cursorMouseDevice = MouseDevice.GetForCurrentView();
+                if (m_cursorMouseDevice != null) m_cursorMouseDevice.MouseMoved += CursorMouse_Moved;
+            }
+            catch (Exception)
+            {
+                // Without the relative-motion event, keep the system cursor.
+                m_cursorMouseDevice = null;
+            }
+            m_mouseInput.InputChanged += MouseInput_InputChanged;
+            Window.Current.Activated += Window_Activated;
+            Window.Current.VisibilityChanged += UiHangWindow_VisibilityChanged;
+            UpdateUiHangMonitoring(Window.Current.Visible);
             ApplyDesktopScale();
             if (!m_desktopInitialized)
             {
@@ -265,6 +304,70 @@ namespace factoryos_10x_shell
                 _ = Dispatcher.RunAsync(
                     Windows.UI.Core.CoreDispatcherPriority.Low,
                     () => m_desktopNavigator.DesktopNavigate(DesktopPageType.RootContentDesktop));
+            }
+        }
+
+        private void MainPage_Unloaded(object sender, RoutedEventArgs e)
+        {
+            m_mouseInput.InputChanged -= MouseInput_InputChanged;
+            if (m_cursorMouseDevice != null) m_cursorMouseDevice.MouseMoved -= CursorMouse_Moved;
+            m_cursorMouseDevice = null;
+            m_cursorInjector = null;
+            m_cursorMovePacket = null;
+            ResetCursorFrames();
+            m_customCursorActive = false;
+            m_customCursorPresented = false;
+            m_customCursorReady = false;
+            MouseCursor.Visibility = Visibility.Collapsed;
+            Window.Current.Activated -= Window_Activated;
+            Window.Current.VisibilityChanged -= UiHangWindow_VisibilityChanged;
+            m_popupCursorTimer.Stop();
+            if (ReferenceEquals(CurrentPage, this))
+            {
+                Window.Current.CoreWindow.PointerCursor = m_systemArrowCursor;
+                CurrentPage = null;
+            }
+            m_appliedCursor = null;
+            UpdateUiHangMonitoring(false);
+        }
+
+        private void UiHangWindow_VisibilityChanged(object sender, VisibilityChangedEventArgs e)
+        {
+            UpdateUiHangMonitoring(e.Visible);
+        }
+
+        private void UpdateUiHangMonitoring(bool visible)
+        {
+            if (!visible)
+            {
+                Interlocked.Exchange(ref m_uiHangTimer, null)?.Cancel();
+                return;
+            }
+
+            if (m_uiHangTimer != null) return;
+
+            Interlocked.Exchange(ref m_uiHangMonitoringStartedAt, m_uiResponsivenessClock.ElapsedMilliseconds);
+            Volatile.Write(ref m_uiHangTimer,
+                ThreadPoolTimer.CreatePeriodicTimer(CheckUiHeartbeat, TimeSpan.FromSeconds(1)));
+        }
+
+        private void CheckUiHeartbeat(ThreadPoolTimer timer)
+        {
+            if (!ShellDiagnostics.IsLoggingEnabled) return;
+            long lastTick = Interlocked.Read(ref m_lastUiResponsivenessTick);
+            long elapsed = m_uiResponsivenessClock.ElapsedMilliseconds -
+                           Math.Max(lastTick, Interlocked.Read(ref m_uiHangMonitoringStartedAt));
+            if (elapsed < 3000 ||
+                !ReferenceEquals(Volatile.Read(ref m_uiHangTimer), timer) ||
+                Interlocked.Read(ref m_lastUiResponsivenessTick) != lastTick)
+                return;
+
+            // A blocked dispatcher cannot write its own log. Write only once per missed heartbeat.
+            long lastReported = Interlocked.Read(ref m_lastReportedUiHangTick);
+            if (lastTick > lastReported &&
+                Interlocked.CompareExchange(ref m_lastReportedUiHangTick, lastTick, lastReported) == lastReported)
+            {
+                ShellDiagnostics.RecordUiHang(elapsed, Volatile.Read(ref m_lastUiOperation));
             }
         }
 
@@ -278,7 +381,8 @@ namespace factoryos_10x_shell
             double scale = m_useXboxDesktopScale ? XboxDesktopScale : 1.0;
             DesktopScaleTransform.ScaleX = scale;
             DesktopScaleTransform.ScaleY = scale;
-            UpdateMouseCursorSize(scale);
+            MouseCursor.Width = MouseCursor.Height = MouseCursorPixelSize / scale;
+            if (m_customCursorPresented) PositionCustomCursor(m_cursorPosition.X, m_cursorPosition.Y);
 
             if (scale == 1.0)
             {
@@ -294,44 +398,44 @@ namespace factoryos_10x_shell
 
         private void MouseInput_InputChanged(object sender, MouseInputChangedEventArgs e)
         {
-            bool firstMouseInput = !m_hasMouseInput;
-            double scale = m_useXboxDesktopScale ? XboxDesktopScale : 1.0;
+            bool positionChanged = m_lastMouseX != e.Snapshot.X || m_lastMouseY != e.Snapshot.Y;
             m_lastMouseInputKind = e.Kind;
             m_lastMouseInputAt = m_uiResponsivenessClock.ElapsedMilliseconds;
             m_lastMouseX = e.Snapshot.X;
             m_lastMouseY = e.Snapshot.Y;
 
-            // PointerPoint coordinates use the physical window space. ContentRoot uses
-            // the larger virtual desktop space when the Xbox scale is enabled.
-            // A render transform moves the cursor without invalidating Canvas
-            // measure/arrange on every raw pointer packet.
-            MouseCursorTransform.X = e.Snapshot.X / scale;
-            MouseCursorTransform.Y = e.Snapshot.Y / scale;
-            if (m_customCursorEnabled && m_hoveredResizeCorner.HasValue)
+            if (m_customCursorActive && !m_cursorMoveAwaitingConfirmation &&
+                (m_cursorPosition.X != m_lastMouseX || m_cursorPosition.Y != m_lastMouseY))
             {
-                double halfSize = ResizeCursor.Width / 2;
-                ResizeCursorTransform.X = MouseCursorTransform.X - halfSize;
-                ResizeCursorTransform.Y = MouseCursorTransform.Y - halfSize;
+                m_lastCursorAbsoluteMoveAt = m_lastMouseInputAt;
+                m_rawCursorDeltaX = 0;
+                m_rawCursorDeltaY = 0;
+                m_cursorPosition = new Point(m_lastMouseX, m_lastMouseY);
+                m_cursorPositionDirty = true;
+                QueueCursorFrame();
             }
-            m_hasMouseInput = true;
+
+            if (e.Kind == MouseInputChangeKind.Moved && positionChanged &&
+                m_customCursorEnabled && !m_customCursorReady && m_cursorMouseDevice != null)
+            {
+                m_customCursorReady = true;
+                _ = Dispatcher.RunAsync(CoreDispatcherPriority.Normal, () =>
+                {
+                    if (ReferenceEquals(CurrentPage, this)) UpdateCursorPresentation();
+                });
+            }
 
             // Popup-tree discovery is a compatibility fallback for controls
             // which do not call SetPopupCursorVisibility themselves. Walking
             // that tree continuously caused a visible UI-thread hitch every
             // 125 ms. Check once after an actual interaction instead. Explicit
             // flyout/dialog hooks still update the cursor immediately.
-            if (firstMouseInput || e.Kind == MouseInputChangeKind.Pressed ||
-                e.Kind == MouseInputChangeKind.Released)
+            if (e.Kind == MouseInputChangeKind.Pressed || e.Kind == MouseInputChangeKind.Released)
             {
                 m_popupCursorTimer.Stop();
                 m_popupCursorTimer.Start();
             }
 
-            // Width/height are set when the desktop scale changes, and cursor
-            // visibility changes only when state changes. Reassigning all three
-            // on every PointerMoved needlessly invalidated XAML layout.
-            if (firstMouseInput)
-                UpdateCursorPresentation();
         }
 
         // Flyouts and ContentDialogs are rendered in the UWP popup layer, above the
@@ -341,23 +445,17 @@ namespace factoryos_10x_shell
             CurrentPage?.SetPopupCursorVisibilityCore(isPopupOpen);
         }
 
-        public static bool IsCustomCursorEnabled
-        {
-            get
-            {
-                return !Windows.Storage.ApplicationData.Current.LocalSettings.Values.TryGetValue(
-                           CustomCursorEnabledSettingKey, out object value) ||
-                       !(value is bool enabled) || enabled;
-            }
-        }
+        public static bool IsCustomCursorEnabled => false;
 
         public static void SetCustomCursorEnabled(bool enabled)
         {
             Windows.Storage.ApplicationData.Current.LocalSettings.Values[
-                CustomCursorEnabledSettingKey] = enabled;
+                CustomCursorEnabledSettingKey] = false;
             if (CurrentPage != null)
             {
-                CurrentPage.m_customCursorEnabled = enabled;
+                CurrentPage.m_customCursorEnabled = false;
+                CurrentPage.m_customCursorReady = false;
+                CurrentPage.m_customCursorBlocked = false;
                 CurrentPage.UpdateCursorPresentation();
             }
         }
@@ -365,14 +463,17 @@ namespace factoryos_10x_shell
         private void SetPopupCursorVisibilityCore(bool isPopupOpen)
         {
             m_popupCursorRequests = Math.Max(0, m_popupCursorRequests + (isPopupOpen ? 1 : -1));
+            // Browser CSS cursors share CoreWindow and can replace our cached cursor.
+            m_appliedCursor = null;
             UpdateCursorPresentation();
         }
 
         private void PopupCursorTimer_Tick(object sender, object e)
         {
-            // DispatcherTimer has no one-shot mode.
-            m_popupCursorTimer.Stop();
             bool hasOpenPopup = VisualTreeHelper.GetOpenPopups(Window.Current).Count > 0;
+            // Keep checking only while an untracked popup is open. It can also
+            // close by keyboard or code, without another mouse click.
+            if (!hasOpenPopup) m_popupCursorTimer.Stop();
             if (m_hasOpenXamlPopup == hasOpenPopup) return;
 
             m_hasOpenXamlPopup = hasOpenPopup;
@@ -385,13 +486,42 @@ namespace factoryos_10x_shell
             if (m_isWindowActive == isActive) return;
 
             m_isWindowActive = isActive;
+            m_customCursorReady = false;
+            m_appliedCursor = null;
+            m_lastResizePointerSource = null;
+            m_hoveredResizeCorner = null;
+            if (isActive) PopupCursorTimer_Tick(null, null);
             UpdateCursorPresentation();
         }
 
         private void ContentRoot_PointerMoved(object sender, PointerRoutedEventArgs e)
         {
+            if (m_customCursorActive && (m_cursorMoveAwaitingConfirmation || !m_customCursorPresented) &&
+                e.Pointer.PointerDeviceType == PointerDeviceType.Mouse)
+            {
+                Point position = e.GetCurrentPoint(null).Position;
+                Point origin = m_cursorMoveAwaitingConfirmation ? m_cursorMoveOrigin : m_cursorActivationOrigin;
+                if (position.X != origin.X || position.Y != origin.Y)
+                {
+                    m_cursorMoveAwaitingConfirmation = false;
+                    m_cursorPosition = position;
+                    m_cursorPositionDirty = true;
+                    if (!m_customCursorPresented)
+                    {
+                        PositionCustomCursor(position.X, position.Y);
+                        m_customCursorPresented = true;
+                        MouseCursor.Visibility = Visibility.Visible;
+                    }
+                    QueueCursorFrame();
+                }
+            }
+
+            var source = e.OriginalSource as DependencyObject;
+            if (source != null && ReferenceEquals(source, m_lastResizePointerSource)) return;
+            m_lastResizePointerSource = source;
+
             Controls.WindowResizeCorner? corner = null;
-            for (DependencyObject element = e.OriginalSource as DependencyObject;
+            for (DependencyObject element = source;
                  element != null;
                  element = VisualTreeHelper.GetParent(element))
             {
@@ -405,87 +535,211 @@ namespace factoryos_10x_shell
                 }
                 if (element == ContentRoot) break;
             }
-            if (m_customCursorEnabled && corner.HasValue && corner != m_hoveredResizeCorner)
-            {
-                var position = e.GetCurrentPoint(ContentRoot).Position;
-                double halfSize = ResizeCursor.Width / 2;
-                ResizeCursorTransform.X = position.X - halfSize;
-                ResizeCursorTransform.Y = position.Y - halfSize;
-            }
             if (corner == m_hoveredResizeCorner) return;
             if (corner.HasValue && (m_hasOpenXamlPopup || m_popupCursorRequests > 0))
                 m_hasOpenXamlPopup = VisualTreeHelper.GetOpenPopups(Window.Current).Count > 0;
             m_hoveredResizeCorner = corner;
-            switch (corner)
-            {
-                case Controls.WindowResizeCorner.Left:
-                case Controls.WindowResizeCorner.Right:
-                    ResizeCursorRotation.Angle = -45;
-                    break;
-                case Controls.WindowResizeCorner.Top:
-                case Controls.WindowResizeCorner.Bottom:
-                    ResizeCursorRotation.Angle = 45;
-                    break;
-                case Controls.WindowResizeCorner.TopRight:
-                case Controls.WindowResizeCorner.BottomLeft:
-                    ResizeCursorRotation.Angle = 90;
-                    break;
-                default:
-                    ResizeCursorRotation.Angle = 0;
-                    break;
-            }
             UpdateCursorPresentation();
         }
 
         private void UpdateCursorPresentation()
         {
-            bool allowResize = !m_hasOpenXamlPopup && m_isWindowActive;
-            bool showResize = allowResize && m_hoveredResizeCorner.HasValue;
-            bool drawResize = showResize && m_customCursorEnabled;
-            bool useSystemCursor = !allowResize || !m_customCursorEnabled || (!showResize && m_popupCursorRequests > 0);
-            Stopwatch cursorClock = Stopwatch.StartNew();
-            bool cursorChanged = false;
-            if (useSystemCursor)
-            {
-                MouseCursor.Visibility = Visibility.Collapsed;
-                ResizeCursor.Visibility = Visibility.Collapsed;
-                CoreCursor cursor = showResize
-                    ? GetSystemResizeCursor(m_hoveredResizeCorner.Value)
-                    : m_systemArrowCursor;
-                if (m_isNativeMouseCursorHidden || m_visibleSystemCursor != cursor)
-                {
-                    Window.Current.CoreWindow.PointerCursor = cursor;
-                    m_isNativeMouseCursorHidden = false;
-                    m_visibleSystemCursor = cursor;
-                    cursorChanged = true;
-                }
-            }
-            else
-            {
-                if (!m_isNativeMouseCursorHidden)
-                {
-                    // Match Bandit Launcher: the Windows cursor is hidden and our image
-                    // is the only visible pointer while interacting with the Shell layer.
-                    Window.Current.CoreWindow.PointerCursor = null;
-                    m_isNativeMouseCursorHidden = true;
-                    m_visibleSystemCursor = null;
-                    cursorChanged = true;
-                }
+            bool canUseShellCursor = m_isWindowActive && !m_hasOpenXamlPopup;
+            CoreCursor cursor = m_systemArrowCursor;
+            if (canUseShellCursor && m_hoveredResizeCorner.HasValue)
+                cursor = GetSystemResizeCursor(m_hoveredResizeCorner.Value);
 
-                MouseCursor.Visibility = m_hasMouseInput && !showResize ? Visibility.Visible : Visibility.Collapsed;
-                ResizeCursor.Visibility = drawResize ? Visibility.Visible : Visibility.Collapsed;
+            bool showCustom = ReferenceEquals(cursor, m_systemArrowCursor) &&
+                canUseShellCursor && m_popupCursorRequests == 0 && m_customCursorEnabled &&
+                m_customCursorReady && !m_customCursorBlocked && m_cursorMouseDevice != null;
+            var coreWindow = Window.Current.CoreWindow;
+
+            if (showCustom)
+            {
+                if (m_customCursorActive) return;
+                m_cursorPosition = new Point(m_lastMouseX, m_lastMouseY);
+                m_cursorActivationOrigin = m_cursorPosition;
+                m_lastCursorAbsoluteMoveAt = m_uiResponsivenessClock.ElapsedMilliseconds;
+                m_cursorActivationDeadline = m_lastCursorAbsoluteMoveAt + CursorActivationMilliseconds;
+                try { coreWindow.PointerCursor = null; }
+                catch (Exception)
+                {
+                    m_customCursorBlocked = true;
+                    coreWindow.PointerCursor = m_appliedCursor = m_systemArrowCursor;
+                    return;
+                }
+                m_appliedCursor = null;
+                m_customCursorActive = true;
+                QueueCursorFrame();
+                return;
             }
 
-            cursorClock.Stop();
-            if (cursorChanged && cursorClock.ElapsedMilliseconds >= 16)
+            if (m_customCursorActive || !ReferenceEquals(m_appliedCursor, cursor))
             {
-                string line = $"{DateTimeOffset.Now:O} Slow cursor transition: " +
-                    $"target={(useSystemCursor ? "system" : "custom")}; " +
-                    $"elapsed={cursorClock.ElapsedMilliseconds} ms; " +
-                    $"popupCursorRequests={m_popupCursorRequests}; xamlPopup={m_hasOpenXamlPopup}";
-                Debug.WriteLine("[ShellStutter] " + line);
-                _ = AppendUiStutterLogAsync(line);
+                coreWindow.PointerCursor = cursor;
+                m_appliedCursor = cursor;
             }
+
+            if (!m_customCursorActive) return;
+            m_customCursorActive = false;
+            m_customCursorPresented = false;
+            MouseCursor.Visibility = Visibility.Collapsed;
+            ResetCursorFrames();
+        }
+
+        private void PositionCustomCursor(double x, double y)
+        {
+            double scale = m_useXboxDesktopScale ? XboxDesktopScale : 1.0;
+            MouseCursorTransform.X = x / scale;
+            MouseCursorTransform.Y = y / scale;
+        }
+
+        private void CursorMouse_Moved(MouseDevice sender, MouseEventArgs args)
+        {
+            if (!m_customCursorActive) return;
+
+            // Ignore raw packets while normal absolute movement is arriving.
+            // This prevents applying the same movement a second time.
+            if (!m_cursorMoveAwaitingConfirmation &&
+                m_uiResponsivenessClock.ElapsedMilliseconds - m_lastCursorAbsoluteMoveAt < CursorAbsoluteGraceMilliseconds)
+                return;
+
+            var delta = args.MouseDelta;
+            if (delta.X == 0 && delta.Y == 0) return;
+            m_rawCursorDeltaX += delta.X;
+            m_rawCursorDeltaY += delta.Y;
+            QueueCursorFrame();
+        }
+
+        private void QueueCursorFrame()
+        {
+            if (m_cursorFramePending) return;
+            m_cursorFramePending = true;
+            CompositionTarget.Rendering += RenderCursorFrame;
+        }
+
+        private void RenderCursorFrame(object sender, object args)
+        {
+            CompositionTarget.Rendering -= RenderCursorFrame;
+            m_cursorFramePending = false;
+            if (!m_customCursorActive) return;
+
+            if (m_cursorPositionDirty && m_customCursorPresented)
+            {
+                m_cursorPositionDirty = false;
+                PositionCustomCursor(m_cursorPosition.X, m_cursorPosition.Y);
+            }
+
+            long now = m_uiResponsivenessClock.ElapsedMilliseconds;
+            if (m_cursorMoveAwaitingConfirmation)
+            {
+                if (now < m_cursorMoveDeadline)
+                    QueueCursorFrame();
+                else
+                    RestoreSystemCursor();
+                return;
+            }
+
+            if (m_rawCursorDeltaX == 0 && m_rawCursorDeltaY == 0)
+            {
+                if (!m_customCursorPresented)
+                {
+                    if (now < m_cursorActivationDeadline)
+                        QueueCursorFrame();
+                    else
+                    {
+                        m_customCursorReady = false;
+                        UpdateCursorPresentation();
+                    }
+                }
+                return;
+            }
+            double dx = m_rawCursorDeltaX;
+            double dy = m_rawCursorDeltaY;
+            m_rawCursorDeltaX = m_rawCursorDeltaY = 0;
+
+            try
+            {
+                var coreWindow = Window.Current.CoreWindow;
+                Rect bounds = coreWindow.Bounds;
+                if (bounds.Width < 1 || bounds.Height < 1)
+                {
+                    RestoreSystemCursor();
+                    return;
+                }
+
+                var display = DisplayInformation.GetForCurrentView();
+                double pixelsPerDip = display.RawPixelsPerViewPixel;
+                if (pixelsPerDip <= 0) pixelsPerDip = 1;
+                var target = new Point(
+                    Math.Max(0, Math.Min(bounds.Width - 1, m_cursorPosition.X + dx / pixelsPerDip)),
+                    Math.Max(0, Math.Min(bounds.Height - 1, m_cursorPosition.Y + dy / pixelsPerDip)));
+                if (target.X == m_cursorPosition.X && target.Y == m_cursorPosition.Y)
+                {
+                    if (!m_customCursorPresented) QueueCursorFrame();
+                    return;
+                }
+
+                m_cursorMoveOrigin = m_cursorPosition;
+                m_cursorMoveDeadline = now + CursorMoveConfirmationMilliseconds;
+                m_cursorMoveAwaitingConfirmation = true;
+                // Let the Xbox input stack apply its own mouse scaling and use
+                // the resulting routed XAML position as the source of truth.
+                if (m_useXboxDesktopScale)
+                {
+                    if (!TryInjectCursorMove(target.X != m_cursorPosition.X ? dx : 0,
+                                             target.Y != m_cursorPosition.Y ? dy : 0))
+                    {
+                        RestoreSystemCursor();
+                        return;
+                    }
+                }
+                else
+                {
+                    coreWindow.PointerPosition = new Point(bounds.X + target.X, bounds.Y + target.Y);
+                }
+
+                // Wait for the routed move before showing the new position.
+                QueueCursorFrame();
+            }
+            catch (Exception)
+            {
+                RestoreSystemCursor();
+            }
+        }
+
+        private bool TryInjectCursorMove(double dx, double dy)
+        {
+            if (m_cursorInjector == null)
+            {
+                m_cursorInjector = InputInjector.TryCreate();
+                if (m_cursorInjector == null) return false;
+
+                m_cursorMovePacket = new[]
+                {
+                    new InjectedInputMouseInfo { MouseOptions = InjectedInputMouseOptions.Move }
+                };
+            }
+
+            m_cursorMovePacket[0].DeltaX = (int)dx;
+            m_cursorMovePacket[0].DeltaY = (int)dy;
+            m_cursorInjector.InjectMouseInput(m_cursorMovePacket);
+            return true;
+        }
+
+        private void RestoreSystemCursor()
+        {
+            m_customCursorBlocked = true;
+            UpdateCursorPresentation();
+        }
+
+        private void ResetCursorFrames()
+        {
+            if (m_cursorFramePending) CompositionTarget.Rendering -= RenderCursorFrame;
+            m_cursorFramePending = false;
+            m_cursorPositionDirty = false;
+            m_cursorMoveAwaitingConfirmation = false;
+            m_rawCursorDeltaX = m_rawCursorDeltaY = 0;
         }
 
         private CoreCursor GetSystemResizeCursor(Controls.WindowResizeCorner corner)
@@ -504,15 +758,6 @@ namespace factoryos_10x_shell
                 default:
                     return m_resizeNwSeCursor;
             }
-        }
-
-        private void UpdateMouseCursorSize(double scale)
-        {
-            double logicalCursorSize = MouseCursorPixelSize / scale;
-            MouseCursor.Width = logicalCursorSize;
-            MouseCursor.Height = logicalCursorSize;
-            ResizeCursor.Width = MouseCursorPixelSize / scale;
-            ResizeCursor.Height = MouseCursorPixelSize / scale;
         }
 
         private void Dispatcher_AcceleratorKeyActivated(CoreDispatcher sender, AcceleratorKeyEventArgs args)

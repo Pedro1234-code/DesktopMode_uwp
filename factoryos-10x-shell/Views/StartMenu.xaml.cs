@@ -61,8 +61,9 @@ namespace factoryos_10x_shell.Views
         private bool m_shortcutsLoading;
         private IReadOnlyList<StartIconModel> m_shortcuts = Array.Empty<StartIconModel>();
         private InputPane m_searchInputPane;
-        public ObservableCollection<StartIconModel> FilteredApps { get; } = new ObservableCollection<StartIconModel>();
-        public ObservableCollection<WebAppDefinition> FilteredWebApps { get; } = new ObservableCollection<WebAppDefinition>();
+        private IReadOnlyList<StartIconModel> m_filteredApps = Array.Empty<StartIconModel>();
+        private IReadOnlyList<WebAppDefinition> m_filteredWebApps = Array.Empty<WebAppDefinition>();
+        private readonly Dictionary<string, BitmapImage> m_webAppIcons = new Dictionary<string, BitmapImage>(StringComparer.Ordinal);
 
         public StartMenu()
         {
@@ -88,6 +89,7 @@ namespace factoryos_10x_shell.Views
                 m_searchInputPane.Showing += SearchInputPane_Showing;
                 ViewModel.StartIcons.CollectionChanged += SearchSource_CollectionChanged;
                 ViewModel.WebApps.CollectionChanged += SearchSource_CollectionChanged;
+                webAppService.AppsChanged += WebAppCatalogChanged;
                 RefreshSearchResults();
                 _ = RefreshWin32ShortcutsAsync();
             };
@@ -98,6 +100,8 @@ namespace factoryos_10x_shell.Views
                 m_searchInputPane = null;
                 ViewModel.StartIcons.CollectionChanged -= SearchSource_CollectionChanged;
                 ViewModel.WebApps.CollectionChanged -= SearchSource_CollectionChanged;
+                webAppService.AppsChanged -= WebAppCatalogChanged;
+                m_webAppIcons.Clear();
             };
             RefreshSearchResults();
         }
@@ -127,18 +131,17 @@ namespace factoryos_10x_shell.Views
         {
             if (!AppState.Instance.UseWindows11Skin) return;
 
-            var apps = FilteredApps.Select(app => app.AppId == "CoreShell.Files" ? new StartIconModel
+            var apps = m_filteredApps.Select(app => app.AppId == "CoreShell.Files" ? new StartIconModel
             {
                 AppId = app.AppId,
                 IconName = app.IconName,
                 IconSource = (ImageSource)Windows.UI.Xaml.Application.Current.Resources["Windows11FilesIcon"],
                 IconGlyph = string.Empty
-            } : app).Concat(FilteredWebApps.Select(app => new StartIconModel
+            } : app).Concat(m_filteredWebApps.Select(app => new StartIconModel
             {
                 AppId = "web:" + app.Id,
                 IconName = app.Name,
-                IconSource = Uri.TryCreate(app.IconUri, UriKind.Absolute, out var icon)
-                    ? new BitmapImage(icon) : null,
+                IconSource = GetWebAppIcon(app.IconUri),
                 IconGlyph = string.IsNullOrEmpty(app.IconUri) ? "\uE774" : string.Empty,
                 Data = app
             })).OrderBy(app => app.IconName, StringComparer.CurrentCultureIgnoreCase).ToList();
@@ -193,6 +196,18 @@ namespace factoryos_10x_shell.Views
                 if (app != null) Windows11RecentApps.Add(app);
             }
             Windows11RecentHint.Visibility = Windows11RecentApps.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
+        }
+
+        private BitmapImage GetWebAppIcon(string iconUri)
+        {
+            if (string.IsNullOrEmpty(iconUri)) return null;
+            if (!m_webAppIcons.TryGetValue(iconUri, out var image) &&
+                Uri.TryCreate(iconUri, UriKind.Absolute, out var uri))
+            {
+                image = new BitmapImage { DecodePixelWidth = 64, UriSource = uri };
+                m_webAppIcons.Add(iconUri, image);
+            }
+            return image;
         }
 
         private static string GetWindows11AppGroupKey(string name, CharacterGroupings collation)
@@ -453,6 +468,8 @@ namespace factoryos_10x_shell.Views
             if (m_windows11SearchStyle != windows11)
             {
                 m_windows11SearchStyle = windows11;
+                AppListGrid.ItemsSource = windows11 ? null : m_filteredApps;
+                WebAppListGrid.ItemsSource = windows11 ? null : m_filteredWebApps;
                 if (windows11)
                 {
                     AppSearchBox.ClearValue(FrameworkElement.StyleProperty);
@@ -503,7 +520,7 @@ namespace factoryos_10x_shell.Views
             }
             catch (Exception exception)
             {
-                Debug.WriteLine("Start shortcut scan failed: " + exception.Message);
+                factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug("Start shortcut scan failed: " + exception.Message);
             }
             finally
             {
@@ -571,7 +588,19 @@ namespace factoryos_10x_shell.Views
             }
         }
 
-        private async void SearchSource_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
+        private void WebAppCatalogChanged(object sender, EventArgs e)
+        {
+            m_webAppIcons.Clear();
+            QueueSearchRefresh();
+        }
+
+        private void SearchSource_CollectionChanged(object sender, NotifyCollectionChangedEventArgs e)
+        {
+            if (ReferenceEquals(sender, ViewModel.WebApps)) m_webAppIcons.Clear();
+            QueueSearchRefresh();
+        }
+
+        private async void QueueSearchRefresh()
         {
             if (m_refreshQueued) return;
             m_refreshQueued = true;
@@ -580,9 +609,13 @@ namespace factoryos_10x_shell.Views
                 await Dispatcher.RunAsync(Windows.UI.Core.CoreDispatcherPriority.Low, () =>
                 {
                     m_refreshQueued = false;
+                    if (!IsLoaded) return;
                     RefreshSearchResults();
+                    int visibleCount = AppListGrid.Items.Count;
+                    if (AppState.Instance.UseWindows11Skin)
+                        visibleCount = m_searching || m_windows11ShowAll ? Windows11AllApps.Items.Count : Windows11Pins.Items.Count;
                     (appHelper as factoryos_10x_shell.Services.Helpers.AppHelper)?.RecordStartMenuProjection(
-                        FilteredApps, AppListGrid.Items.Count, m_searching);
+                        m_filteredApps, visibleCount, m_searching);
                 });
             }
             finally { m_refreshQueued = false; }
@@ -607,19 +640,23 @@ namespace factoryos_10x_shell.Views
             bool Matches(string name) => !searching || CultureInfo.CurrentCulture.CompareInfo.IndexOf(
                 name ?? string.Empty, query, CompareOptions.IgnoreCase | CompareOptions.IgnoreNonSpace) >= 0;
 
-            FilteredApps.Clear();
-            foreach (var app in ViewModel.StartIcons.Concat(m_shortcuts).Where(app => Matches(app.IconName)))
-                FilteredApps.Add(app);
-            FilteredWebApps.Clear();
-            foreach (var app in ViewModel.WebApps.Where(app => Matches(app.Name))) FilteredWebApps.Add(app);
+            m_filteredApps = ViewModel.StartIcons.Concat(m_shortcuts).Where(app => Matches(app.IconName)).ToList();
+            m_filteredWebApps = ViewModel.WebApps.Where(app => Matches(app.Name)).ToList();
 
             ViewModel.AppsListGridHeight = searching || startManager.IsAppsListExpanded ? double.NaN : 310;
             AppListShow.Visibility = searching ? Visibility.Collapsed : Visibility.Visible;
-            WebAppsSection.Visibility = searching && FilteredWebApps.Count == 0
+            WebAppsSection.Visibility = searching && m_filteredWebApps.Count == 0
                 ? Visibility.Collapsed : Visibility.Visible;
-            UpdateWindows11Start();
-            NoSearchResults.Visibility = searching && FilteredApps.Count == 0 && FilteredWebApps.Count == 0
+            NoSearchResults.Visibility = searching && m_filteredApps.Count == 0 && m_filteredWebApps.Count == 0
                 ? Visibility.Visible : Visibility.Collapsed;
+
+            if (AppState.Instance.UseWindows11Skin)
+                UpdateWindows11Start();
+            else
+            {
+                AppListGrid.ItemsSource = m_filteredApps;
+                WebAppListGrid.ItemsSource = m_filteredWebApps;
+            }
         }
 
         private async void AppSearchBox_KeyDown(object sender, KeyRoutedEventArgs e)
@@ -634,10 +671,10 @@ namespace factoryos_10x_shell.Views
                 e.Handled = true;
                 if (AppState.Instance.UseWindows11Skin && m_searching)
                     await LaunchWindows11AppAsync(m_windows11SearchResults.FirstOrDefault());
-                else if (FilteredApps.Count > 0) await LaunchStartAppAsync(FilteredApps[0]);
-                else if (FilteredWebApps.Count > 0)
+                else if (m_filteredApps.Count > 0) await LaunchStartAppAsync(m_filteredApps[0]);
+                else if (m_filteredWebApps.Count > 0)
                 {
-                    windowManager.Open(FilteredWebApps[0]);
+                    windowManager.Open(m_filteredWebApps[0]);
                     startManager.RequestStartVisibilityChange(false);
                 }
             }

@@ -6,6 +6,11 @@ namespace Bridge
 // Kernel32 primitives used by modern desktop applications. Filesystem and
 // process APIs remain routed through the guest-specific subsystems.
 
+void WINAPI BridgeInitializeSRWLock(PSRWLOCK lock)
+{
+    if (lock) ::InitializeSRWLock(lock);
+}
+
 void WINAPI BridgeAcquireSRWLockExclusive(PSRWLOCK lock)
 {
     if (lock) ::AcquireSRWLockExclusive(lock);
@@ -21,6 +26,39 @@ BOOLEAN WINAPI BridgeTryAcquireSRWLockExclusive(PSRWLOCK lock)
     return lock ? ::TryAcquireSRWLockExclusive(lock) : FALSE;
 }
 
+void WINAPI BridgeAcquireSRWLockShared(PSRWLOCK lock)
+{
+    if (lock) ::AcquireSRWLockShared(lock);
+}
+
+void WINAPI BridgeReleaseSRWLockShared(PSRWLOCK lock)
+{
+    if (lock) ::ReleaseSRWLockShared(lock);
+}
+
+BOOLEAN WINAPI BridgeTryAcquireSRWLockShared(PSRWLOCK lock)
+{
+    return lock ? ::TryAcquireSRWLockShared(lock) : FALSE;
+}
+
+void WINAPI BridgeInitializeConditionVariable(PCONDITION_VARIABLE condition)
+{
+    if (condition) ::InitializeConditionVariable(condition);
+}
+
+BOOL WINAPI BridgeSleepConditionVariableCS(
+    PCONDITION_VARIABLE condition, PCRITICAL_SECTION section, DWORD milliseconds)
+{
+    if (!condition || !section)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const BOOL result = ::SleepConditionVariableCS(condition, section, milliseconds);
+    if (!result) SetGuestLastError(::GetLastError());
+    return result;
+}
+
 BOOL WINAPI BridgeSleepConditionVariableSRW(
     PCONDITION_VARIABLE condition, PSRWLOCK lock, DWORD milliseconds, ULONG flags)
 {
@@ -30,13 +68,48 @@ BOOL WINAPI BridgeSleepConditionVariableSRW(
         return FALSE;
     }
     const BOOL result = ::SleepConditionVariableSRW(condition, lock, milliseconds, flags);
-    SetGuestLastError(result ? ERROR_SUCCESS : ::GetLastError());
+    if (!result) SetGuestLastError(::GetLastError());
     return result;
+}
+
+void WINAPI BridgeWakeConditionVariable(PCONDITION_VARIABLE condition)
+{
+    if (condition) ::WakeConditionVariable(condition);
 }
 
 void WINAPI BridgeWakeAllConditionVariable(PCONDITION_VARIABLE condition)
 {
     if (condition) ::WakeAllConditionVariable(condition);
+}
+
+BOOL WINAPI BridgeWaitOnAddress(volatile void* address, void* comparison, SIZE_T size, DWORD milliseconds)
+{
+    ExitGuestThreadOnShutdown();
+    const BOOL result = ::WaitOnAddress(address, comparison, size, milliseconds);
+    const DWORD error = result ? ERROR_SUCCESS : ::GetLastError();
+    ExitGuestThreadOnShutdown();
+    if (!result) SetGuestLastError(error);
+    return result;
+}
+
+void WINAPI BridgeWakeByAddressSingle(void* address)
+{
+    ::WakeByAddressSingle(address);
+}
+
+void WINAPI BridgeWakeByAddressAll(void* address)
+{
+    ::WakeByAddressAll(address);
+}
+
+BOOL WINAPI BridgeTryEnterCriticalSection(LPCRITICAL_SECTION section)
+{
+    return section ? ::TryEnterCriticalSection(section) : FALSE;
+}
+
+DWORD WINAPI BridgeSetCriticalSectionSpinCount(LPCRITICAL_SECTION section, DWORD spinCount)
+{
+    return section ? ::SetCriticalSectionSpinCount(section, spinCount) : 0;
 }
 
 BOOL WINAPI BridgeInitializeCriticalSectionAndSpinCount(
@@ -48,7 +121,7 @@ BOOL WINAPI BridgeInitializeCriticalSectionAndSpinCount(
         return FALSE;
     }
     const BOOL result = ::InitializeCriticalSectionAndSpinCount(section, spinCount);
-    SetGuestLastError(result ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    if (!result) SetGuestLastError(::GetLastError());
     return result;
 }
 
@@ -61,8 +134,13 @@ BOOL WINAPI BridgeInitializeCriticalSectionEx(
         return FALSE;
     }
     const BOOL result = ::InitializeCriticalSectionEx(section, spinCount, flags);
-    SetGuestLastError(result ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    if (!result) SetGuestLastError(::GetLastError());
     return result;
+}
+
+void WINAPI BridgeInitOnceInitialize(PINIT_ONCE once)
+{
+    if (once) ::InitOnceInitialize(once);
 }
 
 BOOL WINAPI BridgeInitOnceBeginInitialize(
@@ -74,7 +152,7 @@ BOOL WINAPI BridgeInitOnceBeginInitialize(
         return FALSE;
     }
     const BOOL result = ::InitOnceBeginInitialize(once, flags, pending, context);
-    SetGuestLastError(result ? ERROR_SUCCESS : ::GetLastError());
+    if (!result) SetGuestLastError(::GetLastError());
     return result;
 }
 
@@ -87,7 +165,39 @@ BOOL WINAPI BridgeInitOnceComplete(
         return FALSE;
     }
     const BOOL result = ::InitOnceComplete(once, flags, context);
-    SetGuestLastError(result ? ERROR_SUCCESS : ::GetLastError());
+    if (!result) SetGuestLastError(::GetLastError());
+    return result;
+}
+
+namespace
+{
+    struct GuestInitOnceInvocation
+    {
+        PINIT_ONCE_FN callback;
+        void* parameter;
+        bool failed = false;
+    };
+
+    BOOL CALLBACK InvokeGuestInitOnce(PINIT_ONCE once, void* parameter, void** context)
+    {
+        auto& invocation = *static_cast<GuestInitOnceInvocation*>(parameter);
+        const BOOL result = invocation.callback(once, invocation.parameter, context);
+        invocation.failed = !result;
+        return result;
+    }
+}
+
+BOOL WINAPI BridgeInitOnceExecuteOnce(PINIT_ONCE once, PINIT_ONCE_FN callback, void* parameter, void** context)
+{
+    if (!once || !callback)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    GuestInitOnceInvocation invocation{callback, parameter};
+    const BOOL result = ::InitOnceExecuteOnce(once, &InvokeGuestInitOnce, &invocation, context);
+    // A callback that returns FALSE supplies the guest last-error itself.
+    if (!result && !invocation.failed) SetGuestLastError(::GetLastError());
     return result;
 }
 
@@ -153,8 +263,7 @@ namespace
     {
         __try
         {
-            callback(value);
-            return true;
+            return InvokeCrtFunction<void>(nullptr, callback, value);
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
@@ -332,33 +441,6 @@ PVOID WINAPI BridgeDecodePointer(PVOID pointer)
     return ::DecodePointer(pointer);
 }
 
-DWORD WINAPI BridgeWaitForSingleObjectEx(
-    HANDLE object, DWORD milliseconds, BOOL alertable)
-{
-    if (!alertable) return BridgeWaitForSingleObject(object, milliseconds);
-
-    const DWORD threadId = BridgeGetCurrentThreadId();
-    if (DispatchGuestApcs(threadId)) return WAIT_IO_COMPLETION;
-
-    const auto started = std::chrono::steady_clock::now();
-    for (;;)
-    {
-        DWORD slice = 10;
-        if (milliseconds != INFINITE)
-        {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                std::chrono::steady_clock::now() - started).count();
-            if (elapsed >= milliseconds)
-                return BridgeWaitForSingleObject(object, 0);
-            slice = (std::min)(slice, milliseconds - static_cast<DWORD>(elapsed));
-        }
-
-        const DWORD result = BridgeWaitForSingleObject(object, slice);
-        if (result != WAIT_TIMEOUT) return result;
-        if (DispatchGuestApcs(threadId)) return WAIT_IO_COMPLETION;
-    }
-}
-
 DWORD WINAPI BridgeSleepEx(DWORD milliseconds, BOOL alertable)
 {
     if (!alertable)
@@ -367,17 +449,31 @@ DWORD WINAPI BridgeSleepEx(DWORD milliseconds, BOOL alertable)
         return 0;
     }
 
+    ExitGuestThreadOnShutdown();
     const DWORD threadId = BridgeGetCurrentThreadId();
-    if (DispatchGuestApcs(threadId)) return WAIT_IO_COMPLETION;
-    std::unique_lock<std::mutex> guard(g_guestApcLock);
-    const auto ready = [threadId]() { return HasGuestApcLocked(threadId); };
-    if (milliseconds == INFINITE)
-        g_guestApcChanged.wait(guard, ready);
-    else if (!g_guestApcChanged.wait_for(
-        guard, std::chrono::milliseconds(milliseconds), ready))
-        return 0;
-    guard.unlock();
-    return DispatchGuestApcs(threadId) ? WAIT_IO_COMPLETION : 0;
+    const auto kernel = CurrentGuestKernelContext();
+    const bool infinite = milliseconds == INFINITE;
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(milliseconds);
+    const auto ready = [kernel, threadId]()
+    { return (kernel && kernel->IsStopping()) || HasGuestApcLocked(threadId); };
+    for (;;)
+    {
+        std::unique_lock<std::mutex> guard(g_guestApcLock);
+        if (infinite)
+            g_guestApcChanged.wait(guard, ready);
+        else if (!g_guestApcChanged.wait_until(guard, deadline, ready))
+            return 0;
+        guard.unlock();
+        ExitGuestThreadOnShutdown();
+        // Cancellation can remove the timer APC between waking and taking the queue.
+        if (DispatchGuestApcs(threadId)) return WAIT_IO_COMPLETION;
+    }
+}
+
+void WakeGuestAlertableWaits()
+{
+    std::lock_guard<std::mutex> guard(g_guestApcLock);
+    g_guestApcChanged.notify_all();
 }
 
 BOOL WINAPI BridgeAreFileApisANSI()
@@ -522,11 +618,6 @@ LPSTR WINAPI BridgeLstrcpynA(
     return destination;
 }
 
-UINT WINAPI BridgeGetConsoleOutputCP()
-{
-    return BridgeGetOEMCP();
-}
-
 BOOL WINAPI BridgeGetCPInfo(UINT codePage, LPCPINFO information)
 {
     if (!information)
@@ -577,7 +668,10 @@ namespace
             L"HOMEDRIVE=C:\0"
             L"HOMEPATH=\\Users\\Default\0"
             L"LOCALAPPDATA=C:\\Users\\Default\\AppData\\Local\0"
+            L"COMSPEC=C:\\Windows\\System32\\cmd.exe\0"
+            L"PATHEXT=.COM;.EXE;.BAT;.CMD\0"
             L"OS=Windows_NT\0"
+            L"PATH=C:\\Windows\\System32;C:\\Windows\0"
             L"PROGRAMDATA=C:\\ProgramData\0"
             L"PROGRAMFILES=C:\\Program Files\0"
             L"SYSTEMDRIVE=C:\0"
@@ -592,6 +686,8 @@ namespace
 
 LPSTR WINAPI BridgeGetCommandLineA()
 {
+    auto loader = CurrentGuestModuleLoader();
+    if (loader && loader->CrtState().narrowCommandLine) return loader->CrtState().narrowCommandLine;
     LPCWSTR wide = BridgeGetCommandLineW();
     const int required = ::WideCharToMultiByte(
         CP_ACP, 0, wide ? wide : L"", -1, nullptr, 0, nullptr, nullptr);
@@ -601,46 +697,6 @@ LPSTR WINAPI BridgeGetCommandLineA()
         g_guestCommandLineA.data(), required, nullptr, nullptr) != required)
         return nullptr;
     return g_guestCommandLineA.data();
-}
-
-LPWCH WINAPI BridgeGetEnvironmentStringsW()
-{
-    BuildGuestEnvironmentBlock();
-    const size_t bytes = g_guestEnvironmentBlock.size() * sizeof(wchar_t);
-    LPWCH result = static_cast<LPWCH>(::HeapAlloc(::GetProcessHeap(), 0, bytes));
-    if (!result)
-    {
-        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return nullptr;
-    }
-    memcpy(result, g_guestEnvironmentBlock.data(), bytes);
-    SetGuestLastError(ERROR_SUCCESS);
-    return result;
-}
-
-BOOL WINAPI BridgeFreeEnvironmentStringsW(LPWCH environment)
-{
-    if (!environment)
-    {
-        SetGuestLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    const BOOL result = ::HeapFree(::GetProcessHeap(), 0, environment);
-    SetGuestLastError(result ? ERROR_SUCCESS : ERROR_INVALID_PARAMETER);
-    return result;
-}
-
-BOOL WINAPI BridgeSetEnvironmentVariableW(LPCWSTR name, LPCWSTR)
-{
-    if (!name || !*name || wcschr(name, L'='))
-    {
-        SetGuestLastError(ERROR_INVALID_PARAMETER);
-        return FALSE;
-    }
-    // Environment mutation is process-local. The base block is rebuilt for
-    // each query; retaining arbitrary overrides belongs in GuestRuntime.
-    SetGuestLastError(ERROR_NOT_SUPPORTED);
-    return FALSE;
 }
 
 PTP_WORK WINAPI BridgeCreateThreadpoolWork(
@@ -746,21 +802,9 @@ DWORD WINAPI BridgeQueueUserAPC(
         SetGuestLastError(error);
         return 0;
     }
-    try
-    {
-        {
-            std::lock_guard<std::mutex> guard(g_guestApcLock);
-            g_guestApcs[threadId].push_back({ procedure, parameter });
-        }
-        g_guestApcChanged.notify_all();
-        SetGuestLastError(ERROR_SUCCESS);
-        return 1;
-    }
-    catch (const std::bad_alloc&)
-    {
-        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return 0;
-    }
+    const bool queued = QueueGuestApcByThreadId(threadId, procedure, parameter);
+    SetGuestLastError(queued ? ERROR_SUCCESS : ERROR_NOT_ENOUGH_MEMORY);
+    return queued ? 1u : 0u;
 }
 
 BOOL WINAPI BridgeTerminateThread(HANDLE, DWORD)
@@ -769,52 +813,80 @@ BOOL WINAPI BridgeTerminateThread(HANDLE, DWORD)
     return FALSE;
 }
 
-BOOL WINAPI BridgeSetStdHandle(DWORD, HANDLE)
+BOOL WINAPI BridgeSetStdHandle(DWORD id, HANDLE value)
 {
-    // GUI guests intentionally have no inherited console handles.
-    SetGuestLastError(ERROR_SUCCESS);
-    return TRUE;
+    auto kernel = CurrentGuestKernelContext(); DWORD error = ERROR_INVALID_FUNCTION;
+    const bool result = kernel && kernel->Console().SetStandard(id, value, &error);
+    SetGuestLastError(error); return result ? TRUE : FALSE;
 }
 
 BOOL WINAPI BridgeCancelIo(HANDLE file)
 {
-    const bool cancelled = CancelGuestDirectoryWatches(
-        file, BridgeGetCurrentThreadId());
-    SetGuestLastError(cancelled ? ERROR_SUCCESS : ERROR_NOT_FOUND);
-    return cancelled ? TRUE : FALSE;
+    const auto storage = CurrentGuestStorageContext();
+    const auto kernel = CurrentGuestKernelContext();
+    const auto description = storage ? storage->RetainFileDescription(file) : nullptr;
+    if (!kernel || !description)
+    {
+        SetGuestLastError(ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    CancelGuestFileRequests(description.get(), kernel, BridgeGetCurrentThreadId());
+    return TRUE;
 }
 
-BOOL WINAPI BridgeLockFileEx(HANDLE file, DWORD flags, DWORD, DWORD lengthLow,
+BOOL WINAPI BridgeLockFileEx(HANDLE file, DWORD flags, DWORD reserved, DWORD lengthLow,
     DWORD lengthHigh, LPOVERLAPPED overlapped)
 {
-    if (!overlapped || (flags & ~3u) != 0) { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    if (!overlapped || reserved || (flags & ~3u) != 0)
+    { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     GuestStorageContext* storage = CurrentGuestStorageContext();
     if (!storage) { SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    const ULONGLONG offset = (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) | overlapped->Offset;
+    OVERLAPPED captured{};
+    if (!CopyConsoleBytes(&captured, overlapped, sizeof(captured)))
+    { SetGuestLastError(ERROR_NOACCESS); return FALSE; }
+    const ULONGLONG offset = (static_cast<ULONGLONG>(captured.OffsetHigh) << 32) | captured.Offset;
+    const ULONGLONG length = (static_cast<ULONGLONG>(lengthHigh) << 32) | lengthLow;
+    void* const context = (reinterpret_cast<ULONG_PTR>(captured.hEvent) & 1) ? nullptr : overlapped;
+    const GuestDiskCompletionTarget target{overlapped, context,
+        GuestOverlappedEvent(captured.hEvent), nullptr, nullptr, true};
+    const DWORD error = RequestGuestRangeLock(*storage, file, offset, length,
+        (flags & 2u) != 0, (flags & 1u) != 0, 0, target);
+    SetGuestLastError(error);
+    if (error == ERROR_OPERATION_ABORTED) ExitGuestThreadOnShutdown();
+    return error == ERROR_SUCCESS;
+}
+
+BOOL WINAPI BridgeUnlockFileEx(HANDLE file, DWORD reserved, DWORD lengthLow,
+    DWORD lengthHigh, LPOVERLAPPED overlapped)
+{
+    if (!overlapped || reserved) { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    GuestStorageContext* storage = CurrentGuestStorageContext();
+    if (!storage) { SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    OVERLAPPED captured{};
+    if (!CopyConsoleBytes(&captured, overlapped, sizeof(captured)))
+    { SetGuestLastError(ERROR_NOACCESS); return FALSE; }
+    const ULONGLONG offset = (static_cast<ULONGLONG>(captured.OffsetHigh) << 32) | captured.Offset;
     const ULONGLONG length = (static_cast<ULONGLONG>(lengthHigh) << 32) | lengthLow;
     DWORD error = ERROR_SUCCESS;
-    const bool locked = storage->LockFileRange(file, offset, length,
-        (flags & 2u) != 0, (flags & 1u) != 0, &error);
-    SetGuestLastError(error); return locked ? TRUE : FALSE;
-}
-
-BOOL WINAPI BridgeUnlockFileEx(HANDLE file, DWORD, DWORD lengthLow,
-    DWORD lengthHigh, LPOVERLAPPED overlapped)
-{
-    if (!overlapped) { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
-    GuestStorageContext* storage = CurrentGuestStorageContext();
-    if (!storage) { SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE; }
-    const ULONGLONG offset = (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) | overlapped->Offset;
-    const ULONGLONG length = (static_cast<ULONGLONG>(lengthHigh) << 32) | lengthLow;
-    DWORD error = ERROR_SUCCESS; const bool unlocked = storage->UnlockFileRange(file, offset, length, &error);
-    SetGuestLastError(error); return unlocked ? TRUE : FALSE;
+    if (!WriteGuestIoStatus(overlapped, GuestIoPending, 0))
+    { SetGuestLastError(ERROR_NOACCESS); return FALSE; }
+    storage->UnlockFileRange(file, offset, length, &error);
+    if (!WriteGuestIoStatus(overlapped, GuestNtStatusForIoError(error), 0)) error = ERROR_NOACCESS;
+    SetGuestLastError(error);
+    return error == ERROR_SUCCESS;
 }
 
 BOOL WINAPI BridgeLockFile(HANDLE file, DWORD offsetLow, DWORD offsetHigh,
     DWORD lengthLow, DWORD lengthHigh)
 {
-    OVERLAPPED value{}; value.Offset = offsetLow; value.OffsetHigh = offsetHigh;
-    return BridgeLockFileEx(file, 2u, 0, lengthLow, lengthHigh, &value);
+    GuestStorageContext* storage = CurrentGuestStorageContext();
+    if (!storage) { SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    const ULONGLONG offset = (static_cast<ULONGLONG>(offsetHigh) << 32) | offsetLow;
+    const ULONGLONG length = (static_cast<ULONGLONG>(lengthHigh) << 32) | lengthLow;
+    DWORD error = ERROR_SUCCESS;
+    const bool locked = storage->LockFileRange(file, offset, length, true, true, &error);
+    SetGuestLastError(error);
+    return locked ? TRUE : FALSE;
 }
 
 BOOL WINAPI BridgeUnlockFile(HANDLE file, DWORD offsetLow, DWORD offsetHigh,
@@ -829,7 +901,11 @@ BOOL WINAPI BridgeReadDirectoryChangesW(
     DWORD notifyFilter, LPDWORD bytesReturned, LPOVERLAPPED overlapped,
     LPOVERLAPPED_COMPLETION_ROUTINE completionRoutine)
 {
-    if (bytesReturned) *bytesReturned = 0;
+    if (!overlapped && bytesReturned && !StoreDirectoryBytesLeaf(bytesReturned, 0))
+    {
+        SetGuestLastError(ERROR_NOACCESS);
+        return FALSE;
+    }
     constexpr DWORD SupportedFilters =
         FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
         FILE_NOTIFY_CHANGE_ATTRIBUTES | FILE_NOTIFY_CHANGE_SIZE |
@@ -844,12 +920,19 @@ BOOL WINAPI BridgeReadDirectoryChangesW(
     }
 
     GuestStorageContext* storage = CurrentGuestStorageContext();
+    const auto kernel = CurrentGuestKernelContext();
     DWORD error = ERROR_INVALID_HANDLE;
     std::wstring path;
-    if (!storage || !storage->IsDirectoryHandle(directory, &error) ||
+    if (!storage || !kernel || !storage->IsDirectoryHandle(directory, &error) ||
         !storage->GetFilePath(directory, &path, &error))
     {
         SetGuestLastError(error);
+        return FALSE;
+    }
+    const auto description = storage->RetainFileDescription(directory);
+    if (!description)
+    {
+        SetGuestLastError(ERROR_INVALID_HANDLE);
         return FALSE;
     }
 
@@ -857,16 +940,20 @@ BOOL WINAPI BridgeReadDirectoryChangesW(
     try
     {
         watch = std::make_shared<GuestDirectoryChangeWatch>();
-        watch->directory = directory;
+        watch->fileDescription = description;
+        watch->fileSignal = storage->LookupFileSignal(directory);
         watch->path = std::move(path);
         watch->subtree = watchSubtree != FALSE;
         watch->filter = notifyFilter;
         watch->buffer = static_cast<BYTE*>(buffer);
         watch->bufferSize = bufferSize;
-        watch->bytesReturned = bytesReturned;
+        watch->bytesReturned = overlapped ? nullptr : bytesReturned;
         watch->overlapped = overlapped;
         watch->completionRoutine = completionRoutine;
         watch->threadId = BridgeGetCurrentThreadId();
+        watch->owner = kernel->shared_from_this();
+        watch->ownerIdentity = kernel;
+        if (overlapped) watch->binding = storage->IoCompletionBinding(directory);
     }
     catch (const std::bad_alloc&)
     {
@@ -874,18 +961,41 @@ BOOL WINAPI BridgeReadDirectoryChangesW(
         return FALSE;
     }
 
-    if (overlapped)
+    if (watch->binding.port && completionRoutine)
     {
-        if (!InitializeDirectoryOverlappedLeaf(overlapped))
-        {
-            SetGuestLastError(ERROR_NOACCESS);
-            return FALSE;
-        }
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
     }
     try
     {
         std::lock_guard<std::mutex> guard(g_directoryWatchesLock);
+        if (kernel->IsStopping() || storage->RetainFileDescription(directory) != description)
+        {
+            SetGuestLastError(kernel->IsStopping() ? ERROR_OPERATION_ABORTED : ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
         g_directoryWatches.push_back(watch);
+        if (overlapped)
+        {
+            if (!InitializeDirectoryOverlappedLeaf(overlapped, watch->overlappedEvent))
+            {
+                g_directoryWatches.pop_back();
+                SetGuestLastError(ERROR_NOACCESS);
+                return FALSE;
+            }
+            if (completionRoutine) watch->overlappedEvent = nullptr;
+            const HANDLE event = GuestOverlappedEvent(watch->overlappedEvent);
+            DWORD eventError = ERROR_SUCCESS;
+            if (event && !kernel->CaptureIoEvent(event, watch->event, &eventError))
+            {
+                g_directoryWatches.pop_back();
+                WriteGuestIoStatus(overlapped, GuestNtStatusForIoError(eventError), 0);
+                SetGuestLastError(eventError);
+                return FALSE;
+            }
+            watch->event.Set(false);
+        }
+        watch->fileSignal.Begin();
     }
     catch (const std::bad_alloc&)
     {
@@ -908,22 +1018,6 @@ BOOL WINAPI BridgeReadDirectoryChangesW(
     }
     SetGuestLastError(ERROR_SUCCESS);
     return TRUE;
-}
-
-BOOL WINAPI BridgeReadConsoleW(
-    HANDLE, LPVOID, DWORD, LPDWORD read, LPVOID)
-{
-    if (read) *read = 0;
-    SetGuestLastError(ERROR_INVALID_HANDLE);
-    return FALSE;
-}
-
-BOOL WINAPI BridgeWriteConsoleW(
-    HANDLE, const VOID*, DWORD, LPDWORD written, LPVOID)
-{
-    if (written) *written = 0;
-    SetGuestLastError(ERROR_INVALID_HANDLE);
-    return FALSE;
 }
 
 BOOL WINAPI BridgeCopyFileW(
@@ -974,6 +1068,10 @@ BOOL WINAPI BridgeGetFileAttributesExW(
 
 DWORD WINAPI BridgeGetFileType(HANDLE file)
 {
+    if (auto kernel = CurrentGuestKernelContext())
+        if (kernel->Pipes().Owns(file)) { SetGuestLastError(ERROR_SUCCESS); return FILE_TYPE_PIPE; }
+    if (auto kernel = CurrentGuestKernelContext())
+        if (kernel->Console().Owns(file)) { SetGuestLastError(ERROR_SUCCESS); return FILE_TYPE_CHAR; }
     GuestStorageContext* storage = CurrentGuestStorageContext();
     std::wstring ignored;
     DWORD error = ERROR_INVALID_HANDLE;
@@ -1279,10 +1377,17 @@ DWORD WINAPI BridgeFormatMessageA(
 
 PVOID WINAPI BridgeRtlPcToFileHeader(PVOID pc, PVOID* base)
 {
-    MEMORY_BASIC_INFORMATION memory{};
-    if (!pc || !base || !::VirtualQuery(pc, &memory, sizeof(memory))) return nullptr;
-    *base = memory.AllocationBase;
-    return memory.AllocationBase;
+    if (!base) return nullptr;
+    *base = nullptr;
+    if (!pc) return nullptr;
+    if (const auto image = CrtGuestImageBase(pc))
+    {
+        *base = reinterpret_cast<PVOID>(image);
+        return *base;
+    }
+    // AllocationBase is not an image test: heap and stack addresses must not
+    // look like PE headers. Native metadata may also be used across the ABI.
+    return ::RtlPcToFileHeader(pc, base);
 }
 
 void WINAPI BridgeRtlUnwind(

@@ -1,11 +1,14 @@
 #include "pch.h"
 #include "Bridge\\GuestStorage.h"
+#include "Bridge/GuestIoCompletionPort.h"
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <windows.storage.fileproperties.h>
 
 #include <algorithm>
+#include <atomic>
+#include <new>
 #include <cwctype>
 #include <vector>
 
@@ -19,7 +22,7 @@ using namespace concurrency;
 
 namespace
 {
-    constexpr DWORD MaxSynchronousIo = 16 * 1024 * 1024;
+    constexpr DWORD MaxSynchronousIo = GuestStorageContext::MaximumTransferSize();
     constexpr size_t MaxGuestPathCharacters = 32767;
     constexpr DWORD VirtualMutableFileAttributes =
         FILE_ATTRIBUTE_READONLY |
@@ -379,18 +382,56 @@ namespace
     }
 }
 
+struct GuestStorageContext::FileRangeState final
+{
+    struct Range
+    {
+        const GuestStorageContext* process;
+        const FileRecord* file;
+        ULONGLONG offset;
+        ULONGLONG length;
+        ULONG key;
+        bool exclusive;
+
+        bool OwnedBy(const GuestStorageContext* owner, const FileRecord* description, ULONG lockKey) const
+        { return process == owner && file == description && key == lockKey; }
+
+        bool Overlaps(ULONGLONG start, ULONGLONG count) const
+        {
+            if (offset == start) return length && count;
+            return offset < start ? start - offset < length : offset - start < count;
+        }
+    };
+
+    bool AllowsIo(const GuestStorageContext* owner, const FileRecord* description, ULONG key,
+        ULONGLONG start, ULONGLONG length, bool writing) const
+    {
+        if (!length) return true;
+        return std::none_of(granted.begin(), granted.end(), [&](const Range& range)
+        {
+            if (!range.length || !range.Overlaps(start, length)) return false;
+            return range.exclusive ? !range.OwnedBy(owner, description, key) : writing;
+        });
+    }
+
+    std::mutex lock;
+    std::condition_variable changed;
+    std::vector<Range> granted;
+};
+
 struct GuestStorageContext::FileRecord final
 {
     FileRecord(IRandomAccessStream^ value, bool canRead, bool canWrite,
-        std::wstring path, DWORD access, DWORD sharing, bool removeOnClose)
+        std::wstring path, DWORD access, DWORD sharing, DWORD flags)
         : stream(value), readable(canRead), writable(canWrite), canonicalPath(std::move(path)),
-          desiredAccess(access), shareMode(sharing), deleteOnClose(removeOnClose)
+          desiredAccess(access), shareMode(sharing), deleteOnClose((flags & FILE_FLAG_DELETE_ON_CLOSE) != 0),
+          overlapped((flags & FILE_FLAG_OVERLAPPED) != 0)
     {
     }
 
-    FileRecord(StorageFolder^ value, std::wstring path, DWORD access, DWORD sharing)
+    FileRecord(StorageFolder^ value, std::wstring path, DWORD access, DWORD sharing, DWORD flags)
         : folder(value), readable(true), writable(false), canonicalPath(std::move(path)),
-          desiredAccess(access), shareMode(sharing), directory(true)
+          desiredAccess(access), shareMode(sharing), directory(true), overlapped((flags & FILE_FLAG_OVERLAPPED) != 0)
     {
     }
 
@@ -403,13 +444,40 @@ struct GuestStorageContext::FileRecord final
     DWORD shareMode = 0;
     bool deleteOnClose = false;
     bool directory = false;
-    // Protected by lock.  Closing first removes the handle from the shared
-    // table, then marks this record closed before releasing its stream.  An
-    // I/O operation that already retained the record therefore cannot race a
-    // subsequent stream close.
-    bool closed = false;
+    bool overlapped = false;
+    // Handle references are protected by the filesystem namespace lock;
+    // stream state and position are protected by the description lock.
+    size_t handleReferences = 0;
+    bool closeScheduled = false;
+    // Only the last handle closes the stream. Existing I/O is serialized
+    // against that final close by the same description lock.
+    std::atomic<bool> closed{false};
+    std::mutex completionLock;
+    GuestIoCompletionBinding completion;
+    const GuestKernelContext::FileSignal waitSignal = GuestKernelContext::CreateFileSignal();
+    std::shared_ptr<FileRangeState> ranges;
     std::mutex lock;
 };
+
+struct GuestStorageContext::SharedFiles final
+{
+    std::mutex lock;
+    std::unordered_map<FileRecord*, std::shared_ptr<FileRecord>> descriptions;
+    std::unordered_map<std::wstring, std::weak_ptr<FileRangeState>> rangeStates;
+    std::unordered_set<std::wstring> deletePending;
+};
+
+std::shared_ptr<GuestStorageContext::SharedFiles> GuestStorageContext::AcquireFileNamespace(StorageFolder^ root)
+{
+    static std::mutex lock;
+    static std::unordered_map<std::wstring, std::weak_ptr<SharedFiles>> namespaces;
+    const std::wstring key = root ? MetadataKey(std::wstring(root->Path->Data())) : std::wstring();
+    std::lock_guard<std::mutex> guard(lock);
+    auto& slot = namespaces[key];
+    auto existing = slot.lock();
+    if (!existing) { existing = std::make_shared<SharedFiles>(); slot = existing; }
+    return existing;
+}
 
 struct GuestStorageContext::FindRecord final
 {
@@ -425,8 +493,10 @@ struct GuestStorageContext::FindRecord final
 
 GuestStorageContext::GuestStorageContext(StorageFolder^ localFolder, const std::wstring& modulePath,
     StorageFolder^ moduleSourceFolder, StorageFolder^ externalFolder)
-    : m_localFolder(localFolder), m_moduleSourceFolder(moduleSourceFolder),
-      m_externalFolder(externalFolder)
+    : m_sharedFiles(AcquireFileNamespace(localFolder)),
+      m_localFolder(localFolder), m_moduleSourceFolder(moduleSourceFolder),
+      m_externalFolder(externalFolder), m_handlesLock(m_sharedFiles->lock),
+      m_deletePending(m_sharedFiles->deletePending)
 {
     if (externalFolder)
     {
@@ -463,7 +533,7 @@ GuestStorageContext::GuestStorageContext(StorageFolder^ localFolder, const std::
 
 GuestStorageContext::~GuestStorageContext()
 {
-    CloseAll();
+    try { CloseAll(); } catch (...) { /* Host teardown cannot propagate guest resource failures. */ }
 }
 
 bool GuestStorageContext::Resolve(LPCWSTR path, GuestPath* resolved, DWORD* win32Error) const
@@ -596,7 +666,7 @@ bool GuestStorageContext::GetAuthorizedFolder(const GuestPath& path, StorageFold
 }
 
 bool GuestStorageContext::OpenAuthorizedFile(const GuestPath& path, DWORD desiredAccess,
-    DWORD shareMode, HANDLE* guestHandle, DWORD* win32Error)
+    DWORD shareMode, DWORD flags, HANDLE* guestHandle, DWORD* win32Error)
 {
     if (IsLowerLayerTombstoned(path.canonical)) return false;
     if (HasWriteAccess(desiredAccess) || path.components.size() <= m_moduleDirectoryComponentCount)
@@ -612,7 +682,7 @@ bool GuestStorageContext::OpenAuthorizedFile(const GuestPath& path, DWORD desire
         StorageFile^ file = create_task(parent->GetFileAsync(ref new String(leaf.c_str()))).get();
         IRandomAccessStream^ stream = create_task(file->OpenAsync(FileAccessMode::Read)).get();
         return AddFile(stream, true, false, path.canonical, desiredAccess, shareMode,
-            false, guestHandle, win32Error);
+            flags & ~FILE_FLAG_DELETE_ON_CLOSE, guestHandle, win32Error);
     }
     catch (...) { return false; }
 }
@@ -686,7 +756,7 @@ bool GuestStorageContext::AddFile(
     const std::wstring& canonicalPath,
     DWORD desiredAccess,
     DWORD shareMode,
-    bool deleteOnClose,
+    DWORD flags,
     HANDLE* guestHandle,
     DWORD* win32Error)
 {
@@ -697,19 +767,9 @@ bool GuestStorageContext::AddFile(
     }
 
     auto record = std::make_shared<FileRecord>(stream, readable, writable,
-        canonicalPath, desiredAccess, shareMode, deleteOnClose);
+        canonicalPath, desiredAccess, shareMode, flags);
     std::lock_guard<std::mutex> guard(m_handlesLock);
-    ULONG_PTR token = 0;
-    if (!AllocateHandleLocked(&token))
-    {
-        SetWin32Error(win32Error, ERROR_TOO_MANY_OPEN_FILES);
-        return false;
-    }
-
-    m_files.emplace(token, record);
-    *guestHandle = reinterpret_cast<HANDLE>(token);
-    SetWin32Error(win32Error, ERROR_SUCCESS);
-    return true;
+    return RegisterFileLocked(record, 0, guestHandle, win32Error);
 }
 
 bool GuestStorageContext::AddDirectory(
@@ -717,6 +777,7 @@ bool GuestStorageContext::AddDirectory(
     const std::wstring& canonicalPath,
     DWORD desiredAccess,
     DWORD shareMode,
+    DWORD flags,
     HANDLE* guestHandle,
     DWORD* win32Error)
 {
@@ -726,18 +787,9 @@ bool GuestStorageContext::AddDirectory(
         return false;
     }
     auto record = std::make_shared<FileRecord>(
-        folder, canonicalPath, desiredAccess, shareMode);
+        folder, canonicalPath, desiredAccess, shareMode, flags);
     std::lock_guard<std::mutex> guard(m_handlesLock);
-    ULONG_PTR token = 0;
-    if (!AllocateHandleLocked(&token))
-    {
-        SetWin32Error(win32Error, ERROR_TOO_MANY_OPEN_FILES);
-        return false;
-    }
-    m_files.emplace(token, record);
-    *guestHandle = reinterpret_cast<HANDLE>(token);
-    SetWin32Error(win32Error, ERROR_SUCCESS);
-    return true;
+    return RegisterFileLocked(record, 0, guestHandle, win32Error);
 }
 
 bool GuestStorageContext::AddFind(
@@ -767,38 +819,92 @@ bool GuestStorageContext::AddFind(
 
 bool GuestStorageContext::AllocateHandleLocked(ULONG_PTR* token)
 {
-    if (!token || m_files.size() + m_finds.size() >= MaximumHandles)
+    if (!token || m_files.size() + m_finds.size() >= MaximumHandles) return false;
+    // A token uniquely identifies a file handle across guest process tables.
+    static std::atomic<ULONG_PTR> next{ FirstHandleToken };
+    const ULONG_PTR candidate = next.fetch_add(1);
+    if (candidate < FirstHandleToken || candidate >= FirstReservedHandleToken) return false;
+    *token = candidate; return true;
+}
+
+bool GuestStorageContext::RegisterFileLocked(const std::shared_ptr<FileRecord>& record,
+    DWORD flags, HANDLE* value, DWORD* error)
+{
+    ULONG_PTR token = 0;
+    if (!AllocateHandleLocked(&token)) { SetWin32Error(error, ERROR_TOO_MANY_OPEN_FILES); return false; }
+    try
     {
-        return false;
+        if (!record->ranges)
+        {
+            auto& weak = m_sharedFiles->rangeStates[MetadataKey(record->canonicalPath)];
+            record->ranges = weak.lock();
+            if (!record->ranges) weak = record->ranges = std::make_shared<FileRangeState>();
+        }
+        m_files.emplace(token, record);
+        m_fileFlags.emplace(token, flags);
+        m_sharedFiles->descriptions.emplace(record.get(), record);
+        ++record->handleReferences;
+        *value = reinterpret_cast<HANDLE>(token); SetWin32Error(error, ERROR_SUCCESS); return true;
     }
-
-    // With the bounded table we will find a free token within this many
-    // probes.  The range check also makes a reused context recover cleanly if
-    // a previous run advanced the cursor to the synchronization namespace.
-    for (size_t attempt = 0; attempt <= MaximumHandles; ++attempt)
+    catch (const std::bad_alloc&)
     {
-        if (m_nextHandle < FirstHandleToken || m_nextHandle >= FirstReservedHandleToken)
-        {
-            m_nextHandle = FirstHandleToken;
-        }
-
-        const ULONG_PTR candidate = m_nextHandle++;
-        if (m_nextHandle >= FirstReservedHandleToken)
-        {
-            m_nextHandle = FirstHandleToken;
-        }
-
-        if (m_files.find(candidate) != m_files.end() ||
-            m_finds.find(candidate) != m_finds.end())
-        {
-            continue;
-        }
-
-        *token = candidate;
-        return true;
+        m_files.erase(token); m_fileFlags.erase(token);
+        if (!record->handleReferences) m_sharedFiles->descriptions.erase(record.get());
+        SetWin32Error(error, ERROR_NOT_ENOUGH_MEMORY); return false;
     }
+}
 
-    return false;
+bool GuestStorageContext::OwnsFile(HANDLE value) const { return LookupFile(value) != nullptr; }
+
+DWORD GuestStorageContext::FileDataAccess(HANDLE value) const
+{
+    const auto record = LookupFile(value);
+    return record ? ((record->readable ? GENERIC_READ : 0) | (record->writable ? GENERIC_WRITE : 0)) : 0;
+}
+
+bool GuestStorageContext::FileHandleFlags(HANDLE value, DWORD* flags, DWORD mask, bool set, DWORD* error)
+{
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    const auto found = m_fileFlags.find(reinterpret_cast<ULONG_PTR>(value));
+    if (found == m_fileFlags.end()) { SetWin32Error(error, ERROR_INVALID_HANDLE); return false; }
+    if (set)
+    {
+        if (mask & ~3u) { SetWin32Error(error, ERROR_INVALID_PARAMETER); return false; }
+        found->second = (found->second & ~mask) | (*flags & mask);
+    }
+    else *flags = found->second;
+    SetWin32Error(error, ERROR_SUCCESS); return true;
+}
+
+bool GuestStorageContext::DuplicateFile(HANDLE source, bool inherit, HANDLE* duplicate, DWORD* error)
+{
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    const auto found = m_files.find(reinterpret_cast<ULONG_PTR>(source));
+    if (found == m_files.end()) { SetWin32Error(error, ERROR_INVALID_HANDLE); return false; }
+    // Copy before insertion: unordered_map rehash may invalidate the iterator.
+    const auto record = found->second;
+    return RegisterFileLocked(record, inherit ? 1u : 0u, duplicate, error);
+}
+
+bool GuestStorageContext::InheritFiles(const GuestStorageContext& parent, DWORD* error)
+{
+    if (this == &parent) { SetWin32Error(error, ERROR_SUCCESS); return true; }
+    if (m_sharedFiles != parent.m_sharedFiles) { SetWin32Error(error, ERROR_INVALID_PARAMETER); return false; }
+    std::lock_guard<std::mutex> guard(m_handlesLock);
+    try
+    {
+        auto files = m_files; auto flags = m_fileFlags;
+        for (const auto& entry : parent.m_fileFlags)
+            if ((entry.second & 1u) && files.find(entry.first) == files.end())
+            { files.emplace(entry.first, parent.m_files.at(entry.first)); flags.emplace(entry); }
+        if (files.size() + m_finds.size() > MaximumHandles)
+        { SetWin32Error(error, ERROR_TOO_MANY_OPEN_FILES); return false; }
+        for (const auto& entry : files)
+            if (m_files.find(entry.first) == m_files.end()) ++entry.second->handleReferences;
+        m_files.swap(files); m_fileFlags.swap(flags);
+        SetWin32Error(error, ERROR_SUCCESS); return true;
+    }
+    catch (const std::bad_alloc&) { SetWin32Error(error, ERROR_NOT_ENOUGH_MEMORY); return false; }
 }
 
 std::shared_ptr<GuestStorageContext::FileRecord> GuestStorageContext::LookupFile(HANDLE guestHandle) const
@@ -872,46 +978,81 @@ bool GuestStorageContext::IsDirectoryHandle(
 }
 
 bool GuestStorageContext::LockFileRange(HANDLE guestHandle, ULONGLONG offset,
-    ULONGLONG length, bool exclusive, bool failImmediately, DWORD* win32Error)
+    ULONGLONG length, bool exclusive, bool failImmediately, DWORD* win32Error, ULONG key)
 {
-    UNREFERENCED_PARAMETER(failImmediately);
-    if (!length || offset > (std::numeric_limits<ULONGLONG>::max)() - length)
-    { SetWin32Error(win32Error, ERROR_INVALID_PARAMETER); return false; }
-    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
-    std::lock_guard<std::mutex> guard(m_handlesLock);
-    const auto file = m_files.find(token);
-    if (file == m_files.end() || !file->second)
-    { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
-    const std::wstring key = MetadataKey(file->second->canonicalPath);
-    const ULONGLONG end = offset + length;
-    for (const auto& existing : m_byteRangeLocks[key])
+    const auto file = CaptureDiskFile(guestHandle);
+    const DWORD result = LockDiskRange(file, offset, length, exclusive, failImmediately,
+        key, Concurrency::cancellation_token::none(), guestHandle);
+    SetWin32Error(win32Error, result);
+    return result == ERROR_SUCCESS;
+}
+
+DWORD GuestStorageContext::LockDiskRange(const DiskFile& file, ULONGLONG offset, ULONGLONG length,
+    bool exclusive, bool failImmediately, ULONG key, const Concurrency::cancellation_token& cancellation,
+    HANDLE callerHandle)
+{
+    const auto& record = file.m_record;
+    const DWORD access = file.ValidateLockAccess();
+    if (access) return access;
+    if (length && length - 1 > (std::numeric_limits<ULONGLONG>::max)() - offset)
+        return ERROR_INVALID_PARAMETER;
+
+    auto& ranges = *record->ranges;
+    const auto owner = file.m_owner;
+    const auto kernel = CurrentGuestKernelContext();
+    std::unique_lock<std::mutex> guard(ranges.lock);
+    for (;;)
     {
-        const ULONGLONG existingEnd = existing.offset + existing.length;
-        if (existing.owner != token && offset < existingEnd && existing.offset < end &&
-            (exclusive || existing.exclusive))
-        { SetWin32Error(win32Error, ERROR_LOCK_VIOLATION); return false; }
+        if (cancellation.is_canceled() || (kernel && kernel->IsStopping())) return ERROR_OPERATION_ABORTED;
+        if (record->closed || (callerHandle && owner->LookupFile(callerHandle) != record))
+            return ERROR_INVALID_HANDLE;
+        const bool conflict = std::any_of(ranges.granted.begin(), ranges.granted.end(),
+            [&](const FileRangeState::Range& existing)
+            {
+                return existing.Overlaps(offset, length) &&
+                    (exclusive || (existing.exclusive && !existing.OwnedBy(owner, record.get(), key)));
+            });
+        if (!conflict) break;
+        if (failImmediately) return ERROR_LOCK_VIOLATION;
+        ranges.changed.wait_for(guard, std::chrono::milliseconds(32));
     }
-    m_byteRangeLocks[key].push_back({ token, offset, length, exclusive });
-    SetWin32Error(win32Error, ERROR_SUCCESS); return true;
+    try { ranges.granted.push_back({owner, record.get(), offset, length, key, exclusive}); }
+    catch (const std::bad_alloc&) { return ERROR_NOT_ENOUGH_MEMORY; }
+    return ERROR_SUCCESS;
 }
 
 bool GuestStorageContext::UnlockFileRange(HANDLE guestHandle, ULONGLONG offset,
-    ULONGLONG length, DWORD* win32Error)
+    ULONGLONG length, DWORD* win32Error, ULONG key)
 {
-    const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
-    std::lock_guard<std::mutex> guard(m_handlesLock);
-    const auto file = m_files.find(token);
-    if (file == m_files.end() || !file->second)
+    const auto file = LookupFile(guestHandle);
+    if (!file || file->closed)
     { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
-    const std::wstring key = MetadataKey(file->second->canonicalPath);
-    auto found = m_byteRangeLocks.find(key);
-    if (found == m_byteRangeLocks.end()) { SetWin32Error(win32Error, ERROR_NOT_LOCKED); return false; }
-    auto& locks = found->second;
-    const auto range = std::find_if(locks.begin(), locks.end(), [=](const ByteRangeLock& value)
-    { return value.owner == token && value.offset == offset && value.length == length; });
-    if (range == locks.end()) { SetWin32Error(win32Error, ERROR_NOT_LOCKED); return false; }
-    locks.erase(range); if (locks.empty()) m_byteRangeLocks.erase(found);
-    SetWin32Error(win32Error, ERROR_SUCCESS); return true;
+    if (file->directory)
+    { SetWin32Error(win32Error, ERROR_INVALID_FUNCTION); return false; }
+    auto& ranges = *file->ranges;
+    std::lock_guard<std::mutex> guard(ranges.lock);
+    const auto matches = [&](const FileRangeState::Range& range)
+    { return range.OwnedBy(this, file.get(), key) && range.offset == offset && range.length == length; };
+    auto found = std::find_if(ranges.granted.begin(), ranges.granted.end(),
+        [&](const FileRangeState::Range& range) { return range.exclusive && matches(range); });
+    if (found == ranges.granted.end()) found = std::find_if(ranges.granted.begin(), ranges.granted.end(), matches);
+    if (found == ranges.granted.end())
+    { SetWin32Error(win32Error, ERROR_NOT_LOCKED); return false; }
+    ranges.granted.erase(found);
+    ranges.changed.notify_all();
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+void GuestStorageContext::ReleaseFileRanges(const std::shared_ptr<FileRecord>& record)
+{
+    auto& ranges = *record->ranges;
+    std::lock_guard<std::mutex> guard(ranges.lock);
+    const auto released = std::remove_if(ranges.granted.begin(), ranges.granted.end(),
+        [&](const FileRangeState::Range& range) { return range.file == record.get() && range.process == this; });
+    if (released == ranges.granted.end()) return;
+    ranges.granted.erase(released, ranges.granted.end());
+    ranges.changed.notify_all();
 }
 
 DWORD GuestStorageContext::ApplyAttributeOverride(
@@ -1058,7 +1199,7 @@ bool GuestStorageContext::CreateFile(
     }
 
     GuestPath path;
-    if (!Resolve(fileName, &path, win32Error) || path.components.empty())
+    if (!Resolve(fileName, &path, win32Error))
     {
         if (win32Error && *win32Error == ERROR_SUCCESS)
         {
@@ -1082,7 +1223,7 @@ bool GuestStorageContext::CreateFile(
             SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
             return false;
         }
-        for (const auto& entry : m_files)
+        for (const auto& entry : m_sharedFiles->descriptions)
         {
             const auto& existing = entry.second;
             if (!existing || _wcsicmp(existing->canonicalPath.c_str(), path.canonical.c_str()) != 0)
@@ -1105,9 +1246,11 @@ bool GuestStorageContext::CreateFile(
 
     DWORD attributeError = ERROR_SUCCESS;
     const DWORD existingAttributes = GetGuestFileAttributes(fileName, &attributeError);
+    if (path.components.empty() && (existingAttributes == INVALID_FILE_ATTRIBUTES || (flagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE)))
+    { SetWin32Error(win32Error, existingAttributes == INVALID_FILE_ATTRIBUTES ? attributeError : ERROR_ACCESS_DENIED); return false; }
     const bool pathExisted = existingAttributes != INVALID_FILE_ATTRIBUTES;
     if (existingAttributes != INVALID_FILE_ATTRIBUTES &&
-        (existingAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        ((existingAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0 || path.components.empty()))
     {
         if (creationDisposition != OPEN_EXISTING ||
             (flagsAndAttributes & FILE_FLAG_BACKUP_SEMANTICS) == 0)
@@ -1120,7 +1263,7 @@ bool GuestStorageContext::CreateFile(
             !GetAuthorizedFolder(path, &folder))
             return false;
         return AddDirectory(folder, path.canonical, desiredAccess, shareMode,
-            guestHandle, win32Error);
+            flagsAndAttributes, guestHandle, win32Error);
     }
 
     GuestPath parentPath = path;
@@ -1162,7 +1305,7 @@ bool GuestStorageContext::CreateFile(
     if (!haveLocalParent)
     {
         if (creationDisposition == OPEN_EXISTING && !writable && authorizedFile &&
-            OpenAuthorizedFile(path, desiredAccess, shareMode, guestHandle, win32Error))
+            OpenAuthorizedFile(path, desiredAccess, shareMode, flagsAndAttributes, guestHandle, win32Error))
             return true;
         return false;
     }
@@ -1174,7 +1317,7 @@ bool GuestStorageContext::CreateFile(
     }
 
     if (authorizedFile && !writable && creationDisposition == OPEN_ALWAYS &&
-        OpenAuthorizedFile(path, desiredAccess, shareMode, guestHandle, win32Error))
+        OpenAuthorizedFile(path, desiredAccess, shareMode, flagsAndAttributes, guestHandle, win32Error))
         return true;
 
     // A writable open of a lower-layer file must not modify the authorised
@@ -1253,8 +1396,7 @@ bool GuestStorageContext::CreateFile(
             stream->Seek(0);
         }
         if (!AddFile(stream, readable || !writable, writable, path.canonical,
-            desiredAccess, shareMode,
-            (flagsAndAttributes & FILE_FLAG_DELETE_ON_CLOSE) != 0,
+            desiredAccess, shareMode, flagsAndAttributes,
             guestHandle, win32Error))
         {
             return false;
@@ -1286,11 +1428,169 @@ bool GuestStorageContext::CreateFile(
     catch (Exception^ exception)
     {
         if (creationDisposition == OPEN_EXISTING &&
-            OpenAuthorizedFile(path, desiredAccess, shareMode, guestHandle, win32Error))
+            OpenAuthorizedFile(path, desiredAccess, shareMode, flagsAndAttributes, guestHandle, win32Error))
             return true;
         SetWin32Error(win32Error, ErrorFromException(exception));
         return false;
     }
+}
+
+std::shared_ptr<const void> GuestStorageContext::RetainFileDescription(HANDLE file) const
+{
+    return LookupFile(file);
+}
+
+bool GuestStorageContext::DiskFile::IsOverlapped() const
+{
+    return m_record && m_record->overlapped;
+}
+
+bool GuestStorageContext::DiskFile::IsAppendOnly() const
+{
+    return m_record && (m_record->desiredAccess & FILE_APPEND_DATA) &&
+        !(m_record->desiredAccess & (FILE_WRITE_DATA | GENERIC_WRITE));
+}
+
+DWORD GuestStorageContext::DiskFile::ValidateAccess(bool writing) const
+{
+    if (!m_record || m_record->closed) return ERROR_INVALID_HANDLE;
+    if (m_record->directory) return ERROR_INVALID_FUNCTION;
+    return (writing ? m_record->writable : m_record->readable) ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
+}
+
+DWORD GuestStorageContext::DiskFile::ValidateLockAccess() const
+{
+    if (!m_record || m_record->closed) return ERROR_INVALID_HANDLE;
+    if (m_record->directory) return ERROR_INVALID_FUNCTION;
+    return m_record->readable || m_record->writable ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
+}
+
+GuestStorageContext::DiskFile GuestStorageContext::CaptureDiskFile(HANDLE file) const
+{
+    DiskFile captured;
+    captured.m_record = LookupFile(file);
+    captured.m_owner = this;
+    return captured;
+}
+
+GuestKernelContext::FileSignal GuestStorageContext::LookupFileSignal(HANDLE file) const
+{
+    const auto record = LookupFile(file);
+    return record ? record->waitSignal : GuestKernelContext::FileSignal{};
+}
+
+DWORD GuestStorageContext::TransferDiskFile(const DiskFile& file, bool writing, ULONGLONG offset, BYTE* buffer,
+    DWORD length, DWORD& transferred, const Concurrency::cancellation_token& cancellation,
+    bool updateFilePosition, ULONG lockKey)
+{
+    transferred = 0;
+    const auto& record = file.m_record;
+    if (!record) return ERROR_INVALID_HANDLE;
+    try
+    {
+        {
+            std::lock_guard<std::mutex> lock(record->lock);
+            if (cancellation.is_canceled()) return ERROR_OPERATION_ABORTED;
+            const DWORD access = file.ValidateAccess(writing);
+            if (access) return access;
+            if (!length) return ERROR_SUCCESS;
+
+            const auto stream = record->stream.Get();
+            if (!stream) return ERROR_INVALID_HANDLE;
+            const ULONGLONG position = writing && (offset == ~0ull || file.IsAppendOnly()) ? stream->Size :
+                (updateFilePosition && offset == UseCurrentFilePosition ? stream->Position : offset);
+            std::lock_guard<std::mutex> rangeGuard(record->ranges->lock);
+            if (cancellation.is_canceled()) return ERROR_OPERATION_ABORTED;
+            if (!record->ranges->AllowsIo(file.m_owner, record.get(), lockKey, position, length, writing))
+                return ERROR_LOCK_VIOLATION;
+            if (!writing)
+            {
+                if (position >= stream->Size) return ERROR_HANDLE_EOF;
+                const auto input = stream->GetInputStreamAt(position);
+                const auto request = ref new Buffer(length);
+                const auto data = create_task(input->ReadAsync(request, length, InputStreamOptions::None), cancellation).get();
+                transferred = data->Length;
+                if (!transferred) return ERROR_HANDLE_EOF;
+                auto bytes = ref new Array<BYTE>(transferred);
+                DataReader::FromBuffer(data)->ReadBytes(bytes);
+                memcpy(buffer, bytes->Data, transferred);
+                delete input;
+                if (updateFilePosition) stream->Seek(position + transferred);
+                return ERROR_SUCCESS;
+            }
+
+            const auto output = stream->GetOutputStreamAt(position);
+            auto bytes = ref new Array<BYTE>(length);
+            memcpy(bytes->Data, buffer, length);
+            auto writer = ref new DataWriter(output);
+            writer->WriteBytes(bytes);
+            transferred = create_task(writer->StoreAsync(), cancellation).get();
+            writer->DetachStream();
+            delete writer;
+            delete output;
+            if (updateFilePosition && transferred) stream->Seek(position + transferred);
+        }
+        if (transferred)
+            NotifyGuestDirectoryChange(record->canonicalPath, FILE_ACTION_MODIFIED,
+                FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
+        return transferred == length ? ERROR_SUCCESS : ERROR_WRITE_FAULT;
+    }
+    catch (const Concurrency::task_canceled&) { return ERROR_OPERATION_ABORTED; }
+    catch (Exception^ exception)
+    {
+        const DWORD error = ErrorFromException(exception);
+        return exception->HResult == E_ABORT || error == ERROR_CANCELLED ? ERROR_OPERATION_ABORTED : error;
+    }
+    catch (const std::bad_alloc&) { return ERROR_NOT_ENOUGH_MEMORY; }
+}
+
+bool GuestStorageContext::BindIoCompletionPort(HANDLE file, const std::shared_ptr<GuestIoCompletionPort>& port,
+    ULONG_PTR key, DWORD* win32Error)
+{
+    const auto record = LookupFile(file);
+    if (!record || !port || port->IsClosed())
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(record->completionLock);
+    if (record->closed || !record->overlapped || record->completion.port)
+    {
+        SetWin32Error(win32Error, record->closed ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    record->completion.port = port;
+    record->completion.key = key;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestStorageContext::SetIoCompletionModes(HANDLE file, UCHAR modes, DWORD* win32Error)
+{
+    const auto record = LookupFile(file);
+    if (!record)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(record->completionLock);
+    if (record->closed || (modes && !record->overlapped))
+    {
+        SetWin32Error(win32Error, record->closed ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER);
+        return false;
+    }
+    record->completion.modes |= modes;
+    if (modes & FILE_SKIP_SET_EVENT_ON_HANDLE) record->waitSignal.SuppressCompletion();
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+GuestIoCompletionBinding GuestStorageContext::IoCompletionBinding(HANDLE file) const
+{
+    const auto record = LookupFile(file);
+    if (!record) return {};
+    std::lock_guard<std::mutex> guard(record->completionLock);
+    return record->closed ? GuestIoCompletionBinding{} : record->completion;
 }
 
 bool GuestStorageContext::ReadFile(HANDLE guestHandle, void* buffer, DWORD bytesToRead, DWORD* bytesRead, DWORD* win32Error)
@@ -1299,7 +1599,7 @@ bool GuestStorageContext::ReadFile(HANDLE guestHandle, void* buffer, DWORD bytes
 }
 
 bool GuestStorageContext::ReadFileAt(HANDLE guestHandle, void* buffer,
-    DWORD bytesToRead, ULONGLONG offset, DWORD* bytesRead, DWORD* win32Error)
+    DWORD bytesToRead, ULONGLONG offset, DWORD* bytesRead, DWORD* win32Error, bool mappedIo)
 {
     if (bytesRead)
     {
@@ -1337,7 +1637,15 @@ bool GuestStorageContext::ReadFileAt(HANDLE guestHandle, void* buffer,
             return true;
         }
         const bool positioned = offset != ~0ull;
-        const ULONGLONG previousPosition = positioned ? stream->Position : 0;
+        const ULONGLONG previousPosition = stream->Position;
+        std::unique_lock<std::mutex> rangeGuard(record->ranges->lock, std::defer_lock);
+        if (!mappedIo)
+        {
+            rangeGuard.lock();
+            if (!record->ranges->AllowsIo(this, record.get(), 0,
+                positioned ? offset : previousPosition, bytesToRead, false))
+            { SetWin32Error(win32Error, ERROR_LOCK_VIOLATION); return false; }
+        }
         if (positioned) stream->Seek(offset);
         auto requested = ref new Buffer(bytesToRead);
         IBuffer^ data = create_task(stream->ReadAsync(requested, bytesToRead, InputStreamOptions::None)).get();
@@ -1365,7 +1673,7 @@ bool GuestStorageContext::WriteFile(HANDLE guestHandle, const void* buffer, DWOR
 }
 
 bool GuestStorageContext::WriteFileAt(HANDLE guestHandle, const void* buffer,
-    DWORD bytesToWrite, ULONGLONG offset, DWORD* bytesWritten, DWORD* win32Error)
+    DWORD bytesToWrite, ULONGLONG offset, DWORD* bytesWritten, DWORD* win32Error, bool mappedIo)
 {
     if (bytesWritten)
     {
@@ -1410,7 +1718,15 @@ bool GuestStorageContext::WriteFileAt(HANDLE guestHandle, const void* buffer,
             return true;
         }
         const bool positioned = offset != ~0ull;
-        const ULONGLONG previousPosition = positioned ? stream->Position : 0;
+        const ULONGLONG previousPosition = stream->Position;
+        std::unique_lock<std::mutex> rangeGuard(record->ranges->lock, std::defer_lock);
+        if (!mappedIo)
+        {
+            rangeGuard.lock();
+            if (!record->ranges->AllowsIo(this, record.get(), 0,
+                positioned ? offset : previousPosition, bytesToWrite, true))
+            { SetWin32Error(win32Error, ERROR_LOCK_VIOLATION); return false; }
+        }
         if (positioned) stream->Seek(offset);
         // Bind the writer directly to the random-access stream.  This is the
         // UWP storage contract equivalent of synchronous Win32 WriteFile and
@@ -1434,6 +1750,7 @@ bool GuestStorageContext::WriteFileAt(HANDLE guestHandle, const void* buffer,
             return false;
         }
         SetWin32Error(win32Error, ERROR_SUCCESS);
+        if (rangeGuard.owns_lock()) rangeGuard.unlock();
         NotifyGuestDirectoryChange(record->canonicalPath, FILE_ACTION_MODIFIED,
             FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
         return true;
@@ -1453,77 +1770,69 @@ bool GuestStorageContext::CloseFile(HANDLE guestHandle, DWORD* win32Error)
 {
     const ULONG_PTR token = reinterpret_cast<ULONG_PTR>(guestHandle);
     std::shared_ptr<FileRecord> record;
-    bool removeFile = false;
+    bool last = false;
+    bool lastInProcess = false;
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
         const auto found = m_files.find(token);
-        if (found == m_files.end())
-        {
-            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
-            return false;
-        }
+        if (found == m_files.end()) { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
+        const auto flags = m_fileFlags.find(token);
+        if (flags != m_fileFlags.end() && (flags->second & 2u))
+        { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
         record = found->second;
-        const std::wstring key = MetadataKey(record->canonicalPath);
-        if (record->deleteOnClose) m_deletePending.insert(key);
-        m_files.erase(found);
-        auto locked = m_byteRangeLocks.find(key);
-        if (locked != m_byteRangeLocks.end())
-        {
-            auto& ranges = locked->second;
-            ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
-                [token](const ByteRangeLock& range) { return range.owner == token; }), ranges.end());
-            if (ranges.empty()) m_byteRangeLocks.erase(locked);
-        }
-        bool stillOpen = false;
-        for (const auto& entry : m_files)
-        {
-            if (entry.second && _wcsicmp(entry.second->canonicalPath.c_str(),
-                record->canonicalPath.c_str()) == 0)
-            {
-                stillOpen = true;
-                break;
-            }
-        }
-        if (!stillOpen && m_deletePending.erase(key) != 0) removeFile = true;
+        m_files.erase(found); m_fileFlags.erase(token);
+        last = --record->handleReferences == 0;
+        lastInProcess = std::none_of(m_files.begin(), m_files.end(), [&](const auto& entry)
+        { return entry.second == record; });
+        if (last) record->closeScheduled = true;
     }
+    if (lastInProcess)
+    {
+        const auto owner = CurrentGuestKernelContext();
+        if (owner && CurrentGuestStorageContext() == this) CancelGuestFileIo(record.get(), owner);
+        ReleaseFileRanges(record);
+    }
+    if (!last) { SetWin32Error(win32Error, ERROR_SUCCESS); return true; }
+    return CloseDescription(record, win32Error);
+}
 
+bool GuestStorageContext::CloseDescription(const std::shared_ptr<FileRecord>& record, DWORD* error)
+{
+    record->waitSignal.Retire();
+    CancelGuestFileIo(record.get(), nullptr);
+    DWORD result = ERROR_SUCCESS;
+    if (record->deleteOnClose)
+    {
+        try { std::lock_guard<std::mutex> guard(m_handlesLock); m_deletePending.insert(MetadataKey(record->canonicalPath)); }
+        catch (const std::bad_alloc&) { result = ERROR_NOT_ENOUGH_MEMORY; }
+    }
+    // A retained I/O reference is serialized against final closure. Never
+    // hold the namespace lock while awaiting/disposing the WinRT stream.
     try
     {
         std::lock_guard<std::mutex> guard(record->lock);
-        if (record->closed)
-        {
-            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
-            return false;
-        }
-
         IRandomAccessStream^ stream = record->stream.Get();
-        StorageFolder^ folder = record->folder.Get();
-        record->closed = true;
-        record->stream = nullptr;
-        record->folder = nullptr;
-        if (!stream && !folder)
-        {
-            SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
-            return false;
-        }
+        record->closed = true; record->stream = nullptr; record->folder = nullptr;
         if (stream) delete stream;
-        if (removeFile)
-        {
-            DWORD deleteError = ERROR_SUCCESS;
-            if (!DeleteGuestFile(record->canonicalPath.c_str(), &deleteError))
-            {
-                SetWin32Error(win32Error, deleteError);
-                return false;
-            }
-        }
-        SetWin32Error(win32Error, ERROR_SUCCESS);
-        return true;
     }
-    catch (Exception^ exception)
+    catch (Exception^ exception) { result = ErrorFromException(exception); }
+    bool removeFile = false;
     {
-        SetWin32Error(win32Error, ErrorFromException(exception));
-        return false;
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        m_sharedFiles->descriptions.erase(record.get());
+        const std::wstring key = MetadataKey(record->canonicalPath);
+        bool stillOpen = false;
+        for (const auto& entry : m_sharedFiles->descriptions)
+            if (MetadataKey(entry.second->canonicalPath) == key) { stillOpen = true; break; }
+        if (!stillOpen) m_sharedFiles->rangeStates.erase(key);
+        if (!stillOpen && (record->deleteOnClose || m_deletePending.count(key))) removeFile = true;
     }
+    if (removeFile)
+    {
+        DWORD deleteError = ERROR_SUCCESS;
+        if (!DeleteGuestFile(record->canonicalPath.c_str(), &deleteError) && result == ERROR_SUCCESS) result = deleteError;
+    }
+    SetWin32Error(error, result); return result == ERROR_SUCCESS;
 }
 
 bool GuestStorageContext::GetFileSize(HANDLE guestHandle, LARGE_INTEGER* fileSize, DWORD* win32Error)
@@ -1831,7 +2140,7 @@ bool GuestStorageContext::DeleteGuestFile(LPCWSTR path, DWORD* win32Error)
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
         bool open = false;
-        for (const auto& entry : m_files)
+        for (const auto& entry : m_sharedFiles->descriptions)
         {
             const auto& record = entry.second;
             if (!record || _wcsicmp(record->canonicalPath.c_str(), resolved.canonical.c_str()) != 0)
@@ -2006,7 +2315,7 @@ bool GuestStorageContext::MoveGuestPath(
 
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
-        for (const auto& entry : m_files)
+        for (const auto& entry : m_sharedFiles->descriptions)
         {
             const auto& record = entry.second;
             if (!record) continue;
@@ -2514,59 +2823,27 @@ std::wstring GuestStorageContext::TempPath() const
 void GuestStorageContext::CloseAll()
 {
     std::unordered_map<ULONG_PTR, std::shared_ptr<FileRecord>> files;
-    std::unordered_set<std::wstring> removePaths;
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
-        files.swap(m_files);
-        for (const auto& entry : files)
-        {
-            if (entry.second && entry.second->deleteOnClose)
-                m_deletePending.insert(MetadataKey(entry.second->canonicalPath));
-        }
-        for (const auto& pending : m_deletePending)
-        {
-            for (const auto& entry : files)
-            {
-                if (entry.second && MetadataKey(entry.second->canonicalPath) == pending)
-                {
-                    removePaths.insert(entry.second->canonicalPath);
-                    break;
-                }
-            }
-        }
-        m_deletePending.clear();
-        m_finds.clear();
-        m_nextHandle = FirstHandleToken;
+        // Detach the table without allocating a second vector during teardown.
+        files.swap(m_files); m_fileFlags.clear(); m_finds.clear();
+        for (const auto& entry : files) --entry.second->handleReferences;
     }
-
-    for (const auto& pair : files)
+    for (const auto& entry : files)
     {
-        try
+        const auto& record = entry.second;
+        ReleaseFileRanges(record);
+        bool final = false;
         {
-            std::lock_guard<std::mutex> guard(pair.second->lock);
-            if (pair.second->closed)
-            {
-                continue;
-            }
-
-            IRandomAccessStream^ stream = pair.second->stream.Get();
-            pair.second->closed = true;
-            pair.second->stream = nullptr;
-            pair.second->folder = nullptr;
-            if (stream)
-            {
-                delete stream;
-            }
+            std::lock_guard<std::mutex> guard(m_handlesLock);
+            if (!record->handleReferences && !record->closeScheduled)
+            { record->closeScheduled = true; final = true; }
         }
-        catch (...)
+        if (final)
         {
-            // Process teardown semantics: a failed close must not keep a guest alive.
+            try { DWORD ignored = ERROR_SUCCESS; CloseDescription(record, &ignored); }
+            catch (...) { /* Process teardown cannot throw into the host. */ }
         }
-    }
-    for (const auto& path : removePaths)
-    {
-        DWORD ignored = ERROR_SUCCESS;
-        DeleteGuestFile(path.c_str(), &ignored);
     }
 }
 

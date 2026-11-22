@@ -1,5 +1,12 @@
 #include "pch.h"
+#include "Bridge/CRT/CrtExceptions.h"
+#include "Bridge/GuestCodePages.h"
+#include "Bridge/GuestIoCompletionPort.h"
+#include "Bridge/Advapi32Shims.h"
 #include "Bridge/ApiSet.h"
+#include "Bridge/DirectX/GraphicsShims.h"
+#include "Bridge/GuestWindow.h"
+#include <climits>
 #include "Bridge\\Kernel32Shims.h"
 #include "Bridge/ActivationContext.h"
 #include "Bridge\\GuestKernel.h"
@@ -10,14 +17,21 @@
 #include "Bridge\\RuntimeDiagnostics.h"
 #include "Bridge\\Win32Shims.h"
 
+#include <algorithm>
 #include <atomic>
+#include <delayloadhandler.h>
+#include <roapi.h>
+#include <threadpoolapiset.h>
+#include <winternl.h>
 #include <array>
 #include <cctype>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <cwchar>
 #include <cwctype>
 #include <limits>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <new>
@@ -25,7 +39,6 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
-#include <winternl.h>
 
 using namespace Win32Bridge::Bridge;
 
@@ -42,10 +55,26 @@ namespace
     std::mutex g_guestResourcesLock;
     std::unordered_map<ULONG_PTR, GuestResourceData> g_guestResources;
 
+    using GuestNativeIoApc = void (NTAPI*)(void*, void*, ULONG);
+
+    struct GuestIoCompletion final
+    {
+        LPOVERLAPPED_COMPLETION_ROUTINE procedure = nullptr;
+        DWORD error = ERROR_SUCCESS;
+        DWORD bytes = 0;
+        LPOVERLAPPED overlapped = nullptr;
+        GuestNativeIoApc nativeProcedure = nullptr;
+        void* nativeContext = nullptr;
+        void* statusBlock = nullptr;
+    };
+
     struct GuestApc final
     {
         PAPCFUNC procedure = nullptr;
         ULONG_PTR parameter = 0;
+        std::shared_ptr<GuestKernelContext::WaitableTimerApc> timer;
+        FILETIME timerTime{};
+        GuestIoCompletion io;
     };
 
     std::mutex g_guestApcLock;
@@ -54,7 +83,7 @@ namespace
 
     struct GuestDirectoryChangeWatch final
     {
-        HANDLE directory = nullptr;
+        std::shared_ptr<const void> fileDescription;
         std::wstring path;
         bool subtree = false;
         DWORD filter = 0;
@@ -63,20 +92,18 @@ namespace
         LPDWORD bytesReturned = nullptr;
         LPOVERLAPPED overlapped = nullptr;
         LPOVERLAPPED_COMPLETION_ROUTINE completionRoutine = nullptr;
+        HANDLE overlappedEvent = nullptr;
+        GuestKernelContext::IoEvent event;
+        GuestKernelContext::FileSignal fileSignal;
+        GuestIoCompletionBinding binding;
+        std::weak_ptr<GuestKernelContext> owner;
+        const GuestKernelContext* ownerIdentity = nullptr;
         DWORD threadId = 0;
         std::mutex lock;
         std::condition_variable changed;
         bool completed = false;
         DWORD completionError = ERROR_SUCCESS;
         DWORD completionBytes = 0;
-    };
-
-    struct GuestIoCompletion final
-    {
-        LPOVERLAPPED_COMPLETION_ROUTINE procedure = nullptr;
-        DWORD error = ERROR_SUCCESS;
-        DWORD bytes = 0;
-        LPOVERLAPPED overlapped = nullptr;
     };
 
     struct GuestDirectoryChange final
@@ -87,7 +114,7 @@ namespace
     };
 
     std::mutex g_directoryWatchesLock;
-    std::vector<std::shared_ptr<GuestDirectoryChangeWatch>> g_directoryWatches;
+    std::list<std::shared_ptr<GuestDirectoryChangeWatch>> g_directoryWatches;
 
     struct GuestFindChangeWatch final
     {
@@ -101,28 +128,58 @@ namespace
     std::mutex g_findChangeWatchesLock;
     std::unordered_map<ULONG_PTR, GuestFindChangeWatch> g_findChangeWatches;
 
+    void PruneTimerApcs(std::deque<GuestApc>& pending)
+    {
+        pending.erase(std::remove_if(pending.begin(), pending.end(), [](const GuestApc& apc)
+        {
+            return apc.timer && !apc.timer->valid.load();
+        }), pending.end());
+    }
+
     bool HasGuestApcLocked(DWORD threadId)
     {
         const auto found = g_guestApcs.find(threadId);
-        return found != g_guestApcs.end() && !found->second.empty();
+        if (found == g_guestApcs.end()) return false;
+        PruneTimerApcs(found->second);
+        if (!found->second.empty()) return true;
+        g_guestApcs.erase(found);
+        return false;
     }
 
-    bool QueueGuestApcByThreadId(
-        DWORD threadId, PAPCFUNC procedure, ULONG_PTR parameter)
+    void PruneGuestTimerApcs(DWORD threadId)
+    {
+        std::lock_guard<std::mutex> guard(g_guestApcLock);
+        HasGuestApcLocked(threadId);
+    }
+
+    bool QueueGuestApcRecord(DWORD threadId, GuestApc record)
     {
         try
         {
             {
                 std::lock_guard<std::mutex> guard(g_guestApcLock);
-                g_guestApcs[threadId].push_back({ procedure, parameter });
+                g_guestApcs[threadId].push_back(std::move(record));
             }
             g_guestApcChanged.notify_all();
+            GuestKernelContext::NotifyAlertableWaiters();
             return true;
         }
         catch (const std::bad_alloc&)
         {
             return false;
         }
+    }
+
+    bool QueueGuestApcByThreadId(DWORD threadId, PAPCFUNC procedure, ULONG_PTR parameter)
+    {
+        return QueueGuestApcRecord(threadId, GuestApc{procedure, parameter});
+    }
+
+    bool QueueGuestIoCompletion(DWORD threadId, GuestIoCompletion completion)
+    {
+        GuestApc record{};
+        record.io = completion;
+        return QueueGuestApcRecord(threadId, std::move(record));
     }
 
     bool InvokeGuestApcSeh(PAPCFUNC procedure, ULONG_PTR parameter)
@@ -138,28 +195,73 @@ namespace
         }
     }
 
-    bool InvokeGuestIoCompletionLeaf(GuestIoCompletion* invocation)
+    void QueueGuestTimerApc(const std::shared_ptr<GuestKernelContext::WaitableTimerApc>& timer, FILETIME completed)
+    {
+        if (timer->queued.exchange(true)) return;
+        try
+        {
+            {
+                std::lock_guard<std::mutex> guard(g_guestApcLock);
+                auto& pending = g_guestApcs[timer->threadId];
+                PruneTimerApcs(pending);
+                GuestApc apc;
+                apc.timer = timer;
+                apc.timerTime = completed;
+                pending.push_back(std::move(apc));
+            }
+            // The timer dispatcher wakes handle waiters after registering
+            // this APC. Wake SleepEx separately without reentering it.
+            g_guestApcChanged.notify_all();
+        }
+        catch (const std::bad_alloc&) { timer->queued.store(false); }
+    }
+
+    bool ArmGuestWaitableTimer(GuestKernelContext& kernel, HANDLE handle, LONGLONG due, LONG period,
+        GuestKernelContext::WaitableTimerApc::Procedure callback, void* parameter, ULONG tolerableDelay,
+        DWORD& error, bool* previousState = nullptr)
+    {
+        std::shared_ptr<GuestKernelContext::WaitableTimerApc> apc;
+        if (callback)
+        {
+            try { apc = std::make_shared<GuestKernelContext::WaitableTimerApc>(); }
+            catch (const std::bad_alloc&)
+            {
+                error = ERROR_NOT_ENOUGH_MEMORY;
+                return false;
+            }
+            apc->procedure = callback;
+            apc->parameter = parameter;
+            apc->threadId = BridgeGetCurrentThreadId();
+            apc->pruneQueue = &PruneGuestTimerApcs;
+        }
+        return kernel.ArmTimerObject(handle, due, period, tolerableDelay, std::move(apc),
+            &QueueGuestTimerApc, &error, previousState);
+    }
+
+    bool InvokeGuestTimerApcSeh(const GuestKernelContext::WaitableTimerApc& timer, FILETIME time)
     {
         __try
         {
-            invocation->procedure(
-                invocation->error, invocation->bytes, invocation->overlapped);
+            timer.procedure(timer.parameter, time.dwLowDateTime, time.dwHighDateTime);
+            return true;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+    }
+
+    bool InvokeGuestIoCompletionLeaf(const GuestIoCompletion& invocation)
+    {
+        __try
+        {
+            if (invocation.nativeProcedure)
+                invocation.nativeProcedure(invocation.nativeContext, invocation.statusBlock, 0);
+            else
+                invocation.procedure(invocation.error, invocation.bytes, invocation.overlapped);
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
         {
             return false;
         }
-    }
-
-    void WINAPI InvokeGuestIoCompletionApc(ULONG_PTR parameter)
-    {
-        std::unique_ptr<GuestIoCompletion> invocation(
-            reinterpret_cast<GuestIoCompletion*>(parameter));
-        if (invocation && invocation->procedure &&
-            !InvokeGuestIoCompletionLeaf(invocation.get()))
-            RuntimeDiagnostics::Record(
-                L"I/O completion: guest callback raised a structured exception.");
     }
 
     bool DispatchGuestApcs(DWORD threadId)
@@ -172,13 +274,31 @@ namespace
             pending.swap(found->second);
             g_guestApcs.erase(found);
         }
+        bool invoked = false;
         for (const GuestApc& apc : pending)
         {
-            if (!apc.procedure || InvokeGuestApcSeh(apc.procedure, apc.parameter)) continue;
+            if (apc.timer)
+            {
+                apc.timer->queued.store(false);
+                if (!apc.timer->valid.load()) continue;
+                invoked = true;
+                if (InvokeGuestTimerApcSeh(*apc.timer, apc.timerTime)) continue;
+            }
+            else if (apc.io.procedure || apc.io.nativeProcedure)
+            {
+                invoked = true;
+                if (InvokeGuestIoCompletionLeaf(apc.io)) continue;
+            }
+            else
+            {
+                if (!apc.procedure) continue;
+                invoked = true;
+                if (InvokeGuestApcSeh(apc.procedure, apc.parameter)) continue;
+            }
             RuntimeDiagnostics::Record(
                 L"APC: guest completion routine raised a structured exception.");
         }
-        return true;
+        return invoked;
     }
 
     void ResetGuestApcs()
@@ -267,12 +387,59 @@ namespace
         }
     }
 
-    bool InitializeDirectoryOverlappedLeaf(LPOVERLAPPED overlapped)
+    HANDLE GuestOverlappedEvent(HANDLE tagged)
     {
-        constexpr ULONG_PTR StatusPending = 0x103u;
+        return reinterpret_cast<HANDLE>(reinterpret_cast<ULONG_PTR>(tagged) & ~static_cast<ULONG_PTR>(1));
+    }
+
+    constexpr ULONG_PTR GuestIoPending = 0x103u;
+
+    ULONG_PTR GuestNtStatusForIoError(DWORD error)
+    {
+        switch (error)
+        {
+        case ERROR_SUCCESS: return 0;
+        case ERROR_IO_PENDING: return GuestIoPending;
+        case ERROR_HANDLE_EOF: return 0xc0000011u;
+        case ERROR_OPERATION_ABORTED: return 0xc0000120u;
+        case ERROR_ACCESS_DENIED: return 0xc0000022u;
+        case ERROR_INVALID_HANDLE: return 0xc0000008u;
+        case ERROR_INVALID_PARAMETER: return 0xc000000du;
+        case ERROR_INVALID_FUNCTION: return 0xc0000010u;
+        case ERROR_NOT_ENOUGH_MEMORY: return 0xc0000017u;
+        case ERROR_NOACCESS: return 0xc0000005u;
+        case ERROR_LOCK_VIOLATION: return 0xc0000054u;
+        case ERROR_NOT_LOCKED: return 0xc000007eu;
+        default: return 0xc0070000u | (error & 0xffffu);
+        }
+    }
+
+    DWORD GuestErrorForIoStatus(ULONG_PTR status)
+    {
+        const DWORD value = static_cast<DWORD>(status);
+        if ((value & 0xffff0000u) == 0xc0070000u) return value & 0xffffu;
+        switch (value)
+        {
+        case 0xc000000du: return ERROR_INVALID_PARAMETER;
+        case 0xc0000010u: return ERROR_INVALID_FUNCTION;
+        case 0xc0000017u: return ERROR_NOT_ENOUGH_MEMORY;
+        case 0xc0000011u: return ERROR_HANDLE_EOF;
+        case 0xc0000120u: return ERROR_OPERATION_ABORTED;
+        case 0xc0000022u: return ERROR_ACCESS_DENIED;
+        case 0xc0000008u: return ERROR_INVALID_HANDLE;
+        case 0xc0000005u: return ERROR_NOACCESS;
+        case 0xc0000054u: case 0xc0000055u: return ERROR_LOCK_VIOLATION;
+        case 0xc000007eu: return ERROR_NOT_LOCKED;
+        default: return value;
+        }
+    }
+
+    bool InitializeDirectoryOverlappedLeaf(LPOVERLAPPED overlapped, HANDLE& eventHandle)
+    {
         __try
         {
-            overlapped->Internal = StatusPending;
+            eventHandle = overlapped->hEvent;
+            overlapped->Internal = GuestIoPending;
             overlapped->InternalHigh = 0;
             return true;
         }
@@ -282,14 +449,15 @@ namespace
         }
     }
 
-    bool CompleteDirectoryOverlappedLeaf(
-        LPOVERLAPPED overlapped, DWORD error, DWORD bytes, HANDLE* eventHandle)
+    bool WriteGuestIoStatus(void* statusBlock, ULONG_PTR status, ULONG_PTR bytes)
     {
         __try
         {
-            overlapped->Internal = error;
-            overlapped->InternalHigh = error == ERROR_SUCCESS ? bytes : 0;
-            if (eventHandle) *eventHandle = overlapped->hEvent;
+            memcpy(static_cast<BYTE*>(statusBlock) + sizeof(ULONG_PTR), &bytes, sizeof(bytes));
+            // Publish readiness after the byte count, as GetOverlappedResult
+            // may read both fields from another thread.
+            ::InterlockedExchangePointer(static_cast<void* volatile*>(statusBlock),
+                reinterpret_cast<void*>(status));
             return true;
         }
         __except (EXCEPTION_EXECUTE_HANDLER)
@@ -298,20 +466,55 @@ namespace
         }
     }
 
+    DWORD PostGuestFileCompletion(const GuestIoCompletionBinding& binding, void* statusBlock, void* context,
+        HANDLE event, DWORD error, DWORD bytes, bool pending,
+        const GuestKernelContext::FileSignal& fileSignal = {})
+    {
+        if (!binding.port || !context ||
+            (!pending && (error || (binding.modes & FILE_SKIP_COMPLETION_PORT_ON_SUCCESS))))
+            return ERROR_NOT_FOUND;
+
+        return binding.port->Post(GuestIoPacket{bytes, binding.key, static_cast<LPOVERLAPPED>(context),
+            static_cast<ULONG>(GuestNtStatusForIoError(error)), pending && !event, fileSignal, statusBlock});
+    }
+
+    void CompletePendingGuestFileIo(const GuestIoCompletionBinding& binding, void* statusBlock,
+        void* context, HANDLE eventHandle, const GuestKernelContext::IoEvent& event,
+        const GuestKernelContext::FileSignal& fileSignal, DWORD& error, DWORD& bytes)
+    {
+        if (!eventHandle && PostGuestFileCompletion(binding, statusBlock, context,
+            eventHandle, error, bytes, true, fileSignal) == ERROR_SUCCESS)
+            return;
+
+        if (!WriteGuestIoStatus(statusBlock, GuestNtStatusForIoError(error), bytes))
+        {
+            error = ERROR_NOACCESS;
+            bytes = 0;
+        }
+        if (eventHandle)
+        {
+            event.Set(true);
+            PostGuestFileCompletion(binding, statusBlock, context, eventHandle, error, bytes, true);
+        }
+        else fileSignal.Complete();
+    }
+
     void CompleteDirectoryWatch(
         const std::shared_ptr<GuestDirectoryChangeWatch>& watch,
         const std::vector<std::pair<std::wstring, DWORD>>& entries,
         DWORD forcedError = ERROR_SUCCESS)
     {
         if (!watch) return;
+        const auto kernel = watch->owner.lock();
+        const bool active = kernel && !kernel->IsStopping();
         DWORD bytes = 0;
-        DWORD error = forcedError;
+        DWORD error = active ? forcedError : ERROR_OPERATION_ABORTED;
         if (error == ERROR_SUCCESS &&
             !WriteDirectoryChangeBuffer(
                 watch->buffer, watch->bufferSize, entries, &bytes))
             error = 1022; // ERROR_NOTIFY_ENUM_DIR
 
-        if (watch->bytesReturned)
+        if (active && watch->bytesReturned)
         {
             if (!StoreDirectoryBytesLeaf(
                 watch->bytesReturned, error == ERROR_SUCCESS ? bytes : 0))
@@ -320,26 +523,18 @@ namespace
                 bytes = 0;
             }
         }
-        if (watch->overlapped)
+        if (active && watch->overlapped)
         {
-            HANDLE eventHandle = nullptr;
-            if (!CompleteDirectoryOverlappedLeaf(
-                watch->overlapped, error, bytes, &eventHandle))
-            {
-                error = ERROR_NOACCESS;
-                bytes = 0;
-            }
-            if (eventHandle) BridgeSetEvent(eventHandle);
+            if (error) bytes = 0;
+            void* const context = reinterpret_cast<ULONG_PTR>(watch->overlappedEvent) & 1 ? nullptr : watch->overlapped;
+            CompletePendingGuestFileIo(watch->binding, watch->overlapped, context, GuestOverlappedEvent(watch->overlappedEvent),
+                watch->event, watch->fileSignal, error, bytes);
         }
-        if (watch->completionRoutine && watch->overlapped)
+        else if (active) watch->fileSignal.Complete();
+        if (active && watch->completionRoutine && watch->overlapped)
         {
-            auto invocation = std::unique_ptr<GuestIoCompletion>(new (std::nothrow)
-                GuestIoCompletion{ watch->completionRoutine, error,
-                    error == ERROR_SUCCESS ? bytes : 0, watch->overlapped });
-            if (invocation && QueueGuestApcByThreadId(
-                watch->threadId, &InvokeGuestIoCompletionApc,
-                reinterpret_cast<ULONG_PTR>(invocation.get())))
-                invocation.release();
+            QueueGuestIoCompletion(watch->threadId,
+                {watch->completionRoutine, error, error == ERROR_SUCCESS ? bytes : 0, watch->overlapped});
         }
         {
             std::lock_guard<std::mutex> guard(watch->lock);
@@ -409,39 +604,53 @@ namespace
         for (HANDLE eventHandle : signalled) BridgeSetEvent(eventHandle);
     }
 
-    bool CancelGuestDirectoryWatches(HANDLE directory, DWORD threadId)
+    bool CancelGuestDirectoryWatches(const void* description, const GuestKernelContext* owner,
+        DWORD threadId, LPOVERLAPPED overlapped = nullptr)
     {
-        std::vector<std::shared_ptr<GuestDirectoryChangeWatch>> cancelled;
+        std::list<std::shared_ptr<GuestDirectoryChangeWatch>> cancelled;
         {
             std::lock_guard<std::mutex> guard(g_directoryWatchesLock);
             for (auto iterator = g_directoryWatches.begin();
                 iterator != g_directoryWatches.end();)
             {
-                if ((*iterator)->directory == directory &&
-                    (threadId == 0 || (*iterator)->threadId == threadId))
+                if ((!description || (*iterator)->fileDescription.get() == description) &&
+                    (!owner || (*iterator)->ownerIdentity == owner) &&
+                    (threadId == 0 || (*iterator)->threadId == threadId) &&
+                    (!overlapped || (*iterator)->overlapped == overlapped))
                 {
-                    cancelled.push_back(*iterator);
-                    iterator = g_directoryWatches.erase(iterator);
+                    auto matching = iterator++;
+                    cancelled.splice(cancelled.end(), g_directoryWatches, matching);
                 }
                 else ++iterator;
             }
         }
         for (const auto& watch : cancelled)
             CompleteDirectoryWatch(watch, {}, ERROR_OPERATION_ABORTED);
-        std::lock_guard<std::mutex> findGuard(g_findChangeWatchesLock);
-        g_findChangeWatches.clear();
         return !cancelled.empty();
+    }
+
+    bool CancelGuestDiskRequests(const void* description, const GuestKernelContext* owner,
+        DWORD threadId, LPOVERLAPPED overlapped = nullptr);
+
+    bool CancelGuestFileRequests(const void* description, const GuestKernelContext* owner,
+        DWORD threadId, LPOVERLAPPED overlapped = nullptr)
+    {
+        const bool disk = CancelGuestDiskRequests(description, owner, threadId, overlapped);
+        const bool directory = CancelGuestDirectoryWatches(description, owner, threadId, overlapped);
+        return disk || directory;
     }
 
     void ResetGuestDirectoryWatches()
     {
-        std::vector<std::shared_ptr<GuestDirectoryChangeWatch>> cancelled;
+        std::list<std::shared_ptr<GuestDirectoryChangeWatch>> cancelled;
         {
             std::lock_guard<std::mutex> guard(g_directoryWatchesLock);
             cancelled.swap(g_directoryWatches);
         }
         for (const auto& watch : cancelled)
             CompleteDirectoryWatch(watch, {}, ERROR_OPERATION_ABORTED);
+        std::lock_guard<std::mutex> findGuard(g_findChangeWatchesLock);
+        g_findChangeWatches.clear();
     }
     constexpr ULONG_PTR FirstFileMappingHandle = 0x74000000;
     std::atomic<ULONG_PTR> g_nextFileMappingHandle{ FirstFileMappingHandle };
@@ -551,6 +760,7 @@ namespace
     {
         const wchar_t* library;
         ULONG_PTR token;
+        bool preferGuestImage = false;
     };
 
     constexpr BridgeSystemModule BridgeSystemModules[] =
@@ -568,6 +778,26 @@ namespace
         { L"msvcrt.dll", BridgeSystemModuleBaseToken + 11 },
         { L"version.dll", BridgeSystemModuleBaseToken + 12 },
         { L"shcore.dll", BridgeSystemModuleBaseToken + 13 },
+        { L"msimg32.dll", BridgeSystemModuleBaseToken + 14 },
+        { L"gdi32full.dll", BridgeSystemModuleBaseToken + 15 },
+        { L"windowscodecs.dll", BridgeSystemModuleBaseToken + 16 },
+        { L"ucrtbase.dll", BridgeSystemModuleBaseToken + 17 },
+        { L"vcruntime140.dll", BridgeSystemModuleBaseToken + 18 },
+        { L"vcruntime140_1.dll", BridgeSystemModuleBaseToken + 19 },
+        { L"vcruntime140_app.dll", BridgeSystemModuleBaseToken + 20 },
+        { L"vcruntime140_1_app.dll", BridgeSystemModuleBaseToken + 21 },
+        { L"ntdll.dll", BridgeSystemModuleBaseToken + 22 },
+        { L"combase.dll", BridgeSystemModuleBaseToken + 23 },
+        { L"mpr.dll", BridgeSystemModuleBaseToken + 24 },
+        { L"cmdext.dll", BridgeSystemModuleBaseToken + 25 },
+        { L"winbrand.dll", BridgeSystemModuleBaseToken + 26 },
+        { L"wldp.dll", BridgeSystemModuleBaseToken + 27 },
+        { L"msvcp140.dll", BridgeSystemModuleBaseToken + 28, true },
+        { L"msvcp140_app.dll", BridgeSystemModuleBaseToken + 29, true },
+        { L"dxgi.dll", BridgeSystemModuleBaseToken + 30 },
+        { L"d3d11.dll", BridgeSystemModuleBaseToken + 31 },
+        { L"d3d12.dll", BridgeSystemModuleBaseToken + 32 },
+        { L"d3dcompiler_47.dll", BridgeSystemModuleBaseToken + 33 },
     };
 
     HMODULE GuestMainModule()
@@ -888,6 +1118,8 @@ namespace
         {
             if (_wcsicmp(fileName, candidate.library) == 0)
             {
+                if (candidate.token == BridgeSystemModuleBaseToken + 33 && !HasHostShaderCompiler())
+                    return nullptr;
                 return &candidate;
             }
         }
@@ -905,6 +1137,16 @@ namespace
             }
         }
         return nullptr;
+    }
+
+    bool PreferGuestModuleImage(const BridgeSystemModule* module)
+    {
+        return module && module->preferGuestImage;
+    }
+
+    bool IsUnqualifiedLibraryName(LPCWSTR name)
+    {
+        return name && !std::wcspbrk(name, L"\\/:");
     }
 
     bool CopyAsciiImportName(LPCSTR source, std::wstring* destination)
@@ -953,7 +1195,10 @@ namespace
             return nullptr;
         }
 
-        const ImportResolution resolution = ResolveRuntimeImport(symbol);
+        GuestModuleLoader* loader = CurrentGuestModuleLoader();
+        const ImportResolution resolution = loader
+            ? loader->ResolveImport(symbol, g_guestDllDirectoryFlags.load(), error)
+            : ResolveRuntimeImport(symbol);
         if (resolution.targetAddress == 0)
         {
             *error = ERROR_PROC_NOT_FOUND;
@@ -966,7 +1211,8 @@ namespace
         *error = ERROR_SUCCESS;
         RuntimeDiagnostics::Record(
             L"DYNAMIC IMPORT OK: " + std::wstring(module.library) + L"!" +
-            (symbol.importedByOrdinal ? (L"#" + std::to_wstring(symbol.ordinal)) : symbol.name));
+            (symbol.importedByOrdinal ? (L"#" + std::to_wstring(symbol.ordinal)) : symbol.name) +
+            L" source='" + resolution.note + L"'.");
         return reinterpret_cast<FARPROC>(static_cast<ULONG_PTR>(resolution.targetAddress));
     }
 
@@ -1090,6 +1336,11 @@ void Win32Bridge::Bridge::NotifyGuestDirectoryChange(
     DeliverGuestDirectoryChanges({ GuestDirectoryChange{ path, action, changeFilter } });
 }
 
+void Win32Bridge::Bridge::CancelGuestFileIo(const void* fileDescription, const GuestKernelContext* owner)
+{
+    CancelGuestFileRequests(fileDescription, owner, 0);
+}
+
 void Win32Bridge::Bridge::NotifyGuestDirectoryRename(
     const std::wstring& oldPath, const std::wstring& newPath,
     DWORD changeFilter)
@@ -1100,11 +1351,26 @@ void Win32Bridge::Bridge::NotifyGuestDirectoryRename(
     });
 }
 
+namespace {
+    bool ReadHandleSecurityAttributes(LPSECURITY_ATTRIBUTES source, DWORD* flags, DWORD* error)
+    {
+        *flags = 0;
+        if (!source) return true;
+        __try
+        {
+            if (source->nLength < sizeof(SECURITY_ATTRIBUTES)) { *error = ERROR_INVALID_PARAMETER; return false; }
+            if (source->bInheritHandle) *flags = 1u;
+            return true;
+        }
+        __except(EXCEPTION_EXECUTE_HANDLER) { *error = ERROR_NOACCESS; return false; }
+    }
+}
+
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileW(
     LPCWSTR fileName,
     DWORD desiredAccess,
     DWORD shareMode,
-    LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES security,
     DWORD creationDisposition,
     DWORD flagsAndAttributes,
     HANDLE templateFile)
@@ -1117,6 +1383,9 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileW(
 
     HANDLE handle = INVALID_HANDLE_VALUE;
     DWORD error = ERROR_SUCCESS;
+    DWORD handleFlags = 0;
+    if (!ReadHandleSecurityAttributes(security, &handleFlags, &error))
+    { SetGuestLastError(error); return INVALID_HANDLE_VALUE; }
     if (!storage->CreateFile(
         fileName,
         desiredAccess,
@@ -1135,8 +1404,66 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileW(
             std::to_wstring(error) + L".");
         return INVALID_HANDLE_VALUE;
     }
+    if (!storage->FileHandleFlags(handle, &handleFlags, 1u, true, &error))
+    { DWORD ignored = ERROR_SUCCESS; storage->CloseFile(handle, &ignored); SetGuestLastError(error); return INVALID_HANDLE_VALUE; }
     SetGuestLastError(ERROR_SUCCESS);
     return handle;
+}
+
+HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileA(LPCSTR path, DWORD access, DWORD share,
+    LPSECURITY_ATTRIBUTES security, DWORD disposition, DWORD attributes, HANDLE model)
+{
+    if (!path) { SetGuestLastError(ERROR_INVALID_PARAMETER); return INVALID_HANDLE_VALUE; }
+    const int count = BridgeMultiByteToWideChar(CP_ACP, 0, path, -1, nullptr, 0);
+    if (count <= 0) return INVALID_HANDLE_VALUE;
+    try
+    {
+        std::vector<wchar_t> wide(static_cast<size_t>(count));
+        if (BridgeMultiByteToWideChar(CP_ACP, 0, path, -1, wide.data(), count) != count) return INVALID_HANDLE_VALUE;
+        return BridgeCreateFileW(wide.data(), access, share, security, disposition, attributes, model);
+    }
+    catch (const std::bad_alloc&) { SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY); return INVALID_HANDLE_VALUE; }
+}
+
+#include "Bridge/ConsoleShims.inl"
+#include "Bridge/PipeShims.inl"
+#include "Bridge/OverlappedDiskIo.inl"
+
+namespace
+{
+    bool BeginGuestDiskIo(LPOVERLAPPED overlapped, ULONGLONG& offset, HANDLE& event)
+    {
+        if (!overlapped) return true;
+        OVERLAPPED captured{};
+        if (!CopyConsoleBytes(&captured, overlapped, sizeof(captured)) ||
+            !WriteGuestIoStatus(overlapped, GuestIoPending, 0))
+            return false;
+        offset = (static_cast<ULONGLONG>(captured.OffsetHigh) << 32) | captured.Offset;
+        event = captured.hEvent;
+        if (const auto kernel = CurrentGuestKernelContext())
+            if (const HANDLE handle = GuestOverlappedEvent(event)) kernel->ResetEvent(handle, nullptr);
+        return true;
+    }
+
+    bool FinishGuestDiskIo(const GuestIoCompletionBinding& binding, LPOVERLAPPED overlapped,
+        HANDLE event, DWORD bytes, DWORD& error)
+    {
+        if (!overlapped) return error == ERROR_SUCCESS;
+        if (!WriteGuestIoStatus(overlapped, GuestNtStatusForIoError(error), error ? 0 : bytes))
+        {
+            error = ERROR_NOACCESS;
+            return false;
+        }
+        if (error) return false; // Immediate failures do not generate completion packets.
+        if (const auto kernel = CurrentGuestKernelContext())
+            if (const HANDLE handle = GuestOverlappedEvent(event)) kernel->SetEvent(handle, nullptr);
+        void* const context = reinterpret_cast<ULONG_PTR>(event) & 1 ? nullptr : overlapped;
+        const DWORD posted = PostGuestFileCompletion(binding, overlapped, context, GuestOverlappedEvent(event),
+            ERROR_SUCCESS, bytes, false);
+        if (posted != ERROR_SUCCESS && posted != ERROR_NOT_FOUND && posted != ERROR_INVALID_HANDLE)
+            error = posted;
+        return error == ERROR_SUCCESS;
+    }
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeReadFile(
@@ -1146,34 +1473,56 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeReadFile(
     LPDWORD bytesRead,
     LPOVERLAPPED overlapped)
 {
+    if (auto kernel = CurrentGuestKernelContext())
+        if (kernel->Pipes().Owns(file))
+        {
+            if (overlapped) { SetGuestLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+            return TransferPipe(file, buffer, bytesToRead, bytesRead, false);
+        }
+    if (auto kernel = CurrentGuestKernelContext())
+        if (kernel->Console().Owns(file))
+        {
+            if (overlapped) { SetGuestLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+            DWORD completed = 0;
+            const BOOL result = BridgeReadConsoleA(file, buffer, bytesToRead, &completed, nullptr);
+            if (bytesRead) *bytesRead = completed;
+            return result;
+        }
     GuestStorageContext* storage = CurrentStorageOrFail();
     if (!storage)
     {
         return FALSE;
     }
+    const auto captured = storage->CaptureDiskFile(file);
+    if (captured.IsOverlapped() && (!overlapped || bytesToRead))
+    {
+        SetGuestLastError(SubmitGuestDiskRequest(*storage, file, captured, false, buffer,
+            bytesToRead, bytesRead, overlapped, nullptr));
+        return FALSE;
+    }
 
     DWORD error = ERROR_SUCCESS;
     DWORD completed = 0;
-    const ULONGLONG offset = overlapped
-        ? (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) | overlapped->Offset
-        : ~0ull;
-    if (!(overlapped
-        ? storage->ReadFileAt(file, buffer, bytesToRead, offset, &completed, &error)
-        : storage->ReadFile(file, buffer, bytesToRead, &completed, &error)))
+    HANDLE event = nullptr;
+    ULONGLONG offset = 0;
+    if (!BeginGuestDiskIo(overlapped, offset, event))
     {
-        if (overlapped) overlapped->Internal = error;
-        SetGuestLastError(error);
+        SetGuestLastError(ERROR_NOACCESS);
         return FALSE;
     }
-    if (bytesRead) *bytesRead = completed;
-    if (overlapped)
-    {
-        overlapped->Internal = 0;
-        overlapped->InternalHigh = completed;
-        if (overlapped->hEvent) BridgeSetEvent(overlapped->hEvent);
-    }
-    SetGuestLastError(ERROR_SUCCESS);
-    return TRUE;
+    const auto binding = overlapped ? storage->IoCompletionBinding(file) : GuestIoCompletionBinding{};
+    const auto fileSignal = storage->LookupFileSignal(file);
+    fileSignal.Begin();
+    const bool read = overlapped
+        ? storage->ReadFileAt(file, buffer, bytesToRead, offset, &completed, &error)
+        : storage->ReadFile(file, buffer, bytesToRead, &completed, &error);
+    if (!read && !error) error = ERROR_READ_FAULT;
+    if (read && overlapped && bytesToRead && !completed) error = ERROR_HANDLE_EOF;
+    if (bytesRead && !CopyConsoleBytes(bytesRead, &completed, sizeof(completed))) error = ERROR_NOACCESS;
+    const bool finished = FinishGuestDiskIo(binding, overlapped, event, completed, error);
+    if (!captured.IsOverlapped() || !GuestOverlappedEvent(event)) fileSignal.Complete();
+    SetGuestLastError(error);
+    return finished ? TRUE : FALSE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
@@ -1183,23 +1532,55 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
     LPDWORD bytesWritten,
     LPOVERLAPPED overlapped)
 {
+    if (auto kernel = CurrentGuestKernelContext())
+        if (kernel->Pipes().Owns(file))
+        {
+            if (overlapped) { SetGuestLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+            return TransferPipe(file, const_cast<void*>(buffer), bytesToWrite, bytesWritten, true);
+        }
+    if (auto kernel = CurrentGuestKernelContext())
+        if (kernel->Console().Owns(file))
+        {
+            if (overlapped) { SetGuestLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+            DWORD completed = 0;
+            const BOOL result = BridgeWriteConsoleA(file, buffer, bytesToWrite, &completed, nullptr);
+            if (bytesWritten) *bytesWritten = completed;
+            return result;
+        }
     GuestStorageContext* storage = CurrentStorageOrFail();
     if (!storage)
     {
         return FALSE;
     }
+    const auto captured = storage->CaptureDiskFile(file);
+    if (captured.IsOverlapped() && (!overlapped || bytesToWrite))
+    {
+        SetGuestLastError(SubmitGuestDiskRequest(*storage, file, captured, true, const_cast<void*>(buffer),
+            bytesToWrite, bytesWritten, overlapped, nullptr));
+        return FALSE;
+    }
 
     DWORD error = ERROR_SUCCESS;
     DWORD completed = 0;
-    const ULONGLONG offset = overlapped
-        ? (static_cast<ULONGLONG>(overlapped->OffsetHigh) << 32) | overlapped->Offset
-        : ~0ull;
-    if (!(overlapped
-        ? storage->WriteFileAt(file, buffer, bytesToWrite, offset, &completed, &error)
-        : storage->WriteFile(file, buffer, bytesToWrite, &completed, &error)))
+    HANDLE event = nullptr;
+    ULONGLONG offset = 0;
+    if (!BeginGuestDiskIo(overlapped, offset, event))
     {
-        if (overlapped) overlapped->Internal = error;
-        if (error == ERROR_SUCCESS) error = ERROR_WRITE_FAULT;
+        SetGuestLastError(ERROR_NOACCESS);
+        return FALSE;
+    }
+    const auto binding = overlapped ? storage->IoCompletionBinding(file) : GuestIoCompletionBinding{};
+    const auto fileSignal = storage->LookupFileSignal(file);
+    fileSignal.Begin();
+    const bool written = overlapped
+        ? storage->WriteFileAt(file, buffer, bytesToWrite, offset, &completed, &error)
+        : storage->WriteFile(file, buffer, bytesToWrite, &completed, &error);
+    if (!written && !error) error = ERROR_WRITE_FAULT;
+    if (bytesWritten && !CopyConsoleBytes(bytesWritten, &completed, sizeof(completed))) error = ERROR_NOACCESS;
+    const bool finished = FinishGuestDiskIo(binding, overlapped, event, completed, error);
+    if (!captured.IsOverlapped() || !GuestOverlappedEvent(event)) fileSignal.Complete();
+    if (!finished)
+    {
         SetGuestLastError(error);
         RuntimeDiagnostics::Record(
             L"STORAGE: WriteFile failed for handle " +
@@ -1208,36 +1589,31 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeWriteFile(
             std::to_wstring(error) + L".");
         return FALSE;
     }
-    if (bytesWritten) *bytesWritten = completed;
-    if (overlapped)
-    {
-        overlapped->Internal = 0;
-        overlapped->InternalHigh = completed;
-        if (overlapped->hEvent) BridgeSetEvent(overlapped->hEvent);
-    }
     SetGuestLastError(ERROR_SUCCESS);
     return TRUE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetOverlappedResult(
-    HANDLE, LPOVERLAPPED overlapped, LPDWORD bytesTransferred, BOOL wait)
+    HANDLE file, LPOVERLAPPED overlapped, LPDWORD bytesTransferred, BOOL wait)
 {
-    constexpr ULONG_PTR StatusPending = 0x103u;
     if (!overlapped || !bytesTransferred)
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if (overlapped->Internal == StatusPending && wait && overlapped->hEvent)
-        BridgeWaitForSingleObject(overlapped->hEvent, INFINITE);
-    if (overlapped->Internal == StatusPending)
+    if (overlapped->Internal == GuestIoPending && wait)
+    {
+        const HANDLE event = GuestOverlappedEvent(overlapped->hEvent);
+        if (BridgeWaitForSingleObject(event ? event : file, INFINITE) == WAIT_FAILED) return FALSE;
+    }
+    if (overlapped->Internal == GuestIoPending)
     {
         SetGuestLastError(ERROR_IO_INCOMPLETE);
         return FALSE;
     }
     if (overlapped->Internal != 0)
     {
-        SetGuestLastError(static_cast<DWORD>(overlapped->Internal));
+        SetGuestLastError(GuestErrorForIoStatus(overlapped->Internal));
         return FALSE;
     }
     *bytesTransferred = static_cast<DWORD>(overlapped->InternalHigh);
@@ -1247,21 +1623,21 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetOverlappedResult(
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeGetOverlappedResultEx(
     HANDLE file, LPOVERLAPPED overlapped, LPDWORD bytesTransferred,
-    DWORD milliseconds, BOOL)
+    DWORD milliseconds, BOOL alertable)
 {
-    constexpr ULONG_PTR StatusPending = 0x103u;
     if (!overlapped || !bytesTransferred)
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if (overlapped->Internal == StatusPending && overlapped->hEvent)
+    if (overlapped->Internal == GuestIoPending)
     {
-        const DWORD waitResult = BridgeWaitForSingleObject(
-            overlapped->hEvent, milliseconds);
-        if (waitResult == WAIT_TIMEOUT)
+        const HANDLE event = GuestOverlappedEvent(overlapped->hEvent);
+        const DWORD waitResult = BridgeWaitForSingleObjectEx(event ? event : file, milliseconds, alertable);
+        if (waitResult == WAIT_FAILED) return FALSE;
+        if (waitResult != WAIT_OBJECT_0)
         {
-            SetGuestLastError(WAIT_TIMEOUT);
+            SetGuestLastError(waitResult);
             return FALSE;
         }
     }
@@ -1270,23 +1646,25 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetOverlappedResultEx(
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeCloseHandle(HANDLE object)
 {
+    auto kernel = CurrentGuestKernelContext();
+    if (kernel)
+    {
+        DWORD error = ERROR_INVALID_HANDLE;
+        if (kernel->Pipes().Owns(object))
+        { const bool result = kernel->Pipes().Close(object, &error); SetGuestLastError(error); return result ? TRUE : FALSE; }
+        if (kernel->Console().Owns(object))
+        { const bool result = kernel->Console().Close(object, &error); SetGuestLastError(error); return result ? TRUE : FALSE; }
+        if (kernel->Owns(object))
+        { const bool result = kernel->CloseHandle(object, &error); SetGuestLastError(error); return result ? TRUE : FALSE; }
+    }
+
     if (CloseFileMappingHandle(object))
     {
         SetGuestLastError(ERROR_SUCCESS);
         return TRUE;
     }
 
-    // The ranges are disjoint, but try the synchronization table first so a
-    // regular CloseHandle works for either family without changing file-handle
-    // or FindClose semantics in the storage adapter.
-    GuestKernelContext* kernel = CurrentGuestKernelContext();
     DWORD error = ERROR_INVALID_HANDLE;
-    if (kernel && kernel->CloseHandle(object, &error))
-    {
-        SetGuestLastError(ERROR_SUCCESS);
-        return TRUE;
-    }
-
     GuestStorageContext* storage = CurrentGuestStorageContext();
     if (!storage)
     {
@@ -1294,9 +1672,6 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCloseHandle(HANDLE object)
         return FALSE;
     }
 
-    // Closing a directory cancels outstanding one-shot change requests before
-    // the token can be reused for another guest object.
-    CancelGuestDirectoryWatches(object, 0);
     error = ERROR_SUCCESS;
     if (!storage->CloseFile(object, &error))
     {
@@ -1737,14 +2112,6 @@ UINT WINAPI Win32Bridge::Bridge::BridgeGetSystemDirectoryW(LPWSTR buffer, UINT b
     return result;
 }
 
-DWORD WINAPI Win32Bridge::Bridge::BridgeExpandEnvironmentStringsW(LPCWSTR source, LPWSTR destination, DWORD destinationLength)
-{
-    if (!source) { SetGuestLastError(ERROR_INVALID_PARAMETER); return 0; }
-    std::wstring text(source); const std::wstring temp = L"%TEMP%";
-    size_t pos = 0; while ((pos = text.find(temp, pos)) != std::wstring::npos) { text.replace(pos, temp.size(), L"C:\\Users\\Default\\AppData\\Local\\Temp"); }
-    DWORD result = 0; CopyGuestString(text, destinationLength, destination, &result);
-    return result + 1;
-}
 
 DWORD WINAPI Win32Bridge::Bridge::BridgeGetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD bufferLength)
 {
@@ -1778,7 +2145,24 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetModuleFileNameW(HMODULE module, LPWST
 
 HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleW(LPCWSTR moduleName)
 {
-    if (const BridgeSystemModule* systemModule = FindBridgeSystemModule(moduleName))
+    const auto systemModule = FindBridgeSystemModule(moduleName);
+    if (PreferGuestModuleImage(systemModule))
+    {
+        HMODULE module = nullptr;
+        DWORD error = ERROR_MOD_NOT_FOUND;
+        const auto loader = CurrentGuestModuleLoader();
+        if (loader && loader->GetModuleHandle(moduleName, &module, &error))
+        {
+            SetGuestLastError(ERROR_SUCCESS);
+            return module;
+        }
+        if (!IsUnqualifiedLibraryName(moduleName) || error != ERROR_MOD_NOT_FOUND)
+        {
+            SetGuestLastError(error);
+            return nullptr;
+        }
+    }
+    if (systemModule)
     {
         SetGuestLastError(ERROR_SUCCESS);
         RuntimeDiagnostics::Record(L"MODULE HANDLE: bridge " + std::wstring(systemModule->library) + L".");
@@ -2541,7 +2925,6 @@ void WINAPI Win32Bridge::Bridge::BridgeInitializeCriticalSection(LPCRITICAL_SECT
         return;
     }
     ::InitializeCriticalSection(criticalSection);
-    SetGuestLastError(ERROR_SUCCESS);
 }
 
 void WINAPI Win32Bridge::Bridge::BridgeEnterCriticalSection(LPCRITICAL_SECTION criticalSection)
@@ -2552,7 +2935,6 @@ void WINAPI Win32Bridge::Bridge::BridgeEnterCriticalSection(LPCRITICAL_SECTION c
         return;
     }
     ::EnterCriticalSection(criticalSection);
-    SetGuestLastError(ERROR_SUCCESS);
 }
 
 void WINAPI Win32Bridge::Bridge::BridgeLeaveCriticalSection(LPCRITICAL_SECTION criticalSection)
@@ -2563,7 +2945,6 @@ void WINAPI Win32Bridge::Bridge::BridgeLeaveCriticalSection(LPCRITICAL_SECTION c
         return;
     }
     ::LeaveCriticalSection(criticalSection);
-    SetGuestLastError(ERROR_SUCCESS);
 }
 
 void WINAPI Win32Bridge::Bridge::BridgeDeleteCriticalSection(LPCRITICAL_SECTION criticalSection)
@@ -2574,7 +2955,6 @@ void WINAPI Win32Bridge::Bridge::BridgeDeleteCriticalSection(LPCRITICAL_SECTION 
         return;
     }
     ::DeleteCriticalSection(criticalSection);
-    SetGuestLastError(ERROR_SUCCESS);
 }
 
 void WINAPI Win32Bridge::Bridge::BridgeGetSystemInfo(LPSYSTEM_INFO systemInfo)
@@ -2707,6 +3087,17 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetVersion()
 
 #include "Bridge/Kernel32LocaleShims.inl"
 #include "Bridge/Kernel32CoreShims.inl"
+#include "Bridge/IoCompletionShims.inl"
+#include "Bridge/EnvironmentShims.inl"
+
+std::vector<std::wstring> Win32Bridge::Bridge::GetGuestInitialEnvironment()
+{
+    BuildGuestEnvironmentBlock();
+    std::vector<std::wstring> result;
+    for (const wchar_t* entry = g_guestEnvironmentBlock.data(); *entry; entry += wcslen(entry) + 1)
+        result.emplace_back(entry);
+    return result;
+}
 
 namespace
 {
@@ -2894,18 +3285,28 @@ void WINAPI Win32Bridge::Bridge::BridgeGetStartupInfoA(LPSTARTUPINFOA startupInf
 {
     if (!startupInfo) { SetGuestLastError(ERROR_INVALID_PARAMETER); return; }
     ZeroMemory(startupInfo, sizeof(*startupInfo)); startupInfo->cb = sizeof(*startupInfo);
-    startupInfo->wShowWindow = SW_SHOWNORMAL; SetGuestLastError(ERROR_SUCCESS);
+    STARTUPINFOW wide{};
+    BridgeGetStartupInfoW(&wide);
+    startupInfo->wShowWindow = wide.wShowWindow;
+    startupInfo->cbReserved2 = wide.cbReserved2;
+    startupInfo->lpReserved2 = wide.lpReserved2;
 }
 
-HANDLE WINAPI Win32Bridge::Bridge::BridgeGetStdHandle(DWORD)
+HANDLE WINAPI Win32Bridge::Bridge::BridgeGetStdHandle(DWORD id)
 {
-    // GUI guests have no inherited console. NULL is the documented absence.
-    SetGuestLastError(ERROR_SUCCESS); return nullptr;
+    auto kernel = CurrentGuestKernelContext(); DWORD error = ERROR_INVALID_FUNCTION;
+    const HANDLE result = kernel ? kernel->Console().GetStandard(id, &error) : INVALID_HANDLE_VALUE;
+    SetGuestLastError(error); return result;
 }
 
-BOOL WINAPI Win32Bridge::Bridge::BridgeGetConsoleMode(HANDLE, LPDWORD)
+BOOL WINAPI Win32Bridge::Bridge::BridgeGetConsoleMode(HANDLE handle, LPDWORD mode)
 {
-    SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE;
+    if (!mode) { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    auto kernel = CurrentGuestKernelContext(); DWORD error = ERROR_INVALID_HANDLE;
+    DWORD value = 0;
+    const bool result = kernel && kernel->Console().Mode(handle, &value, false, &error);
+    if (result && !CopyConsoleBytes(mode, &value, sizeof(value))) error = ERROR_NOACCESS;
+    SetGuestLastError(error); return result && error == ERROR_SUCCESS ? TRUE : FALSE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeSetPriorityClass(HANDLE process, DWORD)
@@ -3059,6 +3460,8 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetDllDirectoryA(
 
 HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryW(LPCWSTR fileName)
 {
+    if (PreferGuestModuleImage(FindBridgeSystemModule(fileName)))
+        return BridgeLoadLibraryExW(fileName, nullptr, 0);
     if (const BridgeSystemModule* systemModule = FindBridgeSystemModule(fileName))
     {
         SetGuestLastError(ERROR_SUCCESS);
@@ -3148,7 +3551,8 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExW(LPCWSTR fileName, HANDL
         SetGuestLastError(ERROR_NOT_SUPPORTED);
         return nullptr;
     }
-    if (const BridgeSystemModule* systemModule = FindBridgeSystemModule(fileName))
+    const auto systemModule = FindBridgeSystemModule(fileName);
+    if (systemModule && !PreferGuestModuleImage(systemModule))
     {
         SetGuestLastError(ERROR_SUCCESS);
         RuntimeDiagnostics::Record(L"LOAD LIBRARY EX: bridge " + std::wstring(systemModule->library) + L".");
@@ -3167,6 +3571,12 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExW(LPCWSTR fileName, HANDL
     if (!loader->LoadLibrary(
         fileName, &module, &error, effectiveSearchFlags, behaviorFlags))
     {
+        if (systemModule && error == ERROR_MOD_NOT_FOUND && !behaviorFlags && IsUnqualifiedLibraryName(fileName))
+        {
+            SetGuestLastError(ERROR_SUCCESS);
+            RuntimeDiagnostics::Record(L"LOAD LIBRARY EX: bridge fallback " + std::wstring(systemModule->library) + L".");
+            return reinterpret_cast<HMODULE>(systemModule->token);
+        }
         SetGuestLastError(error);
         return nullptr;
     }
@@ -3260,6 +3670,8 @@ GuestCommandLineScope::~GuestCommandLineScope()
 
 LPWSTR WINAPI Win32Bridge::Bridge::BridgeGetCommandLineW()
 {
+    auto loader = CurrentGuestModuleLoader();
+    if (loader && loader->CrtState().wideCommandLine) return loader->CrtState().wideCommandLine;
     // The backing string is per guest thread and intentionally writable, as
     // required by the historical GetCommandLineW contract.
     return g_guestCommandLine.empty() ? const_cast<LPWSTR>(L"") : &g_guestCommandLine[0];
@@ -3287,7 +3699,7 @@ void WINAPI Win32Bridge::Bridge::BridgeSetLastError(DWORD error)
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateEventW(
-    LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES security,
     BOOL manualReset,
     BOOL initialState,
     LPCWSTR name)
@@ -3298,8 +3710,10 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateEventW(
         return nullptr;
     }
 
-    DWORD error = ERROR_SUCCESS;
-    HANDLE handle = kernel->CreateEvent(manualReset != FALSE, initialState != FALSE, name, &error);
+    DWORD error = ERROR_SUCCESS, flags = 0;
+    if (!ReadHandleSecurityAttributes(security, &flags, &error))
+    { SetGuestLastError(error); return nullptr; }
+    HANDLE handle = kernel->CreateEvent(manualReset != FALSE, initialState != FALSE, name, &error, flags != 0);
     if (name && *name)
     {
         RuntimeDiagnostics::Record(
@@ -3349,7 +3763,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeResetEvent(HANDLE eventHandle)
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateMutexW(
-    LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES security,
     BOOL initialOwner,
     LPCWSTR name)
 {
@@ -3359,8 +3773,10 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateMutexW(
         return nullptr;
     }
 
-    DWORD error = ERROR_SUCCESS;
-    HANDLE handle = kernel->CreateMutex(initialOwner != FALSE, name, &error);
+    DWORD error = ERROR_SUCCESS, flags = 0;
+    if (!ReadHandleSecurityAttributes(security, &flags, &error))
+    { SetGuestLastError(error); return nullptr; }
+    HANDLE handle = kernel->CreateMutex(initialOwner != FALSE, name, &error, flags != 0);
     SetGuestLastError(error);
     return handle;
 }
@@ -3384,7 +3800,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeReleaseMutex(HANDLE mutexHandle)
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateSemaphoreW(
-    LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES security,
     LONG initialCount,
     LONG maximumCount,
     LPCWSTR name)
@@ -3394,8 +3810,10 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateSemaphoreW(
     {
         return nullptr;
     }
-    DWORD error = ERROR_SUCCESS;
-    HANDLE handle = kernel->CreateSemaphore(initialCount, maximumCount, name, &error);
+    DWORD error = ERROR_SUCCESS, flags = 0;
+    if (!ReadHandleSecurityAttributes(security, &flags, &error))
+    { SetGuestLastError(error); return nullptr; }
+    HANDLE handle = kernel->CreateSemaphore(initialCount, maximumCount, name, &error, flags != 0);
     SetGuestLastError(error);
     return handle;
 }
@@ -3417,59 +3835,98 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeReleaseSemaphore(HANDLE semaphoreHandle, 
     return TRUE;
 }
 
-DWORD WINAPI Win32Bridge::Bridge::BridgeWaitForSingleObject(HANDLE object, DWORD milliseconds)
+namespace
 {
-    GuestKernelContext* kernel = CurrentKernelOrFail();
-    if (!kernel)
+    bool HasPendingGuestApc()
     {
-        return WAIT_FAILED;
+        const DWORD threadId = BridgeGetCurrentThreadId();
+        std::lock_guard<std::mutex> guard(g_guestApcLock);
+        return HasGuestApcLocked(threadId);
     }
 
-    DWORD error = ERROR_SUCCESS;
-    const DWORD result = kernel->WaitForSingleObject(object, milliseconds, &error);
-    if (result == WAIT_FAILED)
+    DWORD FinishGuestWait(DWORD result, DWORD error, bool updateLastError = true)
     {
-        SetGuestLastError(error);
+        if (result == WAIT_IO_COMPLETION) DispatchGuestApcs(BridgeGetCurrentThreadId());
+        else if (result == WAIT_FAILED)
+        {
+            if (error == ERROR_OPERATION_ABORTED) ExitGuestThreadOnShutdown();
+            if (updateLastError) SetGuestLastError(error);
+        }
+        return result;
     }
-    return result;
+
+    DWORD WaitForGuestObjects(DWORD count, const HANDLE* handles, bool waitAll, DWORD milliseconds, bool alertable)
+    {
+        ExitGuestThreadOnShutdown();
+        auto kernel = CurrentKernelOrFail();
+        if (!kernel) return WAIT_FAILED;
+
+        DWORD error = ERROR_SUCCESS;
+        const DWORD result = kernel->WaitForMultipleObjects(count, handles, waitAll, milliseconds,
+            &error, alertable ? &HasPendingGuestApc : nullptr);
+        return FinishGuestWait(result, error);
+    }
 }
 
-DWORD WINAPI Win32Bridge::Bridge::BridgeWaitForMultipleObjects(DWORD count, const HANDLE* handles, BOOL waitAll, DWORD milliseconds)
+bool Win32Bridge::Bridge::CaptureGuestWaitHandles(DWORD count, const HANDLE* handles, HANDLE* copy)
 {
-    GuestKernelContext* kernel = CurrentKernelOrFail();
-    if (!kernel)
+    if (!count || count > MAXIMUM_WAIT_OBJECTS || !handles)
     {
-        return WAIT_FAILED;
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return false;
     }
+    if (!CopyConsoleBytes(copy, handles, sizeof(HANDLE) * count))
+    {
+        SetGuestLastError(ERROR_NOACCESS);
+        return false;
+    }
+    return true;
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeWaitForSingleObject(HANDLE object, DWORD milliseconds)
+{
+    return WaitForGuestObjects(1, &object, false, milliseconds, false);
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeWaitForSingleObjectEx(HANDLE object, DWORD milliseconds, BOOL alertable)
+{
+    return WaitForGuestObjects(1, &object, false, milliseconds, alertable != FALSE);
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeSignalObjectAndWait(HANDLE signal, HANDLE wait, DWORD milliseconds, BOOL alertable)
+{
+    ExitGuestThreadOnShutdown();
+    const auto kernel = CurrentKernelOrFail();
+    if (!kernel) return WAIT_FAILED;
     DWORD error = ERROR_SUCCESS;
-    const DWORD result = kernel->WaitForMultipleObjects(count, handles, waitAll != FALSE, milliseconds, &error);
-    if (result == WAIT_FAILED)
-    {
-        SetGuestLastError(error);
-    }
-    return result;
+    const DWORD result = kernel->SignalObjectAndWait(signal, wait, milliseconds, &error,
+        alertable ? &HasPendingGuestApc : nullptr);
+    if (error == ERROR_INVALID_FUNCTION) error = ERROR_INVALID_HANDLE;
+    return FinishGuestWait(result, error);
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeWaitForMultipleObjects(
+    DWORD count, const HANDLE* handles, BOOL waitAll, DWORD milliseconds)
+{
+    return BridgeWaitForMultipleObjectsEx(count, handles, waitAll, milliseconds, FALSE);
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeWaitForMultipleObjectsEx(
+    DWORD count, const HANDLE* handles, BOOL waitAll, DWORD milliseconds, BOOL alertable)
+{
+    std::array<HANDLE, MAXIMUM_WAIT_OBJECTS> captured;
+    if (!CaptureGuestWaitHandles(count, handles, captured.data())) return WAIT_FAILED;
+    return WaitForGuestObjects(count, captured.data(), waitAll != FALSE, milliseconds, alertable != FALSE);
 }
 
 void WINAPI Win32Bridge::Bridge::BridgeSleep(DWORD milliseconds)
 {
-    if (milliseconds == 0)
-    {
-        std::this_thread::yield();
-        return;
-    }
-
-    if (milliseconds == INFINITE)
-    {
-        // This deliberately has the same terminal behavior as Sleep(INFINITE)
-        // until a future guest-thread/termination subsystem can interrupt it.
-        std::mutex blockerMutex;
-        std::condition_variable blocker;
-        std::unique_lock<std::mutex> lock(blockerMutex);
-        blocker.wait(lock);
-        return;
-    }
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+    ExitGuestThreadOnShutdown();
+    if (!milliseconds) { std::this_thread::yield(); return; }
+    if (auto kernel=CurrentGuestKernelContext())
+    { if (kernel->WaitForStop(milliseconds)) ExitGuestThreadOnShutdown(); return; }
+    if(milliseconds==INFINITE) { std::mutex lock;std::condition_variable changed;std::unique_lock<std::mutex> guard(lock);changed.wait(guard); }
+    else std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeSetEndOfFile(HANDLE file)
@@ -3696,7 +4153,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeFlushViewOfFile(LPCVOID baseAddress, SIZE
     DWORD written = 0; const SIZE_T offset = static_cast<const BYTE*>(baseAddress) - mapping->memory;
     GuestStorageContext* storage = CurrentGuestStorageContext(); DWORD error = ERROR_SUCCESS;
     const BOOL result = storage && count <= MAXDWORD && storage->WriteFileAt(file, baseAddress,
-        static_cast<DWORD>(count), offset, &written, &error);
+        static_cast<DWORD>(count), offset, &written, &error, true);
     if (result) BridgeFlushFileBuffers(file); BridgeCloseHandle(file);
     return result && written == count;
 }
@@ -3794,7 +4251,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeDosDateTimeToFileTime(WORD date, WORD tim
 
 UINT WINAPI Win32Bridge::Bridge::BridgeGetOEMCP()
 {
-    return 437;
+    return GuestOemCodePage;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeFileTimeToSystemTime(const FILETIME* fileTime, LPSYSTEMTIME systemTime)
@@ -3998,11 +4455,33 @@ void WINAPI Win32Bridge::Bridge::BridgeRtlCaptureContext(PCONTEXT contextRecord)
     if (contextRecord) ::RtlCaptureContext(contextRecord);
 }
 
-HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenProcess(DWORD, BOOL, DWORD processId)
+HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenProcess(DWORD, BOOL inherit, DWORD processId)
 {
     if (processId == BridgeGetCurrentProcessId()) return BridgeGetCurrentProcess();
-    SetGuestLastError(ERROR_INVALID_PARAMETER);
-    return nullptr;
+    auto kernel = CurrentGuestKernelContext();
+    DWORD error = ERROR_INVALID_PARAMETER;
+    const HANDLE handle = kernel ? kernel->OpenCompletion(processId, true, inherit != FALSE, &error) : nullptr;
+    SetGuestLastError(error);
+    return handle;
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeGetProcessId(HANDLE process)
+{
+    if (process == BridgeGetCurrentProcess()) return BridgeGetCurrentProcessId();
+    auto kernel = CurrentGuestKernelContext();
+    DWORD id = 0, error = ERROR_INVALID_HANDLE;
+    if (kernel) kernel->GetCompletionId(process, true, &id, &error);
+    SetGuestLastError(error);
+    return id;
+}
+
+DWORD WINAPI Win32Bridge::Bridge::BridgeGetThreadId(HANDLE thread)
+{
+    auto kernel = CurrentGuestKernelContext();
+    DWORD id = 0, error = ERROR_INVALID_HANDLE;
+    if (kernel) kernel->GetThreadId(thread, &id, &error);
+    SetGuestLastError(error);
+    return id;
 }
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateToolhelp32Snapshot(DWORD, DWORD)
 {
@@ -4362,8 +4841,8 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
             const DWORD request = static_cast<DWORD>((std::min)(
                 bytesToRead - offset, static_cast<ULONGLONG>(8 * 1024 * 1024)));
             DWORD received = 0;
-            if (!storage->ReadFile(file, mapping->memory + static_cast<SIZE_T>(offset),
-                    request, &received, &error) || received == 0)
+            if (!storage->ReadFileAt(file, mapping->memory + static_cast<SIZE_T>(offset),
+                    request, ~0ull, &received, &error, true) || received == 0)
             {
                 if (received == 0 && error == ERROR_SUCCESS) error = ERROR_READ_FAULT;
                 LARGE_INTEGER ignored{};
@@ -4419,25 +4898,50 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if ((processAttributes && processAttributes->nLength < sizeof(SECURITY_ATTRIBUTES)) ||
-        (threadAttributes && threadAttributes->nLength < sizeof(SECURITY_ATTRIBUTES)))
+    DWORD processHandleFlags = 0, threadHandleFlags = 0, securityError = ERROR_SUCCESS;
+    if (!ReadHandleSecurityAttributes(processAttributes, &processHandleFlags, &securityError) ||
+        !ReadHandleSecurityAttributes(threadAttributes, &threadHandleFlags, &securityError))
     {
-        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        SetGuestLastError(securityError);
         return FALSE;
     }
+    std::vector<std::wstring> explicitEnvironment;
     if (environment)
     {
-        SetGuestLastError(ERROR_NOT_SUPPORTED);
-        return FALSE;
+        try
+        {
+            constexpr DWORD CreateUnicodeEnvironment = 0x00000400;
+            if (creationFlags & CreateUnicodeEnvironment)
+            {
+                const wchar_t* entry = static_cast<const wchar_t*>(environment);
+                while (*entry)
+                {
+                    explicitEnvironment.emplace_back(entry);
+                    entry += wcslen(entry) + 1;
+                }
+            }
+            else
+            {
+                const char* entry = static_cast<const char*>(environment);
+                while (*entry)
+                {
+                    std::wstring wide;
+                    if (!EnvironmentWide(entry, &wide)) { SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION); return FALSE; }
+                    explicitEnvironment.push_back(std::move(wide));
+                    entry += strlen(entry) + 1;
+                }
+            }
+        }
+        catch (const std::bad_alloc&) { SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
     }
     constexpr DWORD StartfUseStdHandles = 0x00000100;
-    if (inheritHandles && (startupInfo->dwFlags & StartfUseStdHandles) != 0 &&
-        (startupInfo->hStdInput || startupInfo->hStdOutput || startupInfo->hStdError))
-    {
-        SetGuestLastError(ERROR_NOT_SUPPORTED);
-        return FALSE;
-    }
+    const bool explicitStandard = (startupInfo->dwFlags & StartfUseStdHandles) != 0;
+    const HANDLE standardHandles[] = { startupInfo->hStdInput, startupInfo->hStdOutput, startupInfo->hStdError };
+    if (explicitStandard && !inheritHandles && (standardHandles[0] || standardHandles[1] || standardHandles[2]))
+    { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
 
+    if ((creationFlags & 0x00000018u) == 0x00000018u) // DETACHED_PROCESS and CREATE_NEW_CONSOLE
+    { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     constexpr DWORD unsupportedFlags = DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS |
         CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB | EXTENDED_STARTUPINFO_PRESENT;
     if ((creationFlags & unsupportedFlags) != 0)
@@ -4447,6 +4951,15 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
             std::to_wstring(creationFlags) + L".");
         SetGuestLastError(ERROR_NOT_SUPPORTED);
         return FALSE;
+    }
+
+    std::vector<BYTE> startupCrtData;
+    if (inheritHandles && startupInfo->cbReserved2 && startupInfo->lpReserved2)
+    {
+        try { startupCrtData.resize(startupInfo->cbReserved2); }
+        catch (const std::bad_alloc&) { SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY); return FALSE; }
+        if (!CopyConsoleBytes(startupCrtData.data(), startupInfo->lpReserved2, startupCrtData.size()))
+        { SetGuestLastError(ERROR_NOACCESS); return FALSE; }
     }
 
     const std::wstring fullCommandLine = commandLine ? commandLine : L"";
@@ -4533,7 +5046,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
             : fullCommandLine;
         if (runtime->LaunchChildProcess(
             executable.c_str(), effectiveCommandLine.c_str(), currentDirectory,
-            processInformation, &error))
+            processInformation, &error, environment ? &explicitEnvironment : nullptr, creationFlags,
+            inheritHandles != FALSE, explicitStandard ? standardHandles : nullptr, startupCrtData,
+            processHandleFlags != 0, threadHandleFlags != 0))
         {
             SetGuestLastError(ERROR_SUCCESS);
             return TRUE;
@@ -4583,6 +5098,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessA(
     wide.cb = sizeof(wide);
     wide.dwFlags = startupInfo->dwFlags;
     wide.wShowWindow = startupInfo->wShowWindow;
+    wide.cbReserved2 = startupInfo->cbReserved2;
+    wide.lpReserved2 = startupInfo->lpReserved2;
     wide.hStdInput = startupInfo->hStdInput;
     wide.hStdOutput = startupInfo->hStdOutput;
     wide.hStdError = startupInfo->hStdError;
@@ -4615,7 +5132,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetExitCodeThread(HANDLE thread, LPDWORD 
 }
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateThread(
-    LPSECURITY_ATTRIBUTES,
+    LPSECURITY_ATTRIBUTES security,
     SIZE_T stackSize,
     LPTHREAD_START_ROUTINE startAddress,
     LPVOID parameter,
@@ -4629,9 +5146,11 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateThread(
         SetGuestLastError(ERROR_INVALID_FUNCTION);
         return nullptr;
     }
-    DWORD error = ERROR_SUCCESS;
+    DWORD error = ERROR_SUCCESS, flags = 0;
+    if (!ReadHandleSecurityAttributes(security, &flags, &error))
+    { SetGuestLastError(error); return nullptr; }
     HANDLE handle = runtime->LaunchThread(
-        stackSize, startAddress, parameter, creationFlags, threadId, &error);
+        stackSize, startAddress, parameter, creationFlags, threadId, &error, flags != 0);
     SetGuestLastError(error);
     return handle;
 }
@@ -4647,6 +5166,9 @@ void WINAPI Win32Bridge::Bridge::BridgeRaiseException(
     ::RaiseException(code, flags, safeCount, safeCount ? arguments : nullptr);
 }
 
+#include "Bridge/NativeGuestShims.inl"
+#include "Bridge/ExtendedKernelShims.inl"
+
 ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol& symbol)
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
@@ -4655,6 +5177,15 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         return resolution;
     }
 
+    if (_wcsicmp(symbol.library.c_str(), L"ntdll.dll") != 0)
+    {
+        const auto extra = ResolveExtendedKernelImport(symbol);
+        if (extra.targetAddress) return extra;
+    }
+    const auto native = ResolveNativeGuestImport(symbol);
+    if (native.targetAddress) return native;
+    if (_wcsicmp(symbol.name.c_str(), L"createfilea") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateFileA);
     if (_wcsicmp(symbol.name.c_str(), L"createfilew") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateFileW);
     else if (_wcsicmp(symbol.name.c_str(), L"readfile") == 0)
@@ -4767,6 +5298,10 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateProcessA);
     else if (_wcsicmp(symbol.name.c_str(), L"getexitcodeprocess") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetExitCodeProcess);
+    else if (_wcsicmp(symbol.name.c_str(), L"getprocessid") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetProcessId);
+    else if (_wcsicmp(symbol.name.c_str(), L"getthreadid") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetThreadId);
     else if (_wcsicmp(symbol.name.c_str(), L"getexitcodethread") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetExitCodeThread);
     else if (_wcsicmp(symbol.name.c_str(), L"createthread") == 0)
@@ -5084,6 +5619,8 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"encodepointer") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeEncodePointer);
     else if (_wcsicmp(symbol.name.c_str(), L"decodepointer") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDecodePointer);
     else if (_wcsicmp(symbol.name.c_str(), L"waitforsingleobjectex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWaitForSingleObjectEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"signalobjectandwait") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSignalObjectAndWait);
+    else if (_wcsicmp(symbol.name.c_str(), L"waitformultipleobjectsex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWaitForMultipleObjectsEx);
     else if (_wcsicmp(symbol.name.c_str(), L"sleepex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSleepEx);
     else if (_wcsicmp(symbol.name.c_str(), L"arefileapisansi") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAreFileApisANSI);
     else if (_wcsicmp(symbol.name.c_str(), L"getnativesysteminfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetNativeSystemInfo);
@@ -5104,6 +5641,13 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"getconsoleoutputcp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetConsoleOutputCP);
     else if (_wcsicmp(symbol.name.c_str(), L"getcpinfo") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCPInfo);
     else if (_wcsicmp(symbol.name.c_str(), L"getcommandlinea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCommandLineA);
+    else if (symbol.name == L"GetEnvironmentVariableW") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetEnvironmentVariableW);
+    else if (symbol.name == L"GetEnvironmentVariableA") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetEnvironmentVariableA);
+    else if (symbol.name == L"GetEnvironmentStrings") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetEnvironmentStringsA);
+    else if (symbol.name == L"GetEnvironmentStringsA") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetEnvironmentStringsA);
+    else if (symbol.name == L"FreeEnvironmentStringsA") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeEnvironmentStringsA);
+    else if (symbol.name == L"SetEnvironmentVariableA") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetEnvironmentVariableA);
+    else if (symbol.name == L"ExpandEnvironmentStringsA") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExpandEnvironmentStringsA);
     else if (_wcsicmp(symbol.name.c_str(), L"getenvironmentstringsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetEnvironmentStringsW);
     else if (_wcsicmp(symbol.name.c_str(), L"freeenvironmentstringsw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeEnvironmentStringsW);
     else if (_wcsicmp(symbol.name.c_str(), L"setenvironmentvariablew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetEnvironmentVariableW);
@@ -5123,6 +5667,19 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"unlockfile") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnlockFile);
     else if (_wcsicmp(symbol.name.c_str(), L"unlockfileex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeUnlockFileEx);
     else if (_wcsicmp(symbol.name.c_str(), L"readdirectorychangesw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReadDirectoryChangesW);
+    else if (_wcsicmp(symbol.name.c_str(), L"createpipe") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreatePipe);
+    else if (_wcsicmp(symbol.name.c_str(), L"peeknamedpipe") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgePeekNamedPipe);
+    else if (_wcsicmp(symbol.name.c_str(), L"gethandleinformation") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetHandleInformation);
+    else if (_wcsicmp(symbol.name.c_str(), L"sethandleinformation") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetHandleInformation);
+    else if (_wcsicmp(symbol.name.c_str(), L"duplicatehandle") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeDuplicateHandle);
+    else if (_wcsicmp(symbol.name.c_str(), L"allocconsole") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAllocConsole);
+    else if (_wcsicmp(symbol.name.c_str(), L"freeconsole") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFreeConsole);
+    else if (_wcsicmp(symbol.name.c_str(), L"setconsolemode") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetConsoleMode);
+    else if (_wcsicmp(symbol.name.c_str(), L"getconsolecp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetConsoleCP);
+    else if (_wcsicmp(symbol.name.c_str(), L"setconsolecp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetConsoleCP);
+    else if (_wcsicmp(symbol.name.c_str(), L"setconsoleoutputcp") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetConsoleOutputCP);
+    else if (_wcsicmp(symbol.name.c_str(), L"readconsolea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReadConsoleA);
+    else if (_wcsicmp(symbol.name.c_str(), L"writeconsolea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWriteConsoleA);
     else if (_wcsicmp(symbol.name.c_str(), L"readconsolew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReadConsoleW);
     else if (_wcsicmp(symbol.name.c_str(), L"writeconsolew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeWriteConsoleW);
     else if (_wcsicmp(symbol.name.c_str(), L"copyfilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCopyFileW);
@@ -5152,6 +5709,18 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"rtlunwindex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeRtlUnwindEx);
     else if (_wcsicmp(symbol.name.c_str(), L"exitprocess") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExitProcess);
     else if (_wcsicmp(symbol.name.c_str(), L"exitthread") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeExitThread);
+
+    if (symbol.name == L"SetConsoleCtrlHandler") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetConsoleCtrlHandler);
+    if (symbol.name == L"GetConsoleScreenBufferInfo") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetConsoleScreenBufferInfo);
+    if (symbol.name == L"SetConsoleCursorPosition") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetConsoleCursorPosition);
+    if (symbol.name == L"SetConsoleTextAttribute") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetConsoleTextAttribute);
+    if (symbol.name == L"FillConsoleOutputCharacterW") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFillConsoleOutputCharacterW);
+    if (symbol.name == L"FillConsoleOutputAttribute") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFillConsoleOutputAttribute);
+    if (symbol.name == L"ScrollConsoleScreenBufferW") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeScrollConsoleScreenBufferW);
+    if (symbol.name == L"FlushConsoleInputBuffer") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeFlushConsoleInputBuffer);
+    if (symbol.name == L"SetConsoleTitleW") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetConsoleTitleW);
+    if (symbol.name == L"GetConsoleTitleW") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetConsoleTitleW);
+    if (symbol.name == L"GetConsoleWindow") resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetConsoleWindow);
 
     if (resolution.targetAddress != 0)
     {
