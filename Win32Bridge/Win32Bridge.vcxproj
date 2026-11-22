@@ -198,6 +198,8 @@
     <ClInclude Include="Bridge\DirectX\GraphicsDevice.inl" />
     <ClInclude Include="Bridge\DirectX\GraphicsD3D11Context.inl" />
     <ClInclude Include="Bridge\DirectX\GraphicsD3D11Texture.inl" />
+    <ClInclude Include="Bridge\DirectX\GraphicsD3D11Bindings.inl" />
+    <ClInclude Include="Bridge\DirectX\GraphicsD3D11Video.inl" />
     <ClInclude Include="Bridge\DirectX\GraphicsD3D12.inl" />
     <ClInclude Include="Bridge\DirectX\GraphicsD3D12Factory.inl" />
     <ClInclude Include="Bridge\Shell32Shims.h" />

@@ -221,6 +221,8 @@
     <ClInclude Include="Bridge\DirectX\GraphicsDevice.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
     <ClInclude Include="Bridge\DirectX\GraphicsD3D11Context.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
     <ClInclude Include="Bridge\DirectX\GraphicsD3D11Texture.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
+    <ClInclude Include="Bridge\DirectX\GraphicsD3D11Bindings.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
+    <ClInclude Include="Bridge\DirectX\GraphicsD3D11Video.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
     <ClInclude Include="Bridge\DirectX\GraphicsD3D12.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
     <ClInclude Include="Bridge\DirectX\GraphicsD3D12Factory.inl"><Filter>Bridge\DirectX</Filter></ClInclude>
     <ClInclude Include="Bridge\Shell32Shims.h" />

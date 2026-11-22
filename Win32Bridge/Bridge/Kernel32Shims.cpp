@@ -49,7 +49,6 @@ namespace
     thread_local DWORD g_guestProcessId = 1;
     thread_local std::wstring g_guestCommandLine = L"Win32BridgeGuest";
     std::atomic<DWORD> g_nextGuestThreadId{ 1 };
-    std::atomic<DWORD> g_guestDllDirectoryFlags{ 0 };
     std::atomic<unsigned> g_storageEnumerationDiagnostics{ 0 };
     std::atomic<ULONG_PTR> g_nextGuestResourceHandle{ 0x73000000 };
     std::mutex g_guestResourcesLock;
@@ -1148,35 +1147,28 @@ namespace
         }
     }
 
-    const wchar_t* FileNameFromPath(LPCWSTR value)
-    {
-        if (!value)
-        {
-            return nullptr;
-        }
-        const wchar_t* slash = wcsrchr(value, L'\\');
-        const wchar_t* forwardSlash = wcsrchr(value, L'/');
-        const wchar_t* separator = slash;
-        if (!separator || (forwardSlash && forwardSlash > separator))
-        {
-            separator = forwardSlash;
-        }
-        return separator ? separator + 1 : value;
-    }
-
     const BridgeSystemModule* FindBridgeSystemModule(LPCWSTR requestedName)
     {
         if (!requestedName) return nullptr;
-        const std::wstring canonical = ApiSetHostLibrary(requestedName);
-        const wchar_t* fileName = FileNameFromPath(canonical.c_str());
-        if (!fileName || !*fileName)
+        std::wstring name = requestedName;
+        if (std::wcspbrk(requestedName, L"\\/:"))
         {
-            return nullptr;
+            const auto storage = CurrentGuestStorageContext();
+            std::wstring path;
+            if (!storage || !storage->CanonicalPath(requestedName, &path, nullptr)) return nullptr;
+            const auto separator = path.find_last_of(L'\\');
+            if (separator == std::wstring::npos ||
+                _wcsicmp(path.substr(0, separator).c_str(), L"C:\\Windows\\System32") != 0)
+                return nullptr;
+            name = path.substr(separator + 1);
         }
+        if (name.empty()) return nullptr;
+        if (name.find(L'.') == std::wstring::npos) name += L".dll";
+        name = ApiSetHostLibrary(name);
 
         for (const auto& candidate : BridgeSystemModules)
         {
-            if (_wcsicmp(fileName, candidate.library) == 0)
+            if (_wcsicmp(name.c_str(), candidate.library) == 0)
             {
                 if (candidate.token == BridgeSystemModuleBaseToken + 33 && !HasHostShaderCompiler())
                     return nullptr;
@@ -1257,7 +1249,7 @@ namespace
 
         GuestModuleLoader* loader = CurrentGuestModuleLoader();
         const ImportResolution resolution = loader
-            ? loader->ResolveImport(symbol, g_guestDllDirectoryFlags.load(), error)
+            ? loader->ResolveImport(symbol, 0, error)
             : ResolveRuntimeImport(symbol);
         if (resolution.targetAddress == 0)
         {
@@ -1384,7 +1376,6 @@ void Win32Bridge::Bridge::ResetGuestResourceHandles()
         g_guestResources.clear();
         g_nextGuestResourceHandle.store(0x73000000);
     }
-    g_guestDllDirectoryFlags.store(0);
     ResetGuestFileMappings();
     ResetGuestDirectoryWatches();
     ResetGuestApcs();
@@ -1393,6 +1384,7 @@ void Win32Bridge::Bridge::ResetGuestResourceHandles()
 void Win32Bridge::Bridge::NotifyGuestDirectoryChange(
     const std::wstring& path, DWORD action, DWORD changeFilter)
 {
+    if (path.empty()) return;
     DeliverGuestDirectoryChanges({ GuestDirectoryChange{ path, action, changeFilter } });
 }
 
@@ -2204,7 +2196,9 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetModuleFileNameW(HMODULE module, LPWST
     return result;
 }
 
-HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleW(LPCWSTR moduleName)
+namespace
+{
+HMODULE LookupGuestModuleByName(LPCWSTR moduleName, bool addReference, bool pin)
 {
     const auto systemModule = FindBridgeSystemModule(moduleName);
     if (PreferGuestModuleImage(systemModule))
@@ -2212,7 +2206,7 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleW(LPCWSTR moduleName)
         HMODULE module = nullptr;
         DWORD error = ERROR_MOD_NOT_FOUND;
         const auto loader = CurrentGuestModuleLoader();
-        if (loader && loader->GetModuleHandle(moduleName, &module, &error))
+        if (loader && loader->GetModuleHandle(moduleName, &module, &error, addReference, pin))
         {
             SetGuestLastError(ERROR_SUCCESS);
             return module;
@@ -2246,13 +2240,19 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleW(LPCWSTR moduleName)
     if (!loader) return nullptr;
     DWORD error = ERROR_SUCCESS;
     HMODULE module = nullptr;
-    if (!loader->GetModuleHandle(moduleName, &module, &error))
+    if (!loader->GetModuleHandle(moduleName, &module, &error, addReference, pin))
     {
         SetGuestLastError(error);
         return nullptr;
     }
     SetGuestLastError(ERROR_SUCCESS);
     return module;
+}
+}
+
+HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleW(LPCWSTR moduleName)
+{
+    return LookupGuestModuleByName(moduleName, false, false);
 }
 
 HMODULE WINAPI Win32Bridge::Bridge::BridgeGetModuleHandleA(LPCSTR moduleName)
@@ -3404,7 +3404,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeSetDefaultDllDirectories(DWORD directoryF
         RuntimeDiagnostics::Record(L"DLL SEARCH FAILED: unsupported SetDefaultDllDirectories flags.");
         return FALSE;
     }
-    g_guestDllDirectoryFlags.store(directoryFlags);
+    const auto loader = CurrentModuleLoaderOrFail();
+    if (!loader) return FALSE;
+    loader->SetDefaultDllDirectories(directoryFlags);
     SetGuestLastError(ERROR_SUCCESS);
     RuntimeDiagnostics::Record(L"DLL SEARCH: SetDefaultDllDirectories accepted.");
     return TRUE;
@@ -3521,29 +3523,7 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetDllDirectoryA(
 
 HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryW(LPCWSTR fileName)
 {
-    if (PreferGuestModuleImage(FindBridgeSystemModule(fileName)))
-        return BridgeLoadLibraryExW(fileName, nullptr, 0);
-    if (const BridgeSystemModule* systemModule = FindBridgeSystemModule(fileName))
-    {
-        SetGuestLastError(ERROR_SUCCESS);
-        RuntimeDiagnostics::Record(L"LOAD LIBRARY: bridge " + std::wstring(systemModule->library) + L".");
-        return reinterpret_cast<HMODULE>(systemModule->token);
-    }
-
-    GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
-    if (!loader)
-    {
-        return nullptr;
-    }
-    DWORD error = ERROR_SUCCESS;
-    HMODULE module = nullptr;
-    if (!loader->LoadLibrary(fileName, &module, &error, g_guestDllDirectoryFlags.load()))
-    {
-        SetGuestLastError(error);
-        return nullptr;
-    }
-    SetGuestLastError(ERROR_SUCCESS);
-    return module;
+    return BridgeLoadLibraryExW(fileName, nullptr, 0);
 }
 
 HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryA(LPCSTR fileName)
@@ -3595,9 +3575,13 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExA(
     return BridgeLoadLibraryExW(wideName.c_str(), file, flags);
 }
 
-HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExW(LPCWSTR fileName, HANDLE file, DWORD flags)
+namespace
 {
-    constexpr DWORD supportedSearchFlags = 0x00000100u | // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR
+HMODULE LoadGuestLibrary(LPCWSTR fileName, HANDLE file, DWORD flags, LPCWSTR searchPath)
+{
+    constexpr DWORD AlteredSearch = 0x00000008u; // LOAD_WITH_ALTERED_SEARCH_PATH
+    constexpr DWORD DllLoadDirectory = 0x00000100u;
+    constexpr DWORD supportedSearchFlags = DllLoadDirectory |
         0x00000200u | // LOAD_LIBRARY_SEARCH_APPLICATION_DIR
         0x00000400u | // LOAD_LIBRARY_SEARCH_USER_DIRS
         0x00000800u | // LOAD_LIBRARY_SEARCH_SYSTEM32
@@ -3607,9 +3591,26 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExW(LPCWSTR fileName, HANDL
         0x00000002u | // LOAD_LIBRARY_AS_DATAFILE
         0x00000020u | // LOAD_LIBRARY_AS_IMAGE_RESOURCE
         0x00000040u;  // LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE
-    if (file != nullptr || (flags & ~(supportedSearchFlags | supportedBehaviorFlags)) != 0)
+    if (file != nullptr || (flags & ~(supportedSearchFlags | supportedBehaviorFlags | AlteredSearch)) != 0)
     {
         SetGuestLastError(ERROR_NOT_SUPPORTED);
+        return nullptr;
+    }
+    if ((flags & AlteredSearch) && (flags & supportedSearchFlags))
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    if (!fileName || !*fileName)
+    {
+        SetGuestLastError(fileName ? ERROR_MOD_NOT_FOUND : ERROR_INVALID_PARAMETER);
+        return nullptr;
+    }
+    const bool qualified = (fileName[0] == L'\\' || fileName[0] == L'/') ||
+        (fileName[1] == L':' && (fileName[2] == L'\\' || fileName[2] == L'/'));
+    if ((flags & DllLoadDirectory) && !qualified)
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
         return nullptr;
     }
     const auto systemModule = FindBridgeSystemModule(fileName);
@@ -3625,12 +3626,10 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExW(LPCWSTR fileName, HANDL
 
     DWORD error = ERROR_SUCCESS;
     HMODULE module = nullptr;
-    const DWORD requestedSearchFlags = flags & supportedSearchFlags;
-    const DWORD effectiveSearchFlags = requestedSearchFlags == 0
-        ? g_guestDllDirectoryFlags.load() : requestedSearchFlags;
+    const DWORD requestedSearchFlags = flags & (supportedSearchFlags | (qualified ? AlteredSearch : 0));
     const DWORD behaviorFlags = flags & supportedBehaviorFlags;
     if (!loader->LoadLibrary(
-        fileName, &module, &error, effectiveSearchFlags, behaviorFlags))
+        fileName, &module, &error, requestedSearchFlags, behaviorFlags, searchPath))
     {
         if (systemModule && error == ERROR_MOD_NOT_FOUND && !behaviorFlags && IsUnqualifiedLibraryName(fileName))
         {
@@ -3643,6 +3642,12 @@ HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExW(LPCWSTR fileName, HANDL
     }
     SetGuestLastError(ERROR_SUCCESS);
     return module;
+}
+}
+
+HMODULE WINAPI Win32Bridge::Bridge::BridgeLoadLibraryExW(LPCWSTR fileName, HANDLE file, DWORD flags)
+{
+    return LoadGuestLibrary(fileName, file, flags, nullptr);
 }
 
 FARPROC WINAPI Win32Bridge::Bridge::BridgeGetProcAddress(HMODULE module, LPCSTR nameOrOrdinal)
@@ -5776,8 +5781,10 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"getfiletype") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFileType);
     else if (_wcsicmp(symbol.name.c_str(), L"getfinalpathnamebyhandlew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFinalPathNameByHandleW);
     else if (_wcsicmp(symbol.name.c_str(), L"getfileinformationbyhandleex") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetFileInformationByHandleEx);
+    else if (_wcsicmp(symbol.name.c_str(), L"setfileinformationbyhandle") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeSetFileInformationByHandle);
     else if (_wcsicmp(symbol.name.c_str(), L"getlongpathnamew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLongPathNameW);
     else if (_wcsicmp(symbol.name.c_str(), L"replacefilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReplaceFileW);
+    else if (_wcsicmp(symbol.name.c_str(), L"replacefilea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReplaceFileA);
     else if (_wcsicmp(symbol.name.c_str(), L"queryfullprocessimagenamew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueryFullProcessImageNameW);
     else if (_wcsicmp(symbol.name.c_str(), L"getmodulehandleexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetModuleHandleExW);
     else if (_wcsicmp(symbol.name.c_str(), L"getmodulehandleexa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetModuleHandleExA);

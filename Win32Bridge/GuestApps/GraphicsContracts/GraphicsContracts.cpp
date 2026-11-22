@@ -1,5 +1,7 @@
 #include <windows.h>
 #include <d3d11_1.h>
+#include <d3d11_3.h>
+#include <d3d11on12.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -16,10 +18,15 @@ namespace
     bool minimized = false;
     bool switchRenderer = false;
     bool legacyD3D11 = false;
+    bool verifyD3D11Bindings = false;
+    bool verifyD3D11On12 = false;
+    bool verifyDxgiSurfaces = false;
     bool verifySharing = false;
     bool verifyD3D11Sharing = false;
     bool useDeviceFactory = false;
     bool verifyDxgiEvents = false;
+    bool gateFirstFrame = false;
+    bool firstFrameAllowed = false;
     unsigned frame = 0;
     constexpr DXGI_FORMAT Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     constexpr UINT FrameLatencyFlag = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -61,10 +68,43 @@ namespace
     LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (message == WM_SIZE) { minimized = wParam == SIZE_MINIMIZED; resizePending = !minimized; }
+        if (gateFirstFrame && message == WM_PAINT)
+        {
+            PAINTSTRUCT paint{};
+            const HDC dc = BeginPaint(window, &paint);
+            RECT client{};
+            GetClientRect(window, &client);
+            FillRect(dc, &client, reinterpret_cast<HBRUSH>(static_cast<INT_PTR>(COLOR_WINDOW + 1)));
+            DrawTextW(dc, L"Software surface: press Space to present the first GPU frame.", -1,
+                &client, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            EndPaint(window, &paint);
+            return 0;
+        }
+        if (gateFirstFrame && message == WM_KEYDOWN && wParam == VK_SPACE)
+        { firstFrameAllowed = true; return 0; }
         if (message == WM_KEYDOWN && wParam == VK_ESCAPE) { DestroyWindow(window); return 0; }
         if (message == WM_KEYDOWN && wParam == VK_F12 && !(lParam & (1LL << 30))) { switchRenderer = true; return 0; }
         if (message == WM_DESTROY) { PostQuitMessage(0); return 0; }
         return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    HRESULT VerifyClientSizedBuffers(HWND window, IDXGISwapChain* chain)
+    {
+        RECT client{};
+        if (!GetClientRect(window, &client)) return E_HANDLE;
+        DXGI_SWAP_CHAIN_DESC desc{};
+        const HRESULT status = chain->GetDesc(&desc);
+        if (FAILED(status)) return status;
+        if (desc.BufferDesc.Width != static_cast<UINT>(client.right - client.left) ||
+            desc.BufferDesc.Height != static_cast<UINT>(client.bottom - client.top)) return E_FAIL;
+        return S_OK;
+    }
+
+    bool SameIdentity(IUnknown* first, IUnknown* second)
+    {
+        ComPtr<IUnknown> left, right;
+        return first && second && SUCCEEDED(first->QueryInterface(IID_PPV_ARGS(&left))) &&
+            SUCCEEDED(second->QueryInterface(IID_PPV_ARGS(&right))) && left.Get() == right.Get();
     }
 
     void FrameColor(float (&color)[4])
@@ -126,6 +166,16 @@ namespace
             if (FAILED(extended)) return extended;
             const HRESULT identity = VerifyContextIdentity();
             if (FAILED(identity)) return identity;
+            if (verifyD3D11Bindings)
+            {
+                const HRESULT bindings = VerifyResourceBindings();
+                if (FAILED(bindings)) return bindings;
+            }
+            if (verifyDxgiSurfaces)
+            {
+                const HRESULT surfaces = VerifyDxgiSurfaces();
+                if (FAILED(surfaces)) return surfaces;
+            }
             if (verifyD3D11Sharing)
             {
                 const HRESULT shared = VerifySharedTexture();
@@ -150,12 +200,19 @@ namespace
             if (FAILED(status = adapter->GetParent(IID_PPV_ARGS(&factory)))) return status;
             const HANDLE event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (!event) return HRESULT_FROM_WIN32(GetLastError());
-            status = dxgi->EnqueueSetEvent(event);
-            if (SUCCEEDED(status))
+            const auto waitForGpuEvent = [event]() -> HRESULT
             {
                 const DWORD wait = WaitForSingleObject(event, 5000);
-                if (wait != WAIT_OBJECT_0)
-                    status = HRESULT_FROM_WIN32(wait == WAIT_FAILED ? GetLastError() : ERROR_TIMEOUT);
+                if (wait == WAIT_FAILED) return HRESULT_FROM_WIN32(GetLastError());
+                return wait == WAIT_OBJECT_0 ? S_OK : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            };
+            status = dxgi->EnqueueSetEvent(event);
+            if (SUCCEEDED(status)) status = waitForGpuEvent();
+            ComPtr<ID3D11DeviceContext3> context3;
+            if (SUCCEEDED(status) && SUCCEEDED(context.As(&context3)))
+            {
+                context3->Flush1(D3D11_CONTEXT_TYPE_ALL, event);
+                status = waitForGpuEvent();
             }
             DWORD cookie = 0;
             if (SUCCEEDED(status)) status = factory->RegisterAdaptersChangedEvent(event, &cookie);
@@ -213,12 +270,245 @@ namespace
             const BOOL closed = CloseHandle(shared);
             if (FAILED(status)) return status;
             if (!closed) return HRESULT_FROM_WIN32(GetLastError());
-            ComPtr<ID3D11Device> parent;
-            reopened->GetDevice(&parent);
-            ComPtr<IUnknown> identity, parentIdentity;
-            if (FAILED(status = device.As(&identity))) return status;
-            if (!parent || FAILED(status = parent.As(&parentIdentity))) return FAILED(status) ? status : E_FAIL;
-            return identity.Get() == parentIdentity.Get() ? S_OK : E_FAIL;
+            if (!Owns(reopened.Get())) return E_UNEXPECTED;
+            ComPtr<IDXGIKeyedMutex> sourceMutex, reopenedMutex;
+            if (FAILED(status = source.As(&sourceMutex))) return status;
+            if (FAILED(status = reopened.As(&reopenedMutex))) return status;
+            if (!SameIdentity(source.Get(), sourceMutex.Get()) || !SameIdentity(reopened.Get(), reopenedMutex.Get()))
+                return E_UNEXPECTED;
+            status = sourceMutex->AcquireSync(0, 5000);
+            if (status != S_OK) return FAILED(status) ? status : E_UNEXPECTED;
+            if (FAILED(status = sourceMutex->ReleaseSync(1))) return status;
+            status = reopenedMutex->AcquireSync(1, 5000);
+            if (status != S_OK) return FAILED(status) ? status : E_UNEXPECTED;
+            return reopenedMutex->ReleaseSync(0);
+        }
+
+        bool Owns(ID3D11DeviceChild* child) const
+        {
+            if (!child) return false;
+            ComPtr<ID3D11Device> owner;
+            child->GetDevice(&owner);
+            return SameIdentity(device.Get(), owner.Get());
+        }
+
+        HRESULT CheckSurface(IDXGISurface2* surface, IUnknown* texture, UINT expectedIndex) const
+        {
+            ComPtr<IDXGIDevice> owner, parent;
+            HRESULT status = surface->GetDevice(IID_PPV_ARGS(&owner));
+            if (FAILED(status)) return status;
+            if (FAILED(status = surface->GetParent(IID_PPV_ARGS(&parent)))) return status;
+            if (!SameIdentity(device.Get(), owner.Get()) || !SameIdentity(device.Get(), parent.Get()))
+                return E_UNEXPECTED;
+            UINT index = static_cast<UINT>(-1);
+            ComPtr<IUnknown> resource;
+            if (FAILED(status = surface->GetResource(IID_PPV_ARGS(&resource), &index))) return status;
+            return index == expectedIndex && SameIdentity(texture, resource.Get()) ? S_OK : E_UNEXPECTED;
+        }
+
+        HRESULT VerifyDxgiSurfaces()
+        {
+            ComPtr<ID3D11Texture2D> backBuffer;
+            HRESULT status = chain->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+            if (FAILED(status)) return status;
+            ComPtr<IDXGISurface2> direct, fromSwapChain;
+            if (FAILED(status = backBuffer.As(&direct))) return status;
+            if (FAILED(status = chain->GetBuffer(0, IID_PPV_ARGS(&fromSwapChain)))) return status;
+            if (!SameIdentity(backBuffer.Get(), direct.Get()) || !SameIdentity(direct.Get(), fromSwapChain.Get()))
+                return E_UNEXPECTED;
+            if (FAILED(status = CheckSurface(direct.Get(), backBuffer.Get(), 0))) return status;
+
+            ComPtr<IDXGIDevice> dxgi;
+            if (FAILED(status = device.As(&dxgi))) return status;
+            const DXGI_SURFACE_DESC surfaceDesc{8, 4, Format, {1, 0}};
+            IDXGISurface* created[2]{};
+            if (FAILED(status = dxgi->CreateSurface(&surfaceDesc, 2, DXGI_USAGE_RENDER_TARGET_OUTPUT, nullptr, created)))
+                return status;
+            ComPtr<IDXGISurface> first, second;
+            first.Attach(created[0]);
+            second.Attach(created[1]);
+            if (!first || !second || SameIdentity(first.Get(), second.Get())) return E_UNEXPECTED;
+            for (auto* surface : created)
+            {
+                ComPtr<ID3D11Texture2D> texture;
+                ComPtr<IDXGISurface2> extended;
+                if (FAILED(status = surface->QueryInterface(IID_PPV_ARGS(&texture)))) return status;
+                if (FAILED(status = surface->QueryInterface(IID_PPV_ARGS(&extended)))) return status;
+                if (!Owns(texture.Get()) || !SameIdentity(surface, texture.Get())) return E_UNEXPECTED;
+                if (FAILED(status = CheckSurface(extended.Get(), texture.Get(), 0))) return status;
+            }
+
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = 8;
+            desc.Height = 4;
+            desc.ArraySize = desc.MipLevels = 2;
+            desc.Format = Format;
+            desc.SampleDesc.Count = 1;
+            desc.BindFlags = D3D11_BIND_RENDER_TARGET;
+            ComPtr<ID3D11Texture2D> array;
+            if (FAILED(status = device->CreateTexture2D(&desc, nullptr, &array))) return status;
+            ComPtr<IDXGISurface> unsupported;
+            if (array.As(&unsupported) != E_NOINTERFACE) return E_UNEXPECTED;
+            ComPtr<IDXGIResource1> resource;
+            if (FAILED(status = array.As(&resource))) return status;
+            const UINT index = D3D11CalcSubresource(1, 1, desc.MipLevels);
+            ComPtr<IDXGISurface2> subresource, another;
+            if (FAILED(status = resource->CreateSubresourceSurface(index, &subresource))) return status;
+            if (FAILED(status = resource->CreateSubresourceSurface(index, &another))) return status;
+            if (SameIdentity(array.Get(), subresource.Get()) || SameIdentity(subresource.Get(), another.Get()))
+                return E_UNEXPECTED;
+            DXGI_SURFACE_DESC subresourceDesc{};
+            if (FAILED(status = subresource->GetDesc(&subresourceDesc))) return status;
+            if (subresourceDesc.Width != 4 || subresourceDesc.Height != 2 || subresourceDesc.Format != Format)
+                return E_UNEXPECTED;
+            if (FAILED(status = CheckSurface(subresource.Get(), array.Get(), index))) return status;
+
+            desc.ArraySize = desc.MipLevels = 1;
+            desc.BindFlags = 0;
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE | D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> staging;
+            if (FAILED(status = device->CreateTexture2D(&desc, nullptr, &staging))) return status;
+            ComPtr<IDXGISurface> stagingSurface;
+            if (FAILED(status = staging.As(&stagingSurface))) return status;
+            DXGI_MAPPED_RECT mapped{};
+            if (FAILED(status = stagingSurface->Map(&mapped, DXGI_MAP_WRITE))) return status;
+            mapped.pBits[0] = 11;
+            mapped.pBits[1] = 22;
+            if (FAILED(status = stagingSurface->Unmap())) return status;
+            D3D11_MAPPED_SUBRESOURCE d3dMapping{};
+            if (FAILED(status = context->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &d3dMapping))) return status;
+            const auto* bytes = static_cast<const BYTE*>(d3dMapping.pData);
+            const bool correct = bytes[0] == 11 && bytes[1] == 22;
+            context->Unmap(staging.Get(), 0);
+            return correct ? S_OK : E_FAIL;
+        }
+
+        HRESULT VerifyResourceBindings()
+        {
+            ComPtr<ID3D11VideoDevice> videoDevice;
+            if (SUCCEEDED(device.As(&videoDevice)) && !SameIdentity(device.Get(), videoDevice.Get())) return E_UNEXPECTED;
+            ComPtr<ID3D11VideoContext> videoContext;
+            if (SUCCEEDED(context.As(&videoContext)) &&
+                (!SameIdentity(context.Get(), videoContext.Get()) || !Owns(videoContext.Get()))) return E_UNEXPECTED;
+
+            D3D11_BUFFER_DESC vertexDesc{};
+            vertexDesc.ByteWidth = 64;
+            vertexDesc.Usage = D3D11_USAGE_DYNAMIC;
+            vertexDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+            vertexDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+            ComPtr<ID3D11Buffer> vertex;
+            HRESULT status = device->CreateBuffer(&vertexDesc, nullptr, &vertex);
+            if (FAILED(status)) return status;
+            if (!Owns(vertex.Get())) return E_UNEXPECTED;
+            D3D11_MAPPED_SUBRESOURCE mapping{};
+            if (FAILED(status = context->Map(vertex.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapping))) return status;
+            static_cast<float*>(mapping.pData)[0] = 0.5f;
+            context->Unmap(vertex.Get(), 0);
+
+            ID3D11Buffer* inputs[] = {vertex.Get(), nullptr};
+            const UINT strides[] = {4, 0}, offsets[] = {0, 0};
+            context->IASetVertexBuffers(0, 2, inputs, strides, offsets);
+            ID3D11Buffer* returned[2]{};
+            UINT returnedStrides[2]{}, returnedOffsets[2]{};
+            context->IAGetVertexBuffers(0, 2, returned, returnedStrides, returnedOffsets);
+            ComPtr<ID3D11Buffer> bound, empty;
+            bound.Attach(returned[0]);
+            empty.Attach(returned[1]);
+            if (!SameIdentity(vertex.Get(), bound.Get()) || empty || returnedStrides[0] != 4 || returnedOffsets[0])
+                return E_UNEXPECTED;
+
+            D3D11_TEXTURE1D_DESC desc1{};
+            desc1.Width = 4;
+            desc1.MipLevels = desc1.ArraySize = 1;
+            desc1.Format = Format;
+            desc1.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            ComPtr<ID3D11Texture1D> texture1;
+            if (FAILED(status = device->CreateTexture1D(&desc1, nullptr, &texture1))) return status;
+
+            D3D11_TEXTURE3D_DESC desc3{};
+            desc3.Width = desc3.Height = desc3.Depth = 4;
+            desc3.MipLevels = 1;
+            desc3.Format = Format;
+            desc3.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+            ComPtr<ID3D11Texture3D> texture3;
+            if (FAILED(status = device->CreateTexture3D(&desc3, nullptr, &texture3))) return status;
+            if (!Owns(texture1.Get()) || !Owns(texture3.Get())) return E_UNEXPECTED;
+
+            ComPtr<ID3D11ShaderResourceView> srv;
+            if (FAILED(status = device->CreateShaderResourceView(texture3.Get(), nullptr, &srv))) return status;
+            ComPtr<ID3D11Resource> resource;
+            srv->GetResource(&resource);
+            if (!Owns(srv.Get()) || !SameIdentity(texture3.Get(), resource.Get())) return E_UNEXPECTED;
+            context->PSSetShaderResources(0, 1, srv.GetAddressOf());
+            ComPtr<ID3D11ShaderResourceView> boundSrv;
+            context->PSGetShaderResources(0, 1, boundSrv.GetAddressOf());
+            if (!SameIdentity(srv.Get(), boundSrv.Get())) return E_UNEXPECTED;
+
+            D3D11_TEXTURE2D_DESC desc{};
+            desc.Width = desc.Height = 4;
+            desc.MipLevels = desc.ArraySize = desc.SampleDesc.Count = 1;
+            desc.Format = Format;
+            desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_UNORDERED_ACCESS;
+            ComPtr<ID3D11Texture2D> target;
+            if (FAILED(status = device->CreateTexture2D(&desc, nullptr, &target))) return status;
+            ComPtr<ID3D11RenderTargetView> rtv;
+            if (FAILED(status = device->CreateRenderTargetView(target.Get(), nullptr, &rtv))) return status;
+            ComPtr<ID3D11UnorderedAccessView> uav;
+            if (FAILED(status = device->CreateUnorderedAccessView(target.Get(), nullptr, &uav))) return status;
+            rtv->GetResource(resource.ReleaseAndGetAddressOf());
+            if (!Owns(target.Get()) || !Owns(rtv.Get()) || !Owns(uav.Get()) ||
+                !SameIdentity(target.Get(), resource.Get())) return E_UNEXPECTED;
+
+            D3D11_TEXTURE2D_DESC depthDesc = desc;
+            depthDesc.Format = DXGI_FORMAT_D24_UNORM_S8_UINT;
+            depthDesc.BindFlags = D3D11_BIND_DEPTH_STENCIL;
+            ComPtr<ID3D11Texture2D> depth;
+            if (FAILED(status = device->CreateTexture2D(&depthDesc, nullptr, &depth))) return status;
+            ComPtr<ID3D11DepthStencilView> dsv;
+            if (FAILED(status = device->CreateDepthStencilView(depth.Get(), nullptr, &dsv))) return status;
+            if (!Owns(dsv.Get())) return E_UNEXPECTED;
+            context->ClearDepthStencilView(dsv.Get(), D3D11_CLEAR_DEPTH, 1.0f, 0);
+            context->OMSetRenderTargets(1, rtv.GetAddressOf(), dsv.Get());
+            context->OMSetRenderTargetsAndUnorderedAccessViews(D3D11_KEEP_RENDER_TARGETS_AND_DEPTH_STENCIL,
+                nullptr, nullptr, 1, 0, nullptr, nullptr);
+            ComPtr<ID3D11RenderTargetView> boundRtv;
+            ComPtr<ID3D11DepthStencilView> boundDsv;
+            context->OMGetRenderTargets(1, boundRtv.GetAddressOf(), boundDsv.GetAddressOf());
+            if (!SameIdentity(rtv.Get(), boundRtv.Get()) || !SameIdentity(dsv.Get(), boundDsv.Get())) return E_UNEXPECTED;
+            context->OMSetRenderTargets(0, nullptr, nullptr);
+            context->CSSetUnorderedAccessViews(0, 1, uav.GetAddressOf(), nullptr);
+            ComPtr<ID3D11UnorderedAccessView> boundUav;
+            context->CSGetUnorderedAccessViews(0, 1, boundUav.GetAddressOf());
+            if (!SameIdentity(uav.Get(), boundUav.Get())) return E_UNEXPECTED;
+            context->ClearState();
+
+            ComPtr<ID3D11Device3> device3;
+            if (SUCCEEDED(device.As(&device3)))
+            {
+                ComPtr<ID3D11RenderTargetView1> rtv1;
+                if (FAILED(status = device3->CreateRenderTargetView1(target.Get(), nullptr, &rtv1))) return status;
+                D3D11_RENDER_TARGET_VIEW_DESC1 versioned{};
+                rtv1->GetDesc1(&versioned);
+                ComPtr<ID3D11RenderTargetView> base;
+                if (FAILED(status = rtv1.As(&base))) return status;
+                if (versioned.Format != Format || !Owns(rtv1.Get()) || !SameIdentity(rtv1.Get(), base.Get()))
+                    return E_UNEXPECTED;
+            }
+
+            const float red[] = {1, 0, 0, 1};
+            context->ClearRenderTargetView(rtv.Get(), red);
+            desc.BindFlags = 0;
+            desc.Usage = D3D11_USAGE_STAGING;
+            desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+            ComPtr<ID3D11Texture2D> readback;
+            if (FAILED(status = device->CreateTexture2D(&desc, nullptr, &readback))) return status;
+            context->CopySubresourceRegion(readback.Get(), 0, 0, 0, 0, target.Get(), 0, nullptr);
+            if (FAILED(status = context->Map(readback.Get(), 0, D3D11_MAP_READ, 0, &mapping))) return status;
+            const auto bytes = static_cast<const BYTE*>(mapping.pData);
+            const bool correct = bytes[0] == 255 && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 255;
+            context->Unmap(readback.Get(), 0);
+            return correct ? S_OK : E_FAIL;
         }
 
         HRESULT InitializeLegacy(HWND window)
@@ -285,13 +575,14 @@ namespace
             return device->CreateRenderTargetView(buffer.Get(), nullptr, &view);
         }
 
-        HRESULT Draw(bool resize)
+        HRESULT Draw(HWND window, bool resize)
         {
             if (resize)
             {
                 view.Reset();
                 HRESULT status = chain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, legacyD3D11 ? 0 : FrameLatencyFlag);
                 if (FAILED(status)) return status;
+                if (FAILED(status = VerifyClientSizedBuffers(window, chain.Get()))) return status;
                 status = CreateView();
                 if (FAILED(status)) return status;
             }
@@ -381,12 +672,76 @@ namespace
             fenceEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (!fenceEvent) return HRESULT_FROM_WIN32(GetLastError());
             if (FAILED(status = VerifyFenceEvents())) return status;
+            if (verifyD3D11On12 && FAILED(status = VerifyOn12Resource())) return status;
             if (verifySharing && FAILED(status = VerifySharedFence())) return status;
             D3D12_DESCRIPTOR_HEAP_DESC viewDesc{};
             viewDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
             viewDesc.NumDescriptors = BufferCount;
             if (FAILED(status = device->CreateDescriptorHeap(&viewDesc, IID_PPV_ARGS(&views)))) return status;
             return CreateViews();
+        }
+
+        HRESULT VerifyOn12Resource()
+        {
+            const HMODULE d3d11 = GetModuleHandleW(L"d3d11.dll");
+            const auto create = d3d11 ? reinterpret_cast<PFN_D3D11ON12_CREATE_DEVICE>(
+                GetProcAddress(d3d11, "D3D11On12CreateDevice")) : nullptr;
+            if (!create) return DXGI_ERROR_UNSUPPORTED;
+            IUnknown* queues[] = {queue.Get()};
+            ComPtr<ID3D11Device> device11;
+            ComPtr<ID3D11DeviceContext> context11;
+            HRESULT status = create(device.Get(), 0, nullptr, 0, queues, 1, 0, &device11, &context11, nullptr);
+            if (FAILED(status)) return status;
+            ComPtr<ID3D11On12Device> on12;
+            if (FAILED(status = device11.As(&on12))) return status;
+            if (!SameIdentity(on12.Get(), device11.Get())) return E_UNEXPECTED;
+            ComPtr<ID3D11On12Device1> on12v1;
+            if (SUCCEEDED(on12.As(&on12v1)))
+            {
+                ComPtr<ID3D12Device> owner;
+                if (FAILED(status = on12v1->GetD3D12Device(IID_PPV_ARGS(&owner)))) return status;
+                if (!SameIdentity(owner.Get(), device.Get())) return E_UNEXPECTED;
+            }
+
+            D3D12_HEAP_PROPERTIES heap{};
+            heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+            heap.CreationNodeMask = heap.VisibleNodeMask = 1;
+            D3D12_RESOURCE_DESC desc{};
+            desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+            desc.Width = desc.Height = 4;
+            desc.DepthOrArraySize = desc.MipLevels = 1;
+            desc.Format = Format;
+            desc.SampleDesc.Count = 1;
+            desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+            constexpr auto state = D3D12_RESOURCE_STATE_RENDER_TARGET;
+            ComPtr<ID3D12Resource> texture12;
+            status = device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, nullptr,
+                IID_PPV_ARGS(&texture12));
+            if (FAILED(status)) return status;
+            D3D11_RESOURCE_FLAGS flags{};
+            flags.BindFlags = D3D11_BIND_RENDER_TARGET;
+            ComPtr<ID3D11Resource> resource;
+            if (FAILED(status = on12->CreateWrappedResource(texture12.Get(), &flags, state, state, IID_PPV_ARGS(&resource))))
+                return status;
+            ComPtr<ID3D11RenderTargetView> rtv;
+            if (FAILED(status = device11->CreateRenderTargetView(resource.Get(), nullptr, &rtv))) return status;
+            ComPtr<ID3D11Resource> fromView;
+            ComPtr<ID3D11Device> fromResource;
+            rtv->GetResource(&fromView);
+            resource->GetDevice(&fromResource);
+            if (!SameIdentity(resource.Get(), fromView.Get()) || !SameIdentity(device11.Get(), fromResource.Get()))
+                return E_UNEXPECTED;
+
+            on12->ReleaseWrappedResources(resource.GetAddressOf(), 1);
+            on12->AcquireWrappedResources(resource.GetAddressOf(), 1);
+            const float red[] = {1, 0, 0, 1};
+            context11->ClearRenderTargetView(rtv.Get(), red);
+            on12->ReleaseWrappedResources(resource.GetAddressOf(), 1);
+            rtv.Reset();
+            fromView.Reset();
+            resource.Reset();
+            context11->Flush();
+            return WaitForGpu();
         }
 
         HRESULT VerifySharedFence()
@@ -480,13 +835,24 @@ namespace
             return S_OK;
         }
 
-        HRESULT Draw(bool resize)
+        HRESULT WaitForGpu()
+        {
+            HRESULT status = fence->SetEventOnCompletion(++fenceValue, fenceEvent);
+            if (FAILED(status)) return status;
+            if (FAILED(status = queue->Signal(fence.Get(), fenceValue))) return status;
+            const DWORD waited = WaitForSingleObject(fenceEvent, 5000);
+            if (waited == WAIT_FAILED) return HRESULT_FROM_WIN32(GetLastError());
+            return waited == WAIT_OBJECT_0 ? S_OK : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        }
+
+        HRESULT Draw(HWND window, bool resize)
         {
             HRESULT status;
             if (resize)
             {
                 for (auto& buffer : buffers) buffer.Reset();
                 if (FAILED(status = chain->ResizeBuffers(0, 0, 0, DXGI_FORMAT_UNKNOWN, FrameLatencyFlag))) return status;
+                if (FAILED(status = VerifyClientSizedBuffers(window, chain.Get()))) return status;
                 if (FAILED(status = CreateViews())) return status;
             }
             if (FAILED(status = frameLatency.Wait())) return status;
@@ -511,21 +877,26 @@ namespace
             if (FAILED(status = commands->Close())) return status;
             ID3D12CommandList* work[] = {commands.Get()};
             queue->ExecuteCommandLists(1, work);
-            const HRESULT present = chain->Present(1, 0);
-            if (FAILED(status = fence->SetEventOnCompletion(++fenceValue, fenceEvent))) return status;
-            if (FAILED(status = queue->Signal(fence.Get(), fenceValue))) return status;
-            const DWORD waited = WaitForSingleObject(fenceEvent, 5000);
-            if (waited == WAIT_FAILED) return HRESULT_FROM_WIN32(GetLastError());
-            return waited == WAIT_OBJECT_0 ? present : HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            const DXGI_PRESENT_PARAMETERS parameters{};
+            const HRESULT present = gateFirstFrame ? chain->Present1(1, 0, &parameters) : chain->Present(1, 0);
+            const HRESULT completed = WaitForGpu();
+            return FAILED(completed) ? completed : present;
         }
     };
 
     template<class Renderer>
     HRESULT Run(HWND window)
     {
+        firstFrameAllowed = !gateFirstFrame;
         Renderer renderer;
         HRESULT status = renderer.Initialize(window);
         if (FAILED(status)) return status;
+        if (gateFirstFrame)
+        {
+            status = renderer.chain->Present(0, DXGI_PRESENT_TEST);
+            if (FAILED(status)) return status;
+            InvalidateRect(window, nullptr, FALSE);
+        }
         MSG message{};
         for (;;)
         {
@@ -536,8 +907,8 @@ namespace
                 DispatchMessageW(&message);
             }
             if (switchRenderer) { switchRenderer = false; return S_FALSE; }
-            if (minimized) { WaitMessage(); continue; }
-            status = renderer.Draw(resizePending);
+            if (minimized || !firstFrameAllowed) { WaitMessage(); continue; }
+            status = renderer.Draw(window, resizePending);
             resizePending = false;
             if (FAILED(status)) return status;
             if (status == DXGI_STATUS_OCCLUDED) Sleep(20);
@@ -549,10 +920,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int show)
 {
     bool useD3D12 = arguments && std::wcsstr(arguments, L"--d3d12");
     legacyD3D11 = arguments && std::wcsstr(arguments, L"--legacy-d3d11");
+    verifyD3D11Bindings = arguments && std::wcsstr(arguments, L"--d3d11-bindings");
+    verifyD3D11On12 = arguments && std::wcsstr(arguments, L"--d3d11on12");
+    verifyDxgiSurfaces = arguments && std::wcsstr(arguments, L"--dxgi-surfaces");
     verifySharing = arguments && std::wcsstr(arguments, L"--shared-d3d12");
     verifyD3D11Sharing = arguments && std::wcsstr(arguments, L"--shared-d3d11");
     useDeviceFactory = arguments && std::wcsstr(arguments, L"--factory-d3d12");
     verifyDxgiEvents = arguments && std::wcsstr(arguments, L"--dxgi-events");
+    gateFirstFrame = arguments && std::wcsstr(arguments, L"--gate-first-frame");
     WNDCLASSW windowClass{};
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;

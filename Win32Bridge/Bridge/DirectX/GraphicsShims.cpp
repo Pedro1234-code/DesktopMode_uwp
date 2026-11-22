@@ -407,8 +407,8 @@ namespace
             if (!m_window) return m_native->ResizeBuffers(count, width, height, format, flags);
             const HRESULT status = ResolveSize(width, height);
             if (FAILED(status)) return status;
-            return m_native->ResizeBuffers(count == 1 ? 2 : count, width, height, format,
-                flags & ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH);
+            return CheckPresentationDevice(L"ResizeBuffers", m_native->ResizeBuffers(
+                count == 1 ? 2 : count, width, height, format, flags & ~DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH));
         }
 
         HRESULT STDMETHODCALLTYPE ResizeBuffers1(UINT count, UINT width, UINT height, DXGI_FORMAT format, UINT flags,
@@ -432,7 +432,8 @@ namespace
             }
             return WithNativeGraphicsObjects(queueCount, queues, [&](IUnknown* const* nativeQueues)
             {
-                return native->ResizeBuffers1(count, width, height, format, flags, nodeMasks, nativeQueues);
+                return CheckPresentationDevice(L"ResizeBuffers1",
+                    native->ResizeBuffers1(count, width, height, format, flags, nodeMasks, nativeQueues));
             });
         }
 
@@ -458,7 +459,7 @@ namespace
         { return m_guestDevice ? m_guestDevice->QueryInterface(riid, ppDevice) : m_native->GetDevice(riid, ppDevice); }
 
         HRESULT STDMETHODCALLTYPE Present(UINT SyncInterval, UINT Flags) override
-        { return m_native->Present(SyncInterval, Flags); }
+        { return FinishPresent(L"Present", m_native->Present(SyncInterval, Flags), Flags); }
 
         HRESULT STDMETHODCALLTYPE GetBuffer(UINT Buffer, REFIID riid, void** ppSurface) override
         {
@@ -493,7 +494,7 @@ namespace
 
         HRESULT STDMETHODCALLTYPE Present1(UINT SyncInterval, UINT PresentFlags,
             const DXGI_PRESENT_PARAMETERS* pPresentParameters) override
-        { return m_native->Present1(SyncInterval, PresentFlags, pPresentParameters); }
+        { return FinishPresent(L"Present1", m_native->Present1(SyncInterval, PresentFlags, pPresentParameters), PresentFlags); }
 
         BOOL STDMETHODCALLTYPE IsTemporaryMonoSupported() override
         { return m_native->IsTemporaryMonoSupported(); }
@@ -586,6 +587,25 @@ namespace
     private:
         ~GuestSwapChain() { if (m_binding.detach) m_binding.detach(); }
 
+        HRESULT CheckPresentationDevice(const wchar_t* operation, HRESULT status)
+        {
+            if (m_binding.detach && (status == DXGI_ERROR_DEVICE_REMOVED || status == DXGI_ERROR_DEVICE_RESET ||
+                status == DXGI_ERROR_DEVICE_HUNG) && !m_presentationDeviceLost.exchange(true))
+            {
+                m_binding.detach();
+                PresentationError(operation, status);
+            }
+            return status;
+        }
+
+        HRESULT FinishPresent(const wchar_t* operation, HRESULT status, UINT flags)
+        {
+            if (status == S_OK && !(flags & (DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_SEQUENCE)) &&
+                m_binding.framePresented && !m_presentationDeviceLost.load())
+                m_binding.framePresented();
+            return CheckPresentationDevice(operation, status);
+        }
+
         HRESULT ResolveSize(UINT& width, UINT& height)
         {
             if (!m_window) return S_OK;
@@ -605,6 +625,7 @@ namespace
         ComPtr<GuestGraphicsObject> m_guestDevice;
         HWND m_window;
         GuestSwapChainBinding m_binding;
+        std::atomic<bool> m_presentationDeviceLost{false};
         std::mutex m_latencyLock;
         GuestKernelContext::NativeWaitHandle m_latencyWait;
     };
@@ -887,18 +908,20 @@ namespace
         return status;
     }
 
+#include "Bridge/DirectX/GraphicsD3D11Bindings.inl"
 #include "Bridge/DirectX/GraphicsD3D11Texture.inl"
+#include "Bridge/DirectX/GraphicsD3D11Video.inl"
 #include "Bridge/DirectX/GraphicsD3D11Context.inl"
 #include "Bridge/DirectX/GraphicsDevice.inl"
 #include "Bridge/DirectX/GraphicsD3D12.inl"
 #include "Bridge/DirectX/GraphicsD3D12Factory.inl"
 
     HRESULT FinishD3D11Creation(ComPtr<ID3D11Device> native, ComPtr<ID3D11DeviceContext> immediate,
-        IDXGIAdapter* adapter, ID3D11Device** device, ID3D11DeviceContext** context)
+        IDXGIAdapter* adapter, ID3D11Device** device, ID3D11DeviceContext** context, IUnknown* device12 = nullptr)
     {
         if (!native) return immediate ? E_UNEXPECTED : S_OK;
         ComPtr<ID3D11Device> guest;
-        HRESULT status = WrapD3D11Device(std::move(native), adapter, &guest);
+        HRESULT status = WrapD3D11Device(std::move(native), adapter, &guest, device12);
         if (FAILED(status)) return status;
         if (context)
         {
@@ -1032,7 +1055,7 @@ namespace
             const HRESULT status = create(nativeDevice.Get(), flags, levels, levelCount, nativeQueues, queueCount,
                 nodeMask, device || context ? created.GetAddressOf() : nullptr, context ? immediate.GetAddressOf() : nullptr, chosenLevel);
             if (FAILED(status)) return status;
-            const HRESULT wrapped = FinishD3D11Creation(std::move(created), std::move(immediate), nullptr, device, context);
+            const HRESULT wrapped = FinishD3D11Creation(std::move(created), std::move(immediate), nullptr, device, context, device12);
             return FAILED(wrapped) ? wrapped : status;
         });
     }

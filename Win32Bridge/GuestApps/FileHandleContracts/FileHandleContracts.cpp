@@ -6,6 +6,12 @@
 #include <cstdio>
 #include <cstring>
 #pragma comment(lib, "synchronization.lib")
+
+extern "C" __declspec(dllexport) int WINAPI BridgeLoaderContractExport()
+{
+    return 42;
+}
+
 namespace {
 struct Handle
 {
@@ -1114,6 +1120,245 @@ int CheckFileMappings(const wchar_t* temporaryPath)
     return 0;
 }
 
+int CheckReplaceFile(const wchar_t* temporaryPath)
+{
+    constexpr DWORD ShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    for (const bool withBackup : {false, true})
+    {
+        TemporaryFile original, incoming, backup;
+        REQUIRE(GetTempFileNameW(temporaryPath, L"rpo", 0, original.path));
+        REQUIRE(GetTempFileNameW(temporaryPath, L"rpn", 0, incoming.path));
+        REQUIRE(GetTempFileNameW(temporaryPath, L"rpb", 0, backup.path));
+        const auto open = [&](const wchar_t* path, DWORD access)
+        { return CreateFileW(path, access, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr); };
+        Handle old, next, reader;
+        old.value = open(original.path, GENERIC_READ | GENERIC_WRITE);
+        next.value = open(incoming.path, GENERIC_READ | GENERIC_WRITE);
+        REQUIRE(old.value != INVALID_HANDLE_VALUE && next.value != INVALID_HANDLE_VALUE);
+        DWORD count = 0;
+        REQUIRE(WriteFile(old.value, "old", 3, &count, nullptr) && count == 3);
+        REQUIRE(WriteFile(next.value, "new", 3, &count, nullptr) && count == 3);
+        REQUIRE(SetFileAttributesW(original.path, FILE_ATTRIBUTE_HIDDEN));
+        const wchar_t* backupName = withBackup ? backup.path : nullptr;
+        REQUIRE(!ReplaceFileW(original.path, incoming.path, backupName, 0, nullptr, nullptr) &&
+            GetLastError() == ERROR_SHARING_VIOLATION);
+        REQUIRE(GetFileAttributesW(incoming.path) != INVALID_FILE_ATTRIBUTES);
+        next.Reset();
+        REQUIRE(LockFile(old.value, 0, 0, 1, 0));
+        REQUIRE(ReplaceFileW(original.path, incoming.path, backupName, 0, nullptr, nullptr));
+        REQUIRE(GetFileAttributesW(incoming.path) == INVALID_FILE_ATTRIBUTES);
+        const DWORD attributes = GetFileAttributesW(original.path);
+        REQUIRE(attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_HIDDEN));
+        reader.value = open(original.path, GENERIC_READ);
+        REQUIRE(reader.value != INVALID_HANDLE_VALUE);
+        char data[3]{};
+        REQUIRE(ReadFile(reader.value, data, sizeof(data), &count, nullptr) &&
+            count == sizeof(data) && memcmp(data, "new", sizeof(data)) == 0);
+        REQUIRE(SetFilePointerEx(old.value, {}, nullptr, FILE_BEGIN));
+        REQUIRE(ReadFile(old.value, data, sizeof(data), &count, nullptr) &&
+            count == sizeof(data) && memcmp(data, "old", sizeof(data)) == 0);
+        if (withBackup)
+        {
+            reader.Reset(open(backup.path, GENERIC_READ));
+            REQUIRE(reader.value != INVALID_HANDLE_VALUE);
+            REQUIRE(!ReadFile(reader.value, data, sizeof(data), &count, nullptr) &&
+                GetLastError() == ERROR_LOCK_VIOLATION);
+            REQUIRE(UnlockFile(old.value, 0, 0, 1, 0));
+            REQUIRE(ReadFile(reader.value, data, sizeof(data), &count, nullptr) &&
+                count == sizeof(data) && memcmp(data, "old", sizeof(data)) == 0);
+        }
+        old.Reset();
+        REQUIRE(GetFileAttributesW(original.path) != INVALID_FILE_ATTRIBUTES);
+    }
+    TemporaryFile missing, incoming;
+    REQUIRE(GetTempFileNameW(temporaryPath, L"rpa", 0, missing.path));
+    REQUIRE(GetTempFileNameW(temporaryPath, L"rpn", 0, incoming.path));
+    REQUIRE(DeleteFileW(missing.path));
+    REQUIRE(!ReplaceFileW(missing.path, incoming.path, nullptr, 0, nullptr, nullptr) &&
+        GetLastError() == ERROR_FILE_NOT_FOUND);
+    REQUIRE(GetFileAttributesW(incoming.path) != INVALID_FILE_ATTRIBUTES);
+    Handle closedTarget;
+    closedTarget.value = CreateFileW(missing.path, GENERIC_WRITE, ShareAll, nullptr, CREATE_NEW, 0, nullptr);
+    REQUIRE(closedTarget.value != INVALID_HANDLE_VALUE);
+    closedTarget.Reset();
+    REQUIRE(ReplaceFileW(missing.path, incoming.path, nullptr, 0, nullptr, nullptr));
+    REQUIRE(GetFileAttributesW(missing.path) != INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(incoming.path) == INVALID_FILE_ATTRIBUTES);
+    return 0;
+}
+
+int CheckFileInformationUpdates(const wchar_t* temporaryPath)
+{
+    using NativeInformation = LONG (NTAPI*)(HANDLE, NativeDiskStatus*, void*, ULONG, ULONG);
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto setNative = reinterpret_cast<NativeInformation>(GetProcAddress(ntdll, "NtSetInformationFile"));
+    const auto queryNative = reinterpret_cast<NativeInformation>(GetProcAddress(ntdll, "NtQueryInformationFile"));
+    REQUIRE(setNative && queryNative);
+    constexpr DWORD ShareAll = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    TemporaryFile source, renamed, nativeName;
+    REQUIRE(GetTempFileNameW(temporaryPath, L"fhs", 0, source.path));
+    REQUIRE(GetTempFileNameW(temporaryPath, L"fhr", 0, renamed.path) && DeleteFileW(renamed.path));
+    REQUIRE(GetTempFileNameW(temporaryPath, L"fhn", 0, nativeName.path) && DeleteFileW(nativeName.path));
+    Handle file, peer;
+    // A rename through this handle uses its DELETE access even though the
+    // handle itself did not grant FILE_SHARE_DELETE to another opener.
+    file.value = CreateFileW(source.path, GENERIC_READ | GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(file.value != INVALID_HANDLE_VALUE);
+    DWORD written = 0;
+    REQUIRE(WriteFile(file.value, "abcdef", 6, &written, nullptr) && written == 6);
+    FILE_END_OF_FILE_INFO eof{};
+    eof.EndOfFile.QuadPart = 3;
+    REQUIRE(SetFileInformationByHandle(file.value, FileEndOfFileInfo, &eof, sizeof(eof)));
+    NativeDiskStatus status{};
+    LARGE_INTEGER position{};
+    REQUIRE(queryNative(file.value, &status, &position, sizeof(position), 14) == 0 &&
+        status.information == sizeof(position) && position.QuadPart == 6);
+    FILE_STANDARD_INFO standard{};
+    REQUIRE(GetFileInformationByHandleEx(file.value, FileStandardInfo, &standard, sizeof(standard)) &&
+        standard.EndOfFile.QuadPart == 3);
+    eof.EndOfFile.QuadPart = 9;
+    REQUIRE(setNative(file.value, &status, &eof, sizeof(eof), 20) == 0);
+    REQUIRE(queryNative(file.value, &status, &standard, sizeof(standard), 5) == 0 &&
+        standard.EndOfFile.QuadPart == 9);
+    REQUIRE(queryNative(file.value, &status, &position, sizeof(position), 14) == 0 && position.QuadPart == 6);
+
+    struct Rename
+    {
+        DWORD flags;
+        HANDLE root;
+        DWORD nameBytes;
+        wchar_t name[MAX_PATH];
+    } rename{};
+    wcscpy_s(rename.name, renamed.path);
+    rename.nameBytes = static_cast<DWORD>(wcslen(rename.name) * sizeof(wchar_t));
+    REQUIRE(SetFileInformationByHandle(file.value, FileRenameInfo, &rename, sizeof(rename)));
+    REQUIRE(GetFileAttributesW(source.path) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(renamed.path) != INVALID_FILE_ATTRIBUTES);
+    const wchar_t* leaf = wcsrchr(nativeName.path, L'\\');
+    REQUIRE(leaf != nullptr);
+    wcscpy_s(rename.name, leaf + 1);
+    rename.nameBytes = static_cast<DWORD>(wcslen(rename.name) * sizeof(wchar_t));
+    REQUIRE(setNative(file.value, &status, &rename, sizeof(rename), 10) == 0);
+    REQUIRE(GetFileAttributesW(renamed.path) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW(nativeName.path) != INVALID_FILE_ATTRIBUTES);
+
+    file.Reset(CreateFileW(nativeName.path, GENERIC_READ | DELETE, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr));
+    peer.value = CreateFileW(nativeName.path, DELETE, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(file.value != INVALID_HANDLE_VALUE && peer.value != INVALID_HANDLE_VALUE);
+    FILE_DISPOSITION_INFO disposition{TRUE};
+    REQUIRE(SetFileInformationByHandle(file.value, FileDispositionInfo, &disposition, sizeof(disposition)));
+    REQUIRE(queryNative(peer.value, &status, &standard, sizeof(standard), 5) == 0 &&
+        standard.DeletePending && standard.NumberOfLinks == 0);
+    Handle reopened;
+    reopened.value = CreateFileW(nativeName.path, GENERIC_READ, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
+    REQUIRE(reopened.value == INVALID_HANDLE_VALUE && GetLastError() == ERROR_ACCESS_DENIED);
+    disposition.DeleteFile = FALSE;
+    REQUIRE(setNative(peer.value, &status, &disposition, sizeof(disposition), 13) == 0);
+    REQUIRE(GetFileInformationByHandleEx(file.value, FileStandardInfo, &standard, sizeof(standard)) &&
+        !standard.DeletePending && standard.NumberOfLinks == 1);
+    disposition.DeleteFile = TRUE;
+    REQUIRE(setNative(peer.value, &status, &disposition, sizeof(disposition), 13) == 0);
+    peer.Reset();
+    REQUIRE(GetFileInformationByHandleEx(file.value, FileStandardInfo, &standard, sizeof(standard)) &&
+        standard.DeletePending);
+    file.Reset();
+    REQUIRE(GetFileAttributesW(nativeName.path) == INVALID_FILE_ATTRIBUTES);
+
+    TemporaryFile directoryPath;
+    REQUIRE(GetTempFileNameW(temporaryPath, L"fhd", 0, directoryPath.path));
+    REQUIRE(DeleteFileW(directoryPath.path) && CreateDirectoryW(directoryPath.path, nullptr));
+    struct DirectoryCleanup
+    {
+        const wchar_t* path;
+        ~DirectoryCleanup() { RemoveDirectoryW(path); }
+    } cleanup{directoryPath.path};
+    const std::wstring child = std::wstring(directoryPath.path) + L"\\child";
+    Handle directory, member;
+    directory.value = CreateFileW(directoryPath.path, GENERIC_READ | DELETE, ShareAll, nullptr,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    REQUIRE(directory.value != INVALID_HANDLE_VALUE);
+    member.value = CreateFileW(child.c_str(), GENERIC_WRITE, ShareAll, nullptr, CREATE_NEW, 0, nullptr);
+    REQUIRE(member.value != INVALID_HANDLE_VALUE);
+    member.Reset();
+    REQUIRE(!SetFileInformationByHandle(directory.value, FileDispositionInfo, &disposition, sizeof(disposition)) &&
+        GetLastError() == ERROR_DIR_NOT_EMPTY);
+    REQUIRE(DeleteFileW(child.c_str()));
+    REQUIRE(SetFileInformationByHandle(directory.value, FileDispositionInfo, &disposition, sizeof(disposition)));
+    REQUIRE(GetFileInformationByHandleEx(directory.value, FileStandardInfo, &standard, sizeof(standard)) &&
+        standard.Directory && standard.DeletePending);
+    member.value = CreateFileW(child.c_str(), GENERIC_WRITE, ShareAll, nullptr, CREATE_NEW, 0, nullptr);
+    REQUIRE(member.value == INVALID_HANDLE_VALUE);
+    directory.Reset();
+    REQUIRE(GetFileAttributesW(directoryPath.path) == INVALID_FILE_ATTRIBUTES);
+    return 0;
+}
+
+int CheckNativeLoader(const wchar_t* temporaryPath)
+{
+    struct WideString { USHORT length, maximum; const wchar_t* data; };
+    struct AnsiString { USHORT length, maximum; const char* data; };
+    using Load = LONG (NTAPI*)(LPCWSTR, const ULONG*, const WideString*, HMODULE*);
+    using LookupEx = LONG (NTAPI*)(ULONG, LPCWSTR, const ULONG*, const WideString*, HMODULE*);
+    using Procedure = LONG (NTAPI*)(HMODULE, const AnsiString*, ULONG, FARPROC*);
+    using AddReference = LONG (NTAPI*)(ULONG, HMODULE);
+    using Unload = LONG (NTAPI*)(HMODULE);
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll");
+    const auto load = reinterpret_cast<Load>(GetProcAddress(ntdll, "LdrLoadDll"));
+    const auto lookup = reinterpret_cast<Load>(GetProcAddress(ntdll, "LdrGetDllHandle"));
+    const auto lookupEx = reinterpret_cast<LookupEx>(GetProcAddress(ntdll, "LdrGetDllHandleEx"));
+    const auto procedure = reinterpret_cast<Procedure>(GetProcAddress(ntdll, "LdrGetProcedureAddress"));
+    const auto addReference = reinterpret_cast<AddReference>(GetProcAddress(ntdll, "LdrAddRefDll"));
+    const auto unload = reinterpret_cast<Unload>(GetProcAddress(ntdll, "LdrUnloadDll"));
+    REQUIRE(load && lookup && lookupEx && procedure && addReference && unload);
+
+    constexpr char ExportName[] = "BridgeLoaderContractExport!";
+    constexpr USHORT ExportLength = sizeof(ExportName) - 2;
+    const AnsiString symbol{ ExportLength, ExportLength, ExportName };
+    const HMODULE mainImage = GetModuleHandleW(nullptr);
+    REQUIRE(mainImage);
+    const auto mainExport = GetProcAddress(mainImage, "BridgeLoaderContractExport");
+    REQUIRE(mainExport == reinterpret_cast<FARPROC>(&BridgeLoaderContractExport));
+    FARPROC byName = nullptr, byOrdinal = nullptr;
+    SetLastError(ERROR_ALREADY_EXISTS);
+    REQUIRE(procedure(mainImage, &symbol, 0, &byName) == 0 && byName == mainExport);
+    REQUIRE(GetLastError() == ERROR_ALREADY_EXISTS);
+    REQUIRE(procedure(mainImage, nullptr, 1, &byOrdinal) == 0 && byOrdinal == mainExport);
+    REQUIRE(procedure(mainImage, nullptr, 65535, &byOrdinal) == static_cast<LONG>(0xc0000138u));
+
+    wchar_t executable[MAX_PATH]{};
+    REQUIRE(GetModuleFileNameW(nullptr, executable, MAX_PATH) > 0);
+    TemporaryFile copy;
+    REQUIRE(GetTempFileNameW(temporaryPath, L"ldr", 0, copy.path));
+    REQUIRE(CopyFileW(executable, copy.path, FALSE));
+    const wchar_t* leaf = wcsrchr(copy.path, L'\\');
+    REQUIRE(leaf != nullptr);
+    const USHORT length = static_cast<USHORT>(wcslen(leaf + 1) * sizeof(wchar_t));
+    const WideString name{ length, length, leaf + 1 };
+    const std::wstring absentDirectory = std::wstring(copy.path) + L"\\absent";
+    const std::wstring search = absentDirectory + L";" + std::wstring(copy.path, static_cast<size_t>(leaf - copy.path));
+    const std::wstring absentSystemDll = absentDirectory + L"\\kernel32.dll";
+    REQUIRE(!GetModuleHandleW(absentSystemDll.c_str()) && GetLastError() == ERROR_MOD_NOT_FOUND);
+    REQUIRE(!LoadLibraryW(absentSystemDll.c_str()) && GetLastError() == ERROR_MOD_NOT_FOUND);
+
+    HMODULE module = nullptr, found = nullptr;
+    const ULONG executableImage = IMAGE_FILE_EXECUTABLE_IMAGE;
+    REQUIRE(load(search.c_str(), &executableImage, &name, &module) == 0 && module && module != mainImage);
+    REQUIRE(procedure(module, &symbol, 0, &byName) == 0 && byName != mainExport);
+    using Export = int (WINAPI*)();
+    REQUIRE(reinterpret_cast<Export>(byName)() == 42);
+    REQUIRE(addReference(0, module) == 0);
+    REQUIRE(lookup(nullptr, nullptr, &name, &found) == 0 && found == module);
+    REQUIRE(lookupEx(0, nullptr, nullptr, &name, &found) == 0 && found == module);
+    REQUIRE(unload(module) == 0 && FreeLibrary(module));
+    REQUIRE(lookup(nullptr, nullptr, &name, &found) == 0 && found == module);
+    REQUIRE(unload(module) == 0);
+    REQUIRE(lookup(nullptr, nullptr, &name, &found) == static_cast<LONG>(0xc0000135u) && found == module);
+    module = LoadLibraryExW(copy.path, nullptr, DONT_RESOLVE_DLL_REFERENCES | LOAD_WITH_ALTERED_SEARCH_PATH);
+    REQUIRE(module && FreeLibrary(module));
+    return 0;
+}
+
 int CheckNativeIoCompletion(const wchar_t* temporaryPath)
 {
     struct UnicodeString { USHORT length, maximum; LPCWSTR buffer; };
@@ -1466,6 +1711,12 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command, int)
     if (renameOpenFile) return renameOpenFile;
     const int fileMappings = CheckFileMappings(directory);
     if (fileMappings) return fileMappings;
+    const int replaceFile = CheckReplaceFile(directory);
+    if (replaceFile) return replaceFile;
+    const int fileInformation = CheckFileInformationUpdates(directory);
+    if (fileInformation) return fileInformation;
+    const int nativeLoader = CheckNativeLoader(directory);
+    if (nativeLoader) return nativeLoader;
     const int signalAndWait = CheckSignalAndWait();
     if (signalAndWait) return signalAndWait;
     const int multipleWaits = CheckMultipleWaits();

@@ -623,6 +623,156 @@ struct PreserveNativeLastError
     ~PreserveNativeLastError() { SetGuestLastError(saved); }
 };
 
+LONG NativeLoaderStatus(DWORD error, bool ordinal = false)
+{
+    switch (error)
+    {
+    case ERROR_PROC_NOT_FOUND: return static_cast<LONG>(ordinal ? 0xc0000138u : 0xc0000139u);
+    case ERROR_BAD_EXE_FORMAT: return static_cast<LONG>(0xc000007bu);
+    case ERROR_DLL_INIT_FAILED: return static_cast<LONG>(0xc0000142u);
+    default: return NativeStatus(error);
+    }
+}
+
+LONG CaptureNativeModuleName(const GuestUnicodeString* input, std::wstring& name)
+{
+    if (!input) return NtInvalidParameter;
+    GuestUnicodeString string{};
+    if (!CopyConsoleBytes(&string, input, sizeof(string))) return NtAccessViolation;
+    if (string.length > string.maximumLength || string.length % sizeof(wchar_t)) return NtInvalidParameter;
+    name.resize(string.length / sizeof(wchar_t));
+    if (!name.empty() &&
+        (!string.buffer || !CopyConsoleBytes(&name[0], string.buffer, string.length))) return NtAccessViolation;
+    if (name.find(L'\0') != std::wstring::npos) return NtInvalidParameter;
+    if (name.compare(0, 4, L"\\??\\") == 0) name.erase(0, 4);
+    return 0;
+}
+
+LONG WINAPI GuestLdrLoadDll(LPCWSTR searchPath, const ULONG* dllCharacteristics,
+    const GuestUnicodeString* name, HMODULE* output)
+{
+    const PreserveNativeLastError preserve;
+    if (!output) return NtInvalidParameter;
+    HMODULE module = nullptr;
+    if (!ProbeNativeOutput(output, sizeof(module))) return NtAccessViolation;
+    try
+    {
+        std::wstring library, directories;
+        const LONG status = CaptureNativeModuleName(name, library);
+        if (status) return status;
+        if (searchPath)
+        {
+            for (size_t index = 0; index < 32768; ++index)
+            {
+                wchar_t ch = 0;
+                if (!CopyConsoleBytes(&ch, searchPath + index, sizeof(ch))) return NtAccessViolation;
+                if (!ch) break;
+                directories.push_back(ch);
+            }
+            if (directories.size() == 32768) return NtInvalidParameter;
+        }
+        ULONG characteristics = 0;
+        if (dllCharacteristics && !CopyConsoleBytes(&characteristics, dllCharacteristics, sizeof(characteristics)))
+            return NtAccessViolation;
+        if (characteristics & ~IMAGE_FILE_EXECUTABLE_IMAGE) return NtNotSupported;
+        const DWORD flags = characteristics ? DONT_RESOLVE_DLL_REFERENCES : 0;
+        module = LoadGuestLibrary(library.c_str(), nullptr, flags, searchPath ? directories.c_str() : nullptr);
+        if (!module) return NativeLoaderStatus(BridgeGetLastError());
+        if (CopyConsoleBytes(output, &module, sizeof(module))) return 0;
+        BridgeFreeLibrary(module);
+        return NtAccessViolation;
+    }
+    catch (const std::bad_alloc&) { return NativeStatus(ERROR_NOT_ENOUGH_MEMORY); }
+}
+
+LONG WINAPI GuestLdrGetDllHandleEx(ULONG flags, LPCWSTR, const ULONG*,
+    const GuestUnicodeString* name, HMODULE* output)
+{
+    const PreserveNativeLastError preserve;
+    constexpr ULONG Unchanged = 1, Pin = 2;
+    HMODULE module = nullptr;
+    if (output && !ProbeNativeOutput(output, sizeof(module))) return NtAccessViolation;
+    if ((flags & ~7u) || (flags & (Unchanged | Pin)) == (Unchanged | Pin) ||
+        (!output && !(flags & Pin))) return NtInvalidParameter;
+    try
+    {
+        std::wstring library;
+        const LONG status = CaptureNativeModuleName(name, library);
+        if (status) return status;
+        module = LookupGuestModuleByName(library.c_str(), !(flags & Unchanged), (flags & Pin) != 0);
+        if (!module) return NativeLoaderStatus(BridgeGetLastError());
+        if (!output || CopyConsoleBytes(output, &module, sizeof(module))) return 0;
+        if (!(flags & (Unchanged | Pin))) BridgeFreeLibrary(module);
+        return NtAccessViolation;
+    }
+    catch (const std::bad_alloc&) { return NativeStatus(ERROR_NOT_ENOUGH_MEMORY); }
+}
+
+LONG WINAPI GuestLdrGetDllHandle(LPCWSTR searchPath, const ULONG* characteristics,
+    const GuestUnicodeString* name, HMODULE* output)
+{
+    return GuestLdrGetDllHandleEx(1, searchPath, characteristics, name, output);
+}
+
+LONG WINAPI GuestLdrAddRefDll(ULONG flags, HMODULE module)
+{
+    if (flags & ~1u) return NtInvalidParameter;
+    if (FindBridgeSystemModule(module) || IsGuestMainModule(module)) return 0;
+    const auto loader = CurrentGuestModuleLoader();
+    DWORD error = ERROR_MOD_NOT_FOUND;
+    return loader && loader->AddReference(module, (flags & 1u) != 0, &error) ? 0 : NativeLoaderStatus(error);
+}
+
+LONG WINAPI GuestLdrUnloadDll(HMODULE module)
+{
+    const PreserveNativeLastError preserve;
+    return BridgeFreeLibrary(module) ? 0 : NativeLoaderStatus(BridgeGetLastError());
+}
+
+LONG WINAPI GuestLdrDisableThreadCalloutsForDll(HMODULE module)
+{
+    const PreserveNativeLastError preserve;
+    if (FindBridgeSystemModule(module)) return 0;
+    return BridgeDisableThreadLibraryCalls(module) ? 0 : NativeLoaderStatus(BridgeGetLastError());
+}
+
+struct GuestAnsiString { USHORT length, maximumLength; const char* buffer; };
+static_assert(sizeof(GuestAnsiString) == 16, "ANSI_STRING x64 ABI");
+
+LONG WINAPI GuestLdrGetProcedureAddress(HMODULE module, const GuestAnsiString* name,
+    ULONG ordinal, FARPROC* output)
+{
+    const PreserveNativeLastError preserve;
+    if (!output) return NtInvalidParameter;
+    FARPROC procedure = nullptr;
+    if (!CopyConsoleBytes(output, &procedure, sizeof(procedure))) return NtAccessViolation;
+    if (!name && !ordinal) return NtInvalidParameter;
+    try
+    {
+        std::string symbol;
+        LPCSTR requested = nullptr;
+        if (name)
+        {
+            GuestAnsiString string{};
+            if (!CopyConsoleBytes(&string, name, sizeof(string))) return NtAccessViolation;
+            if (!string.length || string.length > string.maximumLength) return NtInvalidParameter;
+            symbol.resize(string.length);
+            if (!string.buffer || !CopyConsoleBytes(&symbol[0], string.buffer, string.length)) return NtAccessViolation;
+            if (symbol.find('\0') != std::string::npos) return NtInvalidParameter;
+            requested = symbol.c_str();
+        }
+        else
+        {
+            if (ordinal > 0xffffu) return NativeLoaderStatus(ERROR_PROC_NOT_FOUND, true);
+            requested = reinterpret_cast<LPCSTR>(static_cast<ULONG_PTR>(ordinal));
+        }
+        procedure = BridgeGetProcAddress(module, requested);
+        if (!procedure) return NativeLoaderStatus(BridgeGetLastError(), !name);
+        return CopyConsoleBytes(output, &procedure, sizeof(procedure)) ? 0 : NtAccessViolation;
+    }
+    catch (const std::bad_alloc&) { return NativeStatus(ERROR_NOT_ENOUGH_MEMORY); }
+}
+
 LONG WINAPI GuestNtClose(HANDLE handle)
 {
     const PreserveNativeLastError preserve;
@@ -645,7 +795,11 @@ ULONG WINAPI GuestRtlNtStatusToDosError(LONG status){
     case 0xc0000010u:return ERROR_INVALID_FUNCTION;case 0xc0000011u:return ERROR_HANDLE_EOF;
     case 0xc0000033u:return ERROR_INVALID_NAME;
     case 0xc00000bau:return ERROR_ACCESS_DENIED;case 0xc0000103u:return ERROR_DIRECTORY;
+    case 0xc00000d4u:return ERROR_NOT_SAME_DEVICE;case 0xc0000101u:return ERROR_DIR_NOT_EMPTY;
+    case 0xc0000106u:return ERROR_FILENAME_EXCED_RANGE;
     case 0xc0000135u:return ERROR_MOD_NOT_FOUND;case 0xc0000139u:return ERROR_PROC_NOT_FOUND;
+    case 0xc000007bu:return ERROR_BAD_EXE_FORMAT;case 0xc0000138u:return ERROR_INVALID_ORDINAL;
+    case 0xc0000142u:return ERROR_DLL_INIT_FAILED;
     case 0xc0000275u:return ERROR_NOT_A_REPARSE_POINT;
     case 0xc0000002u:return ERROR_INVALID_FUNCTION;case 0xc0000003u:return ERROR_INVALID_PARAMETER;
     case 0xc0000004u:return ERROR_BAD_LENGTH;case 0xc0000023u:return ERROR_INSUFFICIENT_BUFFER;case 0xc0000008u:return ERROR_INVALID_HANDLE;
@@ -729,6 +883,14 @@ LONG WINAPI GuestNtOpenFile(HANDLE* output,DWORD access,const GuestObjectAttribu
 
 constexpr ULONG GuestFileCompletionInformation = 30;
 constexpr ULONG GuestFileIoCompletionNotificationInformation = 41;
+constexpr ULONG GuestFileStandardInformation = 5;
+constexpr ULONG GuestFileRenameInformation = 10;
+constexpr ULONG GuestFileDispositionInformation = 13;
+constexpr ULONG GuestFilePositionInformation = 14;
+constexpr ULONG GuestFileEndOfFileInformation = 20;
+constexpr ULONG GuestFileDispositionInformationEx = 64;
+constexpr ULONG GuestFileRenameInformationEx = 65;
+static_assert(sizeof(FILE_STANDARD_INFO) == 24, "FILE_STANDARD_INFORMATION x64 ABI");
 struct GuestFileCompletion
 {
     HANDLE port;
@@ -913,34 +1075,88 @@ LONG SetNativeFileCompletion(HANDLE handle, GuestIoStatus* io, const void* infor
 
 LONG WINAPI GuestNtQueryInformationFile(HANDLE handle, GuestIoStatus* io, void* information, ULONG length, ULONG kind)
 {
-    if (kind != GuestFileIoCompletionNotificationInformation) return NtInvalidInfoClass;
-    if (length < sizeof(ULONG)) return NtLengthMismatch;
-    if (!ProbeNativeOutput(information, sizeof(ULONG)) || !ProbeNativeOutput(io, sizeof(*io))) return NtAccessViolation;
+    size_t required = 0;
+    switch (kind)
+    {
+    case GuestFileStandardInformation: required = sizeof(FILE_STANDARD_INFO); break;
+    case GuestFilePositionInformation: required = sizeof(LARGE_INTEGER); break;
+    case GuestFileIoCompletionNotificationInformation: required = sizeof(ULONG); break;
+    default: return NtInvalidInfoClass;
+    }
+    if (length < required) return NtLengthMismatch;
+    if (!ProbeNativeOutput(information, required) || !ProbeNativeOutput(io, sizeof(*io))) return NtAccessViolation;
     const auto storage = CurrentGuestStorageContext();
     if (!storage || !storage->OwnsFile(handle)) return NtInvalidHandle;
-    const ULONG modes = storage->IoCompletionBinding(handle).modes;
-    const GuestIoStatus result{0, sizeof(modes)};
-    if (!CopyConsoleBytes(information, &modes, sizeof(modes)) ||
-        !CopyConsoleBytes(io, &result, sizeof(result))) return NtAccessViolation;
-    return 0;
+    DWORD error = ERROR_SUCCESS;
+    if (kind == GuestFileStandardInformation)
+    {
+        FILE_STANDARD_INFO standard{};
+        if (!storage->GetFileStandardInfo(handle, &standard, &error)) return NativeStatus(error);
+        if (!CopyConsoleBytes(information, &standard, required)) return NtAccessViolation;
+    }
+    else if (kind == GuestFilePositionInformation)
+    {
+        LARGE_INTEGER position{};
+        if (!storage->SetFilePointer(handle, {}, &position, FILE_CURRENT, &error)) return NativeStatus(error);
+        if (!CopyConsoleBytes(information, &position, required)) return NtAccessViolation;
+    }
+    else
+    {
+        const ULONG modes = storage->IoCompletionBinding(handle).modes;
+        if (!CopyConsoleBytes(information, &modes, required)) return NtAccessViolation;
+    }
+    const GuestIoStatus result{0, required};
+    return CopyConsoleBytes(io, &result, sizeof(result)) ? 0 : NtAccessViolation;
 }
 
-LONG WINAPI GuestNtSetInformationFile(HANDLE handle,GuestIoStatus* io,void* buffer,ULONG length,ULONG kind){
+LONG NativeFileUpdateStatus(DWORD error)
+{
+    switch (error)
+    {
+    case ERROR_NOACCESS: return NtAccessViolation;
+    case ERROR_ALREADY_EXISTS:
+    case ERROR_FILE_EXISTS: return static_cast<LONG>(0xc0000035u);
+    case ERROR_INVALID_NAME: return static_cast<LONG>(0xc0000033u);
+    case ERROR_NOT_SAME_DEVICE: return static_cast<LONG>(0xc00000d4u);
+    case ERROR_DIR_NOT_EMPTY: return static_cast<LONG>(0xc0000101u);
+    case ERROR_FILENAME_EXCED_RANGE: return static_cast<LONG>(0xc0000106u);
+    default: return NativeStatus(error);
+    }
+}
+
+LONG WINAPI GuestNtSetInformationFile(HANDLE handle, GuestIoStatus* io, void* buffer, ULONG length, ULONG kind)
+{
     if (kind == GuestFileCompletionInformation || kind == GuestFileIoCompletionNotificationInformation)
         return SetNativeFileCompletion(handle, io, buffer, length, kind);
-    if(!io||!buffer)return NtInvalidParameter;LONG status=NtNotSupported;
-    if ((kind==14||kind==20)&&length<sizeof(LARGE_INTEGER)) { NativeIoResult(io,NtLengthMismatch); return NtLengthMismatch; }
-    if(kind==14&&length>=sizeof(LARGE_INTEGER)){
-        LARGE_INTEGER position{};if(!CopyConsoleBytes(&position,buffer,sizeof(position)))return NtInvalidParameter;
-        status=BridgeSetFilePointerEx(handle,position,nullptr,FILE_BEGIN)?0:NativeStatus(BridgeGetLastError());
+    if (!ProbeNativeOutput(io, sizeof(*io))) return NtAccessViolation;
+    DWORD error = ERROR_SUCCESS;
+    if (kind == GuestFilePositionInformation)
+    {
+        LARGE_INTEGER position{};
+        if (length < sizeof(position)) return NtLengthMismatch;
+        if (!buffer || !CopyConsoleBytes(&position, buffer, sizeof(position))) return NtAccessViolation;
+        if (position.QuadPart < 0) return NtInvalidParameter;
+        const auto storage = CurrentGuestStorageContext();
+        if (!storage) return NtInvalidHandle;
+        storage->SetFilePointer(handle, position, nullptr, FILE_BEGIN, &error);
     }
-    if(kind==20&&length>=sizeof(LARGE_INTEGER)){
-        LARGE_INTEGER size{},previous{},zero{};if(!CopyConsoleBytes(&size,buffer,sizeof(size)))return NtInvalidParameter;
-        if(size.QuadPart<0)status=NtInvalidParameter;
-        else if(!BridgeSetFilePointerEx(handle,zero,&previous,FILE_CURRENT))status=NativeStatus(BridgeGetLastError());
-        else {status=BridgeSetFilePointerEx(handle,size,nullptr,FILE_BEGIN)&&BridgeSetEndOfFile(handle)?0:NativeStatus(BridgeGetLastError());BridgeSetFilePointerEx(handle,previous,nullptr,FILE_BEGIN);}
+    else
+    {
+        FILE_INFO_BY_HANDLE_CLASS update;
+        switch (kind)
+        {
+        case GuestFileRenameInformation: update = FileRenameInfo; break;
+        case GuestFileDispositionInformation: update = FileDispositionInfo; break;
+        case GuestFileEndOfFileInformation: update = FileEndOfFileInfo; break;
+        case GuestFileDispositionInformationEx: update = FileDispositionInfoEx; break;
+        case GuestFileRenameInformationEx: update = FileRenameInfoEx; break;
+        default: return NtNotSupported;
+        }
+        error = SetGuestFileInformation(handle, update, buffer, length, true);
     }
-    NativeIoResult(io,status);return status;
+    const LONG status = NativeFileUpdateStatus(error);
+    const GuestIoStatus result{status, 0};
+    return CopyConsoleBytes(io, &result, sizeof(result)) ? status : NtAccessViolation;
 }
 LONG WINAPI GuestNtFsControlFile(HANDLE,HANDLE,void*,void*,GuestIoStatus* io,ULONG code,void*,ULONG,void*,ULONG){
     // The virtual drive has no reparse points; other FSCTLs are explicitly unsupported.
@@ -1044,6 +1260,13 @@ ImportResolution ResolveNativeGuestImport(const ImportedSymbol& symbol){
     NATIVE_EXPORT("NtOpenThreadToken",GuestNtOpenThreadToken)
     NATIVE_EXPORT("NtQueryInformationToken",GuestNtQueryInformationToken)
     NATIVE_EXPORT("RtlNtStatusToDosError",GuestRtlNtStatusToDosError)
+    NATIVE_EXPORT("LdrLoadDll",GuestLdrLoadDll)
+    NATIVE_EXPORT("LdrGetDllHandle",GuestLdrGetDllHandle)
+    NATIVE_EXPORT("LdrGetDllHandleEx",GuestLdrGetDllHandleEx)
+    NATIVE_EXPORT("LdrAddRefDll",GuestLdrAddRefDll)
+    NATIVE_EXPORT("LdrUnloadDll",GuestLdrUnloadDll)
+    NATIVE_EXPORT("LdrDisableThreadCalloutsForDll",GuestLdrDisableThreadCalloutsForDll)
+    NATIVE_EXPORT("LdrGetProcedureAddress",GuestLdrGetProcedureAddress)
     NATIVE_EXPORT("RtlCreateUnicodeStringFromAsciiz",GuestRtlCreateUnicodeStringFromAsciiz)
     NATIVE_EXPORT("RtlFreeUnicodeString",GuestRtlFreeUnicodeString)
     NATIVE_EXPORT("RtlDosPathNameToNtPathName_U",GuestRtlDosPathNameToNtPathName_U)

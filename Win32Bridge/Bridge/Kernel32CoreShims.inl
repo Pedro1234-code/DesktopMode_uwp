@@ -1127,6 +1127,19 @@ BOOL WINAPI BridgeGetFileInformationByHandleEx(
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
+    if (informationClass == FileStandardInfo)
+    {
+        if (informationSize < sizeof(FILE_STANDARD_INFO))
+        { SetGuestLastError(ERROR_BAD_LENGTH); return FALSE; }
+        const auto storage = CurrentStorageOrFail();
+        if (!storage) return FALSE;
+        FILE_STANDARD_INFO result{};
+        DWORD error = ERROR_SUCCESS;
+        if (storage->GetFileStandardInfo(file, &result, &error) &&
+            !CopyConsoleBytes(information, &result, sizeof(result))) error = ERROR_NOACCESS;
+        if (error) SetGuestLastError(error);
+        return error == ERROR_SUCCESS;
+    }
     BY_HANDLE_FILE_INFORMATION source{};
     if (!BridgeGetFileInformationByHandle(file, &source)) return FALSE;
     if (informationClass == FileBasicInfo && informationSize >= sizeof(FILE_BASIC_INFO))
@@ -1143,20 +1156,95 @@ BOOL WINAPI BridgeGetFileInformationByHandleEx(
         *static_cast<FILE_BASIC_INFO*>(information) = result;
         return TRUE;
     }
-    if (informationClass == FileStandardInfo && informationSize >= sizeof(FILE_STANDARD_INFO))
-    {
-        FILE_STANDARD_INFO result{};
-        result.EndOfFile.HighPart = source.nFileSizeHigh;
-        result.EndOfFile.LowPart = source.nFileSizeLow;
-        result.AllocationSize = result.EndOfFile;
-        result.NumberOfLinks = source.nNumberOfLinks;
-        result.DeletePending = FALSE;
-        result.Directory = (source.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
-        *static_cast<FILE_STANDARD_INFO*>(information) = result;
-        return TRUE;
-    }
     SetGuestLastError(ERROR_NOT_SUPPORTED);
     return FALSE;
+}
+
+DWORD SetGuestFileInformation(HANDLE file, FILE_INFO_BY_HANDLE_CLASS kind,
+    const void* information, DWORD length, bool nativeName)
+{
+    const auto storage = CurrentGuestStorageContext();
+    if (!storage) return ERROR_INVALID_HANDLE;
+    DWORD error = ERROR_SUCCESS;
+    switch (kind)
+    {
+    case FileEndOfFileInfo:
+    {
+        LARGE_INTEGER size{};
+        if (length < sizeof(size)) return ERROR_BAD_LENGTH;
+        if (!information || !CopyConsoleBytes(&size, information, sizeof(size))) return ERROR_NOACCESS;
+        storage->SetFileSize(file, size, &error);
+        return error;
+    }
+    case FileDispositionInfo:
+    case FileDispositionInfoEx:
+    {
+        bool remove = false;
+        if (kind == FileDispositionInfoEx)
+        {
+            DWORD flags = 0;
+            if (length < sizeof(flags)) return ERROR_BAD_LENGTH;
+            if (!information || !CopyConsoleBytes(&flags, information, sizeof(flags))) return ERROR_NOACCESS;
+            if ((flags & ~1u) != 0) return ERROR_NOT_SUPPORTED;
+            remove = (flags & 1u) != 0;
+        }
+        else
+        {
+            BOOLEAN mark = FALSE;
+            if (length < sizeof(mark)) return ERROR_BAD_LENGTH;
+            if (!information || !CopyConsoleBytes(&mark, information, sizeof(mark))) return ERROR_NOACCESS;
+            remove = mark != FALSE;
+        }
+        storage->SetFileDisposition(file, remove, &error);
+        return error;
+    }
+    case FileRenameInfo:
+    case FileRenameInfoEx:
+    {
+        struct RenameInformation
+        {
+            DWORD flags;
+            HANDLE root;
+            DWORD nameBytes;
+            wchar_t name[1];
+        };
+        constexpr size_t HeaderSize = offsetof(RenameInformation, name);
+        static_assert(HeaderSize == 20, "x64 file rename information ABI");
+        if (length < HeaderSize + sizeof(wchar_t)) return ERROR_BAD_LENGTH;
+        RenameInformation rename{};
+        if (!information || !CopyConsoleBytes(&rename, information, HeaderSize)) return ERROR_NOACCESS;
+        if (!rename.nameBytes || (rename.nameBytes % sizeof(wchar_t)) != 0) return ERROR_INVALID_PARAMETER;
+        if (rename.nameBytes > length - HeaderSize) return ERROR_BAD_LENGTH;
+        if (rename.nameBytes / sizeof(wchar_t) > 32767) return ERROR_FILENAME_EXCED_RANGE;
+        const bool extended = kind == FileRenameInfoEx;
+        if (extended && (rename.flags & ~1u) != 0) return ERROR_NOT_SUPPORTED;
+        const bool replace = extended ? (rename.flags & 1u) != 0 : (rename.flags & 0xffu) != 0;
+        try
+        {
+            std::wstring name(rename.nameBytes / sizeof(wchar_t), L'\0');
+            if (!CopyConsoleBytes(&name[0], static_cast<const BYTE*>(information) + HeaderSize, rename.nameBytes))
+                return ERROR_NOACCESS;
+            if (name.back() == L'\0') name.pop_back();
+            if (name.empty() || name.find(L'\0') != std::wstring::npos) return ERROR_INVALID_NAME;
+            storage->RenameFile(file, rename.root, name.c_str(), replace, nativeName, &error);
+            return error;
+        }
+        catch (const std::bad_alloc&) { return ERROR_NOT_ENOUGH_MEMORY; }
+    }
+    case FileBasicInfo:
+    case FileAllocationInfo:
+    case FileIoPriorityHintInfo:
+        return ERROR_NOT_SUPPORTED;
+    default: return ERROR_INVALID_PARAMETER;
+    }
+}
+
+BOOL WINAPI BridgeSetFileInformationByHandle(
+    HANDLE file, FILE_INFO_BY_HANDLE_CLASS kind, LPVOID information, DWORD length)
+{
+    const DWORD error = SetGuestFileInformation(file, kind, information, length, false);
+    if (error) SetGuestLastError(error);
+    return error == ERROR_SUCCESS;
 }
 
 DWORD WINAPI BridgeGetLongPathNameW(
@@ -1167,15 +1255,52 @@ DWORD WINAPI BridgeGetLongPathNameW(
 
 BOOL WINAPI BridgeReplaceFileW(
     LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup,
-    DWORD, LPVOID, LPVOID)
+    DWORD flags, LPVOID exclude, LPVOID reserved)
+{
+    constexpr DWORD KnownFlags = REPLACEFILE_WRITE_THROUGH |
+        REPLACEFILE_IGNORE_MERGE_ERRORS | REPLACEFILE_IGNORE_ACL_ERRORS;
+    if (!replaced || !replacement || exclude || reserved || (flags & ~KnownFlags))
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return FALSE;
+    }
+    const auto storage = CurrentStorageOrFail();
+    if (!storage) return FALSE;
+    DWORD error = ERROR_SUCCESS;
+    const BOOL replacedFile = storage->ReplaceGuestFile(replaced, replacement, backup, &error);
+    SetGuestLastError(error);
+    return replacedFile;
+}
+
+BOOL WINAPI BridgeReplaceFileA(
+    LPCSTR replaced, LPCSTR replacement, LPCSTR backup,
+    DWORD flags, LPVOID exclude, LPVOID reserved)
 {
     if (!replaced || !replacement)
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    if (backup && *backup && !BridgeCopyFileW(replaced, backup, FALSE)) return FALSE;
-    return BridgeMoveFileExW(replacement, replaced, MOVEFILE_REPLACE_EXISTING);
+    try
+    {
+        const auto widen = [](LPCSTR input, std::wstring& output)
+        {
+            const int count = BridgeMultiByteToWideChar(CP_ACP, 0, input, -1, nullptr, 0);
+            if (count <= 0) return false;
+            output.resize(count);
+            return BridgeMultiByteToWideChar(CP_ACP, 0, input, -1, &output[0], count) == count;
+        };
+        std::wstring target, incoming, saved;
+        if (!widen(replaced, target) || !widen(replacement, incoming) || (backup && !widen(backup, saved)))
+            return FALSE;
+        return BridgeReplaceFileW(target.c_str(), incoming.c_str(), backup ? saved.c_str() : nullptr,
+            flags, exclude, reserved);
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+        return FALSE;
+    }
 }
 
 BOOL WINAPI BridgeQueryFullProcessImageNameW(
@@ -1211,6 +1336,8 @@ BOOL WINAPI BridgeGetModuleHandleExW(
     constexpr DWORD FromAddress = 0x00000004;
     constexpr DWORD UnchangedRefcount = 0x00000002;
     constexpr DWORD Pin = 0x00000001;
+    const bool addReference = (flags & UnchangedRefcount) == 0;
+    const bool pin = (flags & Pin) != 0;
     if (!module || (flags & ~(FromAddress | UnchangedRefcount | Pin)) != 0 ||
         ((flags & Pin) != 0 && (flags & UnchangedRefcount) != 0))
     {
@@ -1236,7 +1363,7 @@ BOOL WINAPI BridgeGetModuleHandleExW(
         {
             GuestModuleLoader* loader = CurrentGuestModuleLoader();
             DWORD error = ERROR_SUCCESS;
-            if (!loader || !loader->GetModuleHandleFromAddress(address, module, &error))
+            if (!loader || !loader->GetModuleHandleFromAddress(address, module, &error, addReference, pin))
             {
                 *module = nullptr;
                 SetGuestLastError(error == ERROR_SUCCESS ? ERROR_MOD_NOT_FOUND : error);
@@ -1246,21 +1373,8 @@ BOOL WINAPI BridgeGetModuleHandleExW(
     }
     else
     {
-        *module = BridgeGetModuleHandleW(moduleName);
+        *module = LookupGuestModuleByName(moduleName, addReference, pin);
         if (!*module) return FALSE;
-    }
-
-    if ((flags & UnchangedRefcount) == 0 && !IsGuestMainModule(*module) &&
-        !FindBridgeSystemModule(*module))
-    {
-        GuestModuleLoader* loader = CurrentGuestModuleLoader();
-        DWORD error = ERROR_SUCCESS;
-        if (!loader || !loader->AddReference(*module, (flags & Pin) != 0, &error))
-        {
-            *module = nullptr;
-            SetGuestLastError(error == ERROR_SUCCESS ? ERROR_MOD_NOT_FOUND : error);
-            return FALSE;
-        }
     }
     SetGuestLastError(ERROR_SUCCESS);
     return TRUE;

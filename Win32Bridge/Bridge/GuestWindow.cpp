@@ -2046,6 +2046,7 @@ struct GuestPresentationState final
     Platform::Agile<SwapChainPanel^> swapChainPanel;
     HWND swapChainWindow = nullptr;
     std::uint64_t swapChainGeneration = 0;
+    std::atomic<bool> swapChainRevealRequested{false};
     Platform::Agile<WriteableBitmap^> bitmap;
     std::shared_ptr<std::vector<MiniGdi::Color>> pixels;
     int width = 0;
@@ -2063,12 +2064,28 @@ struct GuestPresentationState final
 
 namespace
 {
+    void QueuePresentation(const std::shared_ptr<GuestPresentationState>& presentation, std::uint64_t ticket);
+
+    void QueueLatestSoftwareFrame(const std::shared_ptr<GuestPresentationState>& presentation)
+    {
+        std::uint64_t ticket;
+        {
+            std::lock_guard<std::mutex> guard(presentation->lock);
+            if (!presentation->active || !presentation->pixels || presentation->presentQueued) return;
+            presentation->presentQueued = true;
+            ticket = ++presentation->nextTicket;
+            presentation->queuedTicket = ticket;
+        }
+        QueuePresentation(presentation, ticket);
+    }
+
     HRESULT UpdateSwapChainPanel(const std::shared_ptr<GuestPresentationState>& presentation,
         std::uint64_t generation, IDXGISwapChain* chain)
     {
         {
             std::lock_guard<std::mutex> guard(presentation->lock);
-            if (generation != presentation->swapChainGeneration) return DXGI_ERROR_INVALID_CALL;
+            if (generation != presentation->swapChainGeneration || (chain && !presentation->active))
+                return DXGI_ERROR_INVALID_CALL;
         }
         auto panel = presentation->swapChainPanel.Get();
         if (!panel)
@@ -2079,20 +2096,70 @@ namespace
             panel = ref new SwapChainPanel();
             panel->Visibility = Visibility::Collapsed;
             panel->IsHitTestVisible = false;
-            host->Children->Append(panel);
+            // Lay out the GPU surface under the software image while the guest prepares its first frame.
+            host->Children->InsertAt(0, panel);
             presentation->swapChainPanel = Platform::Agile<SwapChainPanel^>(panel);
         }
         ComPtr<ISwapChainPanelNative> nativePanel;
         auto result = reinterpret_cast<IInspectable*>(panel)->QueryInterface(IID_PPV_ARGS(&nativePanel));
-        if (FAILED(result)) return result;
-        result = nativePanel->SetSwapChain(chain);
-        if (SUCCEEDED(result))
+        if (SUCCEEDED(result)) result = nativePanel->SetSwapChain(chain);
+        if (!chain || SUCCEEDED(result))
         {
-            auto image = presentation->image.Get();
-            if (image) image->Visibility = chain ? Visibility::Collapsed : Visibility::Visible;
+            if (auto image = presentation->image.Get()) image->Opacity = 1.0;
             panel->Visibility = chain ? Visibility::Visible : Visibility::Collapsed;
+            QueueLatestSoftwareFrame(presentation);
         }
         return result;
+    }
+
+    void RequestSwapChainReveal(const std::shared_ptr<GuestPresentationState>& presentation,
+        std::uint64_t generation)
+    {
+        if (presentation->swapChainRevealRequested.load(std::memory_order_relaxed)) return;
+        {
+            std::lock_guard<std::mutex> guard(presentation->lock);
+            if (!presentation->active || presentation->swapChainGeneration != generation ||
+                presentation->swapChainRevealRequested) return;
+            presentation->swapChainRevealRequested = true;
+        }
+        const auto reveal = [presentation, generation]()
+        {
+            HWND window;
+            {
+                std::lock_guard<std::mutex> guard(presentation->lock);
+                if (!presentation->active || presentation->swapChainGeneration != generation) return;
+                window = presentation->swapChainWindow;
+            }
+            try
+            {
+                // Keep the Image in layout because guest input uses its transform.
+                if (auto image = presentation->image.Get()) image->Opacity = 0.0;
+            }
+            catch (...)
+            {
+                std::lock_guard<std::mutex> guard(presentation->lock);
+                if (presentation->swapChainGeneration == generation) presentation->swapChainRevealRequested = false;
+                return;
+            }
+            try
+            {
+                RuntimeDiagnostics::Record(L"DXGI: first GPU frame submitted for guest window " +
+                    std::to_wstring(reinterpret_cast<ULONG_PTR>(window)) + L".");
+            }
+            catch (...) {}
+        };
+        try
+        {
+            if (auto dispatcher = presentation->dispatcher.Get())
+            {
+                if (dispatcher->HasThreadAccess) reveal();
+                else dispatcher->RunAsync(CoreDispatcherPriority::Normal, ref new DispatchedHandler(reveal));
+                return;
+            }
+        }
+        catch (...) {}
+        std::lock_guard<std::mutex> guard(presentation->lock);
+        if (presentation->swapChainGeneration == generation) presentation->swapChainRevealRequested = false;
     }
 
     void DetachSwapChainPanel(const std::shared_ptr<GuestPresentationState>& presentation,
@@ -2272,10 +2339,6 @@ namespace
         }
     }
 
-    void QueuePresentation(
-        const std::shared_ptr<GuestPresentationState>& presentation,
-        std::uint64_t ticket);
-
     void ProcessPresentation(
         const std::shared_ptr<GuestPresentationState>& presentation,
         std::uint64_t ticket)
@@ -2327,11 +2390,11 @@ namespace
                 }
                 if (currentFrame)
                 {
-                    auto panel = presentation->swapChainPanel.Get();
-                    swapChainVisible = panel && panel->Visibility == Visibility::Visible;
+                    auto surfaceImage = presentation->image.Get();
+                    swapChainVisible = surfaceImage && surfaceImage->Opacity == 0.0;
                     if (!swapChainVisible)
                     {
-                        image = presentation->image.Get();
+                        image = surfaceImage;
                         bitmap = presentation->bitmap.Get();
                     }
                 }
@@ -2970,8 +3033,8 @@ GuestWindowManager::GuestWindowManager(CoreWindow^ coreWindow, Panel^ surfaceHos
             if (callbacks->owner && args)
             {
                 callbacks->owner->HandleHostSizeChanged(
-                    (std::max)(1, static_cast<int>(std::lround(args->NewSize.Width))),
-                    (std::max)(1, static_cast<int>(std::lround(args->NewSize.Height))));
+                    static_cast<int>(std::lround(args->NewSize.Width)),
+                    static_cast<int>(std::lround(args->NewSize.Height)));
             }
         }
         catch (...)
@@ -3039,7 +3102,22 @@ void GuestWindowManager::Activate()
 void GuestWindowManager::Deactivate()
 {
     m_active.store(false);
-    DetachSwapChainPanel(m_presentation);
+    const auto presentation = m_presentation;
+    std::uint64_t presentationEpoch = 0;
+    if (presentation)
+    {
+        {
+            std::lock_guard<std::mutex> guard(presentation->lock);
+            presentation->active = false;
+            presentationEpoch = ++presentation->epoch;
+            presentation->pixels.reset();
+            presentation->width = 0;
+            presentation->height = 0;
+            presentation->presentQueued = false;
+            presentation->queuedTicket = ++presentation->nextTicket;
+        }
+        DetachSwapChainPanel(presentation);
+    }
     MouseInput().ResetKeyState();
     {
         std::lock_guard<std::mutex> guard(m_popupMenuLock);
@@ -3124,20 +3202,8 @@ void GuestWindowManager::Deactivate()
         m_nextAtom = 0xC000;
     }
 
-    const auto presentation = m_presentation;
     if (presentation)
     {
-        std::uint64_t presentationEpoch = 0;
-        {
-            std::lock_guard<std::mutex> guard(presentation->lock);
-            presentation->active = false;
-            presentationEpoch = ++presentation->epoch;
-            presentation->pixels.reset();
-            presentation->width = 0;
-            presentation->height = 0;
-            presentation->presentQueued = false;
-            presentation->queuedTicket = ++presentation->nextTicket;
-        }
         ClearPresentation(presentation, presentationEpoch);
     }
 }
@@ -4599,6 +4665,7 @@ HRESULT GuestWindowManager::BindGuestSwapChain(HWND window, IDXGISwapChain* chai
         if (!presentation->active || presentation->swapChainWindow) return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
         presentation->swapChainWindow = window;
         generation = ++presentation->swapChainGeneration;
+        presentation->swapChainRevealRequested = false;
     }
 
     HRESULT result = E_FAIL;
@@ -4616,6 +4683,7 @@ HRESULT GuestWindowManager::BindGuestSwapChain(HWND window, IDXGISwapChain* chai
             *height = static_cast<UINT>((std::max)(1L, target->clientArea.bottom - target->clientArea.top));
             return S_OK;
         };
+        candidate.framePresented = [presentation, generation]() { RequestSwapChainReveal(presentation, generation); };
         candidate.detach = [presentation, window, generation]() { DetachSwapChainPanel(presentation, window, generation); };
 
         if (const auto dispatcher = presentation->dispatcher.Get())
@@ -4637,8 +4705,13 @@ HRESULT GuestWindowManager::BindGuestSwapChain(HWND window, IDXGISwapChain* chai
         }
         if (SUCCEEDED(result))
         {
-            *binding = std::move(candidate);
-            return result;
+            std::lock_guard<std::mutex> guard(presentation->lock);
+            if (presentation->active && presentation->swapChainGeneration == generation)
+            {
+                *binding = std::move(candidate);
+                return result;
+            }
+            result = DXGI_ERROR_INVALID_CALL;
         }
     }
     catch (Platform::Exception^ error) { result = error->HResult; }

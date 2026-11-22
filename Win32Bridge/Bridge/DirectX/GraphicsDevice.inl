@@ -150,7 +150,7 @@
     class GuestDxgiDevice final : public IDXGIDevice4
     {
     public:
-        GuestDxgiDevice(IUnknown* owner, ComPtr<IDXGIDevice> native, ComPtr<IDXGIAdapter> adapter)
+        GuestDxgiDevice(ID3D11Device* owner, ComPtr<IDXGIDevice> native, ComPtr<IDXGIAdapter> adapter)
             : m_owner(owner), m_native(std::move(native)), m_adapter(std::move(adapter)) {}
 
         HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override
@@ -175,7 +175,30 @@
 
         HRESULT STDMETHODCALLTYPE CreateSurface(const DXGI_SURFACE_DESC* pDesc, UINT NumSurfaces, DXGI_USAGE Usage,
             const DXGI_SHARED_RESOURCE* pSharedResource, IDXGISurface** ppSurface) override
-        { return m_native->CreateSurface(pDesc, NumSurfaces, Usage, pSharedResource, ppSurface); }
+        {
+            const HRESULT result = m_native->CreateSurface(pDesc, NumSurfaces, Usage, pSharedResource, ppSurface);
+            if (FAILED(result) || !ppSurface) return result;
+            for (UINT i = 0; i < NumSurfaces; ++i)
+            {
+                ComPtr<ID3D11Texture2D> texture;
+                if (!ppSurface[i] || FAILED(ppSurface[i]->QueryInterface(IID_PPV_ARGS(&texture)))) continue;
+                ComPtr<IDXGISurface> surface;
+                const HRESULT wrapped = WrapD3D11Texture(std::move(texture), m_owner, IID_PPV_ARGS(&surface));
+                if (FAILED(wrapped))
+                {
+                    // The entire output array belongs to this call, including entries already wrapped.
+                    for (UINT j = 0; j < NumSurfaces; ++j)
+                    {
+                        if (ppSurface[j]) ppSurface[j]->Release();
+                        ppSurface[j] = nullptr;
+                    }
+                    return wrapped;
+                }
+                ppSurface[i]->Release();
+                ppSurface[i] = surface.Detach();
+            }
+            return result;
+        }
 
         HRESULT STDMETHODCALLTYPE QueryResourceResidency(IUnknown*const* ppResources, DXGI_RESIDENCY* pResidencyStatus,
             UINT NumResources) override
@@ -259,7 +282,7 @@
         }
 
     private:
-        IUnknown* m_owner;
+        ID3D11Device* m_owner;
         ComPtr<IDXGIDevice> m_native;
         ComPtr<IDXGIAdapter> m_adapter;
     };
@@ -341,11 +364,90 @@
         return FAILED(wrapped) ? wrapped : status;
     }
 
+    class GuestD3D11On12Device final : public ID3D11On12Device2
+    {
+    public:
+        GuestD3D11On12Device(ID3D11Device* owner, ID3D11Device* native, IUnknown* device12)
+            : m_owner(owner), m_device12(device12)
+        {
+            native->QueryInterface(IID_PPV_ARGS(&m_native));
+            if (m_native)
+            {
+                m_native.As(&m_native1);
+                m_native.As(&m_native2);
+            }
+        }
+
+        bool Supports(REFIID iid) const
+        {
+            return (iid == __uuidof(ID3D11On12Device) && m_native) ||
+                (iid == __uuidof(ID3D11On12Device1) && m_native1) ||
+                (iid == __uuidof(ID3D11On12Device2) && m_native2);
+        }
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** output) override
+        { return m_owner->QueryInterface(iid, output); }
+        ULONG STDMETHODCALLTYPE AddRef() override { return m_owner->AddRef(); }
+        ULONG STDMETHODCALLTYPE Release() override { return m_owner->Release(); }
+
+        HRESULT STDMETHODCALLTYPE CreateWrappedResource(IUnknown* resource12, const D3D11_RESOURCE_FLAGS* flags,
+            D3D12_RESOURCE_STATES inState, D3D12_RESOURCE_STATES outState, REFIID iid, void** output) override
+        {
+            const auto resource = NativeGraphicsObject(resource12);
+            return OpenD3D11Resource(m_owner, iid, output, [&](void** native)
+            { return m_native->CreateWrappedResource(resource.Get(), flags, inState, outState, iid, native); });
+        }
+
+        void STDMETHODCALLTYPE ReleaseWrappedResources(ID3D11Resource* const* resources, UINT count) override
+        {
+            WithNativeGraphicsObjects(count, resources, [&](ID3D11Resource* const* native)
+            { m_native->ReleaseWrappedResources(native, count); return S_OK; });
+        }
+
+        void STDMETHODCALLTYPE AcquireWrappedResources(ID3D11Resource* const* resources, UINT count) override
+        {
+            WithNativeGraphicsObjects(count, resources, [&](ID3D11Resource* const* native)
+            { m_native->AcquireWrappedResources(native, count); return S_OK; });
+        }
+
+        HRESULT STDMETHODCALLTYPE GetD3D12Device(REFIID iid, void** output) override
+        { return m_device12 ? m_device12->QueryInterface(iid, output) : m_native1->GetD3D12Device(iid, output); }
+
+        HRESULT STDMETHODCALLTYPE UnwrapUnderlyingResource(ID3D11Resource* resource11, ID3D12CommandQueue* queue,
+            REFIID iid, void** output) override
+        {
+            ComPtr<ID3D12CommandQueue> nativeQueue;
+            if (queue)
+            {
+                const HRESULT status = NativeGraphicsObject(queue).As(&nativeQueue);
+                if (FAILED(status)) return status;
+            }
+            return m_native2->UnwrapUnderlyingResource(NativeD3D11Child(resource11), nativeQueue.Get(), iid, output);
+        }
+
+        HRESULT STDMETHODCALLTYPE ReturnUnderlyingResource(ID3D11Resource* resource11, UINT count,
+            UINT64* signalValues, ID3D12Fence** fences) override
+        {
+            return WithNativeGraphicsObjects(count, fences, [&](ID3D12Fence* const* native)
+            { return m_native2->ReturnUnderlyingResource(NativeD3D11Child(resource11), count, signalValues,
+                const_cast<ID3D12Fence**>(native)); });
+        }
+
+    private:
+        ID3D11Device* m_owner;
+        ComPtr<IUnknown> m_device12;
+        ComPtr<ID3D11On12Device> m_native;
+        ComPtr<ID3D11On12Device1> m_native1;
+        ComPtr<ID3D11On12Device2> m_native2;
+    };
+
     class GuestD3D11Device final : public ID3D11Device5, public GuestGraphicsObject
     {
     public:
-        GuestD3D11Device(ComPtr<ID3D11Device> native, ComPtr<IDXGIDevice> dxgi, ComPtr<IDXGIAdapter> adapter)
-            : m_native(std::move(native)), m_dxgi(static_cast<ID3D11Device5*>(this), std::move(dxgi), std::move(adapter)) {}
+        GuestD3D11Device(ComPtr<ID3D11Device> native, ComPtr<IDXGIDevice> dxgi, ComPtr<IDXGIAdapter> adapter,
+            IUnknown* device12)
+            : m_native(std::move(native)), m_dxgi(static_cast<ID3D11Device5*>(this), std::move(dxgi), std::move(adapter)),
+              m_video(this, m_native.Get()), m_on12(this, m_native.Get(), device12) {}
 
         HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void** result) override
         {
@@ -363,6 +465,18 @@
             const bool dxgi = iid == __uuidof(IDXGIObject) || iid == __uuidof(IDXGIDevice) ||
                 iid == __uuidof(IDXGIDevice1) || iid == __uuidof(IDXGIDevice2) || iid == __uuidof(IDXGIDevice3) ||
                 iid == __uuidof(IDXGIDevice4);
+            if (m_video.Supports(iid))
+            {
+                *result = static_cast<ID3D11VideoDevice2*>(&m_video);
+                AddRef();
+                return S_OK;
+            }
+            if (m_on12.Supports(iid))
+            {
+                *result = static_cast<ID3D11On12Device2*>(&m_on12);
+                AddRef();
+                return S_OK;
+            }
             if (!d3d && !dxgi) return m_native->QueryInterface(iid, result);
 
             ComPtr<IUnknown> supported;
@@ -386,42 +500,39 @@
 
         HRESULT STDMETHODCALLTYPE CreateBuffer(const D3D11_BUFFER_DESC* pDesc,
             const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Buffer** ppBuffer) override
-        { return m_native->CreateBuffer(pDesc, pInitialData, ppBuffer); }
+        { return CreateD3D11Child(this, ppBuffer, [&](auto output) { return m_native->CreateBuffer(pDesc, pInitialData, output); }); }
 
         HRESULT STDMETHODCALLTYPE CreateTexture1D(const D3D11_TEXTURE1D_DESC* pDesc,
             const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture1D** ppTexture1D) override
-        { return m_native->CreateTexture1D(pDesc, pInitialData, ppTexture1D); }
+        { return CreateD3D11Child(this, ppTexture1D, [&](auto output) { return m_native->CreateTexture1D(pDesc, pInitialData, output); }); }
 
         HRESULT STDMETHODCALLTYPE CreateTexture2D(const D3D11_TEXTURE2D_DESC* pDesc,
             const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture2D** ppTexture2D) override
-        {
-            if (!pDesc || !(pDesc->MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) || !ppTexture2D)
-                return m_native->CreateTexture2D(pDesc, pInitialData, ppTexture2D);
-            *ppTexture2D = nullptr;
-            ComPtr<ID3D11Texture2D> texture;
-            const HRESULT status = m_native->CreateTexture2D(pDesc, pInitialData, &texture);
-            return FAILED(status) ? status : WrapD3D11Texture(std::move(texture), this, IID_PPV_ARGS(ppTexture2D));
-        }
+        { return CreateD3D11Child(this, ppTexture2D, [&](auto output) { return m_native->CreateTexture2D(pDesc, pInitialData, output); }); }
 
         HRESULT STDMETHODCALLTYPE CreateTexture3D(const D3D11_TEXTURE3D_DESC* pDesc,
             const D3D11_SUBRESOURCE_DATA* pInitialData, ID3D11Texture3D** ppTexture3D) override
-        { return m_native->CreateTexture3D(pDesc, pInitialData, ppTexture3D); }
+        { return CreateD3D11Child(this, ppTexture3D, [&](auto output) { return m_native->CreateTexture3D(pDesc, pInitialData, output); }); }
 
         HRESULT STDMETHODCALLTYPE CreateShaderResourceView(ID3D11Resource* pResource,
             const D3D11_SHADER_RESOURCE_VIEW_DESC* pDesc, ID3D11ShaderResourceView** ppSRView) override
-        { return m_native->CreateShaderResourceView(NativeD3D11Resource(pResource), pDesc, ppSRView); }
+        { return CreateD3D11Child(this, ppSRView, [&](auto output)
+            { return m_native->CreateShaderResourceView(NativeD3D11Child(pResource), pDesc, output); }); }
 
         HRESULT STDMETHODCALLTYPE CreateUnorderedAccessView(ID3D11Resource* pResource,
             const D3D11_UNORDERED_ACCESS_VIEW_DESC* pDesc, ID3D11UnorderedAccessView** ppUAView) override
-        { return m_native->CreateUnorderedAccessView(NativeD3D11Resource(pResource), pDesc, ppUAView); }
+        { return CreateD3D11Child(this, ppUAView, [&](auto output)
+            { return m_native->CreateUnorderedAccessView(NativeD3D11Child(pResource), pDesc, output); }); }
 
         HRESULT STDMETHODCALLTYPE CreateRenderTargetView(ID3D11Resource* pResource,
             const D3D11_RENDER_TARGET_VIEW_DESC* pDesc, ID3D11RenderTargetView** ppRTView) override
-        { return m_native->CreateRenderTargetView(NativeD3D11Resource(pResource), pDesc, ppRTView); }
+        { return CreateD3D11Child(this, ppRTView, [&](auto output)
+            { return m_native->CreateRenderTargetView(NativeD3D11Child(pResource), pDesc, output); }); }
 
         HRESULT STDMETHODCALLTYPE CreateDepthStencilView(ID3D11Resource* pResource,
             const D3D11_DEPTH_STENCIL_VIEW_DESC* pDesc, ID3D11DepthStencilView** ppDepthStencilView) override
-        { return m_native->CreateDepthStencilView(NativeD3D11Resource(pResource), pDesc, ppDepthStencilView); }
+        { return CreateD3D11Child(this, ppDepthStencilView, [&](auto output)
+            { return m_native->CreateDepthStencilView(NativeD3D11Child(pResource), pDesc, output); }); }
 
         HRESULT STDMETHODCALLTYPE CreateInputLayout(const D3D11_INPUT_ELEMENT_DESC* pInputElementDescs, UINT NumElements,
             const void* pShaderBytecodeWithInputSignature, SIZE_T BytecodeLength, ID3D11InputLayout** ppInputLayout) override
@@ -495,7 +606,8 @@
         }
 
         HRESULT STDMETHODCALLTYPE OpenSharedResource(HANDLE hResource, REFIID ReturnedInterface, void** ppResource) override
-        { return m_native->OpenSharedResource(hResource, ReturnedInterface, ppResource); }
+        { return OpenD3D11Resource(this, ReturnedInterface, ppResource, [&](void** output)
+            { return m_native->OpenSharedResource(hResource, ReturnedInterface, output); }); }
 
         HRESULT STDMETHODCALLTYPE CheckFormatSupport(DXGI_FORMAT Format, UINT* pFormatSupport) override
         { return m_native->CheckFormatSupport(Format, pFormatSupport); }
@@ -605,18 +717,8 @@
             ComPtr<ID3D11Device1> native;
             const HRESULT status = m_native.As(&native);
             if (FAILED(status)) return status;
-            if (!handle || !ppResource)
-                return native->OpenSharedResource1(handle ? handle.get() : hResource, returnedInterface, ppResource);
-            *ppResource = nullptr;
-            ComPtr<IUnknown> result;
-            const HRESULT opened = native->OpenSharedResource1(handle.get(), returnedInterface,
-                reinterpret_cast<void**>(result.GetAddressOf()));
-            if (FAILED(opened) || !result) return opened;
-            ComPtr<ID3D11Texture2D> texture;
-            if (SUCCEEDED(result.As(&texture)))
-                return WrapD3D11Texture(std::move(texture), this, returnedInterface, ppResource);
-            *ppResource = result.Detach();
-            return opened;
+            return OpenD3D11Resource(this, returnedInterface, ppResource, [&](void** output)
+            { return native->OpenSharedResource1(handle ? handle.get() : hResource, returnedInterface, output); });
         }
 
         HRESULT STDMETHODCALLTYPE OpenSharedResourceByName(LPCWSTR lpName, DWORD dwDesiredAccess,
@@ -624,7 +726,8 @@
         {
             ComPtr<ID3D11Device1> native;
             const HRESULT status = m_native.As(&native);
-            return FAILED(status) ? status : native->OpenSharedResourceByName(lpName, dwDesiredAccess, returnedInterface, ppResource);
+            return FAILED(status) ? status : OpenD3D11Resource(this, returnedInterface, ppResource, [&](void** output)
+            { return native->OpenSharedResourceByName(lpName, dwDesiredAccess, returnedInterface, output); });
         }
 
         void STDMETHODCALLTYPE GetImmediateContext2(ID3D11DeviceContext2** ppImmediateContext) override
@@ -657,7 +760,7 @@
             D3D11_SUBRESOURCE_TILING* pSubresourceTilingsForNonPackedMips) override
         {
             ComPtr<ID3D11Device2> native;
-            if (SUCCEEDED(m_native.As(&native))) native->GetResourceTiling(NativeD3D11Resource(pTiledResource), pNumTilesForEntireResource, pPackedMipDesc, pStandardTileShapeForNonPackedMips, pNumSubresourceTilings, FirstSubresourceTilingToGet, pSubresourceTilingsForNonPackedMips);
+            if (SUCCEEDED(m_native.As(&native))) native->GetResourceTiling(NativeD3D11Child(pTiledResource), pNumTilesForEntireResource, pPackedMipDesc, pStandardTileShapeForNonPackedMips, pNumSubresourceTilings, FirstSubresourceTilingToGet, pSubresourceTilingsForNonPackedMips);
         }
 
         HRESULT STDMETHODCALLTYPE CheckMultisampleQualityLevels1(DXGI_FORMAT Format, UINT SampleCount, UINT Flags,
@@ -673,13 +776,8 @@
         {
             ComPtr<ID3D11Device3> native;
             const HRESULT status = m_native.As(&native);
-            if (FAILED(status)) return status;
-            if (!pDesc1 || !(pDesc1->MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) || !ppTexture2D)
-                return native->CreateTexture2D1(pDesc1, pInitialData, ppTexture2D);
-            *ppTexture2D = nullptr;
-            ComPtr<ID3D11Texture2D1> texture;
-            const HRESULT created = native->CreateTexture2D1(pDesc1, pInitialData, &texture);
-            return FAILED(created) ? created : WrapD3D11Texture(std::move(texture), this, IID_PPV_ARGS(ppTexture2D));
+            return FAILED(status) ? status : CreateD3D11Child(this, ppTexture2D, [&](auto output)
+            { return native->CreateTexture2D1(pDesc1, pInitialData, output); });
         }
 
         HRESULT STDMETHODCALLTYPE CreateTexture3D1(const D3D11_TEXTURE3D_DESC1* pDesc1,
@@ -687,7 +785,8 @@
         {
             ComPtr<ID3D11Device3> native;
             const HRESULT status = m_native.As(&native);
-            return FAILED(status) ? status : native->CreateTexture3D1(pDesc1, pInitialData, ppTexture3D);
+            return FAILED(status) ? status : CreateD3D11Child(this, ppTexture3D, [&](auto output)
+            { return native->CreateTexture3D1(pDesc1, pInitialData, output); });
         }
 
         HRESULT STDMETHODCALLTYPE CreateRasterizerState2(const D3D11_RASTERIZER_DESC2* pRasterizerDesc,
@@ -703,7 +802,8 @@
         {
             ComPtr<ID3D11Device3> native;
             const HRESULT status = m_native.As(&native);
-            return FAILED(status) ? status : native->CreateShaderResourceView1(NativeD3D11Resource(pResource), pDesc1, ppSRView1);
+            return FAILED(status) ? status : CreateD3D11Child(this, ppSRView1, [&](auto output)
+            { return native->CreateShaderResourceView1(NativeD3D11Child(pResource), pDesc1, output); });
         }
 
         HRESULT STDMETHODCALLTYPE CreateUnorderedAccessView1(ID3D11Resource* pResource,
@@ -711,7 +811,8 @@
         {
             ComPtr<ID3D11Device3> native;
             const HRESULT status = m_native.As(&native);
-            return FAILED(status) ? status : native->CreateUnorderedAccessView1(NativeD3D11Resource(pResource), pDesc1, ppUAView1);
+            return FAILED(status) ? status : CreateD3D11Child(this, ppUAView1, [&](auto output)
+            { return native->CreateUnorderedAccessView1(NativeD3D11Child(pResource), pDesc1, output); });
         }
 
         HRESULT STDMETHODCALLTYPE CreateRenderTargetView1(ID3D11Resource* pResource,
@@ -719,7 +820,8 @@
         {
             ComPtr<ID3D11Device3> native;
             const HRESULT status = m_native.As(&native);
-            return FAILED(status) ? status : native->CreateRenderTargetView1(NativeD3D11Resource(pResource), pDesc1, ppRTView1);
+            return FAILED(status) ? status : CreateD3D11Child(this, ppRTView1, [&](auto output)
+            { return native->CreateRenderTargetView1(NativeD3D11Child(pResource), pDesc1, output); });
         }
 
         HRESULT STDMETHODCALLTYPE CreateQuery1(const D3D11_QUERY_DESC1* pQueryDesc1, ID3D11Query1** ppQuery1) override
@@ -757,14 +859,14 @@
             const D3D11_BOX* pDstBox, const void* pSrcData, UINT SrcRowPitch, UINT SrcDepthPitch) override
         {
             ComPtr<ID3D11Device3> native;
-            if (SUCCEEDED(m_native.As(&native))) native->WriteToSubresource(NativeD3D11Resource(pDstResource), DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
+            if (SUCCEEDED(m_native.As(&native))) native->WriteToSubresource(NativeD3D11Child(pDstResource), DstSubresource, pDstBox, pSrcData, SrcRowPitch, SrcDepthPitch);
         }
 
         void STDMETHODCALLTYPE ReadFromSubresource(void* pDstData, UINT DstRowPitch, UINT DstDepthPitch,
             ID3D11Resource* pSrcResource, UINT SrcSubresource, const D3D11_BOX* pSrcBox) override
         {
             ComPtr<ID3D11Device3> native;
-            if (SUCCEEDED(m_native.As(&native))) native->ReadFromSubresource(pDstData, DstRowPitch, DstDepthPitch, NativeD3D11Resource(pSrcResource), SrcSubresource, pSrcBox);
+            if (SUCCEEDED(m_native.As(&native))) native->ReadFromSubresource(pDstData, DstRowPitch, DstDepthPitch, NativeD3D11Child(pSrcResource), SrcSubresource, pSrcBox);
         }
 
         HRESULT STDMETHODCALLTYPE RegisterDeviceRemovedEvent(HANDLE event, DWORD* cookie) override
@@ -807,10 +909,13 @@
         std::atomic<ULONG> m_refs{1};
         ComPtr<ID3D11Device> m_native;
         GuestDxgiDevice m_dxgi;
+        GuestD3D11VideoDevice m_video;
+        GuestD3D11On12Device m_on12;
         GraphicsEventNotifications m_removalEvents;
     };
 
-    HRESULT WrapD3D11Device(ComPtr<ID3D11Device> native, IDXGIAdapter* requestedAdapter, ID3D11Device** output)
+    HRESULT WrapD3D11Device(ComPtr<ID3D11Device> native, IDXGIAdapter* requestedAdapter, ID3D11Device** output,
+        IUnknown* device12)
     {
         ComPtr<IDXGIDevice> dxgi;
         HRESULT status = native.As(&dxgi);
@@ -827,7 +932,7 @@
             status = WrapAdapter(std::move(adapter), IID_PPV_ARGS(&guestAdapter));
             if (FAILED(status)) return status;
         }
-        auto wrapper = new (std::nothrow) GuestD3D11Device(std::move(native), std::move(dxgi), std::move(guestAdapter));
+        auto wrapper = new (std::nothrow) GuestD3D11Device(std::move(native), std::move(dxgi), std::move(guestAdapter), device12);
         if (!wrapper) return E_OUTOFMEMORY;
         *output = wrapper;
         return S_OK;

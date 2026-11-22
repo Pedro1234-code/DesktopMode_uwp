@@ -7,6 +7,7 @@
 #include "Bridge/PeImage.h"
 #include "Bridge/PeMapper.h"
 #include "Bridge/GuestResources.h"
+#include "Bridge/GuestRuntime.h"
 #include "Bridge/RuntimeDiagnostics.h"
 
 #include <algorithm>
@@ -24,12 +25,13 @@ using namespace concurrency;
 
 namespace
 {
+    constexpr DWORD LoadWithAlteredSearchPath = 0x00000008u;
     constexpr DWORD LoadLibrarySearchDllLoadDir = 0x00000100u;
     constexpr DWORD LoadLibrarySearchApplicationDir = 0x00000200u;
     constexpr DWORD LoadLibrarySearchUserDirs = 0x00000400u;
     constexpr DWORD LoadLibrarySearchSystem32 = 0x00000800u;
     constexpr DWORD LoadLibrarySearchDefaultDirs = 0x00001000u;
-    constexpr DWORD SupportedSearchFlags = LoadLibrarySearchDllLoadDir |
+    constexpr DWORD SupportedSearchFlags = LoadWithAlteredSearchPath | LoadLibrarySearchDllLoadDir |
         LoadLibrarySearchApplicationDir | LoadLibrarySearchUserDirs |
         LoadLibrarySearchSystem32 | LoadLibrarySearchDefaultDirs;
     constexpr DWORD ActCtxResourceNameValid = 0x00000008u;
@@ -231,7 +233,9 @@ bool GuestModuleLoader::BuildCandidates(
     std::vector<ModuleCandidate>* candidates,
     std::wstring* requestedBaseName,
     bool* searchByBaseName,
-    DWORD* win32Error) const
+    DWORD* win32Error,
+    LPCWSTR searchPath,
+    LPCWSTR dependencyDirectory) const
 {
     if (!candidates || !requestedBaseName || !searchByBaseName || !m_storage ||
         (searchFlags & ~SupportedSearchFlags) != 0)
@@ -303,6 +307,14 @@ bool GuestModuleLoader::BuildCandidates(
         candidates->push_back(std::move(candidate));
     };
 
+    const auto addCanonical = [&](const std::wstring& canonical)
+    {
+        std::wstring relative;
+        if (IsWithinDirectory(canonical, applicationDirectory, &relative))
+            addApplicationSource(relative, canonical);
+        return addVirtual(canonical);
+    };
+
     const bool containsPath = normalized.find(L'\\') != std::wstring::npos ||
         (normalized.size() >= 2 && normalized[1] == L':');
     *searchByBaseName = !containsPath;
@@ -315,25 +327,20 @@ bool GuestModuleLoader::BuildCandidates(
             SetWin32Error(win32Error, error);
             return false;
         }
-        std::wstring sourceRelative;
-        if (IsWithinDirectory(canonical, applicationDirectory, &sourceRelative))
-        {
-            addApplicationSource(sourceRelative, canonical);
-        }
-        if (!addVirtual(canonical)) return false;
+        if (!addCanonical(canonical)) return false;
     }
     else
     {
         const DWORD directoryFlags = searchFlags &
             (LoadLibrarySearchApplicationDir | LoadLibrarySearchUserDirs |
              LoadLibrarySearchSystem32 | LoadLibrarySearchDefaultDirs);
-        const bool classicSearch = directoryFlags == 0;
-        const bool searchApplication = classicSearch ||
+        const bool classicSearch = directoryFlags == 0 && (searchFlags & LoadLibrarySearchDllLoadDir) == 0;
+        const bool searchApplication = (classicSearch && !(searchFlags & LoadWithAlteredSearchPath)) ||
             (searchFlags & (LoadLibrarySearchApplicationDir | LoadLibrarySearchDefaultDirs)) != 0;
         const bool searchSystem32 = classicSearch ||
             (searchFlags & (LoadLibrarySearchSystem32 | LoadLibrarySearchDefaultDirs)) != 0;
 
-        if ((searchFlags & LoadLibrarySearchDllLoadDir) != 0)
+        if ((searchFlags & LoadLibrarySearchDllLoadDir) != 0 && !dependencyDirectory)
         {
             SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
             return false;
@@ -344,6 +351,27 @@ bool GuestModuleLoader::BuildCandidates(
         {
             return false;
         }
+        if (searchPath)
+        {
+            const std::wstring directories = searchPath;
+            for (size_t start = 0; start < directories.size();)
+            {
+                const size_t end = directories.find(L';', start);
+                const auto directory = directories.substr(start, end - start);
+                std::wstring canonical;
+                DWORD ignored = ERROR_SUCCESS;
+                if (!directory.empty() && m_storage->CanonicalPath(
+                    JoinPath(directory, normalized).c_str(), &canonical, &ignored))
+                {
+                    if (!addCanonical(canonical)) return false;
+                }
+                if (end == std::wstring::npos) break;
+                start = end + 1;
+            }
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
+        }
+        if (dependencyDirectory && !addCanonical(JoinPath(dependencyDirectory, normalized))) return false;
         if (searchApplication)
         {
             const std::wstring logicalPath = JoinPath(applicationDirectory, normalized);
@@ -352,7 +380,7 @@ bool GuestModuleLoader::BuildCandidates(
         }
         const bool searchUserDirectories =
             (searchFlags & (LoadLibrarySearchUserDirs | LoadLibrarySearchDefaultDirs)) != 0;
-        if (classicSearch &&
+        if ((classicSearch || searchUserDirectories) &&
             m_legacyDllDirectorySpecified && !m_legacyDllDirectory.empty() &&
             !addVirtual(JoinPath(m_legacyDllDirectory, normalized)))
         {
@@ -649,9 +677,12 @@ bool GuestModuleLoader::LoadLibrary(
     HMODULE* module,
     DWORD* win32Error,
     DWORD searchFlags,
-    DWORD loadBehaviorFlags)
+    DWORD loadBehaviorFlags,
+    LPCWSTR searchPath,
+    LPCWSTR dependencyDirectory)
 {
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
+    if (!searchFlags && !searchPath) searchFlags = m_defaultDllDirectoryFlags;
     constexpr DWORD DontResolveDllReferences = 0x00000001u;
     constexpr DWORD LoadAsDataFile = 0x00000002u;
     constexpr DWORD LoadAsImageResource = 0x00000020u;
@@ -680,7 +711,7 @@ bool GuestModuleLoader::LoadLibrary(
     bool searchByBaseName = false;
     if (!BuildCandidates(
         requestedName, searchFlags, &candidates, &requestedBaseName,
-        &searchByBaseName, win32Error))
+        &searchByBaseName, win32Error, searchPath, dependencyDirectory))
     {
         RuntimeDiagnostics::Record(L"DLL FAILED: invalid module name or search policy.");
         return false;
@@ -834,9 +865,13 @@ bool GuestModuleLoader::LoadLibrary(
         return true;
     }
 
-    const ImportResolver dependencyResolver = [this, candidate, searchFlags](const ImportedSymbol& symbol)
+    const DWORD directoryFlags = LoadLibrarySearchDllLoadDir | LoadWithAlteredSearchPath;
+    const std::wstring dependencyRoot = dependencyDirectory ? dependencyDirectory :
+        ((searchFlags & directoryFlags) ? DirectoryOf(canonicalName) : std::wstring());
+    const ImportResolver dependencyResolver = [this, candidate, searchFlags, searchPath, dependencyRoot](const ImportedSymbol& symbol)
     {
-        return ResolveModuleImport(symbol, candidate, searchFlags, nullptr);
+        return ResolveModuleImport(symbol, candidate, searchFlags, nullptr, searchPath,
+            dependencyRoot.empty() ? nullptr : dependencyRoot.c_str());
     };
 
     if (!ImportBinder::Bind(
@@ -972,7 +1007,7 @@ ImportResolution GuestModuleLoader::ResolveImport(
 
 ImportResolution GuestModuleLoader::ResolveModuleImport(
     const ImportedSymbol& symbol, const std::shared_ptr<Module>& importer,
-    DWORD searchFlags, DWORD* win32Error)
+    DWORD searchFlags, DWORD* win32Error, LPCWSTR searchPath, LPCWSTR dependencyDirectory)
 {
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     ImportedSymbol canonical = symbol;
@@ -1049,14 +1084,7 @@ ImportResolution GuestModuleLoader::ResolveModuleImport(
     DWORD error = ERROR_SUCCESS;
     if (!dependency)
     {
-        if (importer && (searchFlags & LoadLibrarySearchDllLoadDir) != 0)
-        {
-            const std::wstring path = JoinPath(DirectoryOf(importer->canonicalName), canonical.library);
-            LoadLibrary(path.c_str(), &dependency, &error);
-        }
-        const DWORD inheritedFlags = importer ? searchFlags & ~LoadLibrarySearchDllLoadDir : searchFlags;
-        if (!dependency && (!importer || (searchFlags & LoadLibrarySearchDllLoadDir) == 0 || inheritedFlags != 0))
-            LoadLibrary(canonical.library.c_str(), &dependency, &error, inheritedFlags);
+        LoadLibrary(canonical.library.c_str(), &dependency, &error, searchFlags, 0, searchPath, dependencyDirectory);
         if (!dependency)
         {
             if (preferGuestMsvcp && resolution.targetAddress && error == ERROR_MOD_NOT_FOUND)
@@ -1120,7 +1148,7 @@ ImportResolution GuestModuleLoader::ResolveModuleImport(
 bool GuestModuleLoader::GetModuleHandle(
     LPCWSTR requestedName,
     HMODULE* module,
-    DWORD* win32Error) const
+    DWORD* win32Error, bool addReference, bool pin) const
 {
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!module)
@@ -1154,19 +1182,20 @@ bool GuestModuleLoader::GetModuleHandle(
             if (found) break;
         }
     }
-    if (!found)
+    if (!found || found->unloading)
     {
         SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
         return false;
     }
 
+    if (addReference) ReferenceModuleLocked(*found, pin);
     *module = reinterpret_cast<HMODULE>(found->runtime.Base());
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return true;
 }
 
 bool GuestModuleLoader::GetModuleHandleFromAddress(
-    ULONG_PTR address, HMODULE* module, DWORD* win32Error) const
+    ULONG_PTR address, HMODULE* module, DWORD* win32Error, bool addReference, bool pin) const
 {
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!address || !module)
@@ -1178,12 +1207,13 @@ bool GuestModuleLoader::GetModuleHandleFromAddress(
     std::lock_guard<std::mutex> guard(m_lock);
     for (const auto& candidate : m_modules)
     {
-        if (!candidate || candidate->resourceOnly || !candidate->runtime.Base() ||
+        if (!candidate || candidate->unloading || candidate->resourceOnly || !candidate->runtime.Base() ||
             candidate->runtime.Size() == 0)
             continue;
         const ULONG_PTR base = reinterpret_cast<ULONG_PTR>(candidate->runtime.Base());
         if (address >= base && address - base < candidate->runtime.Size())
         {
+            if (addReference) ReferenceModuleLocked(*candidate, pin);
             *module = reinterpret_cast<HMODULE>(candidate->runtime.Base());
             SetWin32Error(win32Error, ERROR_SUCCESS);
             return true;
@@ -1203,16 +1233,22 @@ bool GuestModuleLoader::AddReference(HMODULE module, bool pin, DWORD* win32Error
         SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
         return false;
     }
-    if (pin)
-    {
-        candidate->pinned = true;
-    }
-    else if (!candidate->pinned && candidate->references != (std::numeric_limits<ULONG>::max)())
-    {
-        ++candidate->references;
-    }
+    ReferenceModuleLocked(*candidate, pin);
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return true;
+}
+
+void GuestModuleLoader::ReferenceModuleLocked(Module& module, bool pin)
+{
+    if (pin) module.pinned = true;
+    else if (!module.pinned && module.references != (std::numeric_limits<ULONG>::max)())
+        ++module.references;
+}
+
+void GuestModuleLoader::SetDefaultDllDirectories(DWORD flags)
+{
+    std::lock_guard<std::recursive_mutex> guard(m_loaderLock);
+    m_defaultDllDirectoryFlags = flags;
 }
 
 bool GuestModuleLoader::GetModulePath(
@@ -1257,16 +1293,22 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
         std::lock_guard<std::mutex> guard(m_lock);
         candidate = FindModuleLocked(module);
     }
-    if (!candidate || candidate->resourceOnly)
+    const auto runtime = CurrentGuestRuntime();
+    const bool mainImage = runtime && reinterpret_cast<HMODULE>(runtime->ImageBase()) == module;
+    if ((!candidate || candidate->resourceOnly) && !mainImage)
     {
         SetWin32Error(win32Error,
             candidate ? ERROR_PROC_NOT_FOUND : ERROR_MOD_NOT_FOUND);
         RuntimeDiagnostics::Record(
             L"GetProcAddress FAILED: module handle " +
-            std::to_wstring(reinterpret_cast<ULONG_PTR>(module)) + L" is not a loaded guest DLL.");
+            std::to_wstring(reinterpret_cast<ULONG_PTR>(module)) + L" is not a loaded guest image.");
         return nullptr;
     }
 
+    const auto& exports = mainImage ? runtime->Metadata().exports : candidate->metadata.exports;
+    const auto imageBase = mainImage ? runtime->ImageBase() : candidate->runtime.Base();
+    const auto imageSize = mainImage ? runtime->ImageSize() : candidate->runtime.Size();
+    const auto& imageName = mainImage ? m_storage->ModulePath() : candidate->canonicalName;
     const ULONG_PTR raw = reinterpret_cast<ULONG_PTR>(nameOrOrdinal);
     const bool byOrdinal = raw <= 0xffff;
     std::wstring requested;
@@ -1282,7 +1324,7 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
         }
     }
     const ExportedSymbol* found = nullptr;
-    for (const auto& symbol : candidate->metadata.exports)
+    for (const auto& symbol : exports)
     {
         const bool matches = byOrdinal
             ? symbol.ordinal == raw
@@ -1294,11 +1336,11 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
         }
     }
     if (found && found->rva != 0 && found->forwarder.empty() &&
-        found->rva < candidate->runtime.Size())
+        found->rva < imageSize)
     {
         SetWin32Error(win32Error, ERROR_SUCCESS);
-        RuntimeDiagnostics::Record(L"GetProcAddress OK: " + candidate->canonicalName + L"!" + requested + L".");
-        return reinterpret_cast<FARPROC>(candidate->runtime.Base() + found->rva);
+        RuntimeDiagnostics::Record(L"GetProcAddress OK: " + imageName + L"!" + requested + L".");
+        return reinterpret_cast<FARPROC>(imageBase + found->rva);
     }
 
     if (found && !found->forwarder.empty() && g_forwarderDepth < 32)
@@ -1342,7 +1384,7 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
             {
                 SetWin32Error(win32Error, ERROR_SUCCESS);
                 RuntimeDiagnostics::Record(
-                    L"GetProcAddress FORWARDED: " + candidate->canonicalName + L"!" +
+                    L"GetProcAddress FORWARDED: " + imageName + L"!" +
                     requested + L" -> " + found->forwarder + L".");
                 return reinterpret_cast<FARPROC>(resolution.targetAddress);
             }
@@ -1350,7 +1392,7 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
     }
 
     SetWin32Error(win32Error, ERROR_PROC_NOT_FOUND);
-    RuntimeDiagnostics::Record(L"GetProcAddress FAILED: " + candidate->canonicalName + L"!" + requested + L" was not found.");
+    RuntimeDiagnostics::Record(L"GetProcAddress FAILED: " + imageName + L"!" + requested + L" was not found.");
     return nullptr;
 }
 

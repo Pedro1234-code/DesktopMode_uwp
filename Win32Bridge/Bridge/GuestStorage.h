@@ -111,6 +111,11 @@ namespace Bridge
         bool GetFileSize(HANDLE guestHandle, LARGE_INTEGER* fileSize, DWORD* win32Error);
         bool SetFilePointer(HANDLE guestHandle, LARGE_INTEGER distance, LARGE_INTEGER* newPosition, DWORD moveMethod, DWORD* win32Error);
         bool SetEndOfFile(HANDLE guestHandle, DWORD* win32Error);
+        bool SetFileSize(HANDLE guestHandle, LARGE_INTEGER size, DWORD* win32Error);
+        bool SetFileDisposition(HANDLE guestHandle, bool remove, DWORD* win32Error);
+        bool GetFileStandardInfo(HANDLE guestHandle, FILE_STANDARD_INFO* info, DWORD* win32Error) const;
+        bool RenameFile(HANDLE guestHandle, HANDLE root, LPCWSTR name, bool replace,
+            bool nativeName, DWORD* win32Error);
         bool FlushFile(HANDLE guestHandle, DWORD* win32Error);
         bool GetFilePath(HANDLE guestHandle, std::wstring* path, DWORD* win32Error) const;
         bool IsDirectoryHandle(HANDLE guestHandle, DWORD* win32Error) const;
@@ -130,6 +135,7 @@ namespace Bridge
         bool CreateDirectory(LPCWSTR path, DWORD* win32Error);
         bool DeleteGuestFile(LPCWSTR path, DWORD* win32Error);
         bool MoveGuestPath(LPCWSTR existingPath, LPCWSTR newPath, DWORD flags, DWORD* win32Error);
+        bool ReplaceGuestFile(LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup, DWORD* win32Error);
         bool RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error);
         DWORD GetGuestFileAttributes(LPCWSTR path, DWORD* win32Error);
         bool SetGuestFileAttributes(LPCWSTR path, DWORD attributes, DWORD* win32Error);
@@ -160,6 +166,11 @@ namespace Bridge
         bool CloseDescription(const std::shared_ptr<FileRecord>& record, DWORD* error);
         static std::wstring FilePathSnapshot(SharedFiles& files, const FileRecord& record);
         bool DeleteGuestFileLocked(const GuestPath& path, DWORD* win32Error);
+        bool RemoveGuestDirectoryLocked(const GuestPath& path, bool validateOnly, DWORD* win32Error);
+        bool IsDeletePendingLocked(const std::wstring& path, bool includeParents = false) const;
+        bool SetFileEnd(HANDLE guestHandle, const LARGE_INTEGER* size, DWORD* win32Error);
+        bool MoveGuestPathLocked(const GuestPath& source, const GuestPath& destination, DWORD flags,
+            bool sourceWasLowerLayerFile, const FileRecord* initiator, DWORD* win32Error);
         struct FindRecord;
 
         bool Resolve(LPCWSTR path, GuestPath* resolved, DWORD* win32Error) const;

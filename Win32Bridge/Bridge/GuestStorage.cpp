@@ -162,17 +162,17 @@ namespace
 
     bool HasReadAccess(DWORD access)
     {
-        return (access & (GENERIC_READ | FILE_READ_DATA)) != 0;
+        return (access & (GENERIC_ALL | GENERIC_READ | FILE_READ_DATA)) != 0;
     }
 
     bool HasWriteAccess(DWORD access)
     {
-        return (access & (GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
+        return (access & (GENERIC_ALL | GENERIC_WRITE | FILE_WRITE_DATA | FILE_APPEND_DATA)) != 0;
     }
 
     bool HasAppendOnlyAccess(DWORD access)
     {
-        return (access & FILE_APPEND_DATA) && !(access & (FILE_WRITE_DATA | GENERIC_WRITE));
+        return (access & FILE_APPEND_DATA) && !(access & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL));
     }
 
     struct FileShareAccess
@@ -187,7 +187,7 @@ namespace
     FileShareAccess ShareAccessFor(DWORD access, bool deleteOnClose)
     {
         return {HasReadAccess(access) || (access & (FILE_EXECUTE | GENERIC_EXECUTE)) != 0,
-            HasWriteAccess(access), deleteOnClose || (access & DELETE) != 0};
+            HasWriteAccess(access), deleteOnClose || (access & (DELETE | GENERIC_ALL)) != 0};
     }
 
     bool IsDescendantPath(const std::wstring& candidate, const std::wstring& ancestor)
@@ -442,6 +442,12 @@ struct GuestStorageContext::FileRangeState final
     std::vector<Range> granted;
 };
 
+struct ReplacedGuestFile final
+{
+    explicit ReplacedGuestFile(StorageFile^ item) : file(item) {}
+    Platform::Agile<StorageFile^> file;
+};
+
 struct GuestStorageContext::FileRecord final
 {
     FileRecord(IRandomAccessStream^ value, bool canRead, bool canWrite,
@@ -463,6 +469,7 @@ struct GuestStorageContext::FileRecord final
     bool readable;
     bool writable;
     std::wstring canonicalPath; // Protected by the shared handle table lock.
+    std::shared_ptr<ReplacedGuestFile> retiredReplacement; // Protected by the same lock.
     DWORD desiredAccess = 0;
     DWORD shareMode = 0;
     bool deleteOnClose = false;
@@ -490,6 +497,7 @@ struct GuestStorageContext::SharedFiles final
     std::mutex lock;
     std::unordered_map<FileRecord*, std::shared_ptr<FileRecord>> descriptions;
     std::unordered_set<std::wstring> deletePending;
+    std::unordered_set<std::wstring> dispositions;
 };
 
 struct GuestStorageContext::MappedFileState final
@@ -875,7 +883,8 @@ bool GuestStorageContext::RegisterFileLocked(const std::shared_ptr<FileRecord>& 
             for (const auto& entry : m_sharedFiles->descriptions)
             {
                 const auto& existing = entry.second;
-                if (_wcsicmp(existing->canonicalPath.c_str(), record->canonicalPath.c_str()) != 0) continue;
+                if (existing->retiredReplacement ||
+                    _wcsicmp(existing->canonicalPath.c_str(), record->canonicalPath.c_str()) != 0) continue;
                 record->ranges = existing->ranges;
                 break;
             }
@@ -977,7 +986,20 @@ std::shared_ptr<GuestStorageContext::FindRecord> GuestStorageContext::LookupFind
 std::wstring GuestStorageContext::FilePathSnapshot(SharedFiles& files, const FileRecord& record)
 {
     std::lock_guard<std::mutex> guard(files.lock);
-    return record.canonicalPath;
+    return record.retiredReplacement ? std::wstring{} : record.canonicalPath;
+}
+
+bool GuestStorageContext::IsDeletePendingLocked(const std::wstring& path, bool includeParents) const
+{
+    std::wstring key = MetadataKey(path);
+    for (;;)
+    {
+        if (m_deletePending.count(key) || m_sharedFiles->dispositions.count(key)) return true;
+        if (!includeParents) return false;
+        const auto separator = key.find_last_of(L'\\');
+        if (separator == std::wstring::npos || separator <= 2) return false;
+        key.resize(separator);
+    }
 }
 
 bool GuestStorageContext::GetFilePath(
@@ -994,6 +1016,11 @@ bool GuestStorageContext::GetFilePath(
     if (found == m_files.end() || found->second->closed)
     {
         SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    if (found->second->retiredReplacement)
+    {
+        SetWin32Error(win32Error, ERROR_FILE_NOT_FOUND);
         return false;
     }
     *path = found->second->canonicalPath;
@@ -1262,7 +1289,7 @@ bool GuestStorageContext::CreateFile(
     std::shared_ptr<FileRangeState> existingRanges;
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
-        if (m_deletePending.find(MetadataKey(path.canonical)) != m_deletePending.end())
+        if (IsDeletePendingLocked(path.canonical, true))
         {
             SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
             return false;
@@ -1270,7 +1297,8 @@ bool GuestStorageContext::CreateFile(
         for (const auto& entry : m_sharedFiles->descriptions)
         {
             const auto& existing = entry.second;
-            if (!existing || _wcsicmp(existing->canonicalPath.c_str(), path.canonical.c_str()) != 0)
+            if (!existing || existing->retiredReplacement ||
+                _wcsicmp(existing->canonicalPath.c_str(), path.canonical.c_str()) != 0)
                 continue;
             existingRanges = existing->ranges;
             const auto active = ShareAccessFor(existing->desiredAccess, existing->deleteOnClose);
@@ -1933,7 +1961,8 @@ bool GuestStorageContext::CloseDescription(const std::shared_ptr<FileRecord>& re
     CancelGuestFileIo(record.get(), nullptr);
     std::lock_guard<std::mutex> namespaceGuard(m_sharedFiles->namespaceOperations);
     DWORD result = ERROR_SUCCESS;
-    if (record->deleteOnClose)
+    const auto retired = record->retiredReplacement;
+    if (!retired && record->deleteOnClose)
     {
         try { std::lock_guard<std::mutex> guard(m_handlesLock); m_deletePending.insert(MetadataKey(record->canonicalPath)); }
         catch (const std::bad_alloc&) { result = ERROR_NOT_ENOUGH_MEMORY; }
@@ -1948,23 +1977,48 @@ bool GuestStorageContext::CloseDescription(const std::shared_ptr<FileRecord>& re
         if (stream) delete stream;
     }
     catch (Exception^ exception) { result = ErrorFromException(exception); }
-    bool removeFile = false;
+    bool removeFile = false, removeRetired = false;
     {
         std::lock_guard<std::mutex> guard(m_handlesLock);
         m_sharedFiles->descriptions.erase(record.get());
-        const std::wstring key = MetadataKey(record->canonicalPath);
-        bool stillOpen = false;
-        for (const auto& entry : m_sharedFiles->descriptions)
-            if (MetadataKey(entry.second->canonicalPath) == key) { stillOpen = true; break; }
-        if (!stillOpen && (record->deleteOnClose || m_deletePending.count(key))) removeFile = true;
+        if (retired)
+        {
+            removeRetired = std::none_of(m_sharedFiles->descriptions.begin(),
+                m_sharedFiles->descriptions.end(), [&](const auto& entry)
+                { return entry.second->retiredReplacement == retired; });
+        }
+        else
+        {
+            const std::wstring key = MetadataKey(record->canonicalPath);
+            bool stillOpen = false;
+            for (const auto& entry : m_sharedFiles->descriptions)
+                if (!entry.second->retiredReplacement && MetadataKey(entry.second->canonicalPath) == key)
+                { stillOpen = true; break; }
+            if (!stillOpen)
+            {
+                const bool marked = m_sharedFiles->dispositions.erase(key) != 0;
+                removeFile = record->deleteOnClose || m_deletePending.count(key) || marked;
+                if (removeFile && record->directory) m_deletePending.erase(key);
+            }
+        }
     }
     if (removeFile)
     {
         DWORD deleteError = ERROR_SUCCESS;
         GuestPath path;
         const bool deleted = Resolve(record->canonicalPath.c_str(), &path, &deleteError) &&
-            DeleteGuestFileLocked(path, &deleteError);
+            (record->directory ? RemoveGuestDirectoryLocked(path, false, &deleteError)
+                               : DeleteGuestFileLocked(path, &deleteError));
         if (!deleted && result == ERROR_SUCCESS) result = deleteError;
+    }
+    if (removeRetired)
+    {
+        try
+        {
+            if (auto item = retired->file.Get())
+                create_task(item->DeleteAsync(StorageDeleteOption::PermanentDelete)).get();
+        }
+        catch (Exception^ exception) { RecordStorageException(L"delete replaced file after last close", exception); }
     }
     SetWin32Error(error, result); return result == ERROR_SUCCESS;
 }
@@ -2077,6 +2131,16 @@ bool GuestStorageContext::SetFilePointer(
 
 bool GuestStorageContext::SetEndOfFile(HANDLE guestHandle, DWORD* win32Error)
 {
+    return SetFileEnd(guestHandle, nullptr, win32Error);
+}
+
+bool GuestStorageContext::SetFileSize(HANDLE guestHandle, LARGE_INTEGER size, DWORD* win32Error)
+{
+    return SetFileEnd(guestHandle, &size, win32Error);
+}
+
+bool GuestStorageContext::SetFileEnd(HANDLE guestHandle, const LARGE_INTEGER* size, DWORD* win32Error)
+{
     auto record = LookupFile(guestHandle);
     if (!record)
     {
@@ -2093,12 +2157,22 @@ bool GuestStorageContext::SetEndOfFile(HANDLE guestHandle, DWORD* win32Error)
             SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
             return false;
         }
-        if (!record->writable)
+        if (!(record->desiredAccess & (FILE_WRITE_DATA | GENERIC_WRITE | GENERIC_ALL)))
         {
             SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
             return false;
         }
-        stream->Size = stream->Position;
+        if (size && size->QuadPart < 0)
+        {
+            SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
+            return false;
+        }
+        {
+            std::lock_guard<std::mutex> rangeGuard(record->ranges->lock);
+            const ULONGLONG position = stream->Position;
+            stream->Size = size ? static_cast<ULONGLONG>(size->QuadPart) : position;
+            if (stream->Position != position) stream->Seek(position);
+        }
         SetWin32Error(win32Error, ERROR_SUCCESS);
         NotifyGuestDirectoryChange(FilePathSnapshot(*m_sharedFiles, *record), FILE_ACTION_MODIFIED,
             FILE_NOTIFY_CHANGE_SIZE | FILE_NOTIFY_CHANGE_LAST_WRITE);
@@ -2109,6 +2183,80 @@ bool GuestStorageContext::SetEndOfFile(HANDLE guestHandle, DWORD* win32Error)
         SetWin32Error(win32Error, ErrorFromException(exception));
         return false;
     }
+}
+
+bool GuestStorageContext::SetFileDisposition(HANDLE guestHandle, bool remove, DWORD* win32Error)
+{
+    std::lock_guard<std::mutex> namespaceGuard(m_sharedFiles->namespaceOperations);
+    const auto record = LookupFile(guestHandle);
+    if (!record || record->closed)
+    { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
+    if (record->retiredReplacement || !(record->desiredAccess & (DELETE | GENERIC_ALL)))
+    { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+    try
+    {
+        const std::wstring key = MetadataKey(record->canonicalPath);
+        if (remove && record->directory)
+        {
+            GuestPath path;
+            if (!Resolve(record->canonicalPath.c_str(), &path, win32Error)) return false;
+            if (path.components.empty() || (m_externalFolder.Get() && IsExternalMountRoot(path)))
+            { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+            if (!RemoveGuestDirectoryLocked(path, true, win32Error)) return false;
+        }
+        else if (remove)
+        {
+            const DWORD attributes = GetGuestFileAttributes(record->canonicalPath.c_str(), win32Error);
+            if (attributes == INVALID_FILE_ATTRIBUTES) return false;
+            if (attributes & FILE_ATTRIBUTE_READONLY)
+            { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+        }
+
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        if (!remove && m_deletePending.count(key))
+        { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+        if (remove) m_sharedFiles->dispositions.insert(key);
+        else m_sharedFiles->dispositions.erase(key);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (const std::bad_alloc&) { SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY); return false; }
+}
+
+bool GuestStorageContext::GetFileStandardInfo(HANDLE guestHandle, FILE_STANDARD_INFO* info, DWORD* win32Error) const
+{
+    const auto record = LookupFile(guestHandle);
+    if (!record || !info)
+    { SetWin32Error(win32Error, info ? ERROR_INVALID_HANDLE : ERROR_INVALID_PARAMETER); return false; }
+    try
+    {
+        FILE_STANDARD_INFO result{};
+        {
+            std::lock_guard<std::mutex> guard(record->lock);
+            if (record->closed)
+            { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
+            result.Directory = record->directory;
+            if (!record->directory)
+            {
+                const auto stream = record->stream.Get();
+                if (!stream)
+                { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
+                result.EndOfFile.QuadPart = static_cast<LONGLONG>(stream->Size);
+                result.AllocationSize = result.EndOfFile;
+            }
+        }
+        {
+            std::lock_guard<std::mutex> guard(m_handlesLock);
+            result.DeletePending = record->retiredReplacement || IsDeletePendingLocked(record->canonicalPath);
+            result.NumberOfLinks = result.DeletePending ? 0 : 1;
+        }
+        *info = result;
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception) { SetWin32Error(win32Error, ErrorFromException(exception)); }
+    catch (const std::bad_alloc&) { SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY); }
+    return false;
 }
 
 bool GuestStorageContext::FlushFile(HANDLE guestHandle, DWORD* win32Error)
@@ -2225,6 +2373,11 @@ bool GuestStorageContext::CreateDirectory(LPCWSTR path, DWORD* win32Error)
     }
 
     std::lock_guard<std::mutex> namespaceGuard(m_sharedFiles->namespaceOperations);
+    {
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        if (IsDeletePendingLocked(resolved.canonical, true))
+        { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+    }
     DWORD existingError = ERROR_SUCCESS;
     if (GetGuestFileAttributes(path, &existingError) != INVALID_FILE_ATTRIBUTES)
     {
@@ -2273,6 +2426,11 @@ bool GuestStorageContext::DeleteGuestFile(LPCWSTR path, DWORD* win32Error)
     }
 
     std::lock_guard<std::mutex> namespaceGuard(m_sharedFiles->namespaceOperations);
+    {
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        if (IsDeletePendingLocked(resolved.canonical, true))
+        { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+    }
     return DeleteGuestFileLocked(resolved, win32Error);
 }
 
@@ -2284,7 +2442,8 @@ bool GuestStorageContext::DeleteGuestFileLocked(const GuestPath& resolved, DWORD
         for (const auto& entry : m_sharedFiles->descriptions)
         {
             const auto& record = entry.second;
-            if (!record || _wcsicmp(record->canonicalPath.c_str(), resolved.canonical.c_str()) != 0)
+            if (!record || record->retiredReplacement ||
+                _wcsicmp(record->canonicalPath.c_str(), resolved.canonical.c_str()) != 0)
                 continue;
             if ((record->shareMode & FILE_SHARE_DELETE) == 0 &&
                 ShareAccessFor(record->desiredAccess, record->deleteOnClose).Participates())
@@ -2456,6 +2615,60 @@ bool GuestStorageContext::MoveGuestPath(
     }
 
     std::lock_guard<std::mutex> namespaceGuard(m_sharedFiles->namespaceOperations);
+    return MoveGuestPathLocked(source, destination, flags, sourceWasLowerLayerFile, nullptr, win32Error);
+}
+
+bool GuestStorageContext::RenameFile(HANDLE guestHandle, HANDLE root, LPCWSTR name, bool replace,
+    bool nativeName, DWORD* win32Error)
+{
+    if (!name || !*name)
+    { SetWin32Error(win32Error, ERROR_INVALID_NAME); return false; }
+    std::lock_guard<std::mutex> namespaceGuard(m_sharedFiles->namespaceOperations);
+    const auto record = LookupFile(guestHandle);
+    if (!record || record->closed)
+    { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
+    if (record->retiredReplacement || !(record->desiredAccess & (DELETE | GENERIC_ALL)))
+    { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+    try
+    {
+        GuestPath source, destination;
+        if (!Resolve(record->canonicalPath.c_str(), &source, win32Error)) return false;
+        std::wstring path = name;
+        if (path.front() == L':')
+        { SetWin32Error(win32Error, ERROR_NOT_SUPPORTED); return false; }
+        const bool ntDosPath = path.compare(0, 4, L"\\??\\") == 0;
+        if (ntDosPath) path.erase(0, 4);
+        if (root)
+        {
+            const auto directory = LookupFile(root);
+            if (!directory || directory->closed)
+            { SetWin32Error(win32Error, ERROR_INVALID_HANDLE); return false; }
+            if (!directory->directory || directory->retiredReplacement ||
+                path.empty() || path.front() == L'\\' || path.front() == L'/' ||
+                path.find(L':') != std::wstring::npos || ntDosPath)
+            { SetWin32Error(win32Error, ERROR_INVALID_PARAMETER); return false; }
+            path = ChildCanonicalPath(directory->canonicalPath, path);
+        }
+        else if (nativeName && !ntDosPath && path.find_first_of(L"\\/:") == std::wstring::npos)
+        {
+            path = source.canonical.substr(0, source.canonical.find_last_of(L'\\') + 1) + path;
+        }
+        if (!Resolve(path.c_str(), &destination, win32Error)) return false;
+        if (source.components.empty() || destination.components.empty() ||
+            (m_externalFolder.Get() && (IsExternalMountRoot(source) || IsExternalMountRoot(destination))))
+        { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+        if (m_externalFolder.Get() &&
+            IsExternalMountPath(PhysicalComponents(source)) != IsExternalMountPath(PhysicalComponents(destination)))
+        { SetWin32Error(win32Error, ERROR_NOT_SAME_DEVICE); return false; }
+        return MoveGuestPathLocked(source, destination, replace ? MOVEFILE_REPLACE_EXISTING : 0,
+            false, record.get(), win32Error);
+    }
+    catch (const std::bad_alloc&) { SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY); return false; }
+}
+
+bool GuestStorageContext::MoveGuestPathLocked(const GuestPath& source, const GuestPath& destination,
+    DWORD flags, bool sourceWasLowerLayerFile, const FileRecord* initiator, DWORD* win32Error)
+{
     StorageFolder^ sourceParent = nullptr;
     StorageFolder^ destinationParent = nullptr;
     std::wstring sourceName;
@@ -2473,8 +2686,7 @@ bool GuestStorageContext::MoveGuestPath(
         std::vector<std::pair<std::shared_ptr<FileRecord>, std::wstring>> renamedDescriptions;
         {
             std::lock_guard<std::mutex> guard(m_handlesLock);
-            if (m_deletePending.count(MetadataKey(source.canonical)) != 0 ||
-                m_deletePending.count(MetadataKey(destination.canonical)) != 0)
+            if (IsDeletePendingLocked(source.canonical, true) || IsDeletePendingLocked(destination.canonical, true))
             {
                 SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
                 return false;
@@ -2482,6 +2694,7 @@ bool GuestStorageContext::MoveGuestPath(
             for (const auto& entry : m_sharedFiles->descriptions)
             {
                 const auto& record = entry.second;
+                if (record->retiredReplacement) continue;
                 const auto& path = record->canonicalPath;
                 if ((directory && IsDescendantPath(path, source.canonical)) ||
                     (replacing && !samePath && _wcsicmp(path.c_str(), destination.canonical.c_str()) == 0))
@@ -2490,7 +2703,7 @@ bool GuestStorageContext::MoveGuestPath(
                     return false;
                 }
                 if (_wcsicmp(path.c_str(), source.canonical.c_str()) != 0) continue;
-                if ((record->shareMode & FILE_SHARE_DELETE) == 0 &&
+                if (record.get() != initiator && (record->shareMode & FILE_SHARE_DELETE) == 0 &&
                     ShareAccessFor(record->desiredAccess, record->deleteOnClose).Participates())
                 {
                     SetWin32Error(win32Error, ERROR_SHARING_VIOLATION);
@@ -2511,8 +2724,16 @@ bool GuestStorageContext::MoveGuestPath(
         const NameCollisionOption collision = (flags & MOVEFILE_REPLACE_EXISTING) != 0
             ? NameCollisionOption::ReplaceExisting
             : NameCollisionOption::FailIfExists;
+        if (replacing && !samePath)
+        {
+            const DWORD attributes = GetGuestFileAttributes(destination.canonical.c_str(), nullptr);
+            if (attributes != INVALID_FILE_ATTRIBUTES &&
+                (attributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY)))
+            { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+        }
         if (!GetParentFolder(destination, &destinationParent, &destinationName, win32Error))
         {
+            if (initiator) return false;
             std::vector<std::wstring> physical = PhysicalComponents(destination);
             destinationName = physical.back();
             physical.pop_back();
@@ -2593,6 +2814,229 @@ bool GuestStorageContext::MoveGuestPath(
     }
 }
 
+bool GuestStorageContext::ReplaceGuestFile(
+    LPCWSTR replaced, LPCWSTR replacement, LPCWSTR backup, DWORD* win32Error)
+{
+    GuestPath target, incoming, saved;
+    const bool keepBackup = backup != nullptr;
+    if (!Resolve(replaced, &target, win32Error) || !Resolve(replacement, &incoming, win32Error) ||
+        (keepBackup && !Resolve(backup, &saved, win32Error))) return false;
+    if (target.components.empty() || incoming.components.empty() ||
+        (keepBackup && saved.components.empty()))
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+        return false;
+    }
+
+    const auto sameName = [](const std::wstring& left, const std::wstring& right)
+    { return _wcsicmp(left.c_str(), right.c_str()) == 0; };
+    if (sameName(target.canonical, incoming.canonical))
+    { SetWin32Error(win32Error, ERROR_SHARING_VIOLATION); return false; }
+    if (keepBackup && sameName(target.canonical, saved.canonical))
+    { SetWin32Error(win32Error, ERROR_UNABLE_TO_MOVE_REPLACEMENT); return false; }
+    if (keepBackup && sameName(incoming.canonical, saved.canonical))
+    { SetWin32Error(win32Error, ERROR_UNABLE_TO_REMOVE_REPLACED); return false; }
+
+    std::lock_guard<std::mutex> namespaceGuard(m_sharedFiles->namespaceOperations);
+    try
+    {
+        const bool externalVolume = m_externalFolder.Get() &&
+            IsExternalMountPath(PhysicalComponents(target));
+        if (m_externalFolder.Get() &&
+            (externalVolume != IsExternalMountPath(PhysicalComponents(incoming)) ||
+                (keepBackup && externalVolume != IsExternalMountPath(PhysicalComponents(saved)))))
+        { SetWin32Error(win32Error, ERROR_NOT_SAME_DEVICE); return false; }
+
+        const DWORD targetAttributes = GetGuestFileAttributes(target.canonical.c_str(), win32Error);
+        if (targetAttributes == INVALID_FILE_ATTRIBUTES) return false;
+        const DWORD incomingAttributes = GetGuestFileAttributes(incoming.canonical.c_str(), win32Error);
+        if (incomingAttributes == INVALID_FILE_ATTRIBUTES) return false;
+        if ((targetAttributes | incomingAttributes) & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY))
+        { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+        if (keepBackup)
+        {
+            const DWORD savedAttributes = GetGuestFileAttributes(saved.canonical.c_str(), nullptr);
+            if (savedAttributes != INVALID_FILE_ATTRIBUTES &&
+                (savedAttributes & (FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_DIRECTORY)))
+            { SetWin32Error(win32Error, ERROR_UNABLE_TO_REMOVE_REPLACED); return false; }
+        }
+
+        using Rename = std::pair<std::shared_ptr<FileRecord>, std::wstring>;
+        std::vector<Rename> targetHandles, incomingHandles;
+        {
+            std::lock_guard<std::mutex> guard(m_handlesLock);
+            if (IsDeletePendingLocked(target.canonical, true) || IsDeletePendingLocked(incoming.canonical, true))
+            { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+            if (keepBackup && IsDeletePendingLocked(saved.canonical, true))
+            { SetWin32Error(win32Error, ERROR_UNABLE_TO_REMOVE_REPLACED); return false; }
+            for (const auto& entry : m_sharedFiles->descriptions)
+            {
+                const auto& record = entry.second;
+                if (record->retiredReplacement) continue;
+                const bool participates = ShareAccessFor(record->desiredAccess, record->deleteOnClose).Participates();
+                if (sameName(record->canonicalPath, target.canonical))
+                {
+                    constexpr DWORD RequiredShare = FILE_SHARE_READ | FILE_SHARE_DELETE;
+                    if (participates && (record->shareMode & RequiredShare) != RequiredShare)
+                    { SetWin32Error(win32Error, ERROR_SHARING_VIOLATION); return false; }
+                    targetHandles.emplace_back(record, saved.canonical);
+                }
+                else if (sameName(record->canonicalPath, incoming.canonical))
+                {
+                    if (participates)
+                    { SetWin32Error(win32Error, ERROR_SHARING_VIOLATION); return false; }
+                    incomingHandles.emplace_back(record, target.canonical);
+                }
+                else if (keepBackup && sameName(record->canonicalPath, saved.canonical))
+                { SetWin32Error(win32Error, ERROR_UNABLE_TO_REMOVE_REPLACED); return false; }
+            }
+        }
+
+        struct Location
+        {
+            StorageFolder^ parent = nullptr;
+            StorageFile^ file = nullptr;
+            std::wstring name;
+            bool lowerExists = false;
+        };
+        const auto locate = [&](const GuestPath& path, bool needFile, Location& location)
+        {
+            GuestPath parentPath = path;
+            location.name = parentPath.components.back();
+            parentPath.components.pop_back();
+            parentPath.canonical.resize(path.canonical.find_last_of(L'\\'));
+            const auto name = ref new String(location.name.c_str());
+            StorageFolder^ lower = nullptr;
+            StorageFile^ lowerFile = nullptr;
+            if (!IsLowerLayerTombstoned(path.canonical) && GetAuthorizedFolder(parentPath, &lower))
+            {
+                const auto item = create_task(lower->TryGetItemAsync(name)).get();
+                if (item && item->IsOfType(StorageItemTypes::File)) lowerFile = safe_cast<StorageFile^>(item);
+            }
+            location.lowerExists = lowerFile != nullptr;
+            if (!GetParentFolder(path, &location.parent, &location.name, win32Error) &&
+                (!lower || !GetFolder(PhysicalComponents(parentPath), true, &location.parent, win32Error)))
+                return false;
+            if (!needFile) return true;
+            const auto local = create_task(location.parent->TryGetItemAsync(name)).get();
+            if (local && local->IsOfType(StorageItemTypes::File)) location.file = safe_cast<StorageFile^>(local);
+            if (!location.file && lowerFile)
+                location.file = create_task(lowerFile->CopyAsync(location.parent, name,
+                    NameCollisionOption::FailIfExists)).get();
+            if (location.file) return true;
+            SetWin32Error(win32Error, ERROR_FILE_NOT_FOUND);
+            return false;
+        };
+        Location oldLocation, newLocation, backupLocation;
+        if (!locate(target, true, oldLocation) || !locate(incoming, true, newLocation)) return false;
+        if (keepBackup && !locate(saved, false, backupLocation))
+        { SetWin32Error(win32Error, ERROR_UNABLE_TO_REMOVE_REPLACED); return false; }
+
+        std::shared_ptr<ReplacedGuestFile> retired;
+        const auto publishTarget = [&]
+        {
+            for (auto& entry : targetHandles)
+            {
+                if (keepBackup) entry.first->canonicalPath.swap(entry.second);
+                else entry.first->retiredReplacement = retired;
+            }
+        };
+        if (!keepBackup && targetHandles.empty())
+        {
+            create_task(newLocation.file->MoveAndReplaceAsync(oldLocation.file)).get();
+        }
+        else
+        {
+            StorageFolder^ stagingParent = backupLocation.parent;
+            std::wstring stagingName = backupLocation.name;
+            NameCollisionOption stagingCollision = NameCollisionOption::ReplaceExisting;
+            if (!keepBackup)
+            {
+                // In this case WinRT refuses MoveAndReplaceAsync while the old
+                // stream is open. Keep that stream alive outside drive_c.
+                if (externalVolume)
+                { SetWin32Error(win32Error, ERROR_UNABLE_TO_REMOVE_REPLACED); return false; }
+                stagingParent = create_task(m_localFolder.Get()->CreateFolderAsync(
+                    ref new String(L"Win32Bridge-ReplacedFiles"), CreationCollisionOption::OpenIfExists)).get();
+                stagingName = L"replaced";
+                stagingCollision = NameCollisionOption::GenerateUniqueName;
+                retired = std::make_shared<ReplacedGuestFile>(oldLocation.file);
+            }
+            try
+            {
+                create_task(oldLocation.file->MoveAsync(stagingParent,
+                    ref new String(stagingName.c_str()), stagingCollision)).get();
+            }
+            catch (Exception^ exception)
+            {
+                RecordStorageException(L"stage original for ReplaceFile", exception);
+                SetWin32Error(win32Error, ERROR_UNABLE_TO_REMOVE_REPLACED);
+                return false;
+            }
+            try
+            {
+                create_task(newLocation.file->MoveAsync(oldLocation.parent,
+                    ref new String(oldLocation.name.c_str()), NameCollisionOption::FailIfExists)).get();
+            }
+            catch (Exception^ exception)
+            {
+                RecordStorageException(L"install replacement for ReplaceFile", exception);
+                try
+                {
+                    create_task(oldLocation.file->MoveAsync(oldLocation.parent,
+                        ref new String(oldLocation.name.c_str()), NameCollisionOption::FailIfExists)).get();
+                    SetWin32Error(win32Error, ERROR_UNABLE_TO_MOVE_REPLACEMENT);
+                }
+                catch (Exception^ rollbackError)
+                {
+                    RecordStorageException(L"restore original after ReplaceFile", rollbackError);
+                    // A recovery file without a guest-visible backup name must
+                    // be retained, even after all guest handles close.
+                    if (retired) retired->file = nullptr;
+                    {
+                        std::lock_guard<std::mutex> guard(m_handlesLock);
+                        publishTarget();
+                    }
+                    if (oldLocation.lowerExists) SetLowerLayerTombstone(target.canonical, true);
+                    if (keepBackup)
+                    {
+                        MoveAttributeOverrides(target.canonical, saved.canonical);
+                        SetLowerLayerTombstone(saved.canonical, false);
+                        NotifyGuestDirectoryRename(target.canonical, saved.canonical, FILE_NOTIFY_CHANGE_FILE_NAME);
+                    }
+                    SetWin32Error(win32Error, ERROR_UNABLE_TO_MOVE_REPLACEMENT_2);
+                }
+                return false;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> guard(m_handlesLock);
+            publishTarget();
+            for (auto& entry : incomingHandles) entry.first->canonicalPath.swap(entry.second);
+        }
+        if (keepBackup)
+        {
+            MoveAttributeOverrides(target.canonical, saved.canonical);
+            SetLowerLayerTombstone(saved.canonical, false);
+            NotifyGuestDirectoryRename(target.canonical, saved.canonical, FILE_NOTIFY_CHANGE_FILE_NAME);
+        }
+        else NotifyGuestDirectoryChange(target.canonical, FILE_ACTION_REMOVED, FILE_NOTIFY_CHANGE_FILE_NAME);
+        RemoveAttributeOverrides(incoming.canonical, false);
+        const DWORD preserved = (targetAttributes & VirtualMutableFileAttributes & ~FILE_ATTRIBUTE_NORMAL) |
+            FILE_ATTRIBUTE_ARCHIVE;
+        StoreAttributeOverride(target.canonical, preserved);
+        if (newLocation.lowerExists) SetLowerLayerTombstone(incoming.canonical, true);
+        SetLowerLayerTombstone(target.canonical, false);
+        NotifyGuestDirectoryRename(incoming.canonical, target.canonical, FILE_NOTIFY_CHANGE_FILE_NAME);
+        SetWin32Error(win32Error, ERROR_SUCCESS);
+        return true;
+    }
+    catch (Exception^ exception) { SetWin32Error(win32Error, ErrorFromException(exception)); }
+    catch (const std::bad_alloc&) { SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY); }
+    return false;
+}
+
 bool GuestStorageContext::RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error)
 {
     GuestPath resolved;
@@ -2611,6 +3055,38 @@ bool GuestStorageContext::RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error)
     }
 
     std::lock_guard<std::mutex> namespaceGuard(m_sharedFiles->namespaceOperations);
+    bool open = false;
+    {
+        std::lock_guard<std::mutex> guard(m_handlesLock);
+        if (IsDeletePendingLocked(resolved.canonical, true))
+        { SetWin32Error(win32Error, ERROR_ACCESS_DENIED); return false; }
+        for (const auto& entry : m_sharedFiles->descriptions)
+        {
+            const auto& record = entry.second;
+            if (record->retiredReplacement) continue;
+            if (_wcsicmp(record->canonicalPath.c_str(), resolved.canonical.c_str()) != 0) continue;
+            if ((record->shareMode & FILE_SHARE_DELETE) == 0 &&
+                ShareAccessFor(record->desiredAccess, record->deleteOnClose).Participates())
+            { SetWin32Error(win32Error, ERROR_SHARING_VIOLATION); return false; }
+            open = true;
+        }
+    }
+    if (!RemoveGuestDirectoryLocked(resolved, open, win32Error)) return false;
+    if (open)
+    {
+        try
+        {
+            std::lock_guard<std::mutex> guard(m_handlesLock);
+            m_deletePending.insert(MetadataKey(resolved.canonical));
+        }
+        catch (const std::bad_alloc&)
+        { SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY); return false; }
+    }
+    return true;
+}
+
+bool GuestStorageContext::RemoveGuestDirectoryLocked(const GuestPath& resolved, bool validateOnly, DWORD* win32Error)
+{
     StorageFolder^ folder = nullptr;
     DWORD localError = ERROR_SUCCESS;
     const bool haveLocalFolder = GetDirectoryFolder(resolved, &folder, &localError);
@@ -2647,6 +3123,11 @@ bool GuestStorageContext::RemoveGuestDirectory(LPCWSTR path, DWORD* win32Error)
                     return false;
                 }
             }
+        }
+        if (validateOnly)
+        {
+            SetWin32Error(win32Error, ERROR_SUCCESS);
+            return true;
         }
         if (haveLocalFolder) create_task(folder->DeleteAsync()).get();
         if (haveLowerFolder) SetLowerLayerTombstone(resolved.canonical, true);

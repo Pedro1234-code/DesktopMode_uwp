@@ -34,6 +34,7 @@ namespace Bridge
     struct GuestSwapChainBinding
     {
         std::function<HRESULT(UINT*, UINT*)> clientSize;
+        std::function<void()> framePresented;
         std::function<void()> detach;
     };
 

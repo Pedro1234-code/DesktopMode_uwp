@@ -10,9 +10,9 @@ The counts do not represent Windows export coverage or a test pass rate.
 
 | API or subsystem | Implemented | Partial | Planned | Total |
 | --- | ---: | ---: | ---: | ---: |
-| PE loader | 7 | 3 | 2 | 12 |
-| Kernel32 | 9 | 4 | 4 | 17 |
-| NTDLL | 3 | 4 | 2 | 9 |
+| PE loader | 8 | 3 | 2 | 13 |
+| Kernel32 | 10 | 4 | 4 | 18 |
+| NTDLL | 5 | 4 | 2 | 11 |
 | USER32 | 5 | 6 | 2 | 13 |
 | GDI32 | 6 | 4 | 1 | 11 |
 | COMCTL32 | 4 | 6 | 1 | 11 |
@@ -21,8 +21,8 @@ The counts do not represent Windows export coverage or a test pass rate.
 | PE resources / SxS | 5 | 3 | 2 | 10 |
 | CRT / C++ | 4 | 5 | 2 | 11 |
 | Console | 4 | 3 | 1 | 8 |
-| D3D11 / DXGI | 1 | 4 | 3 | 8 |
-| D3D12 | 1 | 4 | 3 | 8 |
+| D3D11 / DXGI | 7 | 4 | 5 | 16 |
+| D3D12 | 1 | 6 | 2 | 9 |
 | Networking | 0 | 0 | 6 | 6 |
 | OLE32 / COM | 0 | 3 | 3 | 6 |
 | OLEAUT32 | 0 | 2 | 2 | 4 |
@@ -53,6 +53,7 @@ The counts do not represent Windows export coverage or a test pass rate.
 - **Implemented** · IAT, delay imports and forwarders
 - **Implemented** · TLS and DLL lifecycle
 - **Implemented** · x64 unwind registration
+- **Implemented** · Per-process DLL search flags and explicit search directories
 - **Partial** · DLL search parity
 - **Implemented** · Section protections
 - **Implemented** · Ordinal exports
@@ -71,6 +72,7 @@ The counts do not represent Windows export coverage or a test pass rate.
 - **Implemented** · Overlapped I/O and IOCP
 - **Implemented** · Byte-range locks
 - **Implemented** · Open-handle identity across local file renames
+- **Implemented** · SetFileInformationByHandle for EOF, local rename and delete disposition
 - **Implemented** · File mappings and directory notifications
 - **Implemented** · Guest environment and current directory
 - **Partial** · Extended startup attributes and jobs
@@ -87,7 +89,9 @@ The counts do not represent Windows export coverage or a test pass rate.
 - **Implemented** · Native read and write
 - **Implemented** · Native lock and unlock
 - **Implemented** · Native I/O cancellation
-- **Partial** · Native file information and object coverage
+- **Implemented** · NtSetInformationFile for position, EOF, rename and delete disposition
+- **Implemented** · Ldr module loading, references, unloading and export lookup
+- **Partial** · Native module lookup flags and additional Ldr entry points
 - **Partial** · NT object manager namespace
 - **Partial** · NT virtual memory and section semantics
 - **Partial** · NT file information classes
@@ -204,22 +208,31 @@ The counts do not represent Windows export coverage or a test pass rate.
 ## D3D11 / DXGI
 
 - **Implemented** · Windowed presentation and resize
-- **Partial** · Context and resource identity
-- **Partial** · Shared textures and fences
+- **Implemented** · Presentation handoff after the first GPU frame
+- **Implemented** · Immediate and deferred context identity
+- **Implemented** · Buffer, texture and rendering-view identity
+- **Implemented** · DXGI surface identity and subresource lookup
+- **Implemented** · D3D11 texture sharing by NT handle and keyed mutexes
+- **Implemented** · EnqueueSetEvent and Flush1 completion via guest events
+- **Partial** · D3D11On12 and video interoperability
+- **Partial** · Shared fences, named texture opens and access rights
 - **Planned** · Fullscreen-exclusive presentation
 - **Partial** · Adapter notifications and frame latency handles
-- **Partial** · Deferred contexts and resource interop
-- **Planned** · Swap-chain color spaces, HDR and tearing
+- **Partial** · Host color-space and HDR forwarding
+- **Planned** · Multiple and child-window swap chains
+- **Planned** · Guest tearing and per-output HDR policy
 - **Planned** · Full DXGI output and monitor contracts
+- **Planned** · Direct2D and WinRT surface interoperability
 
 ## D3D12
 
 - **Implemented** · Windowed swap chains and queues
 - **Partial** · Shared fences and handles
 - **Partial** · Device factory and host SDK selection
-- **Planned** · Device-loss recovery coverage
+- **Partial** · Device-loss fallback and recovery validation
 - **Partial** · Fence waits backed by guest events
 - **Partial** · Agility SDK version and path selection
+- **Partial** · Device identity through queues and fences, with other device children pending
 - **Planned** · Residency and multi-adapter validation
 - **Planned** · D3D12 debug, tooling and capture interoperability
 

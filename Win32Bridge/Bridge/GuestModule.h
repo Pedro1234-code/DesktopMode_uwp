@@ -42,13 +42,18 @@ namespace Bridge
             HMODULE* module,
             DWORD* win32Error,
             DWORD searchFlags = 0,
-            DWORD loadBehaviorFlags = 0);
+            DWORD loadBehaviorFlags = 0,
+            LPCWSTR searchPath = nullptr,
+            LPCWSTR dependencyDirectory = nullptr);
         ImportResolution ResolveImport(const ImportedSymbol& symbol, DWORD searchFlags = 0,
             DWORD* win32Error = nullptr);
-        bool GetModuleHandle(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error) const;
+        bool GetModuleHandle(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error,
+            bool addReference = false, bool pin = false) const;
         bool GetModuleHandleFromAddress(
-            ULONG_PTR address, HMODULE* module, DWORD* win32Error) const;
+            ULONG_PTR address, HMODULE* module, DWORD* win32Error,
+            bool addReference = false, bool pin = false) const;
         bool AddReference(HMODULE module, bool pin, DWORD* win32Error);
+        void SetDefaultDllDirectories(DWORD flags);
         bool AddDllDirectory(LPCWSTR path, PVOID* cookie, DWORD* win32Error);
         bool RemoveDllDirectory(PVOID cookie, DWORD* win32Error);
         bool SetDllDirectory(LPCWSTR path, DWORD* win32Error);
@@ -83,7 +88,8 @@ namespace Bridge
         struct ModuleCandidate;
 
         ImportResolution ResolveModuleImport(const ImportedSymbol& symbol,
-            const std::shared_ptr<Module>& importer, DWORD searchFlags, DWORD* win32Error);
+            const std::shared_ptr<Module>& importer, DWORD searchFlags, DWORD* win32Error,
+            LPCWSTR searchPath = nullptr, LPCWSTR dependencyDirectory = nullptr);
 
         bool BuildCandidates(
             LPCWSTR requestedName,
@@ -91,7 +97,9 @@ namespace Bridge
             std::vector<ModuleCandidate>* candidates,
             std::wstring* requestedBaseName,
             bool* searchByBaseName,
-            DWORD* win32Error) const;
+            DWORD* win32Error,
+            LPCWSTR searchPath = nullptr, LPCWSTR dependencyDirectory = nullptr) const;
+        static void ReferenceModuleLocked(Module& module, bool pin);
         std::shared_ptr<Module> FindModuleLocked(HMODULE module) const;
         std::shared_ptr<Module> FindModuleByIdentityLocked(const std::wstring& identity) const;
         std::shared_ptr<Module> FindModuleByBaseNameLocked(const std::wstring& baseName) const;
@@ -124,6 +132,7 @@ namespace Bridge
         std::vector<std::pair<ULONG_PTR, std::wstring>> m_userDllDirectories;
         std::wstring m_legacyDllDirectory;
         bool m_legacyDllDirectorySpecified = false;
+        DWORD m_defaultDllDirectoryFlags = 0;
         ULONG_PTR m_nextDllDirectoryCookie = 1;
         std::uint64_t m_nextAttachSequence = 1;
     };
