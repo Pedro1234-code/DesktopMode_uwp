@@ -47,6 +47,7 @@ namespace Bridge
             LPCWSTR dependencyDirectory = nullptr);
         ImportResolution ResolveImport(const ImportedSymbol& symbol, DWORD searchFlags = 0,
             DWORD* win32Error = nullptr);
+        bool HasApplicationDllOverride(LPCWSTR requestedName) const;
         bool GetModuleHandle(LPCWSTR requestedName, HMODULE* module, DWORD* win32Error,
             bool addReference = false, bool pin = false) const;
         bool GetModuleHandleFromAddress(
@@ -71,22 +72,21 @@ namespace Bridge
             LPCWSTR requestedName,
             std::vector<BYTE>* bytes,
             std::wstring* logicalPath,
-            DWORD* win32Error) const;
+            DWORD* win32Error,
+            Windows::Storage::StorageFolder^* sourceFolder) const;
         ProcessEnvironment& Environment() { return m_environment; }
         CrtStdio& Stdio() { return m_stdio; }
         CrtFileDescriptors& CrtFiles() { return m_crtFiles; }
         CrtProcessState& CrtState() { return m_crtState; }
         CrtThreadExceptionState* ExceptionThreadState(bool freshThread);
         std::shared_ptr<GuestStorageContext> StorageContext() const { return m_storage; }
-        Windows::Storage::StorageFolder^ ModuleSourceFolder() const
-        {
-            return m_moduleSourceFolder.Get();
-        }
 
     private:
         struct Module;
         struct ModuleCandidate;
 
+        void ReadApplicationDllOverrides();
+        std::wstring ApplicationDllOverridePath(LPCWSTR requestedName) const;
         ImportResolution ResolveModuleImport(const ImportedSymbol& symbol,
             const std::shared_ptr<Module>& importer, DWORD searchFlags, DWORD* win32Error,
             LPCWSTR searchPath = nullptr, LPCWSTR dependencyDirectory = nullptr);
@@ -103,10 +103,12 @@ namespace Bridge
         std::shared_ptr<Module> FindModuleLocked(HMODULE module) const;
         std::shared_ptr<Module> FindModuleByIdentityLocked(const std::wstring& identity) const;
         std::shared_ptr<Module> FindModuleByBaseNameLocked(const std::wstring& baseName) const;
-        bool ReadModuleBytes(const ModuleCandidate& candidate, std::vector<BYTE>* bytes) const;
+        bool ReadModuleBytes(const ModuleCandidate& candidate, std::vector<BYTE>* bytes,
+            Windows::Storage::StorageFolder^* sourceFolder = nullptr) const;
         bool ReadAuthorizedModuleBytes(
             const std::wstring& relativeName,
-            std::vector<BYTE>* bytes) const;
+            std::vector<BYTE>* bytes,
+            Windows::Storage::StorageFolder^* sourceFolder = nullptr) const;
         bool NotifyModule(const std::shared_ptr<Module>& module, DWORD reason,
             std::wstring* error) const;
         void ReleaseModuleDependencies(const std::shared_ptr<Module>& module);
@@ -120,6 +122,7 @@ namespace Bridge
         std::unordered_map<DWORD, std::unique_ptr<CrtThreadExceptionState>> m_exceptionThreads;
         ImportResolver m_resolver;
         Platform::Agile<Windows::Storage::StorageFolder^> m_moduleSourceFolder;
+        std::vector<std::wstring> m_applicationDllOverrides;
         // The native loader serializes mapping, import snapping and entry-point
         // notification under a re-entrant loader lock.  Dependency loading is
         // recursive on the owning thread, hence std::recursive_mutex rather

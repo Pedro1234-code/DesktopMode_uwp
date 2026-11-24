@@ -9,6 +9,9 @@
 #include <cwchar>
 #include <cstdio>
 #include <utility>
+#ifdef BRIDGE_VALIDATION_SUITE
+#include "../Validation/Panel.h"
+#endif
 
 using Microsoft::WRL::ComPtr;
 
@@ -27,6 +30,9 @@ namespace
     bool verifyDxgiEvents = false;
     bool gateFirstFrame = false;
     bool firstFrameAllowed = false;
+#ifdef BRIDGE_VALIDATION_SUITE
+    Validation::Log* runLog = nullptr;
+#endif
     unsigned frame = 0;
     constexpr DXGI_FORMAT Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     constexpr UINT FrameLatencyFlag = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -890,6 +896,10 @@ namespace
         firstFrameAllowed = !gateFirstFrame;
         Renderer renderer;
         HRESULT status = renderer.Initialize(window);
+#ifdef BRIDGE_VALIDATION_SUITE
+        if (runLog) runLog->Write(FAILED(status) ? L"FAIL" : L"READY", L"Renderer initialization", static_cast<unsigned>(status));
+        bool firstPresented = false;
+#endif
         if (FAILED(status)) return status;
         if (gateFirstFrame)
         {
@@ -909,6 +919,13 @@ namespace
             if (switchRenderer) { switchRenderer = false; return S_FALSE; }
             if (minimized || !firstFrameAllowed) { WaitMessage(); continue; }
             status = renderer.Draw(window, resizePending);
+#ifdef BRIDGE_VALIDATION_SUITE
+            if (runLog && status == S_OK && (!firstPresented || resizePending))
+            {
+                runLog->Write(L"EVENT", firstPresented ? L"Frame after resize" : L"First GPU frame submitted");
+                firstPresented = true;
+            }
+#endif
             resizePending = false;
             if (FAILED(status)) return status;
             if (status == DXGI_STATUS_OCCLUDED) Sleep(20);
@@ -916,7 +933,7 @@ namespace
     }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int show)
+static int RunSelection(HINSTANCE instance, PWSTR arguments, int show)
 {
     bool useD3D12 = arguments && std::wcsstr(arguments, L"--d3d12");
     legacyD3D11 = arguments && std::wcsstr(arguments, L"--legacy-d3d11");
@@ -932,10 +949,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int show)
     windowClass.lpfnWndProc = WindowProc;
     windowClass.hInstance = instance;
     windowClass.lpszClassName = L"Win32BridgeGraphicsContracts";
-    if (!RegisterClassW(&windowClass)) return 1;
+    if (!RegisterClassW(&windowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) return GetLastError();
     const HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"GraphicsContracts",
         WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, 640, 420, nullptr, nullptr, instance, nullptr);
-    if (!window) return 1;
+    if (!window) return GetLastError();
+    minimized = false;
+    resizePending = false;
+    switchRenderer = false;
     ShowWindow(window, show);
     for (;;)
     {
@@ -947,8 +967,44 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int show)
             wchar_t error[64]{};
             swprintf_s(error, L"Direct3D / DXGI HRESULT 0x%08lX", static_cast<unsigned long>(status));
             MessageBoxW(window, error, L"GraphicsContracts", MB_OK | MB_ICONERROR);
-            return 1;
+            if (IsWindow(window)) DestroyWindow(window);
+            MSG quit{};
+            PeekMessageW(&quit, nullptr, WM_QUIT, WM_QUIT, PM_REMOVE);
+            return status;
         }
         useD3D12 = !useD3D12;
     }
+}
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR arguments, int show)
+{
+#ifdef BRIDGE_VALIDATION_SUITE
+    (void)arguments;
+    Validation::Log log(L"GraphicsContracts");
+    runLog = &log;
+    const Validation::Button choices[] = {
+        {L"D3D11 presentation", nullptr}, {L"D3D12 presentation", nullptr},
+        {L"D3D11 legacy swap chain", nullptr}, {L"D3D11 pipeline and readback", nullptr},
+        {L"DXGI surface identity", nullptr}, {L"D3D11 shared texture / keyed mutex", nullptr},
+        {L"D3D11 GPU events", nullptr}, {L"D3D12 shared fence", nullptr},
+        {L"D3D12 device factory", nullptr}, {L"D3D11On12", nullptr},
+        {L"D3D11 first-frame handoff", nullptr}, {L"D3D12 first-frame handoff", nullptr},
+    };
+    const wchar_t* const modes[] = {L"", L"--d3d12", L"--legacy-d3d11", L"--d3d11-bindings",
+        L"--dxgi-surfaces", L"--shared-d3d11", L"--dxgi-events", L"--d3d12 --shared-d3d12",
+        L"--d3d12 --factory-d3d12", L"--d3d12 --d3d11on12", L"--gate-first-frame", L"--d3d12 --gate-first-frame"};
+    static_assert(ARRAYSIZE(choices) == ARRAYSIZE(modes));
+    for (;;)
+    {
+        const int selected = Validation::Panel(instance, log, choices, ARRAYSIZE(choices), true).Show(L"Graphics validation");
+        if (selected < 0) return 0;
+        log.Write(L"BEGIN", choices[selected].label);
+        wchar_t options[80]{};
+        wcscpy_s(options, modes[selected]);
+        const int result = RunSelection(instance, options, show);
+        log.Write(result ? L"FAIL" : L"END", choices[selected].label, static_cast<unsigned>(result));
+    }
+#else
+    return RunSelection(instance, arguments, show);
+#endif
 }

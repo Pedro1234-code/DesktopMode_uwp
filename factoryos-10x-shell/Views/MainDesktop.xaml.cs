@@ -166,7 +166,7 @@ namespace factoryos_10x_shell.Views
             ApplyDefaultWallpaper();
             LoadBackgroundImage();
 
-            this.PointerPressed += OnPointerPressed;
+            AddHandler(UIElement.PointerPressedEvent, new PointerEventHandler(OnPointerPressed), true);
 
             TaskbarFrame.NavigationFailed += TaskbarFrame_NavigationFailed;
             TaskbarFrame.Loaded += (sender, args) => LogTaskbarStartup(
@@ -1956,7 +1956,7 @@ namespace factoryos_10x_shell.Views
             // click appear outside Start and dismissed it.
             PointerPoint point = args.GetCurrentPoint(null);
 
-            if (m_actionManager.IsActionCenterOpen)
+            if (!args.Handled && m_actionManager.IsActionCenterOpen)
             {
                 Rect actionCenterBounds = ActionCenterFrame.TransformToVisual(null).TransformBounds(new Rect(0, 0, ActionCenterFrame.ActualWidth, ActionCenterFrame.ActualHeight));
 
@@ -1968,6 +1968,12 @@ namespace factoryos_10x_shell.Views
 
             if (m_startManager.IsStartOpen)
             {
+                // Start toggles on Click, and Search focuses the menu on Click.
+                // Let those controls handle the gesture without closing on press.
+                if (TaskbarFrame.Content is Default10xBar taskbar &&
+                    taskbar.IsStartOrSearchSource(args.OriginalSource as DependencyObject))
+                    return;
+
                 Rect startMenuBounds = StartMenuFrame.TransformToVisual(null).TransformBounds(new Rect(0, 0, StartMenuFrame.ActualWidth, StartMenuFrame.ActualHeight));
 
                 if (!startMenuBounds.Contains(point.Position))

@@ -76,7 +76,6 @@ namespace factoryos_10x_shell.Controls
         private void RefreshPortalControls()
         {
             SetPortalItemEnabled(DisplayNav, SettingsFor("Display").Any());
-            SetPortalItemEnabled(SoundNav, SettingsFor("Sound").Any());
             SetPortalItemEnabled(PowerNav, SettingsFor("Power & sleep").Any());
             SetPortalItemEnabled(NetworkStatusNav, m_networkAdapters != null);
             NetworkTile.IsEnabled = m_networkAdapters != null;
@@ -109,7 +108,9 @@ namespace factoryos_10x_shell.Controls
         private void UpdatePortalPage(string page)
         {
             bool isPortalPage = page == "Status" || IsPortalSystemPage(page);
-            PortalPanel.Visibility = isPortalPage ? Visibility.Visible : Visibility.Collapsed;
+            DisableNavigationSoundsToggle.Visibility = page == "Sound" ? Visibility.Visible : Visibility.Collapsed;
+            PortalPanel.Visibility = isPortalPage && (page != "Sound" || SettingsFor(page).Any())
+                ? Visibility.Visible : Visibility.Collapsed;
             PortalRows.Children.Clear();
             if (!isPortalPage) return;
 

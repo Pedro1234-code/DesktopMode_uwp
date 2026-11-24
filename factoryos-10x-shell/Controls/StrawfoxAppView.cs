@@ -48,7 +48,7 @@ namespace factoryos_10x_shell.Controls
         private uint lastLoggedState = uint.MaxValue;
         private DateTimeOffset nextPendingLog;
         private double loggedWidth = -1, loggedHeight = -1;
-        private bool? softwareFrames;
+        private bool? bitmapFrames;
         private Point contextMenuPoint;
         private MenuFlyout contextMenu;
         private void ShowContextMenu(int flags)
@@ -178,7 +178,7 @@ namespace factoryos_10x_shell.Controls
                 if (!viewportSettled) { UpdateLayout(); UpdateViewport(); viewportSettled = true; Log("window-ready", "nativeId=" + session?.Id); }
                 if (disposed) return;
                 HookInput();
-                UpdateSoftwareFrame();
+                UpdateBitmapFrame();
                 popupSuppressed = model.IsActive && VisualTreeHelper.GetOpenPopups(Window.Current).Count != 0;
                 UpdateActivation();
                 for (int i = 0; i < 16; i++)
@@ -224,18 +224,18 @@ namespace factoryos_10x_shell.Controls
         private void FrameTick(object sender, object args)
         {
             if (disposed || session == null || model.Visibility != Visibility.Visible) { frameTimer.Stop(); return; }
-            try { UpdateSoftwareFrame(); }
+            try { UpdateBitmapFrame(); }
             catch (Exception error) { Fail(error); }
         }
-        private void UpdateSoftwareFrame()
+        private void UpdateBitmapFrame()
         {
-            bool software = model.Visibility == Visibility.Visible && session.UpdateFrame();
-            if (model.Visibility == Visibility.Visible && softwareFrames != software)
+            bool bitmap = model.Visibility == Visibility.Visible && session.UpdateFrame();
+            if (model.Visibility == Visibility.Visible && bitmapFrames != bitmap)
             {
-                softwareFrames = software;
-                Log("frame-source", software ? "software" : "gpu-or-awaiting-first-frame");
+                bitmapFrames = bitmap;
+                Log("frame-source", bitmap ? "bitmap" : "direct-or-awaiting-first-frame");
             }
-            if (software)
+            if (bitmap)
             {
                 if (!frameTimer.IsEnabled) frameTimer.Start();
             }

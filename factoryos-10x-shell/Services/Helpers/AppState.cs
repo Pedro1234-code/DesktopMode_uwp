@@ -62,6 +62,23 @@ namespace factoryos_10x_shell.Services.Helpers
             }
         }
 
+        internal bool DisableNavigationSounds
+        {
+            get => ApplicationData.Current.LocalSettings.Values["DisableNavigationSounds"] as bool? ?? false;
+            set
+            {
+                ApplicationData.Current.LocalSettings.Values["DisableNavigationSounds"] = value;
+                ApplyNavigationSoundPreference();
+            }
+        }
+
+        internal void ApplyNavigationSoundPreference()
+        {
+            Windows.UI.Xaml.ElementSoundPlayer.State = DisableNavigationSounds
+                ? Windows.UI.Xaml.ElementSoundPlayerState.Off
+                : Windows.UI.Xaml.ElementSoundPlayerState.Auto;
+        }
+
         public event Action TaskbarPreferencesChanged;
         internal TaskbarSizeMode TaskbarSize
         {

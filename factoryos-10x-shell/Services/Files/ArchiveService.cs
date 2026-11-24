@@ -81,8 +81,10 @@ namespace factoryos_10x_shell.Services.Files
         {
             return Task.Run(() =>
             {
+                var extractedFiles = new List<StorageFile>();
                 try
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     // Enumerating a solid RAR once just to calculate its total can be
                     // nearly as expensive as extracting it. Keep RAR progress
                     // indeterminate and process the archive in a single pass.
@@ -97,9 +99,10 @@ namespace factoryos_10x_shell.Services.Files
                         long lastProgressMilliseconds = -1000;
                         byte[] copyBuffer = new byte[1024 * 1024];
 
-                        while (reader.MoveToNextEntry())
+                        while (true)
                         {
                             cancellationToken.ThrowIfCancellationRequested();
+                            if (!reader.MoveToNextEntry()) break;
                             IEntry entry = reader.Entry;
                             string safePath = NormalizeEntryPath(entry.Key);
                             if (string.IsNullOrWhiteSpace(safePath)) continue;
@@ -114,14 +117,26 @@ namespace factoryos_10x_shell.Services.Files
 
                             string parentPath = ParentPath(safePath);
                             StorageFolder parent = EnsureFolderAsync(destination, parentPath).GetAwaiter().GetResult();
-                            StorageFile outputFile = parent.CreateFileAsync(EntryName(safePath), CreationCollisionOption.ReplaceExisting).AsTask().GetAwaiter().GetResult();
                             using (Stream source = reader.OpenEntryStream())
-                            using (Stream output = outputFile.OpenStreamForWriteAsync().GetAwaiter().GetResult())
                             {
-                                output.SetLength(0);
-                                CopyWithProgress(source, output, ToUnsignedSize(entry.Size), ref completed,
-                                    total, safePath, progress, cancellationToken, progressClock,
-                                    ref lastProgressMilliseconds, copyBuffer);
+                                cancellationToken.ThrowIfCancellationRequested();
+                                StorageFile outputFile = parent.CreateFileAsync(EntryName(safePath),
+                                    CreationCollisionOption.GenerateUniqueName).AsTask().GetAwaiter().GetResult();
+                                try
+                                {
+                                    using (Stream output = outputFile.OpenStreamForWriteAsync().GetAwaiter().GetResult())
+                                    {
+                                        CopyWithProgress(source, output, ToUnsignedSize(entry.Size), ref completed,
+                                            total, safePath, progress, cancellationToken, progressClock,
+                                            ref lastProgressMilliseconds, copyBuffer);
+                                    }
+                                    extractedFiles.Add(outputFile);
+                                }
+                                catch
+                                {
+                                    RemoveExtractedFile(outputFile);
+                                    throw;
+                                }
                             }
                         }
                         progress?.Report(new ArchiveProgress { Item = "Completed", Percent = 100 });
@@ -129,9 +144,22 @@ namespace factoryos_10x_shell.Services.Files
                 }
                 catch (Exception error) when (IsPasswordError(error))
                 {
+                    // A retry starts at the first entry. Keep it from duplicating
+                    // files already extracted by the unsuccessful attempt.
+                    foreach (StorageFile file in extractedFiles)
+                        RemoveExtractedFile(file);
                     throw new ArchivePasswordRequiredException(error);
                 }
             }, cancellationToken);
+        }
+
+        private static void RemoveExtractedFile(StorageFile file)
+        {
+            try { file.DeleteAsync(StorageDeleteOption.PermanentDelete).AsTask().GetAwaiter().GetResult(); }
+            catch (Exception error)
+            {
+                Services.Helpers.ShellDiagnostics.RecordException("Removing incomplete archive output", error);
+            }
         }
 
         internal static Task CompressAsync(IReadOnlyList<IStorageItem> items, StorageFile destination,
@@ -319,10 +347,13 @@ namespace factoryos_10x_shell.Services.Files
         private static string NormalizeEntryPath(string value)
         {
             if (string.IsNullOrWhiteSpace(value)) return string.Empty;
-            string path = value.Replace('\\', '/').TrimStart('/');
+            string path = value.Replace('\\', '/');
             string[] segments = path.Split(new[] { '/' }, StringSplitOptions.RemoveEmptyEntries);
-            if (segments.Any(segment => segment == "." || segment == ".." || segment.Contains(":")))
+            if (path.StartsWith("/", StringComparison.Ordinal) || segments.Any(segment =>
+                segment == ".." || segment.EndsWith(" ", StringComparison.Ordinal) ||
+                (segment != "." && segment.EndsWith(".", StringComparison.Ordinal)) || segment.Contains(":")))
                 throw new InvalidDataException("The archive contains an unsafe path.");
+            segments = segments.Where(segment => segment != ".").ToArray();
             return string.Join("/", segments);
         }
 

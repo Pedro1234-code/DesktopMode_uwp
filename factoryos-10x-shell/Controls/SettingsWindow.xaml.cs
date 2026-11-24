@@ -1,6 +1,5 @@
 using System;
 using System.Linq;
-using System.Threading.Tasks;
 using Windows.Foundation;
 using Windows.Security.ExchangeActiveSyncProvisioning;
 using Windows.Storage;
@@ -12,7 +11,6 @@ using Windows.UI.Xaml.Controls;
 using Windows.UI.Xaml.Input;
 using Windows.UI.Xaml.Media;
 using Windows.UI.Xaml.Media.Imaging;
-using Windows.UI.ViewManagement;
 using factoryos_10x_shell.Services.Helpers;
 using factoryos_10x_shell.Services.Win32;
 using Microsoft.Extensions.DependencyInjection;
@@ -62,6 +60,7 @@ namespace factoryos_10x_shell.Controls
                 if (m_workspaceHost != null) m_workspaceHost.SizeChanged -= Workspace_SizeChanged;
                 m_workspaceHost = null;
             };
+            DisableNavigationSoundsToggle.IsOn = AppState.Instance.DisableNavigationSounds;
             BackgroundToggle.IsOn = AppState.Instance.IsBgChangeButtonVisible;
             Win32SupportToggle.IsOn = Win32WindowManagerService.Instance.IsAppSupportEnabled;
             AutomaticUpdateCheckToggle.IsOn = UpdateCheckService.IsAutomaticCheckEnabled;
@@ -237,7 +236,6 @@ namespace factoryos_10x_shell.Controls
         private void SettingsBack_Click(object sender, RoutedEventArgs e)
         {
             ShowHome();
-            DismissOnScreenKeyboard();
         }
         private void ShellSkin_Changed(object sender, SelectionChangedEventArgs e)
         {
@@ -277,6 +275,12 @@ namespace factoryos_10x_shell.Controls
                 AppState.Instance.TaskbarSize = (TaskbarSizeMode)TaskbarSizeCombo.SelectedIndex;
         }
 
+        private void DisableNavigationSounds_Toggled(object sender, RoutedEventArgs e)
+        {
+            if (!m_initializing)
+                AppState.Instance.DisableNavigationSounds = DisableNavigationSoundsToggle.IsOn;
+        }
+
         private void TaskbarAutoHide_Toggled(object sender, RoutedEventArgs e)
         { if (!m_initializing) AppState.Instance.TaskbarAutoHide = TaskbarAutoHideToggle.IsOn; }
         private void TaskbarAlignment_Changed(object sender, SelectionChangedEventArgs e)
@@ -284,16 +288,18 @@ namespace factoryos_10x_shell.Controls
 
         private void ShowHome()
         {
-            SettingsBackButton.Visibility = Visibility.Collapsed;
             HomePage.Visibility = Visibility.Visible;
+            if (Visibility == Visibility.Visible && DetailPage.Visibility == Visibility.Visible)
+                SystemHomeTile.Focus(FocusState.Programmatic);
+            SettingsBackButton.Visibility = Visibility.Collapsed;
             DetailPage.Visibility = Visibility.Collapsed;
             TitleText.Text = "Settings";
             SelectNavigationItem("Home");
         }
         private void OpenDetail(string section, string page)
         {
+            bool enteringFromHome = HomePage.Visibility == Visibility.Visible;
             SettingsBackButton.Visibility = Visibility.Visible;
-            HomePage.Visibility = Visibility.Collapsed;
             DetailPage.Visibility = Visibility.Visible;
             SectionTitle.Text = section;
             TitleText.Text = "Settings";
@@ -306,7 +312,9 @@ namespace factoryos_10x_shell.Controls
             PersonalizationNavigation.Visibility = section == "Personalization" ? Visibility.Visible : Visibility.Collapsed;
             SelectDetail(page);
             SelectNavigationItem(page);
-            DismissOnScreenKeyboard();
+            if (enteringFromHome && Visibility == Visibility.Visible)
+                SettingsBackButton.Focus(FocusState.Programmatic);
+            HomePage.Visibility = Visibility.Collapsed;
         }
         private void SettingsNavigation_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
@@ -330,12 +338,10 @@ namespace factoryos_10x_shell.Controls
             if (page == "Home")
             {
                 ShowHome();
-                DismissOnScreenKeyboard();
                 return;
             }
 
             SelectDetail(page);
-            DismissOnScreenKeyboard();
         }
         private void SelectNavigationItem(string page)
         {
@@ -424,17 +430,6 @@ namespace factoryos_10x_shell.Controls
         {
             if (!m_initializing)
                 UpdateCheckService.IsAutomaticCheckEnabled = AutomaticUpdateCheckToggle.IsOn;
-        }
-
-        private async void DismissOnScreenKeyboard()
-        {
-            try
-            {
-                InputPane.GetForCurrentView().TryHide();
-                await Task.Delay(75);
-                InputPane.GetForCurrentView().TryHide();
-            }
-            catch { }
         }
 
         private void PopulateDeviceInformation()

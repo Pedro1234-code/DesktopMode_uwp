@@ -347,6 +347,7 @@ bool PeImage::Inspect(const BYTE* bytes, size_t byteCount, PeImageInfo* result)
     }
 
     result->machine = fileHeader.Machine;
+    result->characteristics = fileHeader.Characteristics;
     result->subsystem = optionalHeader.Subsystem;
     result->entryPointRva = optionalHeader.AddressOfEntryPoint;
     if (fileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)

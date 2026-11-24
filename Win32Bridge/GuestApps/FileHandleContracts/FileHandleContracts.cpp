@@ -12,6 +12,11 @@ extern "C" __declspec(dllexport) int WINAPI BridgeLoaderContractExport()
     return 42;
 }
 
+#ifdef BRIDGE_VALIDATION_SUITE
+#include "../Validation/Scratch.h"
+#define GetTempFileNameW Validation::CreateScratchFile
+#endif
+
 namespace {
 struct Handle
 {
@@ -1243,7 +1248,8 @@ int CheckFileInformationUpdates(const wchar_t* temporaryPath)
     REQUIRE(GetFileAttributesW(renamed.path) == INVALID_FILE_ATTRIBUTES &&
         GetFileAttributesW(nativeName.path) != INVALID_FILE_ATTRIBUTES);
 
-    file.Reset(CreateFileW(nativeName.path, GENERIC_READ | DELETE, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr));
+    file.Reset();
+    file.value = CreateFileW(nativeName.path, GENERIC_READ | DELETE, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
     peer.value = CreateFileW(nativeName.path, DELETE, ShareAll, nullptr, OPEN_EXISTING, 0, nullptr);
     REQUIRE(file.value != INVALID_HANDLE_VALUE && peer.value != INVALID_HANDLE_VALUE);
     FILE_DISPOSITION_INFO disposition{TRUE};
@@ -1592,7 +1598,7 @@ int CheckMultipleWaits()
     return 0;
 }
 }
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command, int)
+static int RunFileContracts(PWSTR command)
 {
     const wchar_t* argument = command ? std::wcsstr(command, L"--writer ") : nullptr;
     if (argument)
@@ -1723,4 +1729,61 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR command, int)
     if (multipleWaits) return multipleWaits;
     const int workerShutdown = CheckThreadShutdown(executable, false);
     return workerShutdown ? workerShutdown : CheckThreadShutdown(executable, true);
+}
+
+#ifdef BRIDGE_VALIDATION_SUITE
+#include "../Validation/Panel.h"
+namespace
+{
+    template<int (*Test)(const wchar_t*)>
+    int FileCase(HWND)
+    {
+        wchar_t directory[MAX_PATH]{};
+        const DWORD size = GetTempPathW(ARRAYSIZE(directory), directory);
+        return size && size < ARRAYSIZE(directory) ? Test(directory) : __LINE__;
+    }
+
+    template<int (*Test)()>
+    int SyncCase(HWND) { return Test(); }
+
+    int ProcessShutdown(HWND)
+    {
+        wchar_t path[MAX_PATH]{};
+        if (!GetModuleFileNameW(nullptr, path, ARRAYSIZE(path))) return __LINE__;
+        const int worker = CheckThreadShutdown(path, false);
+        return worker ? worker : CheckThreadShutdown(path, true);
+    }
+}
+#endif
+
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int)
+{
+#ifdef BRIDGE_VALIDATION_SUITE
+    if (!command || (!std::wcsstr(command, L"--writer ") && !std::wcsstr(command, L"--exit-main-thread ") &&
+        !std::wcsstr(command, L"--exit-worker")))
+    {
+        Validation::Log log(L"FileHandleContracts");
+        const Validation::Button choices[] = {
+            {L"Full suite incl. child process", [](HWND) { return RunFileContracts(nullptr); }},
+            {L"File metadata / EOF / disposition", FileCase<CheckFileInformationUpdates>},
+            {L"Overlapped file I/O", FileCase<CheckOverlappedDiskIo>},
+            {L"I/O completion ports", FileCase<CheckIoCompletionPorts>},
+            {L"Native I/O completion", FileCase<CheckNativeIoCompletion>},
+            {L"Native read / write / cancel", FileCase<CheckNativeDiskIo>},
+            {L"Byte-range locks", FileCase<CheckByteRangeLocks>},
+            {L"Live rename", FileCase<CheckRenameOpenFile>},
+            {L"File mappings and COW", FileCase<CheckFileMappings>},
+            {L"ReplaceFile and backups", FileCase<CheckReplaceFile>},
+            {L"Native loader and DLL search", FileCase<CheckNativeLoader>},
+            {L"Waitable timers", SyncCase<CheckWaitableTimers>},
+            {L"Multi-object waits", SyncCase<CheckMultipleWaits>},
+            {L"Thread synchronization", SyncCase<CheckThreadSynchronization>},
+            {L"Process and thread shutdown", ProcessShutdown},
+        };
+        return Validation::Panel(instance, log, choices, ARRAYSIZE(choices)).Show(L"Files, loader and synchronization") == -1 ? 0 : 1;
+    }
+#else
+    (void)instance;
+#endif
+    return RunFileContracts(command);
 }

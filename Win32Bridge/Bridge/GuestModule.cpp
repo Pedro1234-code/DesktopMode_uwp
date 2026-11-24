@@ -170,6 +170,22 @@ namespace
         if (dot == std::wstring::npos || dot < leafStart) *normalized += L".dll";
         return true;
     }
+
+    bool IsApplicationDllOverrideAllowed(const std::wstring& name)
+    {
+        constexpr const wchar_t* allowed[] = {
+            L"d3d8.dll", L"d3d9.dll", L"ddraw.dll",
+            L"d3dcompiler_43.dll", L"d3dcompiler_46.dll", L"d3dcompiler_47.dll",
+            L"dinput.dll", L"dinput8.dll", L"dsound.dll",
+            L"opengl32.dll", L"vulkan-1.dll", L"winmm.dll",
+            L"xaudio2_7.dll", L"xaudio2_8.dll", L"xaudio2_9.dll",
+            L"xinput1_1.dll", L"xinput1_2.dll", L"xinput1_3.dll",
+            L"xinput1_4.dll", L"xinput9_1_0.dll"
+        };
+        for (const auto* module : allowed)
+            if (name == module) return true;
+        return false;
+    }
 }
 
 struct GuestModuleLoader::Module final
@@ -219,12 +235,74 @@ GuestModuleLoader::GuestModuleLoader(
       m_moduleSourceFolder(moduleSourceFolder)
 {
     if (!m_crtFiles.InitializeStandards(inherited)) throw std::bad_alloc();
+    ReadApplicationDllOverrides();
 }
 
 GuestModuleLoader::~GuestModuleLoader()
 {
     ReleaseAll();
     m_stdio.CloseAll(true, !m_crtState.suppressStdioFlush.load());
+}
+
+void GuestModuleLoader::ReadApplicationDllOverrides()
+{
+    if (!m_storage) return;
+    const std::wstring& executable = m_storage->ModulePath();
+    const std::wstring sidecarName = FileNameOf(executable) + L".dll-overrides";
+    std::vector<BYTE> bytes;
+    if (!ReadAuthorizedModuleBytes(sidecarName, &bytes) &&
+        !m_storage->ReadAllBytes(JoinPath(DirectoryOf(executable), sidecarName).c_str(), &bytes, nullptr))
+        return;
+
+    constexpr size_t maximumProfileSize = 4096;
+    if (bytes.size() > maximumProfileSize ||
+        std::find(bytes.begin(), bytes.end(), BYTE{0}) != bytes.end())
+    {
+        RuntimeDiagnostics::Record(L"DLL OVERRIDE: ignored invalid profile for " + executable + L".");
+        return;
+    }
+
+    // Eligible DLL names are ASCII. Accept a UTF-8 BOM for text editors.
+    std::wstring profile(bytes.begin(), bytes.end());
+    size_t start = profile.compare(0, 3, L"\xEF\xBB\xBF") == 0 ? 3 : 0;
+    for (size_t line = 1; start < profile.size(); ++line)
+    {
+        const size_t newline = profile.find(L'\n', start);
+        std::wstring name = profile.substr(start, newline - start);
+        start = newline == std::wstring::npos ? profile.size() : newline + 1;
+        const auto first = name.find_first_not_of(L" \t\r");
+        if (first == std::wstring::npos || name[first] == L'#') continue;
+        name = Lowercase(name.substr(first, name.find_last_not_of(L" \t\r") - first + 1));
+        if (!IsApplicationDllOverrideAllowed(name))
+        {
+            RuntimeDiagnostics::Record(L"DLL OVERRIDE: ignored ineligible entry at line " +
+                std::to_wstring(line) + L" for " + executable + L".");
+            continue;
+        }
+        if (std::find(m_applicationDllOverrides.begin(), m_applicationDllOverrides.end(), name) ==
+            m_applicationDllOverrides.end())
+        {
+            m_applicationDllOverrides.push_back(name);
+            RuntimeDiagnostics::Record(L"DLL OVERRIDE: " + name + L" selected for " + executable + L".");
+        }
+    }
+}
+
+bool GuestModuleLoader::HasApplicationDllOverride(LPCWSTR requestedName) const
+{
+    return !ApplicationDllOverridePath(requestedName).empty();
+}
+
+std::wstring GuestModuleLoader::ApplicationDllOverridePath(LPCWSTR requestedName) const
+{
+    if (m_applicationDllOverrides.empty() || !requestedName ||
+        std::wcspbrk(requestedName, L"\\/:")) return {};
+    std::wstring name;
+    if (!NormalizeRequestedName(requestedName, &name)) return {};
+    name = Lowercase(std::move(name));
+    if (std::find(m_applicationDllOverrides.begin(), m_applicationDllOverrides.end(), name) ==
+        m_applicationDllOverrides.end()) return {};
+    return JoinPath(DirectoryOf(m_storage->ModulePath()), name);
 }
 
 bool GuestModuleLoader::BuildCandidates(
@@ -438,7 +516,8 @@ std::shared_ptr<GuestModuleLoader::Module> GuestModuleLoader::FindModuleLocked(H
 
 bool GuestModuleLoader::ReadAuthorizedModuleBytes(
     const std::wstring& relativeName,
-    std::vector<BYTE>* bytes) const
+    std::vector<BYTE>* bytes,
+    StorageFolder^* sourceFolder) const
 {
     StorageFolder^ current = m_moduleSourceFolder.Get();
     if (!current || !bytes || relativeName.empty() ||
@@ -491,6 +570,7 @@ bool GuestModuleLoader::ReadAuthorizedModuleBytes(
         reader->ReadBytes(managedBytes);
         bytes->assign(managedBytes->Data, managedBytes->Data + managedBytes->Length);
         delete reader;
+        if (sourceFolder) *sourceFolder = current;
         return true;
     }
     catch (Platform::Exception^)
@@ -502,11 +582,12 @@ bool GuestModuleLoader::ReadAuthorizedModuleBytes(
 
 bool GuestModuleLoader::ReadModuleBytes(
     const ModuleCandidate& candidate,
-    std::vector<BYTE>* bytes) const
+    std::vector<BYTE>* bytes,
+    StorageFolder^* sourceFolder) const
 {
     if (candidate.source == ModuleCandidate::Source::AuthorizedApplicationFolder)
     {
-        if (ReadAuthorizedModuleBytes(candidate.readPath, bytes))
+        if (ReadAuthorizedModuleBytes(candidate.readPath, bytes, sourceFolder))
         {
             RuntimeDiagnostics::Record(
                 L"DLL SOURCE: loaded " + candidate.displayName +
@@ -530,7 +611,8 @@ bool GuestModuleLoader::ReadExecutableBytes(
     LPCWSTR requestedName,
     std::vector<BYTE>* bytes,
     std::wstring* logicalPath,
-    DWORD* win32Error) const
+    DWORD* win32Error,
+    StorageFolder^* sourceFolder) const
 {
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!bytes || !logicalPath)
@@ -540,6 +622,7 @@ bool GuestModuleLoader::ReadExecutableBytes(
     }
     bytes->clear();
     logicalPath->clear();
+    if (sourceFolder) *sourceFolder = nullptr;
 
     std::vector<ModuleCandidate> candidates;
     std::wstring requestedBaseName;
@@ -552,9 +635,14 @@ bool GuestModuleLoader::ReadExecutableBytes(
     }
     for (const auto& candidate : candidates)
     {
-        if (ReadModuleBytes(candidate, bytes))
+        if (ReadModuleBytes(candidate, bytes, sourceFolder))
         {
             *logicalPath = candidate.displayName;
+            // A locally installed or modified EXE in the same directory still
+            // has access to the authorized lower layer of that directory.
+            if (sourceFolder && !*sourceFolder &&
+                _wcsicmp(DirectoryOf(*logicalPath).c_str(), DirectoryOf(m_storage->ModulePath()).c_str()) == 0)
+                *sourceFolder = m_moduleSourceFolder.Get();
             SetWin32Error(win32Error, ERROR_SUCCESS);
             RuntimeDiagnostics::Record(
                 L"PROCESS SOURCE: loaded " + candidate.displayName + L".");
@@ -709,8 +797,11 @@ bool GuestModuleLoader::LoadLibrary(
     std::vector<ModuleCandidate> candidates;
     std::wstring requestedBaseName;
     bool searchByBaseName = false;
+    const std::wstring overridePath = resourceOnly ? std::wstring() :
+        ApplicationDllOverridePath(requestedName);
     if (!BuildCandidates(
-        requestedName, searchFlags, &candidates, &requestedBaseName,
+        overridePath.empty() ? requestedName : overridePath.c_str(),
+        searchFlags, &candidates, &requestedBaseName,
         &searchByBaseName, win32Error, searchPath, dependencyDirectory))
     {
         RuntimeDiagnostics::Record(L"DLL FAILED: invalid module name or search policy.");
@@ -782,6 +873,10 @@ bool GuestModuleLoader::LoadLibrary(
         return false;
     }
 
+    const std::wstring configuredPath = resourceOnly ? std::wstring() :
+        ApplicationDllOverridePath(requestedBaseName.c_str());
+    const bool isOverrideImage = !configuredPath.empty() &&
+        _wcsicmp(configuredPath.c_str(), resolved->displayName.c_str()) == 0;
     auto candidate = std::make_shared<Module>();
     candidate->identity = resolved->identity;
     candidate->canonicalName = resolved->displayName;
@@ -798,6 +893,12 @@ bool GuestModuleLoader::LoadLibrary(
             std::to_wstring(static_cast<unsigned int>(candidate->metadata.machine)) +
             L"; Win32 error " +
             std::to_wstring(static_cast<unsigned long>(ERROR_BAD_EXE_FORMAT)) + L").");
+        return false;
+    }
+    if (isOverrideImage && !(candidate->metadata.characteristics & IMAGE_FILE_DLL))
+    {
+        SetWin32Error(win32Error, ERROR_BAD_EXE_FORMAT);
+        RuntimeDiagnostics::Record(L"DLL OVERRIDE FAILED: " + canonicalName + L" is not a PE DLL.");
         return false;
     }
     if (!PeMapper::Materialize(fileBytes.data(), fileBytes.size(), &candidate->mapped, &preparationError) ||
@@ -992,6 +1093,7 @@ bool GuestModuleLoader::LoadLibrary(
 
     *module = reinterpret_cast<HMODULE>(candidate->runtime.Base());
     SetWin32Error(win32Error, ERROR_SUCCESS);
+    if (isOverrideImage) RuntimeDiagnostics::Record(L"DLL OVERRIDE ACTIVE: " + canonicalName + L".");
     RuntimeDiagnostics::Record(
         L"DLL OK: " + canonicalName + L" loaded; " +
         std::to_wstring(candidate->bindings.bound) + L" imports bound, " +
@@ -1012,7 +1114,11 @@ ImportResolution GuestModuleLoader::ResolveModuleImport(
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     ImportedSymbol canonical = symbol;
     canonical.library = ApiSetHostLibrary(symbol.library);
-    ImportResolution resolution = m_resolver(canonical);
+    const auto overridePath = ApplicationDllOverridePath(canonical.library.c_str());
+    const bool useOverride = !overridePath.empty();
+    ImportResolution resolution = useOverride
+        ? ImportResolution{ ImportDisposition::Unsupported, L"", 0 }
+        : m_resolver(canonical);
     // Keep MSVCP's objects, helpers and allocators in one runtime image when
     // the application supplies it. A partial virtual STL can only be a fallback.
     const bool preferGuestMsvcp = _wcsicmp(canonical.library.c_str(), L"msvcp140.dll") == 0 ||
@@ -1066,7 +1172,9 @@ ImportResolution GuestModuleLoader::ResolveModuleImport(
         if (cached != cache.end()) dependency = cached->second;
         if (!dependency)
         {
-            const auto existing = FindModuleByBaseNameLocked(FileNameOf(canonical.library));
+            const auto existing = useOverride
+                ? FindModuleByIdentityLocked(L"guest:" + Lowercase(overridePath))
+                : FindModuleByBaseNameLocked(FileNameOf(canonical.library));
             if (existing && canonical.library.find_first_of(L"\\/") == std::wstring::npos)
             {
                 dependency = reinterpret_cast<HMODULE>(existing->runtime.Base());
@@ -1092,7 +1200,8 @@ ImportResolution GuestModuleLoader::ResolveModuleImport(
                 SetWin32Error(win32Error, ERROR_SUCCESS);
                 return resolution;
             }
-            return fail(error, L"Guest dependency could not be loaded.");
+            return fail(error, useOverride ? L"Configured app-local DLL override could not be loaded."
+                : L"Guest dependency could not be loaded.");
         }
         // DllMain may have re-entered resolution and populated the cache.
         // Transfer our load reference if that entry was only a cycle edge;
@@ -1137,10 +1246,12 @@ ImportResolution GuestModuleLoader::ResolveModuleImport(
     } scope{ m_resolvingImports };
 
     const FARPROC procedure = GetProcAddress(dependency, requested, &error);
-    if (!procedure) return fail(error, L"Guest dependency does not provide the requested export.");
+    if (!procedure) return fail(error, useOverride ? L"Configured app-local DLL override lacks this export."
+        : L"Guest dependency does not provide the requested export.");
     resolution.targetAddress = reinterpret_cast<ULONGLONG>(procedure);
     resolution.disposition = ImportDisposition::NeedsBridge;
-    resolution.note = L"Resolved from guest dependency " + canonical.library + L".";
+    resolution.note = useOverride ? L"Resolved from app-local DLL override " + overridePath + L"."
+        : L"Resolved from guest dependency " + canonical.library + L".";
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return resolution;
 }
@@ -1161,8 +1272,9 @@ bool GuestModuleLoader::GetModuleHandle(
     std::vector<ModuleCandidate> candidates;
     std::wstring requestedBaseName;
     bool searchByBaseName = false;
+    const auto overridePath = ApplicationDllOverridePath(requestedName);
     if (!BuildCandidates(
-        requestedName, 0, &candidates, &requestedBaseName,
+        overridePath.empty() ? requestedName : overridePath.c_str(), 0, &candidates, &requestedBaseName,
         &searchByBaseName, win32Error))
     {
         return false;
@@ -1294,7 +1406,7 @@ FARPROC GuestModuleLoader::GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, 
         candidate = FindModuleLocked(module);
     }
     const auto runtime = CurrentGuestRuntime();
-    const bool mainImage = runtime && reinterpret_cast<HMODULE>(runtime->ImageBase()) == module;
+    const bool mainImage = runtime && runtime->ImageBase() == reinterpret_cast<const BYTE*>(module);
     if ((!candidate || candidate->resourceOnly) && !mainImage)
     {
         SetWin32Error(win32Error,

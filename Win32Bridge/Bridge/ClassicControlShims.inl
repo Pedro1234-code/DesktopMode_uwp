@@ -38,6 +38,8 @@ void ClassicArrow(HDC dc,RECT box,UINT direction,int color) {
 }
 }
 
+namespace Win32Bridge::Bridge
+{
 int WINAPI BridgeFrameRect(HDC dc,const RECT* rect,HBRUSH brush) {
     if(!rect){BridgeSetLastError(ERROR_INVALID_PARAMETER);return 0;}
     if(!ClassicValidDc(dc))return 0;
@@ -155,4 +157,5 @@ BOOL WINAPI BridgeDrawFrameControl(HDC dc,LPRECT rect,UINT type,UINT state) {
     }
     if(type==4&&shape==16&&(state&0x2000u))ClassicInset(*rect,2); // DFCS_ADJUSTRECT
     BridgeSetLastError(ERROR_SUCCESS);return TRUE;
+}
 }

@@ -92,7 +92,7 @@ HANDLE WithAnsiSynchronizationName(LPCSTR name, const Call& call)
         const int length = BridgeMultiByteToWideChar(CP_ACP, 0, name, -1, nullptr, 0);
         if (!length) return nullptr;
         std::wstring wide(static_cast<size_t>(length), L'\0');
-        if (!BridgeMultiByteToWideChar(CP_ACP, 0, name, -1, wide.data(), length)) return nullptr;
+        if (BridgeMultiByteToWideChar(CP_ACP, 0, name, -1, &wide[0], length) != length) return nullptr;
         return call(wide.c_str());
     }
     catch (const std::bad_alloc&)

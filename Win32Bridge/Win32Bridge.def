@@ -1,4 +1,4 @@
-LIBRARY "Win32Bridge.Runtime"
+LIBRARY "Win32Bridge.Runtime.dll"
 
 EXPORTS
     DllCanUnloadNow PRIVATE

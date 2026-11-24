@@ -19,7 +19,8 @@ namespace factoryos_10x_shell.Services.Files
 
         private FileOperationService() { }
 
-        internal FileOperationModel StartTransfer(IReadOnlyList<IStorageItem> items, StorageFolder destination, FileOperationKind kind)
+        internal FileOperationModel StartTransfer(IReadOnlyList<IStorageItem> items, StorageFolder destination, FileOperationKind kind,
+            StorageDeleteOption deleteOption = StorageDeleteOption.Default)
         {
             var sources = items.ToList();
             var operation = Create(kind == FileOperationKind.Copy ? "Copying items" : kind == FileOperationKind.Move ? "Moving items" : "Deleting items",
@@ -30,7 +31,7 @@ namespace factoryos_10x_shell.Services.Files
                     if (!string.IsNullOrEmpty(item.Path)) AddAffectedPath(operation, Path.GetDirectoryName(item.Path));
             var progress = new Progress<FileOperationProgress>(operation.Update);
             operation.Completion = RunAsync(operation,
-                () => Task.Run(() => FileTransferService.RunAsync(sources, destination, kind, progress, operation.Cancellation.Token)));
+                () => Task.Run(() => FileTransferService.RunAsync(sources, destination, kind, progress, operation.Cancellation.Token, deleteOption)));
             return operation;
         }
 
@@ -78,7 +79,14 @@ namespace factoryos_10x_shell.Services.Files
                 }
                 catch
                 {
-                    if (output != null) await output.DeleteAsync(StorageDeleteOption.PermanentDelete);
+                    if (output != null)
+                    {
+                        try { await output.DeleteAsync(StorageDeleteOption.PermanentDelete); }
+                        catch (Exception error)
+                        {
+                            Services.Helpers.ShellDiagnostics.RecordException("Removing incomplete archive", error);
+                        }
+                    }
                     throw;
                 }
             });

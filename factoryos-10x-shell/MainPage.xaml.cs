@@ -109,6 +109,7 @@ namespace factoryos_10x_shell
 
         public MainPage()
         {
+            AppState.Instance.ApplyNavigationSoundPreference();
             this.InitializeComponent();
             CurrentPage = this;
 

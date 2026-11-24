@@ -340,7 +340,7 @@
 { L"ldiv", reinterpret_cast<ULONGLONG>(&::ldiv) },
 { L"llabs", reinterpret_cast<ULONGLONG>(&::llabs) },
 { L"lldiv", reinterpret_cast<ULONGLONG>(&::lldiv) },
-{ L"llround", reinterpret_cast<ULONGLONG>(&::llround) },
+{ L"llround", reinterpret_cast<ULONGLONG>(static_cast<long long (__cdecl*)(double)>(&::llround)) },
 { L"llroundf", reinterpret_cast<ULONGLONG>(&::llroundf) },
 { L"log", reinterpret_cast<ULONGLONG>(static_cast<double (__cdecl*)(double)>(&::log)) },
 { L"log10", reinterpret_cast<ULONGLONG>(static_cast<double (__cdecl*)(double)>(&::log10)) },

@@ -359,6 +359,9 @@
     <Content Include="..\Win32Bridge\GuestApps\Staged\GraphicsContracts.exe">
       <Link>GuestRuntimeDefaults\Windows\GraphicsContracts.exe</Link>
     </Content>
+    <Content Include="..\Win32Bridge\GuestApps\Staged\TestApps\*.exe">
+      <Link>GuestRuntimeDefaults\Windows\test_apps\%(Filename)%(Extension)</Link>
+    </Content>
     <Content Include="..\Win32Bridge\GuestApps\pt-BR\notepad.exe.mui">
       <Link>GuestRuntimeDefaults\Windows\pt-BR\notepad.exe.mui</Link>
     </Content>

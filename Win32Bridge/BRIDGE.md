@@ -21,6 +21,19 @@ To update the map and inventory, edit the [milestone list](Tools/Generate-Compat
 
 Import resolution can select a bridge implementation, a supported host API, or an export from a mapped guest DLL. Generated export aliases and optional stubs help resolve some imports. A resolved symbol establishes that an entry point is available. Its behavior depends on the implementation behind it.
 
+### App-local DLL overrides
+
+To select an app-supplied library, place the x64 DLL and a text file named after the full executable name plus `.dll-overrides` beside the executable. For example, `game.exe.dll-overrides` can contain:
+
+```text
+# Use the D3D9 implementation shipped with this application.
+d3d9.dll
+```
+
+The profile is read at guest startup. Use one DLL basename per line, with optional blank lines and `#` comments. Eligible names are `d3d8.dll`, `d3d9.dll`, `ddraw.dll`, `d3dcompiler_43.dll`, `d3dcompiler_46.dll`, `d3dcompiler_47.dll`, `dinput.dll`, `dinput8.dll`, `dsound.dll`, `opengl32.dll`, `vulkan-1.dll`, `winmm.dll`, XAudio2 versions 2.7 through 2.9, and XInput versions 1.1 through 1.4 and 9.1.0. Other entries are ignored with a diagnostic.
+
+A configured module takes precedence when requested by basename, including delay loads and dynamic lookups. A missing DLL, failed initialization, or missing export is reported through the corresponding loader error. Absolute or relative path requests and resource-only mappings keep their existing behavior. Each child executable reads its own profile. Check the runtime log for `DLL OVERRIDE ACTIVE` and the final import report for bindings from the app-local image.
+
 ## Implemented subsystems
 
 | Area | Current implementation |
@@ -46,6 +59,7 @@ Use the import and runtime logs in the app's LocalState to distinguish a missing
 | [FileHandleContracts](GuestApps/FileHandleContracts/README.md) | File descriptions, handle lifetime, synchronization and I/O. The source also includes byte-range lock cases for aliases, native lock keys, and cancellation. |
 | [DialogContracts](GuestApps/DialogContracts/README.md) | Dialog behavior and message routing. |
 | [GraphicsContracts](GuestApps/GraphicsContracts/README.md) | D3D11 and D3D12 presentation and resize, plus D3D11 resource and surface identity, keyed mutexes, GPU completion events, D3D11On12 and selected shared-handle and factory paths. The latest fixture checks await a Bridge build and Xbox run. |
+| [Xbox validation suite](GuestApps/Validation/README.md) | Six menu-driven test apps staged in `C:\Windows\test_apps`, with one log per executable. |
 | [BridgeTests](GuestApps/BridgeTests/) | Focused CRT, console, loader, and other compatibility fixtures. |
 
 7-Zip, classic Notepad, Notepad++, and CMD have been used during development. These are application test targets. Compatibility varies with the executable version, exercised feature, build, and host. A successful launch is only one part of validation.

@@ -131,6 +131,10 @@ namespace Bridge
     HDC WINAPI BridgeGetDC(HWND window);
     int WINAPI BridgeReleaseDC(HWND window, HDC dc);
     int WINAPI BridgeFillRect(HDC dc, const RECT* rect, HBRUSH brush);
+    int WINAPI BridgeFrameRect(HDC dc, const RECT* rect, HBRUSH brush);
+    BOOL WINAPI BridgeDrawFocusRect(HDC dc, const RECT* rect);
+    BOOL WINAPI BridgeDrawEdge(HDC dc, LPRECT rect, UINT edge, UINT flags);
+    BOOL WINAPI BridgeDrawFrameControl(HDC dc, LPRECT rect, UINT type, UINT state);
     int WINAPI BridgeDrawTextW(HDC dc, LPWSTR text, int characterCount, LPRECT rect, UINT format);
     int WINAPI BridgeLoadStringW(HINSTANCE instance, UINT identifier, LPWSTR buffer, int bufferCount);
     int WINAPI BridgeMapWindowPoints(HWND from, HWND to, LPPOINT points, UINT count);

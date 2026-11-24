@@ -23,6 +23,7 @@ namespace factoryos_10x_shell.Services.Files
         private sealed class Transfer
         {
             public FileOperationKind Kind;
+            public StorageDeleteOption DeleteOption;
             public IProgress<FileOperationProgress> Progress;
             public CancellationToken Token;
             public ulong TotalBytes, CompletedBytes;
@@ -65,16 +66,18 @@ namespace factoryos_10x_shell.Services.Files
 
         internal static async Task<FileOperationResult> RunAsync(IReadOnlyList<IStorageItem> items,
             StorageFolder destination, FileOperationKind kind, IProgress<FileOperationProgress> progress,
-            CancellationToken token)
+            CancellationToken token, StorageDeleteOption deleteOption)
         {
             var result = new FileOperationResult();
-            var transfer = new Transfer { Kind = kind, Progress = progress, Token = token };
+            var transfer = new Transfer { Kind = kind, Progress = progress, Token = token, DeleteOption = deleteOption };
             var nodes = new List<Node>();
             try
             {
                 foreach (IStorageItem item in RemoveNestedSelections(items))
                 {
                     token.ThrowIfCancellationRequested();
+                    int itemsBeforeScan = transfer.TotalItems;
+                    ulong bytesBeforeScan = transfer.TotalBytes;
                     try
                     {
                         if (kind != FileOperationKind.Delete && item is StorageFolder folder)
@@ -82,7 +85,12 @@ namespace factoryos_10x_shell.Services.Files
                         nodes.Add(await ScanAsync(item, transfer, 0));
                     }
                     catch (OperationCanceledException) { throw; }
-                    catch (Exception error) { result.AddError(item.Name + ": " + error.Message); }
+                    catch (Exception error)
+                    {
+                        transfer.TotalItems = itemsBeforeScan;
+                        transfer.TotalBytes = bytesBeforeScan;
+                        result.AddError(item.Name + ": " + error.Message);
+                    }
                 }
                 transfer.Begin();
                 foreach (Node node in nodes)
@@ -282,20 +290,21 @@ namespace factoryos_10x_shell.Services.Files
             {
                 foreach (Node child in node.Children) await DeleteAsync(child, transfer);
                 EnsureSourceLocation(node);
-                await DeleteEmptyFolderAsync(folder, transfer.Token);
+                await DeleteEmptyFolderAsync(folder, transfer.Token, transfer.DeleteOption);
             }
-            else await node.Item.DeleteAsync();
+            else await node.Item.DeleteAsync(transfer.DeleteOption);
             transfer.CompletedItems++;
             transfer.Report(node.Name);
         }
 
-        private static async Task DeleteEmptyFolderAsync(StorageFolder folder, CancellationToken token)
+        private static async Task DeleteEmptyFolderAsync(StorageFolder folder, CancellationToken token,
+            StorageDeleteOption option = StorageDeleteOption.Default)
         {
             token.ThrowIfCancellationRequested();
             if ((await folder.GetItemsAsync(0, 1)).Count != 0)
                 throw new IOException("The source folder changed during the operation and was kept.");
             token.ThrowIfCancellationRequested();
-            await folder.DeleteAsync();
+            await folder.DeleteAsync(option);
         }
 
         private static void EnsureSourceLocation(Node node)

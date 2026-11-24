@@ -120,6 +120,19 @@ namespace factoryos_10x_shell.Views
 
         internal event Action SearchRequested;
 
+        internal bool IsStartOrSearchSource(DependencyObject source)
+        {
+            for (var element = source; element != null && element != this;
+                element = VisualTreeHelper.GetParent(element))
+            {
+                if (element == StartButton || element == Windows11StartButton ||
+                    element == Windows11TaskbarSearch)
+                    return true;
+            }
+
+            return false;
+        }
+
         private void Windows11TaskbarSearch_Click(object sender, RoutedEventArgs e) => SearchRequested?.Invoke();
 
         public Default10xBar()

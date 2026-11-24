@@ -1294,8 +1294,6 @@ BOOL WINAPI BridgeSetMenuItemBitmaps(HMENU menu, UINT item, UINT flags, HBITMAP 
     return BridgeSetMenuItemInfoW(menu, item, (flags & MF_BYPOSITION) != 0, &info);
 }
 
-#include "Bridge/ClassicControlShims.inl"
-
 int WINAPI BridgeToAscii(UINT virtualKey, UINT, const BYTE* state, LPWORD characters, UINT)
 {
     if (!characters) return 0;

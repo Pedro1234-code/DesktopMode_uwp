@@ -61,6 +61,11 @@ namespace factoryos_10x_shell.Controls
             if (dx * dx + dy * dy < 36) return;
 
             FileEntry candidate = m_fileDragCandidate;
+            if (!ReferenceEquals(ItemsList.ItemFromContainer(m_fileDragRow), candidate))
+            {
+                m_fileDragCandidate = null;
+                return;
+            }
             // Use the item visual as the source so the drag preview contains
             // one row, rather than a screenshot of the entire file list.
             UIElement source = m_fileDragRow.ContentTemplateRoot ?? (UIElement)m_fileDragRow;
@@ -106,7 +111,7 @@ namespace factoryos_10x_shell.Controls
             try
             {
                 var files = await StorageItemsAsync(m_dragEntries);
-                if (files.Count == 0) { e.Cancel = true; return; }
+                if (files.Count != m_dragEntries.Count) { e.Cancel = true; return; }
                 e.Cancel = false;
                 e.AllowedOperations = Windows.ApplicationModel.DataTransfer.DataPackageOperation.Copy;
                 e.Data.SetStorageItems(files, true);
@@ -145,18 +150,20 @@ namespace factoryos_10x_shell.Controls
         private readonly List<NavigationViewItem> m_logicalDriveItems = new List<NavigationViewItem>();
         private bool m_loadingLogicalDrives;
         private StorageFolder m_currentFolder;
+        private FolderLocation m_parentLocation;
         private string m_currentDisplayName = "Home";
         private Stack<FolderLocation> m_history = new Stack<FolderLocation>();
         private Stack<FolderLocation> m_forwardHistory = new Stack<FolderLocation>();
         private FileTabState m_activeTab;
         private bool m_switchingTabs;
-        private int m_tabSelectionRevision;
+        private int m_navigationRequestRevision;
         private int m_folderLoadRevision;
         private readonly List<FileEntry> m_clipboardEntries = new List<FileEntry>();
         private bool m_cutOperation;
         private bool m_cutPasteInProgress;
+        private bool m_deletePromptOpen;
+        private bool m_refreshFolderOnRestore;
         private int m_clipboardRevision;
-        private FileEntry m_contextEntry;
         private IReadOnlyList<FileEntry> m_items = Array.Empty<FileEntry>();
         private IReadOnlyList<FileEntry> m_allItems = Array.Empty<FileEntry>();
         private readonly SemaphoreSlim m_thumbnailSlots = new SemaphoreSlim(3, 3);
@@ -246,6 +253,7 @@ namespace factoryos_10x_shell.Controls
             m_history = state.History;
             m_forwardHistory = state.ForwardHistory;
             m_currentFolder = state.CurrentFolder;
+            m_parentLocation = state.ParentLocation;
             m_currentDisplayName = state.DisplayName;
             LocationsNavigation.SelectedItem = state.SelectedNavigationItem ?? HomeNavigationItem;
         }
@@ -277,14 +285,9 @@ namespace factoryos_10x_shell.Controls
             if (!wasShowingSettings)
                 SaveActiveTabState();
             ActivateTabState(state);
-            int revision = ++m_tabSelectionRevision;
-            string searchText = state.SearchText ?? string.Empty;
             await OpenFolderAsync(state.CurrentFolder ?? ApplicationData.Current.LocalFolder,
-                string.IsNullOrWhiteSpace(state.DisplayName) ? "Home" : state.DisplayName, false);
-
-            if (revision != m_tabSelectionRevision || !ReferenceEquals(state, m_activeTab)) return;
-            SearchBox.Text = searchText;
-            state.SearchText = searchText;
+                string.IsNullOrWhiteSpace(state.DisplayName) ? "Home" : state.DisplayName,
+                searchText: state.SearchText, parent: state.ParentLocation);
         }
 
         private void FilesTabs_TabCloseRequested(Muxc.TabView sender, Muxc.TabViewTabCloseRequestedEventArgs args)
@@ -303,20 +306,47 @@ namespace factoryos_10x_shell.Controls
                 sender.SelectedIndex = Math.Max(0, Math.Min(closedIndex - 1, sender.TabItems.Count - 1));
         }
 
-        private void FilesWindow_KeyDown(object sender, KeyRoutedEventArgs e)
+        private async void FilesWindow_KeyDown(object sender, KeyRoutedEventArgs e)
         {
-            CoreVirtualKeyStates control = Window.Current.CoreWindow.GetKeyState(VirtualKey.Control);
-            if ((control & CoreVirtualKeyStates.Down) == 0) return;
+            var keyboard = Window.Current.CoreWindow;
+            bool control = (keyboard.GetKeyState(VirtualKey.Control) & CoreVirtualKeyStates.Down) != 0;
+            bool shift = (keyboard.GetKeyState(VirtualKey.Shift) & CoreVirtualKeyStates.Down) != 0;
+            bool alt = (keyboard.GetKeyState(VirtualKey.Menu) & CoreVirtualKeyStates.Down) != 0;
+            if (e.Handled || alt) return;
 
-            if (e.Key == VirtualKey.T)
+            if (control && e.Key == VirtualKey.T)
             {
                 FilesTabs.SelectedItem = CreateTab("Home", ApplicationData.Current.LocalFolder);
                 e.Handled = true;
             }
-            else if (e.Key == VirtualKey.W)
+            else if (control && e.Key == VirtualKey.W)
             {
                 CloseTab(FilesTabs, FilesTabs.SelectedItem as Muxc.TabViewItem);
                 e.Handled = true;
+            }
+            else if (SettingsPage.Visibility != Visibility.Visible)
+            {
+                var source = e.OriginalSource as DependencyObject;
+                if (FindVisualAncestor<TextBox>(source) != null ||
+                    FindVisualAncestor<PasswordBox>(source) != null) return;
+
+                if (control && !shift && (e.Key == VirtualKey.X || e.Key == VirtualKey.C))
+                {
+                    e.Handled = true;
+                    SetClipboard(null, e.Key == VirtualKey.X);
+                }
+                else if (control && !shift && e.Key == VirtualKey.V)
+                {
+                    e.Handled = true;
+                    Paste_Click(null, e);
+                }
+                else if (!control && e.Key == VirtualKey.Delete)
+                {
+                    e.Handled = true;
+                    if (!e.KeyStatus.WasKeyDown)
+                        await DeleteEntriesAsync(GetOperationEntries(null),
+                            shift ? StorageDeleteOption.PermanentDelete : StorageDeleteOption.Default);
+                }
             }
         }
 
@@ -338,6 +368,8 @@ namespace factoryos_10x_shell.Controls
             Visibility = Visibility.Visible;
             AppState.Instance.SetFilesWindowState(true, false);
             AppState.Instance.ActivateFiles();
+            if (m_refreshFolderOnRestore && SettingsPage.Visibility != Visibility.Visible && m_currentFolder != null)
+                _ = OpenFolderAsync(m_currentFolder, m_currentDisplayName, reportErrors: false, preserveSearch: true);
         }
 
         public void OpenDownloadedFile(string filePath) => OpenFolderAndSelect(filePath, true);
@@ -354,6 +386,7 @@ namespace factoryos_10x_shell.Controls
                 AppState.Instance.ActivateFiles();
             }
 
+            int request = openFile ? 0 : ++m_navigationRequestRevision;
             StorageFile file;
             StorageFolder folder;
             try
@@ -380,8 +413,11 @@ namespace factoryos_10x_shell.Controls
                 if (openFile) await OpenFileAsync(file, folder);
                 else
                 {
+                    if (request != m_navigationRequestRevision) return;
+                    int expectedRequest = request + 1;
                     await OpenFolderAsync(folder, folder.DisplayName, true);
-                    SelectFile(file.Path, file.Name);
+                    if (expectedRequest == m_navigationRequestRevision)
+                        SelectFile(file.Path, file.Name);
                 }
             }
             catch { }
@@ -403,6 +439,7 @@ namespace factoryos_10x_shell.Controls
 
         private void Close_Click(object sender, RoutedEventArgs e)
         {
+            ++m_navigationRequestRevision;
             Visibility = Visibility.Collapsed;
             AppState.Instance.SetFilesWindowState(false, false);
         }
@@ -443,10 +480,7 @@ namespace factoryos_10x_shell.Controls
             if (list == null)
                 return;
 
-            ListViewItem container = FindVisualAncestor<ListViewItem>(e.OriginalSource as DependencyObject);
-            FileEntry entry = container != null && ItemsList.IndexFromContainer(container) >= 0
-                ? container.Content as FileEntry
-                : null;
+            FileEntry entry = GetRowEntry(e.OriginalSource as DependencyObject);
 
             MenuFlyout flyout;
             if (entry != null)
@@ -459,8 +493,10 @@ namespace factoryos_10x_shell.Controls
                     list.SelectedItem = entry;
                 }
 
-                m_contextEntry = entry;
                 flyout = list.Resources["ItemContextMenu"] as MenuFlyout;
+                var selection = list.SelectedItems.OfType<FileEntry>().ToList();
+                if (!selection.Contains(entry)) selection = new List<FileEntry> { entry };
+                if (flyout != null) SetMenuSelection(flyout.Items, new MenuSelection(entry, selection));
                 MenuFlyoutSubItem archiveMenu = flyout?.Items
                     .OfType<MenuFlyoutSubItem>()
                     .FirstOrDefault(item => string.Equals(item.Tag as string, "ArchiveActions", StringComparison.Ordinal));
@@ -472,13 +508,42 @@ namespace factoryos_10x_shell.Controls
             else
             {
                 // A background click is never allowed to inherit a previous target.
-                m_contextEntry = null;
                 list.SelectedItems.Clear();
                 flyout = list.Resources["BackgroundContextMenu"] as MenuFlyout;
             }
 
             flyout?.ShowAt(list, e.GetPosition(list));
             e.Handled = true;
+        }
+
+        private FileEntry GetRowEntry(DependencyObject source)
+        {
+            var container = FindVisualAncestor<ListViewItem>(source);
+            int index = container == null ? -1 : ItemsList.IndexFromContainer(container);
+            return index >= 0 && index < ItemsList.Items.Count ? ItemsList.Items[index] as FileEntry : null;
+        }
+
+        private static void SetMenuSelection(IEnumerable<MenuFlyoutItemBase> items, MenuSelection selection)
+        {
+            foreach (var item in items)
+            {
+                if (item is MenuFlyoutSubItem submenu)
+                    SetMenuSelection(submenu.Items, selection);
+                else if (item is MenuFlyoutItem action)
+                    action.Tag = selection;
+            }
+        }
+
+        private sealed class MenuSelection
+        {
+            public MenuSelection(FileEntry target, IReadOnlyList<FileEntry> entries)
+            {
+                Target = target;
+                Entries = entries;
+            }
+
+            public FileEntry Target { get; }
+            public IReadOnlyList<FileEntry> Entries { get; }
         }
 
         private static T FindVisualAncestor<T>(DependencyObject source) where T : DependencyObject
@@ -566,6 +631,7 @@ namespace factoryos_10x_shell.Controls
         {
             if (e.IsSettingsInvoked)
             {
+                ++m_navigationRequestRevision;
                 SettingsPage.Visibility = Visibility.Visible;
                 return;
             }
@@ -602,7 +668,9 @@ namespace factoryos_10x_shell.Controls
             ApplicationData.Current.LocalSettings.Values.Remove(RemovableMediaNameKey);
             RemovableMediaItem.Content = "Removable media";
             m_clipboardEntries.Clear();
+            m_clipboardRevision++;
             m_cutOperation = false;
+            UpdateStatus();
 
             foreach (Muxc.TabViewItem tab in FilesTabs.TabItems.OfType<Muxc.TabViewItem>())
             {
@@ -610,6 +678,7 @@ namespace factoryos_10x_shell.Controls
                 if (state == null) continue;
 
                 state.CurrentFolder = ApplicationData.Current.LocalFolder;
+                state.ParentLocation = null;
                 state.DisplayName = "Home";
                 state.SearchText = string.Empty;
                 state.SelectedNavigationItem = HomeNavigationItem;
@@ -622,6 +691,8 @@ namespace factoryos_10x_shell.Controls
             m_currentDisplayName = "Home";
             m_history.Clear();
             m_forwardHistory.Clear();
+            LocationsNavigation.SelectedItem = HomeNavigationItem;
+            if (m_activeTab != null) m_activeTab.SelectedNavigationItem = HomeNavigationItem;
             await OpenFolderAsync(ApplicationData.Current.LocalFolder, "Home", false);
 
             ResetAuthorizedFoldersStatus.Text = filesTokens.Count == 0
@@ -665,7 +736,9 @@ namespace factoryos_10x_shell.Controls
 
         private async Task OpenLogicalDriveAsync(string root)
         {
+            int request = ++m_navigationRequestRevision;
             var folder = await GetMountedFolderAsync(root);
+            if (request != m_navigationRequestRevision) return;
             if (folder == null)
             {
                 try { folder = await StorageFolder.GetFolderFromPathAsync(root); }
@@ -677,6 +750,7 @@ namespace factoryos_10x_shell.Controls
                 }
             }
 
+            if (request != m_navigationRequestRevision) return;
             if (folder == null)
                 await OpenLibraryAsync(root);
             else
@@ -688,7 +762,9 @@ namespace factoryos_10x_shell.Controls
         {
             if (string.IsNullOrWhiteSpace(location)) return;
 
+            int request = ++m_navigationRequestRevision;
             StorageFolder folder = await GetMountedFolderAsync(location);
+            if (request != m_navigationRequestRevision) return;
             if (folder == null)
             {
                 string pickerInstructions = location == "Removable media"
@@ -701,12 +777,13 @@ namespace factoryos_10x_shell.Controls
                     PrimaryButtonText = "Choose folder",
                     CloseButtonText = "Cancel"
                 };
-                if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+                if (await dialog.ShowAsync() != ContentDialogResult.Primary ||
+                    request != m_navigationRequestRevision) return;
 
                 var picker = new FolderPicker();
                 picker.FileTypeFilter.Add("*");
                 folder = await picker.PickSingleFolderAsync();
-                if (folder == null) return;
+                if (folder == null || request != m_navigationRequestRevision) return;
                 StorageApplicationPermissions.FutureAccessList.AddOrReplace(MountPrefix + location, folder);
                 if (location == "Removable media") SaveRemovableMediaName(folder);
             }
@@ -719,32 +796,56 @@ namespace factoryos_10x_shell.Controls
             string token = MountPrefix + location;
             if (!StorageApplicationPermissions.FutureAccessList.ContainsItem(token)) return null;
             try { return await StorageApplicationPermissions.FutureAccessList.GetFolderAsync(token); }
-            catch { StorageApplicationPermissions.FutureAccessList.Remove(token); return null; }
+            catch (Exception error)
+            {
+                // Temporary device removal must not erase the saved permission.
+                ShellDiagnostics.RecordException("Resolving authorized Files folder", error);
+                return null;
+            }
         }
 
-        private async Task OpenFolderAsync(StorageFolder folder, string displayName, bool addToHistory = false, bool reportErrors = true, bool preserveSearch = false)
+        private async Task OpenFolderAsync(StorageFolder folder, string displayName, bool addToHistory = false, bool reportErrors = true, bool preserveSearch = false, string searchText = null, FolderLocation parent = null)
         {
             if (folder == null) return;
+            m_refreshFolderOnRestore = false;
+            if (!preserveSearch) ++m_navigationRequestRevision;
             FileTabState targetTab = m_activeTab;
             int loadRevision = ++m_folderLoadRevision;
             if (addToHistory && m_currentFolder != null)
             {
-                m_history.Push(new FolderLocation { Folder = m_currentFolder, DisplayName = m_currentDisplayName });
+                m_history.Push(CaptureFolderLocation());
                 m_forwardHistory.Clear();
             }
             m_currentFolder = folder;
+            if (!preserveSearch) m_parentLocation = parent;
             m_currentDisplayName = displayName;
             if (m_activeTab != null)
             {
                 m_activeTab.CurrentFolder = folder;
+                m_activeTab.ParentLocation = m_parentLocation;
                 m_activeTab.DisplayName = displayName;
                 if (m_activeTab.TabItem != null)
                     m_activeTab.TabItem.Header = displayName;
             }
             PathText.Text = displayName;
-            m_allItems = Array.Empty<FileEntry>();
-            PublishItems(m_allItems);
-            if (!preserveSearch) SearchBox.Text = string.Empty;
+            bool canGoBack = m_history.Count > 0;
+            bool canGoForward = m_forwardHistory.Count > 0;
+            bool canGoUp = m_parentLocation != null;
+            var focused = FocusManager.GetFocusedElement();
+            if ((!canGoBack && ReferenceEquals(focused, BackButton)) ||
+                (!canGoForward && ReferenceEquals(focused, ForwardButton)) ||
+                (!canGoUp && ReferenceEquals(focused, UpButton)))
+                RefreshButton.Focus(FocusState.Programmatic);
+
+            BackButton.IsEnabled = canGoBack;
+            ForwardButton.IsEnabled = canGoForward;
+            UpButton.IsEnabled = canGoUp;
+            if (!preserveSearch)
+            {
+                m_allItems = Array.Empty<FileEntry>();
+                PublishItems(m_allItems);
+                SearchBox.Text = searchText ?? string.Empty;
+            }
             try
             {
                 string path = folder.Path;
@@ -759,8 +860,16 @@ namespace factoryos_10x_shell.Controls
                 // A slower storage provider must not overwrite the contents after the
                 // user has already changed to another tab or navigated somewhere else.
                 if (loadRevision != m_folderLoadRevision || !ReferenceEquals(targetTab, m_activeTab)) return;
+                var selectedNames = preserveSearch
+                    ? new HashSet<string>(ItemsList.SelectedItems.OfType<FileEntry>().Select(item => item.Name), StringComparer.Ordinal)
+                    : null;
                 m_allItems = loadedItems;
                 ApplyFilter();
+                if (selectedNames != null)
+                {
+                    foreach (var item in m_items)
+                        if (selectedNames.Contains(item.Name)) ItemsList.SelectedItems.Add(item);
+                }
             }
             catch (Exception)
             {
@@ -825,32 +934,39 @@ namespace factoryos_10x_shell.Controls
                     Kind = "Folder",
                     FallbackIcon = GetListingIcon(true, null),
                     Folder = child,
+                    Parent = folder,
                     DateModifiedText = FormatDate(child.DateCreated)
                 });
             foreach (StorageFile child in await folder.GetFilesAsync())
             {
                 if (loadRevision != m_folderLoadRevision) break;
-                BasicProperties properties = await child.GetBasicPropertiesAsync();
+                BasicProperties properties = null;
+                try { properties = await child.GetBasicPropertiesAsync(); }
+                catch (Exception error) { ShellDiagnostics.RecordException("Reading Files item metadata", error); }
                 if (loadRevision != m_folderLoadRevision) break;
                 var entry = new FileEntry
                 {
                     Name = child.Name,
                     Kind = string.IsNullOrWhiteSpace(child.DisplayType) ? child.FileType : child.DisplayType,
-                    SizeText = FormatSize(properties.Size),
-                    DateModifiedText = FormatDate(properties.DateModified),
+                    SizeText = properties == null ? string.Empty : FormatSize(properties.Size),
+                    DateModifiedText = properties == null ? string.Empty : FormatDate(properties.DateModified),
                     FallbackIcon = GetListingIcon(false, child.FileType),
-                    File = child
+                    File = child,
+                    Parent = folder
                 };
                 loadedItems.Add(entry);
             }
 
-            return loadedItems;
+            return loadedItems.OrderBy(item => !item.IsDirectory)
+                .ThenBy(item => item.Name, StringComparer.CurrentCultureIgnoreCase).ToList();
         }
 
         private async void ItemsList_DoubleTapped(object sender, DoubleTappedRoutedEventArgs e)
         {
+            FileEntry entry = GetRowEntry(e.OriginalSource as DependencyObject);
+            if (entry == null) return;
             e.Handled = true;
-            await OpenEntryAsync(ItemsList.SelectedItem as FileEntry);
+            await OpenEntryAsync(entry);
         }
 
         private async void ItemsList_KeyDown(object sender, KeyRoutedEventArgs e)
@@ -864,23 +980,39 @@ namespace factoryos_10x_shell.Controls
         {
             if (entry == null) return;
             var parent = entry.Parent ?? m_currentFolder;
-            int revision = m_folderLoadRevision;
-            var item = await entry.ResolveAsync();
-            if (revision != m_folderLoadRevision) return;
-            if (item is StorageFolder folder) await OpenFolderAsync(folder, entry.Name, true);
-            else if (item is StorageFile file) await OpenFileAsync(file, parent);
-            else await ShowOperationErrorAsync("This item is no longer available.");
+            int request = ++m_navigationRequestRevision;
+            try
+            {
+                var item = await entry.ResolveAsync();
+                if (request != m_navigationRequestRevision) return;
+                if (item is StorageFolder folder)
+                    await OpenFolderAsync(folder, entry.Name, true, parent: CaptureFolderLocation());
+                else if (item is StorageFile file) await OpenFileAsync(file, parent);
+                else await ShowOperationErrorAsync("This item is no longer available.");
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException("Opening Files entry", error);
+                if (request == m_navigationRequestRevision)
+                    await ShowOperationErrorAsync("Files could not open this item.");
+            }
         }
 
         internal async Task OpenDesktopFolderAsync(StorageFolder folder = null)
         {
+            int request = ++m_navigationRequestRevision;
             var desktop = await DesktopItems.GetFolderAsync();
+            if (request != m_navigationRequestRevision) return;
             folder = folder ?? desktop;
             SettingsPage.Visibility = Visibility.Collapsed;
             Restore();
             LocationsNavigation.SelectedItem = DesktopNavigationItem;
             if (m_activeTab != null) m_activeTab.SelectedNavigationItem = DesktopNavigationItem;
-            await OpenFolderAsync(folder, folder.Path == desktop.Path ? DesktopItems.FolderName : folder.DisplayName, true);
+            bool isDesktop = folder.IsEqual(desktop);
+            var parent = !isDesktop && FileTransferService.IsDescendant(folder.Path, desktop.Path)
+                ? new FolderLocation { Folder = desktop, DisplayName = DesktopItems.FolderName }
+                : null;
+            await OpenFolderAsync(folder, isDesktop ? DesktopItems.FolderName : folder.DisplayName, true, parent: parent);
         }
 
         internal async Task OpenFileAsync(StorageFile file, StorageFolder folder)
@@ -904,30 +1036,41 @@ namespace factoryos_10x_shell.Controls
                 AppState.Instance.RequestFirefoxOpen(file);
             else if (ArchiveService.IsArchive(file))
                 await OpenArchivePreviewAsync(file);
-            else await Launcher.LaunchFileAsync(file);
+            else if (!await Launcher.LaunchFileAsync(file))
+                await ShowOperationErrorAsync("No app could open this file.");
         }
 
         private async void Back_Click(object sender, RoutedEventArgs e)
         {
             if (m_history.Count == 0) return;
             if (m_currentFolder != null)
-                m_forwardHistory.Push(new FolderLocation { Folder = m_currentFolder, DisplayName = m_currentDisplayName });
+                m_forwardHistory.Push(CaptureFolderLocation());
             FolderLocation previous = m_history.Pop();
-            await OpenFolderAsync(previous.Folder, previous.DisplayName, false);
+            await OpenFolderAsync(previous.Folder, previous.DisplayName, parent: previous.Parent);
         }
 
         private async void Forward_Click(object sender, RoutedEventArgs e)
         {
             if (m_forwardHistory.Count == 0) return;
             if (m_currentFolder != null)
-                m_history.Push(new FolderLocation { Folder = m_currentFolder, DisplayName = m_currentDisplayName });
+                m_history.Push(CaptureFolderLocation());
             FolderLocation next = m_forwardHistory.Pop();
-            await OpenFolderAsync(next.Folder, next.DisplayName, false);
+            await OpenFolderAsync(next.Folder, next.DisplayName, parent: next.Parent);
         }
 
-        // The folders exposed by UWP are permission roots, so "Up" safely follows
-        // the navigation path rather than attempting to access an unapproved parent.
-        private void Up_Click(object sender, RoutedEventArgs e) => Back_Click(sender, e);
+        private FolderLocation CaptureFolderLocation() => new FolderLocation
+        {
+            Folder = m_currentFolder,
+            DisplayName = m_currentDisplayName,
+            Parent = m_parentLocation
+        };
+
+        private async void Up_Click(object sender, RoutedEventArgs e)
+        {
+            var parent = m_parentLocation;
+            if (parent != null)
+                await OpenFolderAsync(parent.Folder, parent.DisplayName, true, parent: parent.Parent);
+        }
 
         private void ItemsList_ContainerContentChanging(ListViewBase sender, ContainerContentChangingEventArgs e)
         {
@@ -941,20 +1084,26 @@ namespace factoryos_10x_shell.Controls
                 return;
             }
 
-            _ = LoadItemThumbnailAsync(entry, e.ItemContainer, m_folderLoadRevision);
+            entry.ThumbnailRequested = true;
+            _ = LoadItemThumbnailAsync(entry, e.ItemContainer);
         }
 
-        private async Task LoadItemThumbnailAsync(FileEntry entry, SelectorItem container, int folderRevision)
+        private async Task LoadItemThumbnailAsync(FileEntry entry, SelectorItem container)
         {
             await m_thumbnailSlots.WaitAsync();
             try
             {
-                if (folderRevision != m_folderLoadRevision || entry.ThumbnailRequested ||
-                    !ReferenceEquals(ItemsList.ItemFromContainer(container), entry)) return;
-
-                entry.ThumbnailRequested = true;
-                if (!(await entry.ResolveAsync() is StorageFile file) ||
-                    folderRevision != m_folderLoadRevision) return;
+                if (!ReferenceEquals(ItemsList.ItemFromContainer(container), entry))
+                {
+                    entry.ThumbnailRequested = false;
+                    return;
+                }
+                if (!(await entry.ResolveAsync() is StorageFile file)) return;
+                if (!ReferenceEquals(ItemsList.ItemFromContainer(container), entry))
+                {
+                    entry.ThumbnailRequested = false;
+                    return;
+                }
                 using (StorageItemThumbnail thumbnail = await file.GetThumbnailAsync(
                     ThumbnailMode.SingleItem,
                     64,
@@ -981,7 +1130,7 @@ namespace factoryos_10x_shell.Controls
         private async void Refresh_Click(object sender, RoutedEventArgs e)
         {
             if (m_currentFolder != null)
-                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, preserveSearch: true);
         }
 
         private void SearchBox_TextChanged(object sender, TextChangedEventArgs e)
@@ -1001,6 +1150,12 @@ namespace factoryos_10x_shell.Controls
         private void PublishItems(IReadOnlyList<FileEntry> items)
         {
             if (ReferenceEquals(m_items, items)) return;
+            // Replacing ItemsSource removes the focused row. Move focus to a
+            // stable command before XAML picks a new target in the toolbar.
+            var focused = FocusManager.GetFocusedElement() as DependencyObject;
+            if (ReferenceEquals(FindVisualAncestor<ListView>(focused), ItemsList))
+                RefreshButton.Focus(FocusState.Programmatic);
+
             m_items = items;
             ItemsList.ItemsSource = items;
             UpdateStatus();
@@ -1012,9 +1167,21 @@ namespace factoryos_10x_shell.Controls
         {
             if (StatusText == null) return;
             int selected = ItemsList?.SelectedItems?.Count ?? 0;
+            UpdateToolbar(selected);
             StatusText.Text = selected > 0
                 ? selected + (selected == 1 ? " item selected" : " items selected")
                 : m_items.Count + (m_items.Count == 1 ? " item" : " items");
+        }
+
+        private void UpdateToolbar(int selected)
+        {
+            if (CutButton == null || CopyButton == null || PasteButton == null ||
+                RenameButton == null || DeleteButton == null) return;
+
+            CutButton.IsEnabled = CopyButton.IsEnabled = DeleteButton.IsEnabled = selected > 0;
+            RenameButton.IsEnabled = selected == 1;
+            PasteButton.IsEnabled = m_currentFolder != null && m_clipboardEntries.Count > 0 &&
+                (!m_cutOperation || !m_cutPasteInProgress);
         }
 
         private static string FormatDate(DateTimeOffset value) =>
@@ -1067,7 +1234,8 @@ namespace factoryos_10x_shell.Controls
 
         private async void NewFolder_Click(object sender, RoutedEventArgs e)
         {
-            if (m_currentFolder == null) return;
+            var destination = m_currentFolder;
+            if (destination == null) return;
             var nameBox = new TextBox { PlaceholderText = "Folder name" };
             var dialog = new ContentDialog
             {
@@ -1077,8 +1245,8 @@ namespace factoryos_10x_shell.Controls
             if (await dialog.ShowAsync() != ContentDialogResult.Primary || string.IsNullOrWhiteSpace(nameBox.Text)) return;
             try
             {
-                await m_currentFolder.CreateFolderAsync(nameBox.Text.Trim(), CreationCollisionOption.GenerateUniqueName);
-                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+                await destination.CreateFolderAsync(nameBox.Text.Trim(), CreationCollisionOption.GenerateUniqueName);
+                await RefreshFolderIfCurrentAsync(destination);
             }
             catch (Exception) { await ShowOperationErrorAsync("CoreShell could not create that folder."); }
         }
@@ -1094,6 +1262,7 @@ namespace factoryos_10x_shell.Controls
             m_clipboardEntries.AddRange(entries);
             m_cutOperation = cut;
             m_clipboardRevision++;
+            UpdateStatus();
         }
 
         private async void Paste_Click(object sender, RoutedEventArgs e)
@@ -1105,10 +1274,13 @@ namespace factoryos_10x_shell.Controls
             List<FileEntry> entries = m_clipboardEntries.ToList();
             int revision = m_clipboardRevision;
             if (cut) m_cutPasteInProgress = true;
+            UpdateStatus();
             try
             {
+                var items = await ResolveOperationItemsAsync(entries);
+                if (items == null) return;
                 FileOperationModel operation = FileOperationService.Instance.StartTransfer(
-                    await StorageItemsAsync(entries), destination, cut ? FileOperationKind.Move : FileOperationKind.Copy);
+                    items, destination, cut ? FileOperationKind.Move : FileOperationKind.Copy);
                 FileOperationResult result = await operation.Completion;
                 if (cut && revision == m_clipboardRevision)
                     m_clipboardEntries.RemoveAll(entry => result.Succeeded.Contains((IStorageItem)entry.File ?? entry.Folder));
@@ -1116,17 +1288,35 @@ namespace factoryos_10x_shell.Controls
             finally
             {
                 if (cut) m_cutPasteInProgress = false;
+                UpdateStatus();
             }
         }
 
-        private async void Delete_Click(object sender, RoutedEventArgs e)
+        private async void Delete_Click(object sender, RoutedEventArgs e) =>
+            await DeleteEntriesAsync(GetOperationEntries(sender), StorageDeleteOption.Default);
+
+        private async Task DeleteEntriesAsync(IReadOnlyList<FileEntry> entries, StorageDeleteOption option)
         {
-            IReadOnlyList<FileEntry> entries = GetOperationEntries(sender);
-            if (entries.Count == 0) return;
-            string prompt = entries.Count == 1 ? "Delete " + entries[0].Name + "?" : "Delete these " + entries.Count + " items?";
-            var dialog = new ContentDialog { Title = "Delete", Content = prompt, PrimaryButtonText = "Delete", CloseButtonText = "Cancel" };
-            if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
-            FileOperationService.Instance.StartTransfer(await StorageItemsAsync(entries), null, FileOperationKind.Delete);
+            if (entries.Count == 0 || m_deletePromptOpen) return;
+            m_deletePromptOpen = true;
+            try
+            {
+                string action = option == StorageDeleteOption.PermanentDelete ? "Permanently delete" : "Delete";
+                string target = entries.Count == 1 ? entries[0].Name : "these " + entries.Count + " items";
+                var dialog = new ContentDialog
+                {
+                    Title = action, Content = action + " " + target + "?",
+                    PrimaryButtonText = "Delete", CloseButtonText = "Cancel"
+                };
+                if (await dialog.ShowAsync() != ContentDialogResult.Primary) return;
+                var items = await ResolveOperationItemsAsync(entries);
+                if (items != null)
+                    FileOperationService.Instance.StartTransfer(items, null, FileOperationKind.Delete, option);
+            }
+            finally
+            {
+                m_deletePromptOpen = false;
+            }
         }
 
         private async void MoveTo_Click(object sender, RoutedEventArgs e)
@@ -1137,7 +1327,9 @@ namespace factoryos_10x_shell.Controls
             picker.FileTypeFilter.Add("*");
             StorageFolder destination = await picker.PickSingleFolderAsync();
             if (destination == null) return;
-            FileOperationService.Instance.StartTransfer(await StorageItemsAsync(entries), destination, FileOperationKind.Move);
+            var items = await ResolveOperationItemsAsync(entries);
+            if (items != null)
+                FileOperationService.Instance.StartTransfer(items, destination, FileOperationKind.Move);
         }
 
         private async void Rename_Click(object sender, RoutedEventArgs e)
@@ -1155,8 +1347,8 @@ namespace factoryos_10x_shell.Controls
             {
                 var item = await entry.ResolveAsync();
                 if (item == null) { await ShowOperationErrorAsync("This item is no longer available."); return; }
-                await item.RenameAsync(nameBox.Text.Trim(), NameCollisionOption.GenerateUniqueName);
-                await OpenFolderAsync(m_currentFolder, m_currentDisplayName, false);
+                await item.RenameAsync(nameBox.Text.Trim(), NameCollisionOption.FailIfExists);
+                await RefreshFolderIfCurrentAsync(entry.Parent);
             }
             catch (Exception) { await ShowOperationErrorAsync("CoreShell could not rename this item."); }
         }
@@ -1164,7 +1356,7 @@ namespace factoryos_10x_shell.Controls
         private async void ArchiveExtractHere_Click(object sender, RoutedEventArgs e)
         {
             FileEntry entry = GetEntry(sender);
-            var destination = m_currentFolder;
+            var destination = entry?.Parent ?? m_currentFolder;
             if (destination == null || entry == null) return;
             if (await entry.ResolveAsync() is StorageFile file) await ExtractArchiveWithPasswordAsync(file, destination);
         }
@@ -1186,10 +1378,10 @@ namespace factoryos_10x_shell.Controls
         }
 
         private async void CompressZip_Click(object sender, RoutedEventArgs e) =>
-            await CompressEntryAsync(GetEntry(sender), false);
+            await CompressEntryAsync(sender, false);
 
         private async void CompressSevenZip_Click(object sender, RoutedEventArgs e) =>
-            await CompressEntryAsync(GetEntry(sender), true);
+            await CompressEntryAsync(sender, true);
 
         private Task ExtractArchiveWithPasswordAsync(StorageFile archive, StorageFolder destination)
         {
@@ -1250,33 +1442,54 @@ namespace factoryos_10x_shell.Controls
             }
         }
 
-        private async Task CompressEntryAsync(FileEntry entry, bool sevenZip)
+        private async Task CompressEntryAsync(object sender, bool sevenZip)
         {
-            var destination = m_currentFolder;
+            var entry = GetEntry(sender);
+            var destination = entry?.Parent ?? m_currentFolder;
             if (entry == null || destination == null) return;
-            var selectedEntries = ItemsList.SelectedItems.Cast<FileEntry>().ToList();
-            if (!selectedEntries.Contains(entry)) selectedEntries = new List<FileEntry> { entry };
-            var items = await StorageItemsAsync(selectedEntries);
-            if (items.Count == 0) return;
+            var selectedEntries = GetOperationEntries(sender);
+            var items = await ResolveOperationItemsAsync(selectedEntries);
+            if (items == null || items.Count == 0) return;
             string extension = sevenZip ? ".7z" : ".zip";
             string baseName = selectedEntries.Count == 1
-                ? System.IO.Path.GetFileNameWithoutExtension(entry.Name)
+                ? (entry.IsDirectory ? entry.Name : System.IO.Path.GetFileNameWithoutExtension(entry.Name))
                 : "Archive";
+            if (string.IsNullOrEmpty(baseName)) baseName = entry.Name;
             FileOperationService.Instance.StartCompression(items, destination, baseName + extension, sevenZip);
         }
 
         private async void RefreshAfterFileOperation(FileOperationModel operation)
         {
-            if (Visibility != Visibility.Visible || SettingsPage.Visibility == Visibility.Visible || m_currentFolder == null) return;
+            if (m_currentFolder == null) return;
             if (operation.AffectedFolderPaths.Count > 0 && !operation.AffectedFolderPaths.Any(path =>
                 string.Equals(path, m_currentFolder.Path, StringComparison.OrdinalIgnoreCase) ||
                 FileTransferService.IsDescendant(m_currentFolder.Path, path))) return;
+            if (Visibility != Visibility.Visible || SettingsPage.Visibility == Visibility.Visible)
+            {
+                m_refreshFolderOnRestore = true;
+                return;
+            }
             StorageFolder folder = m_currentFolder;
             try
             {
                 await OpenFolderAsync(folder, m_currentDisplayName, false, false, true);
             }
             catch { }
+        }
+
+        private Task RefreshFolderIfCurrentAsync(StorageFolder folder)
+        {
+            if (folder == null || m_currentFolder == null || !folder.IsEqual(m_currentFolder))
+                return Task.CompletedTask;
+            return OpenFolderAsync(m_currentFolder, m_currentDisplayName, preserveSearch: true);
+        }
+
+        private async Task<IReadOnlyList<IStorageItem>> ResolveOperationItemsAsync(IReadOnlyList<FileEntry> entries)
+        {
+            var items = await StorageItemsAsync(entries);
+            if (items.Count == entries.Count) return items;
+            await ShowOperationErrorAsync("Some selected items are no longer available. Refresh the folder and try again.");
+            return null;
         }
 
         private static async Task<IReadOnlyList<IStorageItem>> StorageItemsAsync(IEnumerable<FileEntry> entries)
@@ -1314,24 +1527,16 @@ namespace factoryos_10x_shell.Controls
 
         private FileEntry GetEntry(object sender)
         {
-            FileEntry senderEntry = (sender as FrameworkElement)?.DataContext as FileEntry;
-            return m_contextEntry ?? senderEntry ?? ItemsList.SelectedItem as FileEntry;
+            if (sender is MenuFlyoutItem menu && menu.Tag is MenuSelection selection)
+                return selection.Target;
+            return ItemsList.SelectedItem as FileEntry;
         }
 
         private IReadOnlyList<FileEntry> GetOperationEntries(object sender)
         {
-            FileEntry target = GetEntry(sender);
-            if (target == null)
-                return Array.Empty<FileEntry>();
-
-            List<FileEntry> selected = ItemsList.SelectedItems
-                .OfType<FileEntry>()
-                .Distinct()
-                .ToList();
-
-            // A context menu opened on one of the selected rows operates on the
-            // complete selection. A menu opened on another row targets only it.
-            return selected.Contains(target) ? selected : new List<FileEntry> { target };
+            if (sender is MenuFlyoutItem menu && menu.Tag is MenuSelection selection)
+                return selection.Entries;
+            return ItemsList.SelectedItems.OfType<FileEntry>().ToList();
         }
 
         private string GetLocationDisplayName(string location, StorageFolder folder)
@@ -1371,11 +1576,13 @@ namespace factoryos_10x_shell.Controls
         {
             public StorageFolder Folder { get; set; }
             public string DisplayName { get; set; }
+            public FolderLocation Parent { get; set; }
         }
 
         private sealed class FileTabState
         {
             public StorageFolder CurrentFolder { get; set; }
+            public FolderLocation ParentLocation { get; set; }
             public string DisplayName { get; set; } = "Home";
             public string SearchText { get; set; } = string.Empty;
             public Stack<FolderLocation> History { get; } = new Stack<FolderLocation>();
@@ -1416,12 +1623,16 @@ namespace factoryos_10x_shell.Controls
             public async Task<IStorageItem> ResolveAsync()
             {
                 var cached = (IStorageItem)File ?? Folder;
-                if (cached != null || Parent == null) return cached;
+                if (cached != null)
+                    return string.Equals(cached.Name, Name, StringComparison.Ordinal) ? cached : null;
+                if (Parent == null) return null;
                 try
                 {
                     var item = await Parent.TryGetItemAsync(Name);
                     cached = (IStorageItem)File ?? Folder;
-                    if (cached != null) return cached;
+                    if (cached != null)
+                        return string.Equals(cached.Name, Name, StringComparison.Ordinal) ? cached : null;
+                    if (item == null || (item is StorageFolder) != IsDirectory) return null;
                     File = item as StorageFile;
                     Folder = item as StorageFolder;
                     return item;

@@ -954,9 +954,10 @@ bool GuestRuntime::LaunchChildProcess(
 
     std::vector<BYTE> bytes;
     std::wstring logicalPath;
+    Windows::Storage::StorageFolder^ childSourceFolder = nullptr;
     DWORD errorCode = ERROR_SUCCESS;
     if (!m_modules->ReadExecutableBytes(
-        executableName, &bytes, &logicalPath, &errorCode))
+        executableName, &bytes, &logicalPath, &errorCode, &childSourceFolder))
     {
         if (win32Error) *win32Error = errorCode;
         RuntimeDiagnostics::Record(
@@ -969,7 +970,7 @@ bool GuestRuntime::LaunchChildProcess(
     try
     {
         childStorage = std::make_shared<GuestStorageContext>(
-            m_storage->LocalFolder(), logicalPath, m_modules->ModuleSourceFolder(),
+            m_storage->LocalFolder(), logicalPath, childSourceFolder,
             m_storage->ExternalFolder());
         child = std::make_shared<GuestRuntime>();
     }
@@ -985,7 +986,7 @@ bool GuestRuntime::LaunchChildProcess(
     // one synchronized logical context also prevents two cooperative guests
     // from overwriting each other's persisted hive snapshots.
     child->SetWindowManager(m_windows);
-    child->SetModuleSourceFolder(m_modules->ModuleSourceFolder());
+    child->SetModuleSourceFolder(childSourceFolder);
     child->SetCommandLine(commandLine ? commandLine : executableName);
     child->SetInitialCurrentDirectory(currentDirectory ? std::wstring(currentDirectory) : m_storage->CurrentDirectory());
     child->SetSharedWindowManager(true);

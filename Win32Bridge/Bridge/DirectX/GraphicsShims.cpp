@@ -164,7 +164,7 @@ namespace
         const int length = ::MultiByteToWideChar(GuestAnsiCodePage, 0, name, -1, nullptr, 0);
         if (length <= 1) return {};
         std::wstring path(static_cast<size_t>(length), L'\0');
-        if (!::MultiByteToWideChar(GuestAnsiCodePage, 0, name, -1, path.data(), length)) return {};
+        if (!::MultiByteToWideChar(GuestAnsiCodePage, 0, name, -1, &path[0], length)) return {};
         path.pop_back();
         return path;
     }

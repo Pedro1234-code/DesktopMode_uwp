@@ -738,7 +738,7 @@ namespace
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
         const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
         if (found == g_fileMappings.end()) return false;
-        if (mask & ~(HANDLE_FLAG_INHERIT | HANDLE_FLAG_PROTECT_FROM_CLOSE))
+        if (mask & ~(GuestKernelContext::HandleInherit | GuestKernelContext::HandleProtectFromClose))
         {
             error = ERROR_INVALID_PARAMETER;
             return true;
@@ -764,7 +764,7 @@ namespace
         }
         try
         {
-            result = RegisterFileMappingLocked(source.mapping, granted, inherit ? HANDLE_FLAG_INHERIT : 0);
+            result = RegisterFileMappingLocked(source.mapping, granted, inherit ? GuestKernelContext::HandleInherit : 0);
             error = result ? ERROR_SUCCESS : ERROR_TOO_MANY_OPEN_FILES;
         }
         catch (const std::bad_alloc&) { error = ERROR_NOT_ENOUGH_MEMORY; }
@@ -776,7 +776,7 @@ namespace
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
         const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
         if (found == g_fileMappings.end()) return false;
-        if (found->second.flags & HANDLE_FLAG_PROTECT_FROM_CLOSE) error = ERROR_INVALID_HANDLE;
+        if (found->second.flags & GuestKernelContext::HandleProtectFromClose) error = ERROR_INVALID_HANDLE;
         else
         {
             g_fileMappings.erase(found);
@@ -2201,17 +2201,18 @@ namespace
 HMODULE LookupGuestModuleByName(LPCWSTR moduleName, bool addReference, bool pin)
 {
     const auto systemModule = FindBridgeSystemModule(moduleName);
-    if (PreferGuestModuleImage(systemModule))
+    auto loader = CurrentGuestModuleLoader();
+    const bool applicationOverride = loader && loader->HasApplicationDllOverride(moduleName);
+    if (PreferGuestModuleImage(systemModule) || applicationOverride)
     {
         HMODULE module = nullptr;
         DWORD error = ERROR_MOD_NOT_FOUND;
-        const auto loader = CurrentGuestModuleLoader();
         if (loader && loader->GetModuleHandle(moduleName, &module, &error, addReference, pin))
         {
             SetGuestLastError(ERROR_SUCCESS);
             return module;
         }
-        if (!IsUnqualifiedLibraryName(moduleName) || error != ERROR_MOD_NOT_FOUND)
+        if (applicationOverride || !IsUnqualifiedLibraryName(moduleName) || error != ERROR_MOD_NOT_FOUND)
         {
             SetGuestLastError(error);
             return nullptr;
@@ -2236,7 +2237,7 @@ HMODULE LookupGuestModuleByName(LPCWSTR moduleName, bool addReference, bool pin)
         return GuestMainModuleHandle();
     }
 
-    GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
+    loader = CurrentModuleLoaderOrFail();
     if (!loader) return nullptr;
     DWORD error = ERROR_SUCCESS;
     HMODULE module = nullptr;
@@ -3614,14 +3615,18 @@ HMODULE LoadGuestLibrary(LPCWSTR fileName, HANDLE file, DWORD flags, LPCWSTR sea
         return nullptr;
     }
     const auto systemModule = FindBridgeSystemModule(fileName);
-    if (systemModule && !PreferGuestModuleImage(systemModule))
+    constexpr DWORD resourceOnlyFlags = 0x00000062u;
+    auto loader = CurrentGuestModuleLoader();
+    const bool applicationOverride = loader && (flags & resourceOnlyFlags) == 0 &&
+        loader->HasApplicationDllOverride(fileName);
+    if (systemModule && !PreferGuestModuleImage(systemModule) && !applicationOverride)
     {
         SetGuestLastError(ERROR_SUCCESS);
         RuntimeDiagnostics::Record(L"LOAD LIBRARY EX: bridge " + std::wstring(systemModule->library) + L".");
         return reinterpret_cast<HMODULE>(systemModule->token);
     }
 
-    GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
+    loader = CurrentModuleLoaderOrFail();
     if (!loader) return nullptr;
 
     DWORD error = ERROR_SUCCESS;
@@ -3631,7 +3636,8 @@ HMODULE LoadGuestLibrary(LPCWSTR fileName, HANDLE file, DWORD flags, LPCWSTR sea
     if (!loader->LoadLibrary(
         fileName, &module, &error, requestedSearchFlags, behaviorFlags, searchPath))
     {
-        if (systemModule && error == ERROR_MOD_NOT_FOUND && !behaviorFlags && IsUnqualifiedLibraryName(fileName))
+        if (systemModule && !applicationOverride && error == ERROR_MOD_NOT_FOUND &&
+            !behaviorFlags && IsUnqualifiedLibraryName(fileName))
         {
             SetGuestLastError(ERROR_SUCCESS);
             RuntimeDiagnostics::Record(L"LOAD LIBRARY EX: bridge fallback " + std::wstring(systemModule->library) + L".");
@@ -4056,7 +4062,7 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenFileMappingW(DWORD desiredAccess, B
         ? (desiredAccess & ~FILE_MAP_COPY) | FILE_MAP_READ : desiredAccess;
     try
     {
-        const HANDLE handle = RegisterFileMappingLocked(mapping, access, inherit ? HANDLE_FLAG_INHERIT : 0);
+        const HANDLE handle = RegisterFileMappingLocked(mapping, access, inherit ? GuestKernelContext::HandleInherit : 0);
         SetGuestLastError(handle ? ERROR_SUCCESS : ERROR_TOO_MANY_OPEN_FILES);
         return handle;
     }

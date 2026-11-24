@@ -4680,6 +4680,7 @@ INT_PTR WINAPI Win32Bridge::Bridge::BridgeDialogBoxParamW(HINSTANCE instance, LP
 }
 
 #include "Bridge/User32CompatibilityShims.inl"
+#include "Bridge/ClassicControlShims.inl"
 
 LRESULT Win32Bridge::Bridge::DispatchGuestHook(
     int hookType, int code, WPARAM wParam, LPARAM lParam, DWORD targetThreadId)

@@ -39,6 +39,8 @@ namespace
     constexpr DWORD DialogDisabledStyle = 0x08000000;
     constexpr DWORD DialogTabStopStyle = 0x00010000;
     constexpr DWORD DialogCenterStyle = 0x00000800;
+    constexpr DWORD DialogCenterMouseStyle = 0x00001000;
+    constexpr DWORD DialogAbsoluteAlign = 0x00000001;
     constexpr DWORD DialogNoFailCreateStyle = 0x00000010;
     constexpr DWORD DialogModalFrameStyle = 0x00000080;
     constexpr DWORD DialogPopupStyle = 0x80000000;
@@ -1246,27 +1248,43 @@ namespace
         const int dialogHeight = clientHeight + nonClient.top + nonClient.bottom;
         int dialogX = PixelsX(dialog.x, baseUnits);
         int dialogY = PixelsY(dialog.y, baseUnits);
-        if ((dialog.style & DialogCenterStyle) != 0 && parent)
+        if (childDialog)
         {
-            RECT parentRect{};
-            if (!childDialog && manager->GetGuestWindowRect(parent, &parentRect, nullptr))
+            RECT parentClient{};
+            if ((dialog.style & DialogCenterStyle) && parent &&
+                manager->GetGuestClientRect(parent, &parentClient, nullptr))
             {
-                dialogX = parentRect.left + (std::max)(0,
-                    (static_cast<int>(parentRect.right - parentRect.left) - dialogWidth) / 2);
-                dialogY = parentRect.top + (std::max)(0,
-                    (static_cast<int>(parentRect.bottom - parentRect.top) - dialogHeight) / 2);
+                dialogX = (std::max)(0, (static_cast<int>(parentClient.right) - dialogWidth) / 2);
+                dialogY = (std::max)(0, (static_cast<int>(parentClient.bottom) - dialogHeight) / 2);
+            }
+        }
+        else
+        {
+            // The virtual desktop can start at the host window's guest origin.
+            // Resource offsets ordinarily start at the owner's client origin.
+            const RECT workArea = manager->GetGuestViewportRect();
+            if (dialog.style & DialogCenterStyle)
+            {
+                dialogX = workArea.left + (workArea.right - workArea.left - dialogWidth) / 2;
+                dialogY = workArea.top + (workArea.bottom - workArea.top - dialogHeight) / 2;
+            }
+            else if (dialog.style & DialogCenterMouseStyle)
+            {
+                POINT cursor{ workArea.left, workArea.top };
+                BridgeGetCursorPos(&cursor);
+                dialogX = cursor.x;
+                dialogY = cursor.y;
             }
             else
             {
-                RECT parentClient{};
-                if (manager->GetGuestClientRect(parent, &parentClient, nullptr))
-                {
-                    dialogX = (std::max)(0,
-                        (static_cast<int>(parentClient.right - parentClient.left) - dialogWidth) / 2);
-                    dialogY = (std::max)(0,
-                        (static_cast<int>(parentClient.bottom - parentClient.top) - dialogHeight) / 2);
-                }
+                POINT origin{};
+                if (parent && !(dialog.style & DialogAbsoluteAlign))
+                    manager->GetGuestClientOrigin(parent, &origin, nullptr);
+                dialogX += origin.x - nonClient.left;
+                dialogY += origin.y - nonClient.top;
             }
+            dialogX = (std::max<LONG>)(workArea.left, (std::min<LONG>)(dialogX, workArea.right - dialogWidth));
+            dialogY = (std::max<LONG>)(workArea.top, (std::min<LONG>)(dialogY, workArea.bottom - dialogHeight));
         }
 
         const std::wstring title = dialog.title.ordinal ? L"" : dialog.title.text;

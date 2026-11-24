@@ -411,3 +411,4 @@ Contexto Win32Bridge.html
 # file and keep workstation-specific paths out of the project itself.
 /gecko-source/GeckoShellHost/GeckoBuild.local.props
 /XboxAppInstaller
+/Win32Bridge/Tiramisu-code

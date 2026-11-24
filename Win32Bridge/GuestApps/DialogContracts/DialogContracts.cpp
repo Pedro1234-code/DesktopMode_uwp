@@ -62,7 +62,7 @@ namespace
         windowClass.hInstance = instance;
         windowClass.lpfnWndProc = PaintProcedure;
         windowClass.lpszClassName = L"Win32BridgePaintContracts";
-        CHECK(RegisterClassW(&windowClass));
+        CHECK(RegisterClassW(&windowClass) || GetLastError() == ERROR_CLASS_ALREADY_EXISTS);
         const HWND window = CreateWindowExW(0, windowClass.lpszClassName, L"", WS_POPUP | WS_VISIBLE,
             0, 0, 120, 100, nullptr, nullptr, instance, nullptr);
         CHECK(window != nullptr);
@@ -146,9 +146,8 @@ namespace
     }
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
+static int CheckPropertySheet(HINSTANCE instance, HWND owner, bool strictBridgeChecks)
 {
-    CheckPaintContracts(instance);
     INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_TAB_CLASSES };
     CHECK(InitCommonControlsEx(&controls));
     EmptyTemplate content{};
@@ -174,6 +173,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     }
     PROPSHEETHEADERW header{};
     header.dwSize = sizeof(header); header.dwFlags = PSH_MODELESS;
+    header.hwndParent = owner;
     header.hInstance = instance; header.pszCaption = L"Win32Bridge dialog contracts";
     header.nPages = 3; header.phpage = pages;
     const HWND sheet = reinterpret_cast<HWND>(PropertySheetW(&header));
@@ -182,6 +182,27 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     const HWND tab = reinterpret_cast<HWND>(SendMessageW(sheet, PSM_GETTABCONTROL, 0, 0));
     CHECK(tab && IsWindow(tab));
     CHECK(SendMessageW(sheet, PSM_GETCURRENTPAGEHWND, 0, 0) == reinterpret_cast<LRESULT>(states[0].window));
+
+    if (!strictBridgeChecks)
+    {
+        // Check active pages and notifications, which are stable across comctl32 versions.
+        CHECK(states[0].window && states[0].first && states[0].preferred);
+        CHECK(SendMessageW(sheet, PSM_HWNDTOINDEX, reinterpret_cast<WPARAM>(states[0].window), 0) == 0);
+        CHECK(SendMessageW(sheet, PSM_SETCURSEL, 1, 0) != FALSE);
+        CHECK(states[1].window && SendMessageW(sheet, PSM_GETCURRENTPAGEHWND, 0, 0) == reinterpret_cast<LRESULT>(states[1].window));
+        CHECK(SendMessageW(sheet, PSM_SETCURSEL, 0, 0) != FALSE);
+        CHECK(SendMessageW(sheet, PSM_GETCURRENTPAGEHWND, 0, 0) == reinterpret_cast<LRESULT>(states[0].window));
+        states[0].vetoApply = true;
+        SendMessageW(sheet, PSM_CHANGED, reinterpret_cast<WPARAM>(states[0].window), 0);
+        CHECK(SendMessageW(sheet, PSM_APPLY, 0, 0) == FALSE);
+        CHECK(states[0].applies == 1 && IsWindow(sheet));
+        states[0].vetoApply = false;
+        CHECK(SendMessageW(sheet, PSM_APPLY, 0, 0) != FALSE);
+        CHECK(states[0].applies == 2);
+        DestroyWindow(sheet);
+        for (const auto& state : states) CHECK(state.releases == 1);
+        return failure;
+    }
     CHECK(GetFocus() == states[0].preferred);
     CHECK(SendMessageW(sheet, PSM_HWNDTOINDEX, 0, 0) == -1);
     CHECK(SendMessageW(sheet, PSM_HWNDTOINDEX, reinterpret_cast<WPARAM>(states[0].window), 0) == 0);
@@ -237,3 +258,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     for (auto& state : states) CHECK(state.releases == 1);
     return failure; // zero = success, otherwise first failing source line
 }
+
+#ifdef BRIDGE_VALIDATION_SUITE
+int RunGalleryPropertySheet(HINSTANCE instance, HWND owner)
+{
+    failure = 0;
+    return CheckPropertySheet(instance, owner, false);
+}
+
+int RunGalleryPaintAssertions(HINSTANCE instance)
+{
+    failure = 0;
+    paints = erases = 0;
+    CheckPaintContracts(instance);
+    return failure;
+}
+#else
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
+{
+    failure = 0;
+    CheckPaintContracts(instance);
+    return failure ? failure : CheckPropertySheet(instance, nullptr, true);
+}
+#endif

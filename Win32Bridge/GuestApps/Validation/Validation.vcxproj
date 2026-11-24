@@ -1,0 +1,57 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{CC2710B2-37D2-4BE9-850C-D8F614E8F238}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <TargetName>$(ValidationApp)</TargetName>
+    <OutDir>$(MSBuildProjectDirectory)\x64\Release\$(ValidationApp)\</OutDir>
+    <IntDir>$(OutDir)obj\</IntDir>
+    <LinkIncremental>false</LinkIncremental>
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp17</LanguageStandard>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <RuntimeLibrary Condition="'$(ValidationApp)'=='CrtValidation'">MultiThreadedDLL</RuntimeLibrary>
+      <AdditionalOptions Condition="'$(ValidationApp)'=='CrtValidation'">/d2FH4- %(AdditionalOptions)</AdditionalOptions>
+      <PreprocessorDefinitions>UNICODE;_UNICODE;NOMINMAX;BRIDGE_VALIDATION_SUITE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <SubSystem Condition="'$(ValidationApp)'=='ConsoleValidation'">Console</SubSystem>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(ValidationApp)'=='GraphicsContracts'">
+    <Link><AdditionalDependencies>d3d11.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(ValidationApp)'=='Win32Gallery'">
+    <Link><AdditionalDependencies>comctl32.lib;comdlg32.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(ValidationApp)'=='SystemValidation'">
+    <Link><AdditionalDependencies>advapi32.lib;ole32.lib;oleaut32.lib;shlwapi.lib;%(AdditionalDependencies)</AdditionalDependencies></Link>
+  </ItemDefinitionGroup>
+  <ItemGroup Condition="'$(ValidationApp)'=='CrtValidation' Or '$(ValidationApp)'=='SystemValidation' Or '$(ValidationApp)'=='Win32Gallery' Or '$(ValidationApp)'=='ConsoleValidation'">
+    <ClCompile Include="$(ValidationApp).cpp" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(ValidationApp)'=='Win32Gallery'">
+    <ResourceCompile Include="Gallery.rc" />
+    <ClCompile Include="..\DialogContracts\DialogContracts.cpp" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(ValidationApp)'=='GraphicsContracts' Or '$(ValidationApp)'=='FileHandleContracts'">
+    <ClCompile Include="..\$(ValidationApp)\$(ValidationApp).cpp" />
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

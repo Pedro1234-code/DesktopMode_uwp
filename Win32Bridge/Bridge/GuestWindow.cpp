@@ -1007,6 +1007,7 @@ namespace
     constexpr UINT ToolbarCommandToIndex = 0x0419;
     constexpr UINT ToolbarSetButtonSize = 0x041f;
     constexpr UINT ToolbarSetBitmapSize = 0x0420;
+    constexpr UINT ToolbarSetParent = 0x0425;
     constexpr UINT ToolbarAutoSize = 0x0421;
     constexpr UINT ToolbarAddButtonsW = 0x0444;
     constexpr UINT ToolbarGetButtonTextW = 0x044b;
@@ -1206,6 +1207,10 @@ namespace
     constexpr BYTE ToolbarStateIndeterminate = 0x10;
     constexpr BYTE ToolbarStateMarked = 0x80;
     constexpr BYTE ToolbarStyleDropDown = 0x08;
+    constexpr BYTE ToolbarStyleCheck = 0x02;
+    constexpr BYTE ToolbarStyleGroup = 0x04;
+    constexpr DWORD ToolbarFlat = 0x0800;
+    constexpr DWORD ToolbarList = 0x1000;
 
     MiniGdi::Color ColorFromGuestColorRef(COLORREF color)
     {
@@ -2031,6 +2036,8 @@ namespace
             ? MiniGdi::InvalidDc
             : static_cast<MiniGdi::DcHandle>(value);
     }
+
+    void QueuePresentation(const std::shared_ptr<GuestPresentationState>& presentation, std::uint64_t ticket);
 }
 
 namespace Win32Bridge
@@ -2064,8 +2071,6 @@ struct GuestPresentationState final
 
 namespace
 {
-    void QueuePresentation(const std::shared_ptr<GuestPresentationState>& presentation, std::uint64_t ticket);
-
     void QueueLatestSoftwareFrame(const std::shared_ptr<GuestPresentationState>& presentation)
     {
         std::uint64_t ticket;
@@ -2737,6 +2742,7 @@ struct GuestWindowManager::WindowRecord final
     int toolbarBitmapWidth = GuestMetrics::DefaultBitmapExtent;
     int toolbarBitmapHeight = GuestMetrics::DefaultBitmapExtent;
     int toolbarPressedIndex = -1;
+    HWND toolbarNotificationWindow = nullptr;
     HANDLE toolbarImageList = nullptr;
     bool commonControlUnicode = true;
     std::vector<RebarBand> rebarBands;
@@ -3063,6 +3069,14 @@ POINT GuestWindowManager::ViewportOrigin() const
     if (!m_presentation) return {};
     std::lock_guard<std::mutex> guard(m_presentation->lock);
     return m_presentation->viewportOrigin;
+}
+
+RECT GuestWindowManager::GetGuestViewportRect() const
+{
+    const POINT origin = ViewportOrigin();
+    return { origin.x, origin.y,
+        SaturatingAdd(origin.x, (std::max)(1, m_viewportWidth.load())),
+        SaturatingAdd(origin.y, (std::max)(1, m_viewportHeight.load())) };
 }
 
 void GuestWindowManager::Activate()
@@ -3528,6 +3542,8 @@ HWND GuestWindowManager::CreateGuestWindow(
     window->extendedStyle = extendedStyle;
     window->instance = instance;
     window->parent = parent;
+    if (registered->builtinKind == BuiltinControlKind::Toolbar)
+        window->toolbarNotificationWindow = parent;
     window->owner = owner;
     window->controlId = parent ? reinterpret_cast<UINT_PTR>(menu) : 0;
     // Comctl32 binds a control to the activation context in effect when the
@@ -9951,6 +9967,13 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
 
     if (controlKind == BuiltinControlKind::Toolbar)
     {
+        if (message == ToolbarSetParent)
+        {
+            std::lock_guard<std::mutex> guard(window->lock);
+            const HWND previous = window->toolbarNotificationWindow;
+            window->toolbarNotificationWindow = reinterpret_cast<HWND>(wParam);
+            return reinterpret_cast<LRESULT>(previous);
+        }
         if (message == ToolbarButtonStructSize)
         {
             return wParam == sizeof(GuestToolbarButton) ? TRUE : FALSE;
@@ -10674,6 +10697,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             int desiredHeight = GuestMetrics::StatusBarHeight;
             {
                 std::lock_guard<std::mutex> guard(window->lock);
+                if (window->style & 0x0004u) return 0; // CCS_NORESIZE
                 status = window->handle;
                 parent = window->parent;
                 currentLeft = window->bounds.left;
@@ -10751,7 +10775,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         }
         if (message == StatusBarSetTextW)
         {
-            const UINT part = LOWORD(wParam);
+            const UINT part = LOBYTE(wParam);
             const UINT style = static_cast<UINT>(wParam) & 0xff00u;
             std::wstring text;
             if (lParam && !TryReadGuestWideString(reinterpret_cast<LPCWSTR>(lParam), &text))
@@ -12311,6 +12335,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         int toolbarPressedIndex = -1;
         std::vector<int> statusBarParts;
         std::vector<std::wstring> statusBarTexts;
+        std::vector<UINT> statusBarTextStyles;
+        UINT statusBarSimpleStyle = 0;
         std::wstring statusBarSimpleText;
         bool statusBarSimple = false;
         int progressMinimum = 0;
@@ -12331,6 +12357,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         std::vector<std::wstring> headerItems;
         std::vector<int> headerItemWidths;
         std::vector<int> headerItemOrders;
+        std::vector<int> headerItemFormats;
         std::vector<int> headerItemImages;
         HANDLE headerImageList = nullptr;
         int headerPressedItem = -1;
@@ -12405,6 +12432,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             toolbarPressedIndex = window->toolbarPressedIndex;
             statusBarParts = window->statusBarParts;
             statusBarTexts = window->statusBarTexts;
+            statusBarTextStyles = window->statusBarTextStyles;
+            statusBarSimpleStyle = window->statusBarSimpleStyle;
             statusBarSimpleText = window->statusBarSimpleText;
             statusBarSimple = window->statusBarSimple;
             progressMinimum = window->progressMinimum;
@@ -12425,6 +12454,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             headerItems = window->headerItems;
             headerItemWidths = window->headerItemWidths;
             headerItemOrders = window->headerItemOrders;
+            headerItemFormats = window->headerItemFormats;
             headerItemImages = window->headerItemImages;
             headerImageList = window->headerImageList;
             headerPressedItem = window->headerPressedItem;
@@ -12437,7 +12467,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             treeBackgroundColor = window->treeBackgroundColor;
             treeTextColor = window->treeTextColor;
             handle = window->handle;
-            parent = window->parent;
+            parent = controlKind == BuiltinControlKind::Toolbar
+                ? window->toolbarNotificationWindow : window->parent;
             controlId = window->controlId;
         }
 
@@ -12468,8 +12499,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
         const DWORD buttonType = style & GuestAbi::BsTypeMask;
         const bool groupBox = controlKind == BuiltinControlKind::Button &&
             buttonType == GroupBoxButtonStyle;
+        const bool radioButton = buttonType == 4 || buttonType == 9;
         const bool checkBox = controlKind == BuiltinControlKind::Button &&
-            (buttonType == 2 || buttonType == 3 || buttonType == 5 || buttonType == 6);
+            (style & 0x1000u) == 0 && // BS_PUSHLIKE
+            (radioButton || buttonType == 2 || buttonType == 3 || buttonType == 5 || buttonType == 6);
         const bool ownerDrawStatic = staticControl &&
             (style & StaticTypeMask) == OwnerDrawStaticStyle;
         HBRUSH controlBrush = nullptr;
@@ -12702,6 +12735,7 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 : MiniGdi::MakeColor(128, 128, 128);
 
             const int checkSize = (std::min)({ controlTextHeight, width - 4, height - 2 });
+            const bool defaultButton = controlKind == BuiltinControlKind::Button && buttonType == 1;
             if (groupBox)
             {
                 clearPaintClip(*surface);
@@ -12723,34 +12757,36 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 if (checkSize >= 4)
                 {
                     const int top = (height - checkSize) / 2;
-                    const auto ink = enabled ? MiniGdi::OpaqueBlack : MiniGdi::MakeColor(128, 128, 128);
-                    MiniGdi::DrawRectangle(*surface,
-                        { 2, top, 2 + checkSize, top + checkSize },
-                        pressed ? MiniGdi::MakeColor(224, 224, 224) : MiniGdi::OpaqueWhite, ink);
-                    if (buttonCheck == 1)
-                    {
-                        const MiniGdi::Point middle{ 2 + checkSize / 2, top + checkSize - 3 };
-                        MiniGdi::DrawLine(*surface, { 4, top + checkSize / 2 }, middle, ink);
-                        MiniGdi::DrawLine(*surface, middle, { checkSize, top + 2 }, ink);
-                    }
-                    else if (buttonCheck == 2)
-                    {
-                        MiniGdi::FillRect(*surface,
-                            { 4, top + 2, checkSize, top + checkSize - 2 }, ink);
-                    }
+                    RECT glyph{ 2, top, 2 + checkSize, top + checkSize };
+                    const UINT shape = radioButton ? DFCS_BUTTONRADIO :
+                        (buttonCheck == 2 ? DFCS_BUTTON3STATE : DFCS_BUTTONCHECK);
+                    BridgeDrawFrameControl(dc, &glyph, DFC_BUTTON, shape |
+                        (pressed ? DFCS_PUSHED : 0) | (!enabled ? DFCS_INACTIVE : 0) |
+                        (buttonCheck ? DFCS_CHECKED : 0));
                 }
             }
             else if (controlKind == BuiltinControlKind::Button)
             {
-                const MiniGdi::Color fill = enabled
-                    ? (pressed ? MiniGdi::MakeColor(214, 214, 214) :
-                        (visualStyles ? MiniGdi::MakeColor(250, 250, 250) : MiniGdi::MakeColor(240, 240, 240)))
-                    : MiniGdi::MakeColor(235, 235, 235);
-                MiniGdi::DrawRectangle(
-                    *surface,
-                    fullRect,
-                    fill,
-                    focused && visualStyles ? MiniGdi::MakeColor(0, 120, 215) : MiniGdi::MakeColor(96, 96, 96));
+                if (visualStyles)
+                {
+                    const BYTE shade = !enabled ? 235 : (pressed ? 214 : 250);
+                    const auto fill = MiniGdi::MakeColor(shade, shade, shade);
+                    MiniGdi::DrawRectangle(*surface, fullRect, fill,
+                        focused || defaultButton ? MiniGdi::MakeColor(0, 120, 215) :
+                        MiniGdi::MakeColor(96, 96, 96));
+                }
+                else
+                {
+                    RECT face{ 0, 0, width, height };
+                    if (defaultButton)
+                    {
+                        BridgeFrameRect(dc, &face, BridgeGetSysColorBrush(COLOR_WINDOWFRAME));
+                        face = { 1, 1, width - 1, height - 1 };
+                    }
+                    BridgeDrawFrameControl(dc, &face, DFC_BUTTON, DFCS_BUTTONPUSH |
+                        (pressed ? DFCS_PUSHED : 0) | (!enabled ? DFCS_INACTIVE : 0) |
+                        (buttonCheck ? DFCS_CHECKED : 0) | ((style & 0x8000u) ? DFCS_MONO : 0)); // BS_FLAT
+                }
             }
             else if (controlKind == BuiltinControlKind::Edit ||
                 controlKind == BuiltinControlKind::IpAddress ||
@@ -13224,7 +13260,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             }
             else if (controlKind == BuiltinControlKind::Button)
             {
-                textX = (std::max)(2, (width - visibleTextWidth) / 2);
+                const DWORD horizontal = style & ButtonHorizontalAlignmentMask;
+                textX = horizontal == 0x0100u ? 3 :
+                    (horizontal == 0x0200u ? (std::max)(3, width - visibleTextWidth - 3) :
+                        (std::max)(2, (width - visibleTextWidth) / 2));
                 if (pressed)
                 {
                     ++textX;
@@ -13332,14 +13371,29 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 }
             }
 
+            const auto drawControlLabel = [dc](const std::wstring& label, RECT bounds, UINT alignment)
+            {
+                if (!label.empty() && bounds.left < bounds.right && bounds.top < bounds.bottom)
+                    BridgeDrawTextW(dc, const_cast<LPWSTR>(label.c_str()), static_cast<int>(label.size()),
+                        &bounds, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS | alignment);
+            };
             if (controlKind == BuiltinControlKind::StatusBar)
             {
+                const auto drawPart = [&](const std::wstring& label, UINT partStyle, int left, int right)
+                {
+                    RECT part{ left, 1, right, height - 1 };
+                    constexpr UINT noBorders = 0x0100u; // SBT_NOBORDERS
+                    constexpr UINT popOut = 0x0200u; // SBT_POPOUT
+                    if (!(partStyle & noBorders) && part.left < part.right)
+                        BridgeDrawEdge(dc, &part, (partStyle & popOut) ? EDGE_RAISED : EDGE_SUNKEN,
+                            BF_RECT | BF_ADJUST);
+                    part.left += 3;
+                    part.right -= 3;
+                    drawControlLabel(label, part, DT_LEFT);
+                };
                 if (statusBarSimple)
                 {
-                    const size_t visible = (std::min)(statusBarSimpleText.size(),
-                        static_cast<size_t>((std::max)(0, width - 6) / controlTextWidth));
-                    m_gdi.TextOutW(guestDc, MiniGdi::Point{ 3, textY },
-                        statusBarSimpleText.data(), visible, nullptr);
+                    drawPart(statusBarSimpleText, statusBarSimpleStyle, 0, width);
                 }
                 else
                 {
@@ -13349,20 +13403,10 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                         const int right = statusBarParts[part] < 0
                             ? width
                             : (std::min)(width, (std::max)(left, statusBarParts[part]));
-                        if (part != 0)
-                        {
-                            MiniGdi::DrawLine(*surface,
-                                MiniGdi::Point{ left, 1 },
-                                MiniGdi::Point{ left, (std::max)(1, height - 2) },
-                                MiniGdi::MakeColor(184, 184, 184));
-                        }
                         if (part < statusBarTexts.size())
                         {
-                            const size_t visible = (std::min)(statusBarTexts[part].size(),
-                                static_cast<size_t>((std::max)(0, right - left - 6) /
-                                    controlTextWidth));
-                            m_gdi.TextOutW(guestDc, MiniGdi::Point{ left + 3, textY },
-                                statusBarTexts[part].data(), visible, nullptr);
+                            const UINT partStyle = part < statusBarTextStyles.size() ? statusBarTextStyles[part] : 0;
+                            drawPart(statusBarTexts[part], partStyle, left, right);
                         }
                         left = right;
                         if (left >= width)
@@ -13514,11 +13558,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             continue;
                         }
                     }
-                    MiniGdi::DrawRectangle(*surface, MiniGdi::Rect{ left, 0, right, height },
-                        static_cast<int>(item) == headerPressedItem
-                            ? MiniGdi::MakeColor(216, 216, 216)
-                            : MiniGdi::MakeColor(240, 240, 240),
-                        MiniGdi::MakeColor(160, 160, 160));
+                    RECT edge = itemBounds;
+                    BridgeDrawEdge(dc, &edge, itemState ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT | BF_MIDDLE);
                     int textLeft = left + 4;
                     if (headerImageList && item < headerItemImages.size() && headerItemImages[item] >= 0)
                     {
@@ -13531,12 +13572,9 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             textLeft += iconSize + 3;
                         }
                     }
-                    const size_t visible = (std::min)(headerItems[item].size(),
-                        static_cast<size_t>((std::max)(0, right - textLeft - 3) /
-                            controlTextWidth));
-                    m_gdi.TextOutW(guestDc, MiniGdi::Point{ textLeft,
-                        (std::max)(0, (height - controlTextHeight) / 2) },
-                        headerItems[item].data(), visible, nullptr);
+                    const int justify = item < headerItemFormats.size() ? headerItemFormats[item] & 0x3 : 0;
+                    drawControlLabel(headerItems[item], { textLeft, 0, right - 3, height },
+                        justify == 1 ? DT_RIGHT : (justify == 2 ? DT_CENTER : DT_LEFT));
                     if ((itemDrawMode & CustomDrawNotifyPostPaint) != 0)
                     {
                         sendCustomDraw(CustomDrawItemPostPaint,
@@ -13665,8 +13703,8 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
             {
                 const int buttonWidth = (std::max)(
                     GuestMetrics::DefaultBitmapExtent, toolbarButtonWidth);
-                const int buttonHeight = (std::min)(height - 2 * GuestMetrics::Border,
-                    (std::max)(GuestMetrics::DefaultBitmapExtent, toolbarButtonHeight));
+                const int buttonHeight = (std::max)(0, (std::min)(height - 2 * GuestMetrics::Border,
+                    (std::max)(GuestMetrics::DefaultBitmapExtent, toolbarButtonHeight)));
                 for (size_t index = 0; index < toolbarCommands.size(); ++index)
                 {
                     const BYTE buttonStyle = index < toolbarButtonStyles.size() ? toolbarButtonStyles[index] : 0;
@@ -13726,49 +13764,51 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                             continue;
                         }
                     }
-                    MiniGdi::DrawRectangle(
-                        *surface,
-                        MiniGdi::Rect{ itemBounds.left, itemBounds.top,
-                            itemBounds.right, itemBounds.bottom },
-                        ColorFromGuestColorRef(customItemBackground),
-                        buttonEnabled ? MiniGdi::MakeColor(128, 128, 128) : MiniGdi::MakeColor(184, 184, 184));
+                    MiniGdi::FillRect(*surface, { itemBounds.left, itemBounds.top,
+                        itemBounds.right, itemBounds.bottom }, ColorFromGuestColorRef(customItemBackground));
+                    if ((style & ToolbarFlat) == 0 || buttonPressed)
+                    {
+                        RECT edge = itemBounds;
+                        BridgeDrawEdge(dc, &edge, buttonPressed ? EDGE_SUNKEN : EDGE_RAISED, BF_RECT);
+                    }
                     MiniGdi::Surface image;
                     const int bitmapIndex = index < toolbarBitmaps.size()
                         ? toolbarBitmaps[index] : static_cast<int>(index);
-                    const int iconWidth = (std::min)(itemWidth - 4, (std::max)(1, toolbarBitmapWidth));
-                    const int iconHeight = (std::min)(buttonHeight - 4, (std::max)(1, toolbarBitmapHeight));
                     const bool hasText = index < toolbarButtonTexts.size() &&
                         !toolbarButtonTexts[index].empty();
-                    const int iconTop = hasText
-                        ? 1 + GuestMetrics::ControlVerticalPadding
-                        : 1 + (buttonHeight - iconHeight) / 2;
-                    const MiniGdi::Rect iconRect{ left + (itemWidth - iconWidth) / 2, iconTop,
-                        left + (itemWidth - iconWidth) / 2 + iconWidth, iconTop + iconHeight };
-                    if (toolbarImageList && bitmapIndex >= 0 &&
-                        CopyGuestImageListImage(toolbarImageList, bitmapIndex, &image) && !image.Empty())
+                    const bool list = (style & ToolbarList) != 0;
+                    const bool dropdown = (buttonStyle & ToolbarStyleDropDown) != 0 && itemWidth >= 14;
+                    RECT labelBounds{ itemBounds.left + 3, itemBounds.top + 1,
+                        itemBounds.right - (dropdown ? 12 : 3), itemBounds.bottom - 1 };
+                    if (bitmapIndex >= 0)
                     {
-                        DrawToolbarImage(*surface, iconRect, image);
-                    }
-                    else
-                    {
-                        DrawToolbarGlyph(*surface, iconRect, bitmapIndex);
+                        const int iconWidth = (std::min)(toolbarBitmapWidth,
+                            static_cast<int>(labelBounds.right - labelBounds.left));
+                        const int iconHeight = (std::min)(toolbarBitmapHeight,
+                            static_cast<int>(labelBounds.bottom - labelBounds.top) -
+                                (hasText && !list ? controlTextHeight + 1 : 0));
+                        if (iconWidth > 0 && iconHeight > 0)
+                        {
+                            const int iconLeft = static_cast<int>(labelBounds.left) +
+                                (hasText && list ? 0 : (labelBounds.right - labelBounds.left - iconWidth) / 2);
+                            const int iconTop = static_cast<int>(labelBounds.top) +
+                                (hasText && !list ? 0 : (labelBounds.bottom - labelBounds.top - iconHeight) / 2);
+                            const MiniGdi::Rect iconRect{ iconLeft, iconTop, iconLeft + iconWidth, iconTop + iconHeight };
+                            if (toolbarImageList && CopyGuestImageListImage(toolbarImageList, bitmapIndex, &image) && !image.Empty())
+                                DrawToolbarImage(*surface, iconRect, image);
+                            else
+                                DrawToolbarGlyph(*surface, iconRect, bitmapIndex);
+                            if (list) labelBounds.left = iconRect.right + 3;
+                            else labelBounds.top = iconRect.bottom + 1;
+                        }
                     }
                     if (hasText)
                     {
-                        const auto& label = toolbarButtonTexts[index];
-                        const size_t visible = (std::min)(label.size(),
-                            static_cast<size_t>((std::max)(0, itemWidth - 4) /
-                                GuestMetrics::TextWidth));
-                        const int labelWidth = static_cast<int>(visible) * GuestMetrics::TextWidth;
-                        m_gdi.SetTextColor(guestDc,
-                            ColorFromGuestColorRef(customItemText), nullptr);
-                        m_gdi.TextOutW(guestDc,
-                            MiniGdi::Point{ left + (itemWidth - labelWidth) / 2,
-                                (std::max)(iconTop + iconHeight + 1,
-                                    1 + buttonHeight - GuestMetrics::TextHeight - 1) },
-                            label.data(), visible, nullptr);
+                        m_gdi.SetTextColor(guestDc, ColorFromGuestColorRef(customItemText), nullptr);
+                        drawControlLabel(toolbarButtonTexts[index], labelBounds,
+                            list && bitmapIndex >= 0 ? DT_LEFT : DT_CENTER);
                     }
-                    if ((buttonStyle & ToolbarStyleDropDown) != 0 && itemWidth >= 14)
+                    if (dropdown)
                     {
                         const MiniGdi::Color arrow = buttonEnabled
                             ? MiniGdi::MakeColor(48, 48, 48)
@@ -14130,6 +14170,16 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                     MiniGdi::MakeColor(0, 120, 215));
             }
 
+            if (focused && enabled && !groupBox && controlKind == BuiltinControlKind::Button)
+            {
+                const int inset = defaultButton ? 4 : 3;
+                const RECT focus = checkBox
+                    ? RECT{ textX - 1, textY - 1, (std::min)(width, textX + visibleTextWidth + 1),
+                        (std::min)(height, textY + controlTextHeight + 1) }
+                    : RECT{ inset, inset, width - inset, height - inset };
+                BridgeDrawFocusRect(dc, &focus);
+            }
+
             if (fontSelected)
             {
                 m_gdi.SelectFont(guestDc, previousFont, nullptr);
@@ -14408,9 +14458,39 @@ LRESULT GuestWindowManager::BuiltinControlProcedure(
                 window->toolbarPressedIndex = -1;
                 if (index >= 0 && static_cast<size_t>(index) < window->toolbarCommands.size())
                 {
-                    command = window->toolbarCommands[static_cast<size_t>(index)];
                     handle = window->handle;
-                    parent = window->parent;
+                    parent = window->toolbarNotificationWindow;
+                    const size_t item = static_cast<size_t>(index);
+                    const int width = (std::max)(GuestMetrics::DefaultBitmapExtent, window->toolbarButtonWidth);
+                    const int left = ToolbarItemLeft(window->toolbarButtonStyles, window->toolbarBitmaps,
+                        window->toolbarButtonStates, item, width, &window->toolbarButtonTexts);
+                    const int right = left + ToolbarItemWidth(window->toolbarButtonStyles, window->toolbarBitmaps,
+                        window->toolbarButtonStates, item, width, &window->toolbarButtonTexts);
+                    const int x = static_cast<SHORT>(LOWORD(lParam));
+                    const int y = static_cast<SHORT>(HIWORD(lParam));
+                    auto& states = window->toolbarButtonStates;
+                    const auto& styles = window->toolbarButtonStyles;
+                    if (x >= left && x < right && y >= 0 && y < window->surface.Height() &&
+                        (states[item] & ToolbarStateEnabled))
+                    {
+                        command = window->toolbarCommands[item];
+                        if (styles[item] & ToolbarStyleCheck)
+                        {
+                            if (styles[item] & ToolbarStyleGroup)
+                            {
+                                size_t first = item;
+                                while (first > 0 && (styles[first - 1] & ToolbarStyleGroup)) --first;
+                                for (size_t member = first; member < styles.size() &&
+                                    (styles[member] & ToolbarStyleGroup); ++member)
+                                    states[member] &= ~ToolbarStateChecked;
+                                states[item] |= ToolbarStateChecked;
+                            }
+                            else
+                            {
+                                states[item] ^= ToolbarStateChecked;
+                            }
+                        }
+                    }
                 }
             }
             DWORD ignored = ERROR_SUCCESS;

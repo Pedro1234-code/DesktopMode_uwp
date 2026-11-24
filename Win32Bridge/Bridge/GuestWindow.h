@@ -91,6 +91,7 @@ namespace Bridge
         BOOL EndGuestMenu(DWORD* win32Error);
         BOOL GetGuestClientRect(HWND window, LPRECT rect, DWORD* win32Error) const;
         BOOL GetGuestWindowRect(HWND window, LPRECT rect, DWORD* win32Error) const;
+        RECT GetGuestViewportRect() const;
         BOOL GetGuestClientOrigin(HWND window, LPPOINT point, DWORD* win32Error) const;
         BOOL SetGuestWindowText(HWND window, LPCWSTR text, DWORD* win32Error);
         int GetGuestWindowText(HWND window, LPWSTR buffer, int count, DWORD* win32Error) const;

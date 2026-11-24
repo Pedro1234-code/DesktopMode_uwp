@@ -186,9 +186,9 @@
             ID3D11VideoDecoder* pDecoder, UINT NumBuffers, const D3D11_VIDEO_DECODER_BUFFER_DESC* pBufferDesc) override
         { return m_video->SubmitDecoderBuffers(pDecoder, NumBuffers, pBufferDesc); }
 
-        APP_DEPRECATED_HRESULT STDMETHODCALLTYPE DecoderExtension(
-            ID3D11VideoDecoder* pDecoder, const D3D11_VIDEO_DECODER_EXTENSION* pExtensionData) override
-        { return m_video->DecoderExtension(pDecoder, pExtensionData); }
+        // The desktop-only extension calls remain in the COM interface. The UWP host cannot forward them.
+        HRESULT STDMETHODCALLTYPE DecoderExtension(ID3D11VideoDecoder*, const D3D11_VIDEO_DECODER_EXTENSION*) override
+        { return DXGI_ERROR_UNSUPPORTED; }
 
         void STDMETHODCALLTYPE VideoProcessorSetOutputTargetRect(
             ID3D11VideoProcessor* pVideoProcessor, BOOL Enable, const RECT* pRect) override
@@ -213,9 +213,8 @@
         void STDMETHODCALLTYPE VideoProcessorSetOutputStereoMode(ID3D11VideoProcessor* pVideoProcessor, BOOL Enable) override
         { m_video->VideoProcessorSetOutputStereoMode(pVideoProcessor, Enable); }
 
-        APP_DEPRECATED_HRESULT STDMETHODCALLTYPE VideoProcessorSetOutputExtension(
-            ID3D11VideoProcessor* pVideoProcessor, const GUID* pExtensionGuid, UINT DataSize, void* pData) override
-        { return m_video->VideoProcessorSetOutputExtension(pVideoProcessor, pExtensionGuid, DataSize, pData); }
+        HRESULT STDMETHODCALLTYPE VideoProcessorSetOutputExtension(ID3D11VideoProcessor*, const GUID*, UINT, void*) override
+        { return DXGI_ERROR_UNSUPPORTED; }
 
         void STDMETHODCALLTYPE VideoProcessorGetOutputTargetRect(
             ID3D11VideoProcessor* pVideoProcessor, BOOL* Enabled, RECT* pRect) override
@@ -240,9 +239,8 @@
         void STDMETHODCALLTYPE VideoProcessorGetOutputStereoMode(ID3D11VideoProcessor* pVideoProcessor, BOOL* pEnabled) override
         { m_video->VideoProcessorGetOutputStereoMode(pVideoProcessor, pEnabled); }
 
-        APP_DEPRECATED_HRESULT STDMETHODCALLTYPE VideoProcessorGetOutputExtension(
-            ID3D11VideoProcessor* pVideoProcessor, const GUID* pExtensionGuid, UINT DataSize, void* pData) override
-        { return m_video->VideoProcessorGetOutputExtension(pVideoProcessor, pExtensionGuid, DataSize, pData); }
+        HRESULT STDMETHODCALLTYPE VideoProcessorGetOutputExtension(ID3D11VideoProcessor*, const GUID*, UINT, void*) override
+        { return DXGI_ERROR_UNSUPPORTED; }
 
         void STDMETHODCALLTYPE VideoProcessorSetStreamFrameFormat(
             ID3D11VideoProcessor* pVideoProcessor, UINT StreamIndex, D3D11_VIDEO_FRAME_FORMAT FrameFormat) override
@@ -298,9 +296,8 @@
             int Level) override
         { m_video->VideoProcessorSetStreamFilter(pVideoProcessor, StreamIndex, Filter, Enable, Level); }
 
-        APP_DEPRECATED_HRESULT STDMETHODCALLTYPE VideoProcessorSetStreamExtension(
-            ID3D11VideoProcessor* pVideoProcessor, UINT StreamIndex, const GUID* pExtensionGuid, UINT DataSize, void* pData) override
-        { return m_video->VideoProcessorSetStreamExtension(pVideoProcessor, StreamIndex, pExtensionGuid, DataSize, pData); }
+        HRESULT STDMETHODCALLTYPE VideoProcessorSetStreamExtension(ID3D11VideoProcessor*, UINT, const GUID*, UINT, void*) override
+        { return DXGI_ERROR_UNSUPPORTED; }
 
         void STDMETHODCALLTYPE VideoProcessorGetStreamFrameFormat(
             ID3D11VideoProcessor* pVideoProcessor, UINT StreamIndex, D3D11_VIDEO_FRAME_FORMAT* pFrameFormat) override
@@ -357,9 +354,8 @@
             int* pLevel) override
         { m_video->VideoProcessorGetStreamFilter(pVideoProcessor, StreamIndex, Filter, pEnabled, pLevel); }
 
-        APP_DEPRECATED_HRESULT STDMETHODCALLTYPE VideoProcessorGetStreamExtension(
-            ID3D11VideoProcessor* pVideoProcessor, UINT StreamIndex, const GUID* pExtensionGuid, UINT DataSize, void* pData) override
-        { return m_video->VideoProcessorGetStreamExtension(pVideoProcessor, StreamIndex, pExtensionGuid, DataSize, pData); }
+        HRESULT STDMETHODCALLTYPE VideoProcessorGetStreamExtension(ID3D11VideoProcessor*, UINT, const GUID*, UINT, void*) override
+        { return DXGI_ERROR_UNSUPPORTED; }
 
         HRESULT STDMETHODCALLTYPE VideoProcessorBlt(
             ID3D11VideoProcessor* pVideoProcessor, ID3D11VideoProcessorOutputView* pView, UINT OutputFrame, UINT StreamCount,
