@@ -15,6 +15,7 @@
 #include "Bridge/Win32Shims.h"
 
 #include <atomic>
+#include <algorithm>
 #include <csetjmp>
 #include <cwchar>
 #include <fileapifromapp.h>
@@ -26,6 +27,55 @@ using namespace Win32Bridge::Bridge;
 
 namespace
 {
+    class GuestWinRtApartment final
+    {
+    public:
+        GuestWinRtApartment() : status(RoInitialize(RO_INIT_MULTITHREADED)) {}
+        ~GuestWinRtApartment() { if (SUCCEEDED(status)) RoUninitialize(); }
+        GuestWinRtApartment(const GuestWinRtApartment&) = delete;
+        GuestWinRtApartment& operator=(const GuestWinRtApartment&) = delete;
+
+        const HRESULT status;
+    };
+
+    struct RunningGuestProcess
+    {
+        const GuestRuntime* runtime;
+        const GuestWindowManager* windows;
+        DWORD id;
+        std::wstring path;
+        std::weak_ptr<GuestModuleLoader> modules;
+        HMODULE image;
+        DWORD imageSize;
+        DWORD entryPointRva;
+    };
+    std::mutex g_guestProcessesLock;
+    std::vector<RunningGuestProcess> g_guestProcesses;
+
+    class GuestProcessRegistration final
+    {
+    public:
+        explicit GuestProcessRegistration(RunningGuestProcess process) : m_runtime(process.runtime)
+        {
+            std::lock_guard<std::mutex> guard(g_guestProcessesLock);
+            g_guestProcesses.push_back(std::move(process));
+        }
+
+        ~GuestProcessRegistration()
+        {
+            std::lock_guard<std::mutex> guard(g_guestProcessesLock);
+            const auto entry = std::find_if(g_guestProcesses.begin(), g_guestProcesses.end(),
+                [this](const RunningGuestProcess& process) { return process.runtime == m_runtime; });
+            if (entry != g_guestProcesses.end()) g_guestProcesses.erase(entry);
+        }
+
+        GuestProcessRegistration(const GuestProcessRegistration&) = delete;
+        GuestProcessRegistration& operator=(const GuestProcessRegistration&) = delete;
+
+    private:
+        const GuestRuntime* m_runtime;
+    };
+
     constexpr DWORD GuestExitException = 0xE0424242u;
     thread_local GuestRuntime* g_currentGuestRuntime = nullptr;
     thread_local std::jmp_buf* g_guestExitTarget = nullptr;
@@ -426,21 +476,27 @@ struct GuestRuntime::WorkerLease final
 {
     WorkerLease(GuestRuntime* owner, DWORD threadId) : runtime(owner), id(threadId) {}
 
-    ~WorkerLease()
+    ~WorkerLease() { Unregister(nullptr, 0); }
+
+    void Unregister(const GuestKernelContext::Completion* completion, DWORD exitCode)
     {
         if (!registered) return;
         runtime->m_windows->InterruptGuestThreadMessages(id, true);
         std::lock_guard<std::mutex> guard(runtime->m_threadLock);
-        if (ran) runtime->m_lastWorkerExitCode = exitCode;
+        if (completion)
+        {
+            if (runtime->m_processExitRequested) exitCode = runtime->m_processExitCode;
+            runtime->m_lastWorkerExitCode = exitCode;
+        }
         runtime->m_workerThreads.erase(id);
+        registered = false;
+        if (completion) completion->Finish(exitCode);
         runtime->m_threadsChanged.notify_all();
     }
 
     GuestRuntime* runtime;
     DWORD id;
-    DWORD exitCode = ERROR_PROCESS_ABORTED;
     bool registered = false;
-    bool ran = false;
 };
 
 bool Win32Bridge::Bridge::RequestGuestExit(DWORD exitCode, bool threadExit)
@@ -506,9 +562,10 @@ bool GuestRuntime::Prepare(const BYTE* fileBytes, size_t fileSize, const ImportR
     m_bindings = BindingReport{};
     std::atomic_store(&m_consoleTransport, std::shared_ptr<GuestKernelContext>{});
     m_kernel.reset();
+    m_sessionKernel.reset();
     m_initialKernel.reset();
-    m_mainThreadCompleted = {};
-    m_initialConsole.reset(); m_initialPipes.reset(); m_hasInitialStandardHandles = false;
+    m_initialThread = {};
+    m_hasInitialStandardHandles = false;
     m_startupCrtData.clear();
     m_detachedConsole = m_createConsole = false;
     m_modules.reset();
@@ -570,6 +627,7 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<v
         RuntimeDiagnostics::Record(L"RUN FAILED: called before a successful prepare.");
         return false;
     }
+    *exitCode = ERROR_PROCESS_ABORTED;
     if (m_mapped.entryPointRva == 0 ||
         m_mapped.entryPointRva >= m_runtime.Size())
     {
@@ -593,8 +651,6 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<v
     try
     {
         m_kernel = m_initialKernel ? std::move(m_initialKernel) : std::make_shared<GuestKernelContext>();
-        if (m_initialConsole) m_kernel->Console().Inherit(*m_initialConsole);
-        if (m_initialPipes) { m_kernel->Pipes().Adopt(*m_initialPipes); m_initialPipes.reset(); }
         if (!m_detachedConsole && !m_kernel->Console().IsAttached() &&
             (m_createConsole || m_metadata.subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI))
         {
@@ -663,20 +719,25 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<v
         m_mainThreadId ? m_mainThreadId : g_nextGuestProcessId.fetch_add(1));
     DWORD mainThreadError = 0;
     const DWORD mainThreadId = BridgeGetCurrentThreadId();
-    GuestKernelContext::Completion mainThread;
-    if (!m_kernel->CreateCompletionObject(mainThreadId, false, &mainThread, nullptr, &mainThreadError))
-    { SetError(error, L"Could not register the guest main thread."); return false; }
+    GuestKernelContext::Completion mainThread = std::move(m_initialThread);
+    GuestKernelContext::Completion rootProcess;
+    const std::wstring imagePath = m_storage ? m_storage->ModulePath() : std::wstring();
+    if (!mainThread)
+    {
+        if (!m_kernel->CreateCompletionObject(m_processId, true, &rootProcess, nullptr, &mainThreadError) ||
+            !m_kernel->CreateCompletionObject(mainThreadId, false, &mainThread, nullptr, &mainThreadError,
+                false, m_processId))
+        { SetError(error, L"Could not register the guest process and its main thread."); return false; }
+        rootProcess.SetProcessDetails(mainThread, imagePath);
+    }
+    const GuestProcessRegistration process({ this, m_windows.get(), m_processId, imagePath, m_modules,
+        reinterpret_cast<HMODULE>(m_runtime.Base()), static_cast<DWORD>(m_runtime.Size()), m_metadata.entryPointRva });
     {
         std::lock_guard<std::mutex> guard(m_threadLock);
         m_runningMainThreadId = mainThreadId;
         m_threadsMayRun = false;
     }
     DWORD mainThreadExitCode = ERROR_PROCESS_ABORTED;
-    const auto finishMainThread = [&]()
-    {
-        mainThread.Finish(mainThreadExitCode);
-        if (m_mainThreadCompleted) m_mainThreadCompleted(mainThreadExitCode);
-    };
     bool mainTlsAttached = false;
     bool cleaned = false;
     const auto cleanupGuest = [&]()
@@ -692,7 +753,11 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<v
         {
             std::lock_guard<std::mutex> guard(m_threadLock);
             m_runningMainThreadId = 0;
-            if (m_processExitRequested) mainThreadExitCode = m_processExitCode;
+            if (m_processExitRequested)
+            {
+                mainThreadExitCode = m_processExitCode;
+                *exitCode = static_cast<int>(m_processExitCode);
+            }
         }
         // TLS and DLL detach callbacks may still perform file or kernel I/O.
         // Release code before closing the resources those callbacks can use.
@@ -712,10 +777,12 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<v
         ResetGuestPropertySheetsForCurrentProcess();
         m_modules->Stdio().CloseAll(true, !m_modules->CrtState().suppressStdioFlush.load());
         m_modules->CrtFiles().CloseAll();
+        ReleaseGuestFileMappingViews();
         if (m_storage) m_storage->CloseAll();
         kernelScope.AbandonOwnedMutexes();
-        finishMainThread();
+        mainThread.Finish(mainThreadExitCode);
         m_kernel->CloseAll();
+        rootProcess.Finish(static_cast<DWORD>(*exitCode));
     };
     try
     {
@@ -846,6 +913,8 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<v
             }
             else
             {
+                mainThreadExitCode = guestException.code;
+                *exitCode = static_cast<int>(mainThreadExitCode);
                 const std::wstring exceptionDescription = DescribeGuestException(
                     guestException,
                     m_runtime.Base(),
@@ -866,25 +935,25 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<v
         mainThreadExitCode = static_cast<DWORD>(*exitCode);
         if (guestException.threadExit && !m_stopRequested.load())
         {
-            if (m_windows) m_windows->InterruptGuestThreadMessages(mainThreadId, true);
-            kernelScope.AbandonOwnedMutexes();
-            finishMainThread();
             std::unique_lock<std::mutex> guard(m_threadLock);
-            const bool workersOutlivedMain = !m_workerThreads.empty();
-            m_threadsChanged.wait(guard, [&]() { return m_workerThreads.empty(); });
-            if (workersOutlivedMain) *exitCode = static_cast<int>(m_lastWorkerExitCode);
+            if (!m_workerThreads.empty() && !m_processExitRequested)
+            {
+                m_runningMainThreadId = 0;
+                if (m_windows) m_windows->InterruptGuestThreadMessages(mainThreadId, true);
+                kernelScope.AbandonOwnedMutexes();
+                mainThread.Finish(mainThreadExitCode);
+                m_threadsChanged.wait(guard, [&]() { return m_workerThreads.empty(); });
+                *exitCode = static_cast<int>(m_lastWorkerExitCode);
+            }
         }
         cleanupGuest();
-        {
-            std::lock_guard<std::mutex> guard(m_threadLock);
-            if (m_processExitRequested) *exitCode = static_cast<int>(m_processExitCode);
-        }
-
         RuntimeDiagnostics::Record(L"RUN: guest returned exit code " + std::to_wstring(*exitCode) + L".");
         return true;
     }
     catch (Platform::Exception^ exception)
     {
+        *exitCode = exception->HResult;
+        mainThreadExitCode = static_cast<DWORD>(*exitCode);
         cleanupGuest();
 
         SetError(error, L"The guest raised an unhandled WinRT exception.");
@@ -894,6 +963,8 @@ bool GuestRuntime::Run(int* exitCode, std::wstring* error, const std::function<v
     }
     catch (...)
     {
+        *exitCode = ERROR_PROCESS_ABORTED;
+        mainThreadExitCode = ERROR_PROCESS_ABORTED;
         cleanupGuest();
 
         SetError(error, L"The guest raised an unhandled C++ exception.");
@@ -910,7 +981,7 @@ bool GuestRuntime::LaunchChildProcess(
     DWORD* win32Error,
     const std::vector<std::wstring>* environment, DWORD creationFlags, bool inheritHandles,
     const HANDLE* standardHandles, const std::vector<BYTE>& startupCrtData,
-    bool inheritProcessHandle, bool inheritThreadHandle)
+    bool inheritProcessHandle, bool inheritThreadHandle, const std::unordered_set<ULONG_PTR>* inheritedHandleList)
 {
     if (!processInformation || !executableName || !*executableName ||
         !m_modules || !m_kernel || !m_storage || !m_windows)
@@ -929,6 +1000,12 @@ bool GuestRuntime::LaunchChildProcess(
             shareConsole ? m_kernel->Console().GetStandard(static_cast<DWORD>(-10 - static_cast<int>(index)), &status) : nullptr;
         const HANDLE value = inheritedStandard[index];
         if (!value || value == INVALID_HANDLE_VALUE) continue;
+        if (inheritedHandleList && !inheritedHandleList->count(reinterpret_cast<ULONG_PTR>(value)))
+        {
+            if (standardHandles) { if (win32Error) *win32Error = ERROR_INVALID_HANDLE; return false; }
+            inheritedStandard[index] = nullptr;
+            continue;
+        }
         useStandard = true;
         // An implicit std slot may contain a value that wasn't inherited.
         // Only explicitly supplied STARTF_USESTDHANDLES are validated here.
@@ -979,7 +1056,7 @@ bool GuestRuntime::LaunchChildProcess(
         if (win32Error) *win32Error = ERROR_NOT_ENOUGH_MEMORY;
         return false;
     }
-    if (inheritHandles && !childStorage->InheritFiles(*m_storage, &errorCode))
+    if (inheritHandles && !childStorage->InheritFiles(*m_storage, &errorCode, inheritedHandleList))
     { if (win32Error) *win32Error = errorCode; return false; }
     child->SetStorageContext(childStorage);
     // The registry is machine/user state, not process-private state. Sharing
@@ -1003,23 +1080,30 @@ bool GuestRuntime::LaunchChildProcess(
     try
     {
         child->SetInitialEnvironment(environment ? *environment : m_modules->Environment().Snapshot());
+        child->m_initialKernel = std::make_shared<GuestKernelContext>(m_kernel.get());
         if (inheritHandles)
         {
             child->m_startupCrtData = startupCrtData;
-            child->m_initialKernel = std::make_shared<GuestKernelContext>();
-            if (!child->m_initialKernel->InheritHandles(*m_kernel, &errorCode))
+            if (!child->m_initialKernel->InheritHandles(*m_kernel, &errorCode, inheritedHandleList))
             { if (win32Error) *win32Error = errorCode; return false; }
+            child->m_initialKernel->Pipes().Inherit(m_kernel->Pipes(), inheritedHandleList);
         }
-        child->m_initialPipes = std::make_shared<GuestPipeContext>();
-        if (inheritHandles) child->m_initialPipes->Inherit(m_kernel->Pipes());
         child->m_initialStandardHandles = inheritedStandard;
         child->m_hasInitialStandardHandles = useStandard;
         child->m_detachedConsole = (creationFlags & 0x00000008u) != 0; // DETACHED_PROCESS
         child->m_createConsole = (creationFlags & 0x00000010u) != 0; // CREATE_NEW_CONSOLE
-        if (!(creationFlags & (0x00000008u | 0x00000010u | 0x08000000u)))
+        if (shareConsole)
+            child->m_initialKernel->Console().Inherit(m_kernel->Console(), inheritHandles, inheritedHandleList);
+        if (inheritedHandleList)
         {
-            child->m_initialConsole = std::make_shared<GuestConsoleContext>();
-            child->m_initialConsole->Inherit(m_kernel->Console(), inheritHandles);
+            for (const ULONG_PTR token : *inheritedHandleList)
+            {
+                const HANDLE handle = reinterpret_cast<HANDLE>(token);
+                const auto& kernel = child->m_initialKernel;
+                if (!kernel->Owns(handle) && !kernel->Pipes().Owns(handle) && !kernel->Console().Owns(handle) &&
+                    !childStorage->OwnsFile(handle))
+                { if (win32Error) *win32Error = ERROR_INVALID_HANDLE; return false; }
+            }
         }
     }
     catch (const std::bad_alloc&)
@@ -1031,60 +1115,91 @@ bool GuestRuntime::LaunchChildProcess(
     const std::shared_ptr<GuestKernelContext> completionKernel = m_kernel;
     const DWORD processId = g_nextGuestProcessId.fetch_add(1);
     const DWORD threadId = g_nextGuestProcessId.fetch_add(1);
+    const bool startSuspended = (creationFlags & CREATE_SUSPENDED) != 0;
     GuestKernelContext::Completion processCompletion, threadCompletion;
     HANDLE processHandle = nullptr;
-    if (!completionKernel->CreateCompletionObject(processId, true, &processCompletion, &processHandle, &errorCode, inheritProcessHandle))
+    if (!completionKernel->CreateCompletionObject(processId, true, &processCompletion, &processHandle,
+        &errorCode, inheritProcessHandle, m_processId))
     {
         if (win32Error) *win32Error = errorCode;
         return false;
     }
     HANDLE threadHandle = nullptr;
-    if (!completionKernel->CreateCompletionObject(threadId, false, &threadCompletion, &threadHandle, &errorCode, inheritThreadHandle))
+    if (!completionKernel->CreateCompletionObject(threadId, false, &threadCompletion, &threadHandle,
+        &errorCode, inheritThreadHandle, processId, startSuspended))
     {
         completionKernel->CloseHandle(processHandle, nullptr);
         if (win32Error) *win32Error = errorCode;
         return false;
     }
-
     child->SetProcessId(processId);
+    child->m_sessionKernel = m_sessionKernel ? m_sessionKernel : completionKernel;
     child->SetMainThreadId(threadId);
     processInformation->hProcess = processHandle;
     processInformation->hThread = threadHandle;
     processInformation->dwProcessId = processId;
     processInformation->dwThreadId = threadId;
 
-    RuntimeDiagnostics::Record(
-        L"PROCESS: created asynchronous cooperative child guest for " + logicalPath + L".");
     const std::shared_ptr<GuestWindowManager> childWindows = m_windows;
     const HWND previousForeground = childWindows->GetGuestForegroundWindow();
     DWORD activationError = ERROR_SUCCESS;
     const HWND previousFocus = childWindows->GetGuestFocus(&activationError);
     try
     {
-        child->m_mainThreadCompleted = [threadCompletion](DWORD code) { threadCompletion.Finish(code); };
+        RuntimeDiagnostics::Record(L"PROCESS: created cooperative child for " + logicalPath +
+            (startSuspended ? L" with its primary thread suspended." : L"."));
+        processCompletion.SetProcessDetails(threadCompletion, logicalPath);
+        child->m_initialThread = threadCompletion;
         std::thread([child, childWindows, processCompletion, threadCompletion,
-            processId, logicalPath, previousForeground, previousFocus]()
+            processId, logicalPath, previousForeground, previousFocus, startSuspended]() mutable
         {
             int exitCode = static_cast<int>(ERROR_PROCESS_ABORTED);
             std::wstring childError;
             bool completed = false;
-            try { completed = child->Run(&exitCode, &childError); }
+            DWORD cancellationCode = ERROR_OPERATION_ABORTED;
+            const bool admitted = !startSuspended ||
+                threadCompletion.WaitForStart(*child->m_sessionKernel, &cancellationCode);
+            const GuestWinRtApartment apartment;
+            if (!admitted)
+            {
+                exitCode = static_cast<int>(cancellationCode);
+                childError = L"suspended startup was canceled";
+                child.reset();
+            }
+            else if (SUCCEEDED(apartment.status))
+            {
+                try { completed = child->Run(&exitCode, &childError); }
+                catch (Platform::Exception^ exception)
+                {
+                    exitCode = exception->HResult;
+                    childError = L"WinRT exception during guest startup";
+                }
+                catch (...) { childError = L"C++ exception during guest startup"; }
+                try { childWindows->DestroyGuestWindowsForProcess(processId, previousForeground, previousFocus); }
+                catch (...) { }
+            }
+            else
+            {
+                exitCode = apartment.status;
+                childError = L"could not initialize WinRT on the child thread";
+            }
+            const DWORD reportedExitCode = static_cast<DWORD>(exitCode);
+            try
+            {
+                RuntimeDiagnostics::Record(
+                    (completed ? L"PROCESS: child returned from " : L"PROCESS FAILED: child stopped in ") +
+                        logicalPath + L" (PID " + std::to_wstring(processId) + L") with exit code " +
+                        std::to_wstring(reportedExitCode) + (childError.empty() ? L"." : L": " + childError));
+            }
             catch (...) { }
-            try { childWindows->DestroyGuestWindowsForProcess(processId, previousForeground, previousFocus); }
-            catch (...) { }
-            const DWORD reportedExitCode = completed
-                ? static_cast<DWORD>(exitCode) : ERROR_PROCESS_ABORTED;
             threadCompletion.Finish(reportedExitCode);
             processCompletion.Finish(reportedExitCode);
-            RuntimeDiagnostics::Record(
-                completed
-                    ? L"PROCESS: child returned from " + logicalPath +
-                        L" with exit code " + std::to_wstring(exitCode) + L"."
-                    : L"PROCESS FAILED: child stopped in " + logicalPath + L": " + childError);
         }).detach();
     }
     catch (const std::exception&)
     {
+        threadCompletion.Finish(ERROR_NOT_ENOUGH_MEMORY);
+        processCompletion.Finish(ERROR_NOT_ENOUGH_MEMORY);
         completionKernel->CloseHandle(threadHandle, nullptr);
         completionKernel->CloseHandle(processHandle, nullptr);
         ZeroMemory(processInformation, sizeof(*processInformation));
@@ -1110,12 +1225,12 @@ HANDLE GuestRuntime::LaunchThread(
         if (win32Error) *win32Error = ERROR_INVALID_PARAMETER;
         return nullptr;
     }
-    if ((creationFlags & CREATE_SUSPENDED) != 0 ||
-        (creationFlags & ~static_cast<DWORD>(STACK_SIZE_PARAM_IS_A_RESERVATION)) != 0)
+    if ((creationFlags & ~(static_cast<DWORD>(STACK_SIZE_PARAM_IS_A_RESERVATION) | CREATE_SUSPENDED)) != 0)
     {
         if (win32Error) *win32Error = ERROR_NOT_SUPPORTED;
         return nullptr;
     }
+    const bool startSuspended = (creationFlags & CREATE_SUSPENDED) != 0;
 
     const DWORD assignedThreadId = g_nextGuestProcessId.fetch_add(1);
     DWORD errorCode = ERROR_SUCCESS;
@@ -1126,7 +1241,7 @@ HANDLE GuestRuntime::LaunchThread(
         const auto lease = std::make_shared<WorkerLease>(this, assignedThreadId);
         {
             std::lock_guard<std::mutex> guard(m_threadLock);
-            if (!m_runningMainThreadId || m_stopRequested.load())
+            if ((!m_runningMainThreadId && m_workerThreads.empty()) || m_stopRequested.load())
             {
                 if (win32Error) *win32Error = ERROR_OPERATION_ABORTED;
                 return nullptr;
@@ -1134,7 +1249,8 @@ HANDLE GuestRuntime::LaunchThread(
             m_workerThreads.insert(assignedThreadId);
             lease->registered = true;
         }
-        if (!m_kernel->CreateCompletionObject(assignedThreadId, false, &threadCompletion, &completion, &errorCode, inheritHandle))
+        if (!m_kernel->CreateCompletionObject(assignedThreadId, false, &threadCompletion, &completion,
+            &errorCode, inheritHandle, m_processId, startSuspended))
         {
             if (win32Error) *win32Error = errorCode;
             return nullptr;
@@ -1160,7 +1276,7 @@ HANDLE GuestRuntime::LaunchThread(
             lease, kernel, modules, registry, storage, windows,
             imageBase, imageSize, resourceSatelliteBase, resourceSatelliteSize,
             commandLine, processId, assignedThreadId, runtime,
-            threadCompletion, startAddress, parameter]()
+            threadCompletion, startAddress, parameter, startSuspended]()
         {
             bool canRun;
             {
@@ -1171,10 +1287,17 @@ HANDLE GuestRuntime::LaunchThread(
                 });
                 canRun = !runtime->m_stopRequested.load();
             }
+            if (canRun && startSuspended)
+                canRun = threadCompletion.WaitForStart(*kernel) && !kernel->IsStopping();
             DWORD exitCode = ERROR_OPERATION_ABORTED;
             if (canRun)
             {
-                const HRESULT apartment = RoInitialize(RO_INIT_MULTITHREADED);
+                const GuestWinRtApartment apartment;
+                if (FAILED(apartment.status))
+                {
+                    lease->Unregister(&threadCompletion, static_cast<DWORD>(apartment.status));
+                    return;
+                }
                 try
                 {
                     exitCode = ERROR_PROCESS_ABORTED;
@@ -1249,16 +1372,8 @@ HANDLE GuestRuntime::LaunchThread(
                 // callbacks or a notification failed partway through.
                 modules->ReleaseThreadTls();
                 runtime->m_runtime.ReleaseThreadTls();
-                if (SUCCEEDED(apartment)) RoUninitialize();
             }
-            if (kernel->IsStopping())
-            {
-                std::lock_guard<std::mutex> guard(runtime->m_threadLock);
-                if (runtime->m_processExitRequested) exitCode = runtime->m_processExitCode;
-            }
-            lease->exitCode = exitCode;
-            lease->ran = true;
-            threadCompletion.Finish(exitCode);
+            lease->Unregister(&threadCompletion, exitCode);
         }).detach();
     }
     catch (const std::bad_alloc&)
@@ -1271,6 +1386,7 @@ HANDLE GuestRuntime::LaunchThread(
     }
     if (errorCode != ERROR_SUCCESS)
     {
+        threadCompletion.Finish(errorCode);
         if (completion) m_kernel->CloseHandle(completion, nullptr);
         if (win32Error) *win32Error = errorCode;
         return nullptr;
@@ -1281,6 +1397,27 @@ HANDLE GuestRuntime::LaunchThread(
     RuntimeDiagnostics::Record(
         L"THREAD: launched guest thread " + std::to_wstring(assignedThreadId) + L".");
     return completion;
+}
+
+bool GuestRuntime::CaptureToolhelpModules(GuestToolhelpSnapshot& snapshot, DWORD processId, bool nativeModules) const
+{
+    std::shared_ptr<GuestModuleLoader> modules;
+    {
+        std::lock_guard<std::mutex> guard(g_guestProcessesLock);
+        const auto process = std::find_if(g_guestProcesses.begin(), g_guestProcesses.end(),
+            [this, processId](const RunningGuestProcess& candidate)
+            {
+                return candidate.windows == m_windows.get() && candidate.id == processId;
+            });
+        if (process == g_guestProcesses.end()) return false;
+        snapshot.processId = process->id;
+        if (!nativeModules) return true;
+        modules = process->modules.lock();
+        if (!modules) return false;
+        snapshot.modules.push_back({ process->image, process->imageSize, process->path, process->entryPointRva });
+    }
+    modules->AppendModuleSnapshot(snapshot.modules);
+    return true;
 }
 
 GuestRuntime* Win32Bridge::Bridge::CurrentGuestRuntime()

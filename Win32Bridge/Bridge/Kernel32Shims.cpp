@@ -37,7 +37,9 @@
 #include <new>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 using namespace Win32Bridge::Bridge;
@@ -651,9 +653,6 @@ namespace
         std::lock_guard<std::mutex> findGuard(g_findChangeWatchesLock);
         g_findChangeWatches.clear();
     }
-    constexpr ULONG_PTR FirstFileMappingHandle = 0x74000000;
-    std::atomic<ULONG_PTR> g_nextFileMappingHandle{ FirstFileMappingHandle };
-
     bool IsWritableMappingProtection(DWORD protection)
     {
         const DWORD page = protection & 0xffu;
@@ -677,6 +676,7 @@ namespace
 
     struct GuestMappingView final
     {
+        const GuestKernelContext* owner;
         std::shared_ptr<GuestFileMapping> mapping;
         std::shared_ptr<void> allocation;
         ULONGLONG offset = 0;
@@ -684,17 +684,9 @@ namespace
         bool copyOnWrite = false;
     };
 
-    struct GuestMappingHandle final
-    {
-        std::shared_ptr<GuestFileMapping> mapping;
-        DWORD access = 0;
-        DWORD flags = 0;
-    };
-
     constexpr DWORD FullMappingAccess = FILE_MAP_ALL_ACCESS | FILE_MAP_EXECUTE;
     std::mutex g_namedMappingCreationLock;
     std::mutex g_fileMappingsLock;
-    std::unordered_map<ULONG_PTR, GuestMappingHandle> g_fileMappings;
     std::unordered_map<std::wstring, std::weak_ptr<GuestFileMapping>> g_namedFileMappings;
     std::unordered_map<const void*, GuestMappingView> g_fileMappingViews;
 
@@ -708,90 +700,11 @@ namespace
         return key;
     }
 
-    HANDLE RegisterFileMappingLocked(const std::shared_ptr<GuestFileMapping>& mapping, DWORD access, DWORD flags)
-    {
-        if (!mapping) return nullptr;
-        for (size_t attempt = 0; attempt < 4096; ++attempt)
-        {
-            ULONG_PTR token = g_nextFileMappingHandle.fetch_add(1);
-            if (token < FirstFileMappingHandle)
-            {
-                token = FirstFileMappingHandle;
-                g_nextFileMappingHandle.store(token + 1);
-            }
-            if (g_fileMappings.find(token) != g_fileMappings.end()) continue;
-            g_fileMappings.emplace(token, GuestMappingHandle{mapping, access, flags});
-            return reinterpret_cast<HANDLE>(token);
-        }
-        return nullptr;
-    }
-
-    GuestMappingHandle LookupFileMapping(HANDLE handle)
-    {
-        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
-        const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
-        return found == g_fileMappings.end() ? GuestMappingHandle{} : found->second;
-    }
-
-    bool FileMappingHandleFlags(HANDLE handle, DWORD& flags, DWORD mask, bool set, DWORD& error)
-    {
-        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
-        const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
-        if (found == g_fileMappings.end()) return false;
-        if (mask & ~(GuestKernelContext::HandleInherit | GuestKernelContext::HandleProtectFromClose))
-        {
-            error = ERROR_INVALID_PARAMETER;
-            return true;
-        }
-        if (set) found->second.flags = (found->second.flags & ~mask) | (flags & mask);
-        flags = found->second.flags;
-        error = ERROR_SUCCESS;
-        return true;
-    }
-
-    bool DuplicateFileMappingHandle(HANDLE handle, DWORD access, BOOL inherit, bool sameAccess,
-        HANDLE& result, DWORD& error)
-    {
-        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
-        const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
-        if (found == g_fileMappings.end()) return false;
-        const auto source = found->second;
-        const DWORD granted = sameAccess ? source.access : access;
-        if ((granted & ~source.access) != 0)
-        {
-            error = ERROR_ACCESS_DENIED;
-            return true;
-        }
-        try
-        {
-            result = RegisterFileMappingLocked(source.mapping, granted, inherit ? GuestKernelContext::HandleInherit : 0);
-            error = result ? ERROR_SUCCESS : ERROR_TOO_MANY_OPEN_FILES;
-        }
-        catch (const std::bad_alloc&) { error = ERROR_NOT_ENOUGH_MEMORY; }
-        return true;
-    }
-
-    bool CloseFileMappingHandle(HANDLE handle, DWORD& error)
-    {
-        std::lock_guard<std::mutex> guard(g_fileMappingsLock);
-        const auto found = g_fileMappings.find(reinterpret_cast<ULONG_PTR>(handle));
-        if (found == g_fileMappings.end()) return false;
-        if (found->second.flags & GuestKernelContext::HandleProtectFromClose) error = ERROR_INVALID_HANDLE;
-        else
-        {
-            g_fileMappings.erase(found);
-            error = ERROR_SUCCESS;
-        }
-        return true;
-    }
-
     void ResetGuestFileMappings()
     {
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
         g_fileMappingViews.clear();
-        g_fileMappings.clear();
         g_namedFileMappings.clear();
-        g_nextFileMappingHandle.store(FirstFileMappingHandle);
     }
 
     void RecordStorageEnumeration(const wchar_t* message)
@@ -857,6 +770,7 @@ namespace
         { L"d3d11.dll", BridgeSystemModuleBaseToken + 31 },
         { L"d3d12.dll", BridgeSystemModuleBaseToken + 32 },
         { L"d3dcompiler_47.dll", BridgeSystemModuleBaseToken + 33 },
+        { L"psapi.dll", BridgeSystemModuleBaseToken + 34 },
     };
 
     HMODULE GuestMainModule()
@@ -1381,6 +1295,17 @@ void Win32Bridge::Bridge::ResetGuestResourceHandles()
     ResetGuestApcs();
 }
 
+void Win32Bridge::Bridge::ReleaseGuestFileMappingViews()
+{
+    const auto kernel = CurrentGuestKernelContext();
+    std::lock_guard<std::mutex> guard(g_fileMappingsLock);
+    for (auto it = g_fileMappingViews.begin(); it != g_fileMappingViews.end();)
+    {
+        if (it->second.owner == kernel) it = g_fileMappingViews.erase(it);
+        else ++it;
+    }
+}
+
 void Win32Bridge::Bridge::NotifyGuestDirectoryChange(
     const std::wstring& path, DWORD action, DWORD changeFilter)
 {
@@ -1711,13 +1636,6 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCloseHandle(HANDLE object)
         { const bool result = kernel->CloseHandle(object, &error); SetGuestLastError(error); return result ? TRUE : FALSE; }
     }
 
-    DWORD error = ERROR_INVALID_HANDLE;
-    if (CloseFileMappingHandle(object, error))
-    {
-        SetGuestLastError(error);
-        return error == ERROR_SUCCESS;
-    }
-
     GuestStorageContext* storage = CurrentGuestStorageContext();
     if (!storage)
     {
@@ -1725,7 +1643,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCloseHandle(HANDLE object)
         return FALSE;
     }
 
-    error = ERROR_SUCCESS;
+    DWORD error = ERROR_SUCCESS;
     if (!storage->CloseFile(object, &error))
     {
         SetGuestLastError(error);
@@ -2166,31 +2084,39 @@ UINT WINAPI Win32Bridge::Bridge::BridgeGetSystemDirectoryW(LPWSTR buffer, UINT b
 }
 
 
+namespace
+{
+    bool GetGuestModuleFilePath(HMODULE module, std::wstring& path, bool executableOnly = false)
+    {
+        if (const auto systemModule = FindBridgeSystemModule(module))
+        {
+            path = L"C:\\Windows\\System32\\" + std::wstring(systemModule->library);
+        }
+        else if (IsGuestMainModule(module))
+        {
+            GuestStorageContext* storage = CurrentStorageOrFail();
+            if (!storage) return false;
+            path = storage->ModulePath();
+        }
+        else
+        {
+            GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
+            if (!loader) return false;
+            DWORD error = ERROR_SUCCESS;
+            if (!loader->GetModulePath(module, &path, &error, executableOnly))
+            {
+                SetGuestLastError(executableOnly && error == ERROR_MOD_NOT_FOUND ? ERROR_INVALID_HANDLE : error);
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
 DWORD WINAPI Win32Bridge::Bridge::BridgeGetModuleFileNameW(HMODULE module, LPWSTR buffer, DWORD bufferLength)
 {
     std::wstring path;
-    if (const BridgeSystemModule* systemModule = FindBridgeSystemModule(module))
-    {
-        path = L"C:\\Windows\\System32\\" + std::wstring(systemModule->library);
-    }
-    else if (IsGuestMainModule(module))
-    {
-        GuestStorageContext* storage = CurrentStorageOrFail();
-        if (!storage) return 0;
-        path = storage->ModulePath();
-    }
-    else
-    {
-        GuestModuleLoader* loader = CurrentModuleLoaderOrFail();
-        if (!loader) return 0;
-        DWORD error = ERROR_SUCCESS;
-        if (!loader->GetModulePath(module, &path, &error))
-        {
-            SetGuestLastError(error);
-            return 0;
-        }
-    }
-
+    if (!GetGuestModuleFilePath(module, path)) return 0;
     DWORD result = 0;
     CopyGuestString(path, bufferLength, buffer, &result);
     return result;
@@ -2810,6 +2736,11 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeGetCurrentProcess()
     return reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-1));
 }
 
+HANDLE WINAPI Win32Bridge::Bridge::BridgeGetCurrentThread()
+{
+    return reinterpret_cast<HANDLE>(static_cast<LONG_PTR>(-2));
+}
+
 LONG WINAPI Win32Bridge::Bridge::BridgeAppPolicyGetProcessTerminationMethod(
     HANDLE,
     int* policy)
@@ -3373,13 +3304,17 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetConsoleMode(HANDLE handle, LPDWORD mod
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeSetPriorityClass(HANDLE process, DWORD)
 {
-    if (process != BridgeGetCurrentProcess()) { SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE; }
+    const auto kernel = CurrentGuestKernelContext();
+    if (!kernel || !kernel->IsCurrentProcessHandle(process, PROCESS_SET_INFORMATION))
+    { SetGuestLastError(ERROR_INVALID_HANDLE); return FALSE; }
     SetGuestLastError(ERROR_SUCCESS); return TRUE;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeSetProcessAffinityMask(HANDLE process, DWORD_PTR processMask)
 {
-    if (process != BridgeGetCurrentProcess() || processMask == 0) { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    const auto kernel = CurrentGuestKernelContext();
+    if (!kernel || !kernel->IsCurrentProcessHandle(process, PROCESS_SET_INFORMATION) || processMask == 0)
+    { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     SetGuestLastError(ERROR_SUCCESS); return TRUE;
 }
 
@@ -4039,6 +3974,8 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenEventW(
 
 HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenFileMappingW(DWORD desiredAccess, BOOL inherit, LPCWSTR name)
 {
+    const auto kernel = CurrentGuestKernelContext();
+    if (!kernel) { SetGuestLastError(ERROR_INVALID_HANDLE); return nullptr; }
     if (!name || !*name || !desiredAccess || (desiredAccess & ~FullMappingAccess))
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
@@ -4060,17 +3997,10 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenFileMappingW(DWORD desiredAccess, B
     }
     const DWORD access = (desiredAccess & FILE_MAP_COPY) && (desiredAccess & FILE_MAP_ALL_ACCESS) != FILE_MAP_ALL_ACCESS
         ? (desiredAccess & ~FILE_MAP_COPY) | FILE_MAP_READ : desiredAccess;
-    try
-    {
-        const HANDLE handle = RegisterFileMappingLocked(mapping, access, inherit ? GuestKernelContext::HandleInherit : 0);
-        SetGuestLastError(handle ? ERROR_SUCCESS : ERROR_TOO_MANY_OPEN_FILES);
-        return handle;
-    }
-    catch (const std::bad_alloc&)
-    {
-        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
-        return nullptr;
-    }
+    DWORD error = ERROR_SUCCESS;
+    const HANDLE handle = kernel->CreateFileMappingHandle(mapping, access, inherit != FALSE, &error);
+    SetGuestLastError(error);
+    return handle;
 }
 
 LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
@@ -4097,8 +4027,10 @@ LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
         SetGuestLastError(error);
         return nullptr;
     };
-    const auto opened = LookupFileMapping(handle);
-    const auto& mapping = opened.mapping;
+    const auto kernel = CurrentGuestKernelContext();
+    DWORD handleAccess = 0;
+    const auto mapping = kernel ? std::static_pointer_cast<GuestFileMapping>(
+        kernel->LookupFileMappingHandle(handle, &handleAccess)) : nullptr;
     if (!mapping)
     {
         return fail(ERROR_INVALID_HANDLE, L"unknown mapping handle");
@@ -4120,7 +4052,7 @@ LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
     const DWORD dataAccess = writeRequested && !copyRequested ? FileMapWrite :
         (copyRequested || readRequested || !executeRequested ? FileMapRead : 0);
     const DWORD neededAccess = dataAccess | (executeRequested ? FileMapExecute : 0);
-    if ((opened.access & neededAccess) != neededAccess)
+    if ((handleAccess & neededAccess) != neededAccess)
         return fail(ERROR_ACCESS_DENIED, L"view access exceeds the mapping handle rights");
     const bool readableMapping = pageProtection == PAGE_READONLY || pageProtection == PAGE_WRITECOPY ||
         writableMapping || executableMapping;
@@ -4170,7 +4102,7 @@ LPVOID WINAPI Win32Bridge::Bridge::BridgeMapViewOfFile(
         std::shared_ptr<void> allocation(address, [](void* view) { ::UnmapViewOfFile(view); });
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
         g_fileMappingViews.emplace(address, GuestMappingView{
-            mapping, std::move(allocation), offset.QuadPart, viewSize, copyRequested});
+            kernel, mapping, std::move(allocation), offset.QuadPart, viewSize, copyRequested});
     }
     catch (const std::bad_alloc&)
     {
@@ -4192,7 +4124,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeUnmapViewOfFile(LPCVOID baseAddress)
     }
     std::lock_guard<std::mutex> guard(g_fileMappingsLock);
     const auto found = g_fileMappingViews.find(baseAddress);
-    if (found == g_fileMappingViews.end())
+    if (found == g_fileMappingViews.end() || found->second.owner != CurrentGuestKernelContext())
     {
         SetGuestLastError(ERROR_INVALID_ADDRESS);
         return FALSE;
@@ -4204,7 +4136,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeUnmapViewOfFile(LPCVOID baseAddress)
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeFlushViewOfFile(LPCVOID baseAddress, SIZE_T bytes)
 {
-    GuestMappingView view;
+    GuestMappingView view{};
+    const auto kernel = CurrentGuestKernelContext();
     const ULONG_PTR address = reinterpret_cast<ULONG_PTR>(baseAddress);
     SIZE_T displacement = 0;
     SIZE_T remaining = 0;
@@ -4216,10 +4149,11 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeFlushViewOfFile(LPCVOID baseAddress, SIZE
             found = std::find_if(g_fileMappingViews.begin(), g_fileMappingViews.end(), [&](const auto& entry)
             {
                 const ULONG_PTR start = reinterpret_cast<ULONG_PTR>(entry.first);
-                return address >= start && address - start < entry.second.size;
+                return entry.second.owner == kernel && address >= start && address - start < entry.second.size;
             });
         }
-        if (found == g_fileMappingViews.end()) { SetGuestLastError(ERROR_INVALID_ADDRESS); return FALSE; }
+        if (found == g_fileMappingViews.end() || found->second.owner != kernel)
+        { SetGuestLastError(ERROR_INVALID_ADDRESS); return FALSE; }
         view = found->second;
         displacement = address - reinterpret_cast<ULONG_PTR>(found->first);
         remaining = view.size - displacement;
@@ -4385,18 +4319,25 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeGetProcessAffinityMask(HANDLE, PDWORD_PTR
     return TRUE;
 }
 
-DWORD WINAPI Win32Bridge::Bridge::BridgeResumeThread(HANDLE)
+DWORD WINAPI Win32Bridge::Bridge::BridgeResumeThread(HANDLE thread)
 {
-    SetGuestLastError(ERROR_INVALID_HANDLE);
-    return static_cast<DWORD>(-1);
+    const auto kernel = CurrentGuestKernelContext();
+    DWORD error = ERROR_INVALID_HANDLE;
+    DWORD previousCount = MAXDWORD;
+    if (kernel) kernel->ResumeThread(thread, &previousCount, &error);
+    SetGuestLastError(error);
+    return previousCount;
 }
 
 BOOL WINAPI Win32Bridge::Bridge::BridgeTerminateProcess(HANDLE process, UINT exitCode)
 {
-    if (process != BridgeGetCurrentProcess())
+    const auto kernel = CurrentGuestKernelContext();
+    if (!kernel || !kernel->IsCurrentProcessHandle(process, PROCESS_TERMINATE))
     {
-        SetGuestLastError(ERROR_INVALID_HANDLE);
-        return FALSE;
+        DWORD error = ERROR_INVALID_HANDLE;
+        const bool terminated = kernel && kernel->TerminateSuspendedProcess(process, exitCode, &error);
+        SetGuestLastError(error);
+        return terminated ? TRUE : FALSE;
     }
 
     // TerminateProcess(GetCurrentProcess(), ...) must not return to the guest.
@@ -4538,12 +4479,11 @@ void WINAPI Win32Bridge::Bridge::BridgeRtlCaptureContext(PCONTEXT contextRecord)
     if (contextRecord) ::RtlCaptureContext(contextRecord);
 }
 
-HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenProcess(DWORD, BOOL inherit, DWORD processId)
+HANDLE WINAPI Win32Bridge::Bridge::BridgeOpenProcess(DWORD access, BOOL inherit, DWORD processId)
 {
-    if (processId == BridgeGetCurrentProcessId()) return BridgeGetCurrentProcess();
     auto kernel = CurrentGuestKernelContext();
     DWORD error = ERROR_INVALID_PARAMETER;
-    const HANDLE handle = kernel ? kernel->OpenCompletion(processId, true, inherit != FALSE, &error) : nullptr;
+    const HANDLE handle = kernel ? kernel->OpenCompletion(processId, true, inherit != FALSE, &error, access) : nullptr;
     SetGuestLastError(error);
     return handle;
 }
@@ -4553,33 +4493,337 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeGetProcessId(HANDLE process)
     if (process == BridgeGetCurrentProcess()) return BridgeGetCurrentProcessId();
     auto kernel = CurrentGuestKernelContext();
     DWORD id = 0, error = ERROR_INVALID_HANDLE;
-    if (kernel) kernel->GetCompletionId(process, true, &id, &error);
+    if (kernel) kernel->GetCompletionId(process, true, &id, &error, PROCESS_QUERY_LIMITED_INFORMATION);
     SetGuestLastError(error);
     return id;
 }
 
 DWORD WINAPI Win32Bridge::Bridge::BridgeGetThreadId(HANDLE thread)
 {
+    if (thread == BridgeGetCurrentThread()) return BridgeGetCurrentThreadId();
     auto kernel = CurrentGuestKernelContext();
     DWORD id = 0, error = ERROR_INVALID_HANDLE;
-    if (kernel) kernel->GetThreadId(thread, &id, &error);
+    if (kernel) kernel->GetCompletionId(thread, false, &id, &error, THREAD_QUERY_LIMITED_INFORMATION);
     SetGuestLastError(error);
     return id;
 }
-HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateToolhelp32Snapshot(DWORD, DWORD)
+
+static DWORD WINAPI BridgeGetProcessIdOfThread(HANDLE thread)
 {
-    SetGuestLastError(ERROR_NOT_SUPPORTED);
+    if (thread == BridgeGetCurrentThread()) return BridgeGetCurrentProcessId();
+    const auto kernel = CurrentGuestKernelContext();
+    DWORD id = 0, error = ERROR_INVALID_HANDLE;
+    if (kernel) kernel->GetCompletionId(thread, false, &id, &error, THREAD_QUERY_LIMITED_INFORMATION, true);
+    SetGuestLastError(error);
+    return id;
+}
+HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateToolhelp32Snapshot(DWORD flags, DWORD processId)
+{
+    constexpr DWORD SnapProcess = 0x00000002u;
+    constexpr DWORD SnapThread = 0x00000004u;
+    constexpr DWORD SnapModule = 0x00000008u;
+    constexpr DWORD SnapModule32 = 0x00000010u;
+    constexpr DWORD Inherit = 0x80000000u;
+    constexpr DWORD ModuleFlags = SnapModule | SnapModule32;
+    const DWORD currentProcess = BridgeGetCurrentProcessId();
+    if (flags == 0 || !(flags & ~Inherit))
+    {
+        SetGuestLastError(ERROR_INVALID_PARAMETER);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (flags & ~(ModuleFlags | SnapProcess | SnapThread | Inherit))
+    {
+        SetGuestLastError(ERROR_NOT_SUPPORTED);
+        return INVALID_HANDLE_VALUE;
+    }
+    auto kernel = CurrentGuestKernelContext();
+    auto runtime = CurrentGuestRuntime();
+    if (!kernel || !runtime)
+    {
+        SetGuestLastError(ERROR_INVALID_FUNCTION);
+        return INVALID_HANDLE_VALUE;
+    }
+    try
+    {
+        auto snapshot = std::make_shared<GuestToolhelpSnapshot>();
+        snapshot->processId = currentProcess;
+        if ((flags & ModuleFlags) &&
+            !runtime->CaptureToolhelpModules(*snapshot, processId ? processId : currentProcess,
+                (flags & SnapModule) != 0))
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return INVALID_HANDLE_VALUE;
+        }
+        if (flags & (SnapProcess | SnapThread))
+            kernel->CaptureToolhelpProcesses(*snapshot, (flags & SnapProcess) != 0, (flags & SnapThread) != 0);
+        DWORD error = ERROR_SUCCESS;
+        const HANDLE handle = kernel->CreateToolhelpSnapshot(std::move(snapshot), (flags & Inherit) != 0, &error);
+        if (handle) return handle;
+        SetGuestLastError(error);
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+    }
     return INVALID_HANDLE_VALUE;
 }
-BOOL WINAPI Win32Bridge::Bridge::BridgeProcess32FirstW(HANDLE, LPVOID)
+
+namespace
 {
-    SetGuestLastError(ERROR_NO_MORE_FILES);
-    return FALSE;
+    // tlhelp32.h hides these declarations in UWP SDK partitions.
+    template<typename Char>
+    struct GuestToolhelpModuleEntry
+    {
+        DWORD size;
+        DWORD moduleId;
+        DWORD processId;
+        DWORD globalUsage;
+        DWORD processUsage;
+        BYTE* base;
+        DWORD imageSize;
+        HMODULE module;
+        Char name[256];
+        Char path[MAX_PATH];
+    };
+    static_assert(sizeof(GuestToolhelpModuleEntry<wchar_t>) == 1080, "MODULEENTRY32W x64 ABI");
+    static_assert(sizeof(GuestToolhelpModuleEntry<char>) == 568, "MODULEENTRY32 x64 ABI");
+
+    template<typename Char, size_t Capacity>
+    bool CopyToolhelpModuleText(Char (&destination)[Capacity], const wchar_t* text, size_t length)
+    {
+        const size_t count = (std::min)(length, Capacity - 1);
+        if constexpr (std::is_same_v<Char, wchar_t>)
+        {
+            std::copy_n(text, count, destination);
+            return true;
+        }
+        else
+        {
+            return !count || ::WideCharToMultiByte(GuestAnsiCodePage, 0, text, static_cast<int>(count),
+                destination, static_cast<int>(Capacity - 1), nullptr, nullptr) != 0;
+        }
+    }
+
+    template<typename Char>
+    BOOL ReadToolhelpModule(HANDLE handle, GuestToolhelpModuleEntry<Char>* output, bool first)
+    {
+        DWORD size = 0;
+        if (!output)
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        if (!CopyConsoleBytes(&size, output, sizeof(size)))
+        {
+            SetGuestLastError(ERROR_NOACCESS);
+            return FALSE;
+        }
+        if (size < sizeof(GuestToolhelpModuleEntry<Char>) ||
+            (std::is_same_v<Char, wchar_t> && size != sizeof(GuestToolhelpModuleEntry<Char>)))
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        const auto kernel = CurrentGuestKernelContext();
+        const auto snapshot = kernel ? kernel->LookupToolhelpSnapshot(handle) : nullptr;
+        if (!snapshot)
+        {
+            SetGuestLastError(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        std::lock_guard<std::mutex> guard(snapshot->lock);
+        const size_t index = first ? 0 : snapshot->nextModule;
+        if (index >= snapshot->modules.size())
+        {
+            SetGuestLastError(ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+
+        const auto& entry = snapshot->modules[index];
+        GuestToolhelpModuleEntry<Char> result{};
+        result.size = size;
+        result.moduleId = 1;
+        result.processId = snapshot->processId;
+        result.globalUsage = result.processUsage = 0xffffu;
+        result.base = reinterpret_cast<BYTE*>(entry.module);
+        result.imageSize = entry.imageSize;
+        result.module = entry.module;
+        const size_t separator = entry.path.find_last_of(L"\\/");
+        const size_t basename = separator == std::wstring::npos ? 0 : separator + 1;
+        if (!CopyToolhelpModuleText(result.name, entry.path.data() + basename, entry.path.size() - basename) ||
+            !CopyToolhelpModuleText(result.path, entry.path.data(), entry.path.size()))
+        {
+            SetGuestLastError(::GetLastError());
+            return FALSE;
+        }
+        if (!CopyConsoleBytes(output, &result, sizeof(result)))
+        {
+            SetGuestLastError(ERROR_NOACCESS);
+            return FALSE;
+        }
+        snapshot->nextModule = index + 1;
+        return TRUE;
+    }
+
+    BOOL WINAPI BridgeModule32FirstW(HANDLE handle, GuestToolhelpModuleEntry<wchar_t>* output)
+    { return ReadToolhelpModule(handle, output, true); }
+
+    BOOL WINAPI BridgeModule32NextW(HANDLE handle, GuestToolhelpModuleEntry<wchar_t>* output)
+    { return ReadToolhelpModule(handle, output, false); }
+
+    BOOL WINAPI BridgeModule32FirstA(HANDLE handle, GuestToolhelpModuleEntry<char>* output)
+    { return ReadToolhelpModule(handle, output, true); }
+
+    BOOL WINAPI BridgeModule32NextA(HANDLE handle, GuestToolhelpModuleEntry<char>* output)
+    { return ReadToolhelpModule(handle, output, false); }
+
+    struct GuestToolhelpThreadEntry
+    {
+        DWORD size;
+        DWORD usage;
+        DWORD id;
+        DWORD processId;
+        LONG basePriority;
+        LONG deltaPriority;
+        DWORD flags;
+    };
+    static_assert(sizeof(GuestToolhelpThreadEntry) == 28, "THREADENTRY32 ABI");
+
+    BOOL ReadToolhelpThread(HANDLE handle, GuestToolhelpThreadEntry* output, bool first)
+    {
+        DWORD size = 0;
+        if (!output)
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        if (!CopyConsoleBytes(&size, output, sizeof(size)))
+        {
+            SetGuestLastError(ERROR_NOACCESS);
+            return FALSE;
+        }
+        if (size < sizeof(GuestToolhelpThreadEntry))
+        {
+            SetGuestLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        const auto kernel = CurrentGuestKernelContext();
+        const auto snapshot = kernel ? kernel->LookupToolhelpSnapshot(handle) : nullptr;
+        if (!snapshot)
+        {
+            SetGuestLastError(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        std::lock_guard<std::mutex> guard(snapshot->lock);
+        const size_t index = first ? 0 : snapshot->nextThread;
+        if (index >= snapshot->threads.size())
+        {
+            SetGuestLastError(ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        // Guest threads currently share a normal base scheduling priority.
+        constexpr LONG normalBasePriority = 8;
+        const auto& thread = snapshot->threads[index];
+        const GuestToolhelpThreadEntry result{ sizeof(GuestToolhelpThreadEntry), 0, thread.id,
+            thread.processId, normalBasePriority, 0, 0 };
+        if (!CopyConsoleBytes(output, &result, sizeof(result)))
+        {
+            SetGuestLastError(ERROR_NOACCESS);
+            return FALSE;
+        }
+        snapshot->nextThread = index + 1;
+        return TRUE;
+    }
+
+    BOOL WINAPI BridgeThread32First(HANDLE handle, GuestToolhelpThreadEntry* output)
+    { return ReadToolhelpThread(handle, output, true); }
+
+    BOOL WINAPI BridgeThread32Next(HANDLE handle, GuestToolhelpThreadEntry* output)
+    { return ReadToolhelpThread(handle, output, false); }
+
+    template<typename Char>
+    struct GuestToolhelpProcessEntry
+    {
+        DWORD size;
+        DWORD usage;
+        DWORD processId;
+        ULONG_PTR defaultHeap;
+        DWORD moduleId;
+        DWORD threadCount;
+        DWORD parentId;
+        LONG basePriority;
+        DWORD flags;
+        Char name[MAX_PATH];
+    };
+    static_assert(sizeof(GuestToolhelpProcessEntry<wchar_t>) == 568, "PROCESSENTRY32W x64 ABI");
+    static_assert(sizeof(GuestToolhelpProcessEntry<char>) == 304, "PROCESSENTRY32 x64 ABI");
+
+    template<typename Char>
+    BOOL ReadToolhelpProcess(HANDLE handle, GuestToolhelpProcessEntry<Char>* output, bool first)
+    {
+        DWORD size = 0;
+        if (!output || !CopyConsoleBytes(&size, output, sizeof(size)))
+        {
+            SetGuestLastError(output ? ERROR_NOACCESS : ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        if (size < sizeof(GuestToolhelpProcessEntry<Char>) ||
+            (std::is_same_v<Char, wchar_t> && size != sizeof(GuestToolhelpProcessEntry<Char>)))
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        const auto kernel = CurrentGuestKernelContext();
+        const auto snapshot = kernel ? kernel->LookupToolhelpSnapshot(handle) : nullptr;
+        if (!snapshot)
+        {
+            SetGuestLastError(ERROR_INVALID_HANDLE);
+            return FALSE;
+        }
+        std::lock_guard<std::mutex> guard(snapshot->lock);
+        const size_t index = first ? 0 : snapshot->nextProcess;
+        if (index >= snapshot->processes.size())
+        {
+            SetGuestLastError(ERROR_NO_MORE_FILES);
+            return FALSE;
+        }
+        const auto& process = snapshot->processes[index];
+        GuestToolhelpProcessEntry<Char> result{};
+        result.size = size;
+        result.processId = process.id;
+        result.parentId = process.parentId;
+        result.threadCount = process.threadCount;
+        result.basePriority = 8;
+        const auto separator = process.path.find_last_of(L"\\/");
+        const size_t basename = separator == std::wstring::npos ? 0 : separator + 1;
+        if (!CopyToolhelpModuleText(result.name, process.path.data() + basename, process.path.size() - basename))
+        {
+            SetGuestLastError(::GetLastError());
+            return FALSE;
+        }
+        if (!CopyConsoleBytes(output, &result, sizeof(result)))
+        {
+            SetGuestLastError(ERROR_NOACCESS);
+            return FALSE;
+        }
+        snapshot->nextProcess = index + 1;
+        return TRUE;
+    }
+
+    BOOL WINAPI BridgeProcess32FirstA(HANDLE handle, GuestToolhelpProcessEntry<char>* output)
+    { return ReadToolhelpProcess(handle, output, true); }
+
+    BOOL WINAPI BridgeProcess32NextA(HANDLE handle, GuestToolhelpProcessEntry<char>* output)
+    { return ReadToolhelpProcess(handle, output, false); }
 }
-BOOL WINAPI Win32Bridge::Bridge::BridgeProcess32NextW(HANDLE, LPVOID)
+
+BOOL WINAPI Win32Bridge::Bridge::BridgeProcess32FirstW(HANDLE handle, LPVOID output)
 {
-    SetGuestLastError(ERROR_NO_MORE_FILES);
-    return FALSE;
+    return ReadToolhelpProcess(handle, static_cast<GuestToolhelpProcessEntry<wchar_t>*>(output), true);
+}
+BOOL WINAPI Win32Bridge::Bridge::BridgeProcess32NextW(HANDLE handle, LPVOID output)
+{
+    return ReadToolhelpProcess(handle, static_cast<GuestToolhelpProcessEntry<wchar_t>*>(output), false);
 }
 BOOL WINAPI Win32Bridge::Bridge::BridgeCopyFileExW(
     LPCWSTR existingFileName,
@@ -4815,6 +5059,8 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
     DWORD maximumSizeLow,
     LPCWSTR name)
 {
+    const auto kernel = CurrentGuestKernelContext();
+    if (!kernel) { SetGuestLastError(ERROR_INVALID_HANDLE); return nullptr; }
     const DWORD pageProtection = protection & 0xffu;
     if (pageProtection != PAGE_READONLY && pageProtection != PAGE_READWRITE &&
         pageProtection != PAGE_WRITECOPY && pageProtection != PAGE_EXECUTE_READ &&
@@ -4843,17 +5089,10 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
             const std::shared_ptr<GuestFileMapping> existing = named->second.lock();
             if (existing)
             {
-                try
-                {
-                    const HANDLE handle = RegisterFileMappingLocked(existing, FullMappingAccess, flags);
-                    SetGuestLastError(handle ? ERROR_ALREADY_EXISTS : ERROR_TOO_MANY_OPEN_FILES);
-                    return handle;
-                }
-                catch (const std::bad_alloc&)
-                {
-                    SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
-                    return nullptr;
-                }
+                const HANDLE handle = kernel->CreateFileMappingHandle(existing, FullMappingAccess,
+                    (flags & GuestKernelContext::HandleInherit) != 0, &error);
+                SetGuestLastError(handle ? ERROR_ALREADY_EXISTS : error);
+                return handle;
             }
             g_namedFileMappings.erase(named);
         }
@@ -4958,19 +5197,20 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
         std::lock_guard<std::mutex> guard(g_fileMappingsLock);
         try
         {
-            handle = RegisterFileMappingLocked(mapping, FullMappingAccess, flags);
+            handle = kernel->CreateFileMappingHandle(mapping, FullMappingAccess,
+                (flags & GuestKernelContext::HandleInherit) != 0, &error);
             if (handle && !nameKey.empty()) g_namedFileMappings[nameKey] = mapping;
         }
         catch (const std::bad_alloc&)
         {
-            if (handle) g_fileMappings.erase(reinterpret_cast<ULONG_PTR>(handle));
+            if (handle) kernel->CloseHandle(handle, nullptr);
             SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
             return nullptr;
         }
     }
     if (!handle)
     {
-        SetGuestLastError(ERROR_TOO_MANY_OPEN_FILES);
+        SetGuestLastError(error);
         return nullptr;
     }
     RuntimeDiagnostics::Record(
@@ -4979,6 +5219,58 @@ HANDLE WINAPI Win32Bridge::Bridge::BridgeCreateFileMappingW(
     SetGuestLastError(ERROR_SUCCESS);
     return handle;
 }
+namespace
+{
+    constexpr ULONGLONG GuestAttributeListMagic = 0x5742333241545452ull;
+    constexpr DWORD MaximumGuestAttributes = 64;
+    constexpr ULONG_PTR GuestProcThreadAttributeHandleList = 0x00020002u;
+
+    struct GuestAttributeListHeader { ULONGLONG magic; DWORD capacity, count; };
+    struct GuestAttributeEntry { ULONG_PTR attribute; SIZE_T size; const void* value; };
+
+    template<class StartupInfo>
+    struct GuestStartupInfoEx { StartupInfo startup; const void* attributes; };
+
+    DWORD ReadGuestAttributeList(const void* list, GuestAttributeListHeader& header)
+    {
+        if (!list) return ERROR_INVALID_PARAMETER;
+        if (!CopyConsoleBytes(&header, list, sizeof(header))) return ERROR_NOACCESS;
+        if (header.magic != GuestAttributeListMagic || header.capacity > MaximumGuestAttributes ||
+            header.count > header.capacity || header.count > 1) return ERROR_INVALID_PARAMETER;
+        return ERROR_SUCCESS;
+    }
+
+    DWORD CaptureInheritedHandleList(const void* list, bool inheritHandles, std::unordered_set<ULONG_PTR>& handles)
+    {
+        if (!list) return ERROR_SUCCESS;
+        GuestAttributeListHeader header{};
+        const DWORD status = ReadGuestAttributeList(list, header);
+        if (status != ERROR_SUCCESS || !header.count) return status;
+        if (!inheritHandles) return ERROR_INVALID_PARAMETER;
+        GuestAttributeEntry entry{};
+        if (!CopyConsoleBytes(&entry, static_cast<const BYTE*>(list) + sizeof(header), sizeof(entry)))
+            return ERROR_NOACCESS;
+        if (entry.attribute != GuestProcThreadAttributeHandleList) return ERROR_NOT_SUPPORTED;
+        if (!entry.value || !entry.size || entry.size % sizeof(HANDLE)) return ERROR_BAD_LENGTH;
+        try
+        {
+            std::vector<HANDLE> values;
+            const SIZE_T count = entry.size / sizeof(HANDLE);
+            if (count > values.max_size() || count > handles.max_size()) return ERROR_NOT_ENOUGH_MEMORY;
+            values.resize(count);
+            if (!CopyConsoleBytes(values.data(), entry.value, entry.size)) return ERROR_NOACCESS;
+            for (const HANDLE value : values)
+            {
+                if (!value || value == BridgeGetCurrentProcess() || value == BridgeGetCurrentThread())
+                    return ERROR_INVALID_HANDLE;
+                handles.insert(reinterpret_cast<ULONG_PTR>(value));
+            }
+        }
+        catch (const std::bad_alloc&) { return ERROR_NOT_ENOUGH_MEMORY; }
+        return ERROR_SUCCESS;
+    }
+}
+
 BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
     LPCWSTR applicationName,
     LPWSTR commandLine,
@@ -4992,10 +5284,22 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
     LPPROCESS_INFORMATION processInformation)
 {
     if (processInformation) ZeroMemory(processInformation, sizeof(*processInformation));
-    if (!processInformation || !startupInfo || startupInfo->cb < sizeof(STARTUPINFOW))
+    const bool extended = (creationFlags & EXTENDED_STARTUPINFO_PRESENT) != 0;
+    const SIZE_T startupSize = extended ? sizeof(GuestStartupInfoEx<STARTUPINFOW>) : sizeof(STARTUPINFOW);
+    if (!processInformation || !startupInfo || startupInfo->cb < startupSize)
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
+    }
+    std::unordered_set<ULONG_PTR> inheritedHandles;
+    if (extended)
+    {
+        const auto extra = reinterpret_cast<const GuestStartupInfoEx<STARTUPINFOW>*>(startupInfo);
+        const void* attributes = nullptr;
+        if (!CopyConsoleBytes(&attributes, &extra->attributes, sizeof(attributes)))
+        { SetGuestLastError(ERROR_NOACCESS); return FALSE; }
+        const DWORD status = CaptureInheritedHandleList(attributes, inheritHandles != FALSE, inheritedHandles);
+        if (status != ERROR_SUCCESS) { SetGuestLastError(status); return FALSE; }
     }
     DWORD processHandleFlags = 0, threadHandleFlags = 0, securityError = ERROR_SUCCESS;
     if (!ReadHandleSecurityAttributes(processAttributes, &processHandleFlags, &securityError) ||
@@ -5042,7 +5346,7 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
     if ((creationFlags & 0x00000018u) == 0x00000018u) // DETACHED_PROCESS and CREATE_NEW_CONSOLE
     { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
     constexpr DWORD unsupportedFlags = DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS |
-        CREATE_SUSPENDED | CREATE_BREAKAWAY_FROM_JOB | EXTENDED_STARTUPINFO_PRESENT;
+        CREATE_BREAKAWAY_FROM_JOB;
     if ((creationFlags & unsupportedFlags) != 0)
     {
         RuntimeDiagnostics::Record(
@@ -5147,7 +5451,8 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessW(
             executable.c_str(), effectiveCommandLine.c_str(), currentDirectory,
             processInformation, &error, environment ? &explicitEnvironment : nullptr, creationFlags,
             inheritHandles != FALSE, explicitStandard ? standardHandles : nullptr, startupCrtData,
-            processHandleFlags != 0, threadHandleFlags != 0))
+            processHandleFlags != 0, threadHandleFlags != 0,
+            inheritedHandles.empty() ? nullptr : &inheritedHandles))
         {
             SetGuestLastError(ERROR_SUCCESS);
             return TRUE;
@@ -5169,7 +5474,9 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessA(
     LPPROCESS_INFORMATION processInformation)
 {
     if (processInformation) ZeroMemory(processInformation, sizeof(*processInformation));
-    if (!startupInfo || startupInfo->cb < sizeof(STARTUPINFOA))
+    const bool extended = (creationFlags & EXTENDED_STARTUPINFO_PRESENT) != 0;
+    const SIZE_T startupSize = extended ? sizeof(GuestStartupInfoEx<STARTUPINFOA>) : sizeof(STARTUPINFOA);
+    if (!startupInfo || startupInfo->cb < startupSize)
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
@@ -5193,8 +5500,15 @@ BOOL WINAPI Win32Bridge::Bridge::BridgeCreateProcessA(
         SetGuestLastError(ERROR_NO_UNICODE_TRANSLATION);
         return FALSE;
     }
-    STARTUPINFOW wide{};
-    wide.cb = sizeof(wide);
+    GuestStartupInfoEx<STARTUPINFOW> startup{};
+    if (extended)
+    {
+        const auto extra = reinterpret_cast<const GuestStartupInfoEx<STARTUPINFOA>*>(startupInfo);
+        if (!CopyConsoleBytes(&startup.attributes, &extra->attributes, sizeof(startup.attributes)))
+        { SetGuestLastError(ERROR_NOACCESS); return FALSE; }
+    }
+    auto& wide = startup.startup;
+    wide.cb = static_cast<DWORD>(extended ? sizeof(startup) : sizeof(wide));
     wide.dwFlags = startupInfo->dwFlags;
     wide.wShowWindow = startupInfo->wShowWindow;
     wide.cbReserved2 = startupInfo->cbReserved2;
@@ -5268,9 +5582,240 @@ void WINAPI Win32Bridge::Bridge::BridgeRaiseException(
 #include "Bridge/NativeGuestShims.inl"
 #include "Bridge/ExtendedKernelShims.inl"
 
+namespace
+{
+    constexpr DWORD PsapiQueryAndRead = 0x0400u | 0x0010u;
+    bool CapturePsapiModules(HANDLE process, GuestToolhelpSnapshot& snapshot, bool nativeModules)
+    {
+        DWORD id = BridgeGetCurrentProcessId();
+        if (process != BridgeGetCurrentProcess())
+        {
+            const auto kernel = CurrentGuestKernelContext();
+            DWORD error = ERROR_INVALID_HANDLE;
+            if (!kernel || !kernel->GetCompletionId(process, true, &id, &error, PsapiQueryAndRead))
+            {
+                SetGuestLastError(error);
+                return false;
+            }
+        }
+        const auto runtime = CurrentGuestRuntime();
+        if (runtime && runtime->CaptureToolhelpModules(snapshot, id, nativeModules)) return true;
+        SetGuestLastError(ERROR_INVALID_HANDLE);
+        return false;
+    }
+
+    const GuestModuleSnapshotEntry* FindPsapiModule(const GuestToolhelpSnapshot& snapshot, HMODULE module)
+    {
+        if (snapshot.modules.empty()) return nullptr;
+        if (!module) return &snapshot.modules.front();
+        const auto found = std::find_if(snapshot.modules.begin(), snapshot.modules.end(),
+            [module](const GuestModuleSnapshotEntry& entry) { return entry.module == module; });
+        return found == snapshot.modules.end() ? nullptr : &*found;
+    }
+
+    BOOL WINAPI BridgeEnumProcessModulesEx(HANDLE process, HMODULE* modules, DWORD bytes,
+        DWORD* bytesNeeded, DWORD filter)
+    {
+        if (!bytesNeeded || (bytes >= sizeof(HMODULE) && !modules) || filter > 3)
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return FALSE;
+        }
+        try
+        {
+            GuestToolhelpSnapshot snapshot;
+            if (!CapturePsapiModules(process, snapshot, filter != 1)) return FALSE; // LIST_MODULES_32BIT
+            std::vector<HMODULE> handles;
+            const DWORD needed = static_cast<DWORD>(snapshot.modules.size() * sizeof(HMODULE));
+            const size_t count = (std::min)(snapshot.modules.size(), bytes / sizeof(HMODULE));
+            handles.reserve(count);
+            for (size_t index = 0; index < count; ++index) handles.push_back(snapshot.modules[index].module);
+            if ((count && !CopyConsoleBytes(modules, handles.data(), count * sizeof(HMODULE))) ||
+                !CopyConsoleBytes(bytesNeeded, &needed, sizeof(needed)))
+            {
+                SetGuestLastError(ERROR_NOACCESS);
+                return FALSE;
+            }
+            return TRUE;
+        }
+        catch (const std::bad_alloc&)
+        {
+            SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+    }
+
+    BOOL WINAPI BridgeEnumProcessModules(HANDLE process, HMODULE* modules, DWORD bytes, DWORD* bytesNeeded)
+    {
+        return BridgeEnumProcessModulesEx(process, modules, bytes, bytesNeeded, 0);
+    }
+
+    template<typename Char>
+    DWORD GetPsapiModuleName(HANDLE process, HMODULE module, Char* output, DWORD capacity, bool baseName)
+    {
+        if (!output || !capacity)
+        {
+            SetGuestLastError(ERROR_INVALID_PARAMETER);
+            return 0;
+        }
+        try
+        {
+            std::wstring path;
+            if (!baseName && !module)
+            {
+                if (!GetGuestProcessImagePath(process, false, path)) return 0;
+            }
+            else if (process == BridgeGetCurrentProcess())
+            {
+                if (!GetGuestModuleFilePath(module, path, true)) return 0;
+            }
+            else
+            {
+                GuestToolhelpSnapshot snapshot;
+                if (!CapturePsapiModules(process, snapshot, true)) return 0;
+                const auto entry = FindPsapiModule(snapshot, module);
+                if (!entry)
+                {
+                    SetGuestLastError(ERROR_INVALID_HANDLE);
+                    return 0;
+                }
+                path = entry->path;
+            }
+            if (baseName)
+            {
+                const auto separator = path.find_last_of(L"\\/");
+                if (separator != std::wstring::npos) path.erase(0, separator + 1);
+            }
+            std::basic_string<Char> value;
+            if constexpr (std::is_same_v<Char, wchar_t>)
+            {
+                value = std::move(path);
+            }
+            else
+            {
+                const int length = static_cast<int>(path.size());
+                const int bytes = ::WideCharToMultiByte(GuestAnsiCodePage, 0, path.data(), length,
+                    nullptr, 0, nullptr, nullptr);
+                if (bytes <= 0)
+                {
+                    SetGuestLastError(::GetLastError());
+                    return 0;
+                }
+                value.resize(bytes);
+                if (!::WideCharToMultiByte(GuestAnsiCodePage, 0, path.data(), length,
+                    value.data(), bytes, nullptr, nullptr))
+                {
+                    SetGuestLastError(::GetLastError());
+                    return 0;
+                }
+            }
+            const bool truncated = value.size() >= capacity;
+            if (truncated) value.resize(capacity - 1);
+            if (!CopyConsoleBytes(output, value.c_str(), (value.size() + 1) * sizeof(Char)))
+            {
+                SetGuestLastError(ERROR_NOACCESS);
+                return 0;
+            }
+            return truncated ? capacity : static_cast<DWORD>(value.size());
+        }
+        catch (const std::bad_alloc&)
+        {
+            SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return 0;
+        }
+    }
+
+    DWORD WINAPI BridgeGetModuleFileNameExW(HANDLE process, HMODULE module, LPWSTR output, DWORD capacity)
+    {
+        return GetPsapiModuleName(process, module, output, capacity, false);
+    }
+
+    DWORD WINAPI BridgeGetModuleFileNameExA(HANDLE process, HMODULE module, LPSTR output, DWORD capacity)
+    {
+        return GetPsapiModuleName(process, module, output, capacity, false);
+    }
+
+    DWORD WINAPI BridgeGetModuleBaseNameW(HANDLE process, HMODULE module, LPWSTR output, DWORD capacity)
+    {
+        return GetPsapiModuleName(process, module, output, capacity, true);
+    }
+
+    DWORD WINAPI BridgeGetModuleBaseNameA(HANDLE process, HMODULE module, LPSTR output, DWORD capacity)
+    {
+        return GetPsapiModuleName(process, module, output, capacity, true);
+    }
+
+    struct GuestModuleInformation
+    {
+        LPVOID base;
+        DWORD size;
+        LPVOID entryPoint;
+    };
+    static_assert(sizeof(GuestModuleInformation) == 24, "MODULEINFO x64 ABI");
+
+    BOOL WINAPI BridgeGetModuleInformation(HANDLE process, HMODULE module,
+        GuestModuleInformation* information, DWORD bytes)
+    {
+        if (!information || bytes < sizeof(GuestModuleInformation))
+        {
+            SetGuestLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        try
+        {
+            GuestToolhelpSnapshot snapshot;
+            if (!CapturePsapiModules(process, snapshot, true)) return FALSE;
+            if (process == BridgeGetCurrentProcess() && module && IsGuestMainModule(module))
+                module = GuestMainModuleHandle();
+            const auto entry = FindPsapiModule(snapshot, module);
+            if (!entry)
+            {
+                SetGuestLastError(ERROR_INVALID_HANDLE);
+                return FALSE;
+            }
+            const GuestModuleInformation result{ entry->module, entry->imageSize,
+                entry->entryPointRva
+                    ? reinterpret_cast<LPVOID>(reinterpret_cast<ULONG_PTR>(entry->module) + entry->entryPointRva)
+                    : nullptr };
+            if (!CopyConsoleBytes(information, &result, sizeof(result)))
+            {
+                SetGuestLastError(ERROR_NOACCESS);
+                return FALSE;
+            }
+            return TRUE;
+        }
+        catch (const std::bad_alloc&)
+        {
+            SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
+            return FALSE;
+        }
+    }
+}
+
 ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol& symbol)
 {
     auto resolution = CompatibilityCatalog::Resolve(symbol);
+    const bool psapi = _wcsicmp(symbol.library.c_str(), L"psapi.dll") == 0;
+    if (!symbol.importedByOrdinal && (psapi || IsKernelLibrary(symbol.library)))
+    {
+        const wchar_t* name = symbol.name.c_str();
+        if (!psapi && symbol.name.compare(0, 3, L"K32") == 0) name += 3;
+        else if (!psapi) name = L"";
+        if (wcscmp(name, L"EnumProcessModules") == 0)
+            return { ImportDisposition::NeedsBridge, L"Guest module enumeration.", reinterpret_cast<ULONGLONG>(&BridgeEnumProcessModules) };
+        if (wcscmp(name, L"EnumProcessModulesEx") == 0)
+            return { ImportDisposition::NeedsBridge, L"Guest module enumeration.", reinterpret_cast<ULONGLONG>(&BridgeEnumProcessModulesEx) };
+        if (wcscmp(name, L"GetModuleInformation") == 0)
+            return { ImportDisposition::NeedsBridge, L"Guest image metadata.", reinterpret_cast<ULONGLONG>(&BridgeGetModuleInformation) };
+        if (wcscmp(name, L"GetModuleFileNameExW") == 0)
+            return { ImportDisposition::NeedsBridge, L"Guest module path.", reinterpret_cast<ULONGLONG>(&BridgeGetModuleFileNameExW) };
+        if (wcscmp(name, L"GetModuleFileNameExA") == 0)
+            return { ImportDisposition::NeedsBridge, L"Guest module path.", reinterpret_cast<ULONGLONG>(&BridgeGetModuleFileNameExA) };
+        if (wcscmp(name, L"GetModuleBaseNameW") == 0)
+            return { ImportDisposition::NeedsBridge, L"Guest module base name.", reinterpret_cast<ULONGLONG>(&BridgeGetModuleBaseNameW) };
+        if (wcscmp(name, L"GetModuleBaseNameA") == 0)
+            return { ImportDisposition::NeedsBridge, L"Guest module base name.", reinterpret_cast<ULONGLONG>(&BridgeGetModuleBaseNameA) };
+    }
     if (symbol.importedByOrdinal || !IsKernelLibrary(symbol.library))
     {
         return resolution;
@@ -5375,10 +5920,30 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeOpenProcess);
     else if (_wcsicmp(symbol.name.c_str(), L"createtoolhelp32snapshot") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCreateToolhelp32Snapshot);
+    else if (_wcsicmp(symbol.name.c_str(), L"thread32first") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeThread32First);
+    else if (_wcsicmp(symbol.name.c_str(), L"thread32next") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeThread32Next);
+    else if (_wcsicmp(symbol.name.c_str(), L"module32firstw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeModule32FirstW);
+    else if (_wcsicmp(symbol.name.c_str(), L"module32nextw") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeModule32NextW);
+    else if (_wcsicmp(symbol.name.c_str(), L"module32first") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"module32firsta") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeModule32FirstA);
+    else if (_wcsicmp(symbol.name.c_str(), L"module32next") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"module32nexta") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeModule32NextA);
     if (_wcsicmp(symbol.name.c_str(), L"process32firstw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeProcess32FirstW);
     else if (_wcsicmp(symbol.name.c_str(), L"process32nextw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeProcess32NextW);
+    else if (_wcsicmp(symbol.name.c_str(), L"process32first") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"process32firsta") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeProcess32FirstA);
+    else if (_wcsicmp(symbol.name.c_str(), L"process32next") == 0 ||
+        _wcsicmp(symbol.name.c_str(), L"process32nexta") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeProcess32NextA);
     else if (_wcsicmp(symbol.name.c_str(), L"copyfileexw") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeCopyFileExW);
     else if (_wcsicmp(symbol.name.c_str(), L"getcompressedfilesizew") == 0)
@@ -5401,6 +5966,8 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetProcessId);
     else if (_wcsicmp(symbol.name.c_str(), L"getthreadid") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetThreadId);
+    else if (_wcsicmp(symbol.name.c_str(), L"getprocessidofthread") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetProcessIdOfThread);
     else if (_wcsicmp(symbol.name.c_str(), L"getexitcodethread") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetExitCodeThread);
     else if (_wcsicmp(symbol.name.c_str(), L"createthread") == 0)
@@ -5531,6 +6098,8 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCurrentProcessId);
     else if (_wcsicmp(symbol.name.c_str(), L"getcurrentprocess") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCurrentProcess);
+    else if (_wcsicmp(symbol.name.c_str(), L"getcurrentthread") == 0)
+        resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetCurrentThread);
     else if (_wcsicmp(symbol.name.c_str(), L"apppolicygetprocessterminationmethod") == 0)
         resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeAppPolicyGetProcessTerminationMethod);
     else if (_wcsicmp(symbol.name.c_str(), L"getsystemtimeasfiletime") == 0)
@@ -5792,6 +6361,7 @@ ImportResolution Win32Bridge::Bridge::ResolveKernel32Import(const ImportedSymbol
     else if (_wcsicmp(symbol.name.c_str(), L"replacefilew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReplaceFileW);
     else if (_wcsicmp(symbol.name.c_str(), L"replacefilea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeReplaceFileA);
     else if (_wcsicmp(symbol.name.c_str(), L"queryfullprocessimagenamew") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueryFullProcessImageNameW);
+    else if (_wcsicmp(symbol.name.c_str(), L"queryfullprocessimagenamea") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeQueryFullProcessImageNameA);
     else if (_wcsicmp(symbol.name.c_str(), L"getmodulehandleexw") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetModuleHandleExW);
     else if (_wcsicmp(symbol.name.c_str(), L"getmodulehandleexa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetModuleHandleExA);
     else if (_wcsicmp(symbol.name.c_str(), L"getlocaleinfoa") == 0) resolution.targetAddress = reinterpret_cast<ULONGLONG>(&BridgeGetLocaleInfoA);

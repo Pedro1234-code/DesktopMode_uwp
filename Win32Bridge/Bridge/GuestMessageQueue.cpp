@@ -20,7 +20,7 @@ GuestMessageQueue::GuestMessageQueue(size_t maximumMessages)
 {
 }
 
-bool GuestMessageQueue::Post(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam)
+bool GuestMessageQueue::Post(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam, UINT queueBits)
 {
     GuestAbi::Message posted = {};
     posted.hwnd = hwnd;
@@ -30,10 +30,10 @@ bool GuestMessageQueue::Post(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPar
     posted.time = ::GetTickCount();
     posted.pt.x = 0;
     posted.pt.y = 0;
-    return Post(posted);
+    return Post(posted, queueBits);
 }
 
-bool GuestMessageQueue::Post(const GuestAbi::Message& message)
+bool GuestMessageQueue::Post(const GuestAbi::Message& message, UINT queueBits)
 {
     bool accepted = false;
     {
@@ -49,7 +49,11 @@ bool GuestMessageQueue::Post(const GuestAbi::Message& message)
         }
         else if (m_messages.size() < m_maximumMessages)
         {
-            m_messages.push_back(message);
+            if (message.hwnd == nullptr && message.message >= 0xfffffffeu)
+                queueBits = QS_SENDMESSAGE;
+            if (queueBits & QS_POSTMESSAGE) queueBits |= QS_ALLPOSTMESSAGE;
+            m_messages.emplace_back(message, queueBits);
+            m_changedBits |= queueBits;
             accepted = true;
         }
     }
@@ -99,7 +103,8 @@ bool GuestMessageQueue::PostTimer(HWND hwnd, UINT_PTR timerId)
             timer.time = ::GetTickCount();
             timer.pt.x = 0;
             timer.pt.y = 0;
-            m_messages.push_back(timer);
+            m_messages.emplace_back(timer, QS_TIMER);
+            m_changedBits |= QS_TIMER;
             accepted = true;
             notify = true;
         }
@@ -143,6 +148,7 @@ void GuestMessageQueue::Reset()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_messages.clear();
+        m_changedBits = 0;
         m_closed = false;
     }
     m_messageAvailable.notify_all();
@@ -166,6 +172,7 @@ GuestGetMessageResult GuestMessageQueue::Get(
         if (found != m_messages.end())
         {
             *message = *found;
+            m_changedBits &= ~found->queueBits;
             m_messages.erase(found);
             return message->message == GuestAbi::WmQuit
                 ? GuestGetMessageResult::Quit
@@ -198,6 +205,8 @@ bool GuestMessageQueue::Peek(
 
     std::lock_guard<std::mutex> lock(m_mutex);
     const auto found = FindMatchingMessageLocked(windowFilter, firstMessage, lastMessage);
+    if (firstMessage < 0xfffffffeu)
+        m_changedBits = 0;
     if (found == m_messages.end())
     {
         return false;
@@ -216,6 +225,7 @@ void GuestMessageQueue::Clear()
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_messages.clear();
+        m_changedBits = 0;
     }
     m_messageAvailable.notify_all();
 }
@@ -241,6 +251,16 @@ size_t GuestMessageQueue::Count() const
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_messages.size();
+}
+
+DWORD GuestMessageQueue::GetStatus(UINT mask, bool clearChanges)
+{
+    std::lock_guard<std::mutex> lock(m_mutex);
+    UINT available = 0;
+    for (const auto& entry : m_messages) available |= entry.queueBits;
+    const UINT changed = m_changedBits & available & mask;
+    if (clearChanges) m_changedBits &= ~mask;
+    return MAKELONG(changed, available & mask);
 }
 
 bool GuestMessageQueue::WaitForMessage(DWORD milliseconds)
@@ -352,6 +372,8 @@ bool GuestMessageQueue::QueueQuitLocked(int exitCode)
     quit.message = GuestAbi::WmQuit;
     quit.wParam = static_cast<WPARAM>(exitCode);
     quit.time = ::GetTickCount();
-    m_messages.push_back(quit);
+    constexpr UINT bits = QS_POSTMESSAGE | QS_ALLPOSTMESSAGE;
+    m_messages.emplace_back(quit, bits);
+    m_changedBits |= bits;
     return true;
 }

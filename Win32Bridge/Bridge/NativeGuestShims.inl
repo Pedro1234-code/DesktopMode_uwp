@@ -104,6 +104,69 @@ constexpr LONG NtDatatypeMisalignment = static_cast<LONG>(0x80000002u);
 constexpr LONG NtTimerResumeIgnored = 0x40000025L;
 constexpr LONG NtObjectNameExists = 0x40000000L;
 
+struct GuestClientId { HANDLE process; HANDLE thread; };
+static_assert(sizeof(GuestClientId) == 16, "CLIENT_ID x64 ABI");
+
+LONG OpenNativeGuestCompletion(bool process, HANDLE* output, DWORD access,
+    const GuestObjectAttributes* attributes, const GuestClientId* clientId)
+{
+    constexpr ULONG ObjectInherit = 0x00000002u;
+    constexpr LONG InvalidClientId = static_cast<LONG>(0xc000000bu);
+    GuestObjectAttributes capturedAttributes{};
+    GuestClientId capturedId{};
+    if (!output || !attributes || !CopyConsoleBytes(&capturedAttributes, attributes, sizeof(capturedAttributes)))
+        return NtAccessViolation;
+    if (capturedAttributes.length != sizeof(capturedAttributes)) return NtInvalidParameter;
+    if (capturedAttributes.name)
+    {
+        GuestUnicodeString name{};
+        if (!CopyConsoleBytes(&name, capturedAttributes.name, sizeof(name))) return NtAccessViolation;
+        if (name.length) return NtObjectNameInvalid;
+    }
+    if (!clientId) return NtInvalidParameter;
+    if (!CopyConsoleBytes(&capturedId, clientId, sizeof(capturedId))) return NtAccessViolation;
+    const auto pid = reinterpret_cast<ULONG_PTR>(capturedId.process);
+    const auto tid = reinterpret_cast<ULONG_PTR>(capturedId.thread);
+    if (pid > MAXDWORD || tid > MAXDWORD || !(process ? pid : tid)) return InvalidClientId;
+
+    const auto kernel = CurrentGuestKernelContext();
+    if (!kernel) return NtInvalidHandle;
+    DWORD error = ERROR_SUCCESS;
+    const HANDLE handle = kernel->OpenCompletion(static_cast<DWORD>(process ? pid : tid), process,
+        (capturedAttributes.attributes & ObjectInherit) != 0, &error, access, process ? 0 : static_cast<DWORD>(pid));
+    if (!handle) return error == ERROR_INVALID_PARAMETER ? InvalidClientId : NativeStatus(error);
+    if (CopyConsoleBytes(output, &handle, sizeof(handle))) return 0;
+    kernel->CloseHandle(handle, nullptr);
+    return NtAccessViolation;
+}
+
+LONG WINAPI GuestNtOpenProcess(HANDLE* output, DWORD access,
+    const GuestObjectAttributes* attributes, const GuestClientId* clientId)
+{
+    return OpenNativeGuestCompletion(true, output, access, attributes, clientId);
+}
+
+LONG WINAPI GuestNtOpenThread(HANDLE* output, DWORD access,
+    const GuestObjectAttributes* attributes, const GuestClientId* clientId)
+{
+    return OpenNativeGuestCompletion(false, output, access, attributes, clientId);
+}
+
+LONG WINAPI GuestNtResumeThread(HANDLE thread, ULONG* previousCount)
+{
+    DWORD count = 0;
+    if (previousCount)
+    {
+        if (reinterpret_cast<ULONG_PTR>(previousCount) % alignof(ULONG)) return NtDatatypeMisalignment;
+        if (!CopyConsoleBytes(&count, previousCount, sizeof(count)) ||
+            !CopyConsoleBytes(previousCount, &count, sizeof(count))) return NtAccessViolation;
+    }
+    const auto kernel = CurrentGuestKernelContext();
+    DWORD error = ERROR_INVALID_HANDLE;
+    if (!kernel || !kernel->ResumeThread(thread, &count, &error)) return NativeStatus(error);
+    return !previousCount || CopyConsoleBytes(previousCount, &count, sizeof(count)) ? 0 : NtAccessViolation;
+}
+
 bool CaptureLocalSyncTimeout(const LARGE_INTEGER* timeout, DWORD& milliseconds)
 {
     milliseconds = INFINITE;
@@ -1168,7 +1231,42 @@ LONG WINAPI GuestNtQueryVolumeInformationFile(HANDLE handle,GuestIoStatus* io,vo
     if(kind==4){ULONG device[2]={type==FILE_TYPE_PIPE?0x11u:7u,0};LONG status=length<sizeof(device)?NtLengthMismatch:0;if(!status&&!CopyConsoleBytes(output,device,sizeof(device)))status=NtInvalidParameter;NativeIoResult(io,status,status?0:sizeof(device));return status;}
     NativeIoResult(io,NtNotSupported);return NtNotSupported;
 }
+LONG QueryNativeGuestProcessImageName(HANDLE process, bool nativePath, void* output,
+    ULONG length, ULONG* returned)
+{
+    const PreserveNativeLastError preserve;
+    try
+    {
+        std::wstring path;
+        if (!GetGuestProcessImagePath(process, nativePath, path)) return NativeStatus(BridgeGetLastError());
+        if (path.size() > (0xffffu / sizeof(wchar_t)) - 1) return NtLengthMismatch;
+        const auto textBytes = static_cast<USHORT>(path.size() * sizeof(wchar_t));
+        const auto capacity = static_cast<USHORT>(textBytes + sizeof(wchar_t));
+        const ULONG required = sizeof(GuestUnicodeString) + capacity;
+        if (returned && !CopyConsoleBytes(returned, &required, sizeof(required))) return NtAccessViolation;
+        if (length < required) return NtLengthMismatch;
+        if (!output) return NtAccessViolation;
+
+        auto buffer = reinterpret_cast<wchar_t*>(static_cast<BYTE*>(output) + sizeof(GuestUnicodeString));
+        GuestUnicodeString result{};
+        result.length = textBytes;
+        result.maximumLength = capacity;
+        result.buffer = buffer;
+        if (!CopyConsoleBytes(buffer, path.c_str(), capacity) ||
+            !CopyConsoleBytes(output, &result, sizeof(result))) return NtAccessViolation;
+        return 0;
+    }
+    catch (const std::bad_alloc&)
+    {
+        return NativeStatus(ERROR_NOT_ENOUGH_MEMORY);
+    }
+}
+
 LONG WINAPI GuestNtQueryInformationProcess(HANDLE process,ULONG kind,void* output,ULONG length,ULONG* returned){
+    constexpr ULONG processImageFileName = 27;
+    constexpr ULONG processImageFileNameWin32 = 43;
+    if (kind == processImageFileName || kind == processImageFileNameWin32)
+        return QueryNativeGuestProcessImageName(process, kind == processImageFileName, output, length, returned);
     if(returned)*returned=0;if(process!=BridgeGetCurrentProcess())return NtInvalidHandle;
     // Guest processes are native x64, not debugged, and cannot terminate the host.
     ULONG_PTR value=0;ULONG required=sizeof(value);
@@ -1205,6 +1303,12 @@ ImportResolution ResolveNativeGuestImport(const ImportedSymbol& symbol){
     NATIVE_EXPORT("ZwWaitForMultipleObjects",GuestNtWaitForMultipleObjects)
     NATIVE_EXPORT("NtSignalAndWaitForSingleObject",GuestNtSignalAndWaitForSingleObject)
     NATIVE_EXPORT("ZwSignalAndWaitForSingleObject",GuestNtSignalAndWaitForSingleObject)
+    NATIVE_EXPORT("NtResumeThread",GuestNtResumeThread)
+    NATIVE_EXPORT("ZwResumeThread",GuestNtResumeThread)
+    NATIVE_EXPORT("NtOpenProcess",GuestNtOpenProcess)
+    NATIVE_EXPORT("ZwOpenProcess",GuestNtOpenProcess)
+    NATIVE_EXPORT("NtOpenThread",GuestNtOpenThread)
+    NATIVE_EXPORT("ZwOpenThread",GuestNtOpenThread)
     NATIVE_EXPORT("NtCreateTimer",GuestNtCreateTimer)
     NATIVE_EXPORT("ZwCreateTimer",GuestNtCreateTimer)
     NATIVE_EXPORT("NtOpenTimer",GuestNtOpenTimer)

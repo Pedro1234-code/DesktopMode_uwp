@@ -10,6 +10,7 @@
 #include <iterator>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace Win32Bridge { namespace Bridge {
 // Transport/state only. No host console handles, HWNDs or host standard streams.
@@ -106,7 +107,8 @@ public:
         if (!attached) { *error = ERROR_INVALID_HANDLE; return false; }
         attached.reset(); handles.clear(); controlHandlers.clear(); ignoreControlC=false; *error = ERROR_SUCCESS; return true;
     }
-    void Inherit(const GuestConsoleContext& parent, bool inheritHandles = true)
+    void Inherit(const GuestConsoleContext& parent, bool inheritHandles = true,
+        const std::unordered_set<ULONG_PTR>* selected = nullptr)
     {
         if (this == &parent) return;
         std::unique_lock<std::mutex> mine(lock, std::defer_lock), theirs(parent.lock, std::defer_lock);
@@ -118,7 +120,8 @@ public:
         {
             bool standardHandle = false;
             for (const auto value : parent.standard) if (reinterpret_cast<ULONG_PTR>(value) == item.first) standardHandle = true;
-            if ((inheritHandles && (item.second.flags & 1u)) || standardHandle) fresh.emplace(item);
+            if (selected && !selected->count(item.first)) continue;
+            if ((inheritHandles && (item.second.flags & 1u)) || (!selected && standardHandle)) fresh.emplace(item);
         }
         handles.swap(fresh); attached = parent.attached; controlHandlers.clear(); ignoreControlC=parent.ignoreControlC;
         for (size_t i = 0; i < standard.size(); ++i)

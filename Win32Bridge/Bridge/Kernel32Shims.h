@@ -29,6 +29,7 @@ namespace Bridge
     };
 
     void ResetGuestResourceHandles();
+    void ReleaseGuestFileMappingViews();
     // Storage mutations feed the virtual ReadDirectoryChangesW implementation.
     // Paths are canonical guest paths; no host filesystem identity escapes.
     void NotifyGuestDirectoryChange(
@@ -168,6 +169,7 @@ namespace Bridge
     DWORD WINAPI BridgeGetCurrentThreadId();
     DWORD WINAPI BridgeGetCurrentProcessId();
     HANDLE WINAPI BridgeGetCurrentProcess();
+    HANDLE WINAPI BridgeGetCurrentThread();
     LONG WINAPI BridgeAppPolicyGetProcessTerminationMethod(HANDLE token, int* policy);
     void WINAPI BridgeGetSystemTimeAsFileTime(LPFILETIME systemTime);
     void WINAPI BridgeGetSystemTimePreciseAsFileTime(LPFILETIME systemTime);

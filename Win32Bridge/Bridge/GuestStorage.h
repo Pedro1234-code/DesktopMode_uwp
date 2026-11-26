@@ -107,7 +107,8 @@ namespace Bridge
         GuestIoCompletionBinding IoCompletionBinding(HANDLE file) const;
         bool FileHandleFlags(HANDLE guestHandle, DWORD* flags, DWORD mask, bool set, DWORD* win32Error);
         bool DuplicateFile(HANDLE source, bool inherit, HANDLE* duplicate, DWORD* win32Error);
-        bool InheritFiles(const GuestStorageContext& parent, DWORD* win32Error);
+        bool InheritFiles(const GuestStorageContext& parent, DWORD* win32Error,
+            const std::unordered_set<ULONG_PTR>* selected);
         bool GetFileSize(HANDLE guestHandle, LARGE_INTEGER* fileSize, DWORD* win32Error);
         bool SetFilePointer(HANDLE guestHandle, LARGE_INTEGER distance, LARGE_INTEGER* newPosition, DWORD moveMethod, DWORD* win32Error);
         bool SetEndOfFile(HANDLE guestHandle, DWORD* win32Error);

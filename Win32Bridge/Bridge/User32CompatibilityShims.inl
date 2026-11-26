@@ -632,19 +632,13 @@ DWORD WINAPI BridgeGetQueueStatus(UINT flags)
 {
     GuestWindowManager* manager = CurrentManagerOrFail();
     if (!manager) return 0;
-    UINT available = 0; GuestAbi::Message message{};
-    if (manager->PeekGuestMessage(&message, nullptr, WM_KEYFIRST, WM_KEYLAST, PM_NOREMOVE)) available |= QS_KEY;
-    if (manager->PeekGuestMessage(&message, nullptr, WM_MOUSEFIRST, WM_MOUSELAST, PM_NOREMOVE)) available |= QS_MOUSE;
-    if (manager->PeekGuestMessage(&message, nullptr, WM_PAINT, WM_PAINT, PM_NOREMOVE)) available |= QS_PAINT;
-    if (manager->PeekGuestMessage(&message, nullptr, WM_TIMER, WM_TIMER, PM_NOREMOVE)) available |= QS_TIMER;
-    if (manager->PeekGuestMessage(&message, nullptr, 0, 0, PM_NOREMOVE)) available |= QS_POSTMESSAGE;
-    available &= flags;
-    return MAKELONG(available, available);
+    return manager->GetGuestQueueStatus(flags, true);
 }
 
 BOOL WINAPI BridgeGetInputState()
 {
-    return (BridgeGetQueueStatus(QS_INPUT) & 0xffffu) != 0;
+    GuestWindowManager* manager = CurrentManagerOrFail();
+    return manager && HIWORD(manager->GetGuestQueueStatus(QS_KEY | QS_MOUSEBUTTON, false)) != 0;
 }
 
 HANDLE WINAPI BridgeGetClipboardData(UINT format)

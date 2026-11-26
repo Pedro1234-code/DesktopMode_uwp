@@ -11,8 +11,8 @@ The counts do not represent Windows export coverage or a test pass rate.
 | API or subsystem | Implemented | Partial | Planned | Total |
 | --- | ---: | ---: | ---: | ---: |
 | PE loader | 8 | 3 | 2 | 13 |
-| Kernel32 | 10 | 4 | 4 | 18 |
-| NTDLL | 5 | 4 | 2 | 11 |
+| Kernel32 | 14 | 5 | 4 | 23 |
+| NTDLL | 6 | 5 | 1 | 12 |
 | USER32 | 5 | 6 | 2 | 13 |
 | GDI32 | 6 | 4 | 1 | 11 |
 | COMCTL32 | 4 | 6 | 1 | 11 |
@@ -75,7 +75,12 @@ The counts do not represent Windows export coverage or a test pass rate.
 - **Implemented** · SetFileInformationByHandle for EOF, local rename and delete disposition
 - **Implemented** · File mappings and directory notifications
 - **Implemented** · Guest environment and current directory
-- **Partial** · Extended startup attributes and jobs
+- **Implemented** · Process-local section handles, shared views and section handle inheritance
+- **Implemented** · Selective handle inheritance through STARTUPINFOEX
+- **Implemented** · Suspended process and thread creation with ResumeThread
+- **Implemented** · Session-local process and thread lookup, Toolhelp snapshots and PSAPI module queries
+- **Partial** · Process termination and suspension after execution starts
+- **Partial** · Additional startup attributes and job objects
 - **Partial** · Named kernel-object namespaces and inheritance
 - **Partial** · Threadpool and alertable waits
 - **Partial** · File metadata and reparse points
@@ -94,9 +99,10 @@ The counts do not represent Windows export coverage or a test pass rate.
 - **Partial** · Native module lookup flags and additional Ldr entry points
 - **Partial** · NT object manager namespace
 - **Partial** · NT virtual memory and section semantics
+- **Implemented** · Native process and thread open by client ID and resume after suspended creation
 - **Partial** · NT file information classes
+- **Partial** · Native process and thread information classes
 - **Planned** · ALPC
-- **Planned** · Full native process and thread introspection
 
 ## USER32
 

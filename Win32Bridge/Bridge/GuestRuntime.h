@@ -3,6 +3,7 @@
 #include "Bridge\\ImportBinder.h"
 #include "Bridge\\RuntimeImage.h"
 #include "Bridge\\GuestStorage.h"
+#include "Bridge/GuestKernel.h"
 
 #include <memory>
 #include <functional>
@@ -18,11 +19,9 @@ namespace Win32Bridge
 {
 namespace Bridge
 {
+    struct GuestToolhelpSnapshot;
     namespace MiniGdi { class Surface; }
     class GuestWindowManager;
-    class GuestKernelContext;
-    class GuestConsoleContext;
-    class GuestPipeContext;
     class GuestModuleLoader;
     class GuestRegistryContext;
 
@@ -64,7 +63,8 @@ namespace Bridge
             DWORD creationFlags = 0, bool inheritHandles = false,
             const HANDLE* standardHandles = nullptr,
             const std::vector<BYTE>& startupCrtData = {},
-            bool inheritProcessHandle = false, bool inheritThreadHandle = false);
+            bool inheritProcessHandle = false, bool inheritThreadHandle = false,
+            const std::unordered_set<ULONG_PTR>* inheritedHandleList = nullptr);
         void FillStartupCrtData(STARTUPINFOW& startupInfo)
         {
             startupInfo.cbReserved2 = static_cast<WORD>(m_startupCrtData.size());
@@ -81,6 +81,7 @@ namespace Bridge
         const BYTE* ImageBase() const { return m_runtime.Base(); }
         size_t ImageSize() const { return m_runtime.Size(); }
         const PeImageInfo& Metadata() const { return m_metadata; }
+        bool CaptureToolhelpModules(GuestToolhelpSnapshot& snapshot, DWORD processId, bool nativeModules) const;
         const BindingReport& Bindings() const { return m_bindings; }
 
     private:
@@ -95,6 +96,7 @@ namespace Bridge
         std::shared_ptr<GuestStorageContext> m_storage;
         std::shared_ptr<GuestWindowManager> m_windows;
         std::shared_ptr<GuestKernelContext> m_kernel;
+        std::shared_ptr<GuestKernelContext> m_sessionKernel;
         std::shared_ptr<GuestKernelContext> m_consoleTransport;
         std::atomic<unsigned> m_consoleColumns{80}, m_consoleRows{25};
         std::shared_ptr<GuestModuleLoader> m_modules;
@@ -108,10 +110,8 @@ namespace Bridge
         bool m_sharedWindowManager = false;
         DWORD m_processId = 1;
         DWORD m_mainThreadId = 0;
-        std::function<void(DWORD)> m_mainThreadCompleted;
+        GuestKernelContext::Completion m_initialThread;
         std::shared_ptr<GuestKernelContext> m_initialKernel;
-        std::shared_ptr<GuestConsoleContext> m_initialConsole;
-        std::shared_ptr<GuestPipeContext> m_initialPipes;
         std::array<HANDLE,3> m_initialStandardHandles{};
         std::vector<BYTE> m_startupCrtData;
         bool m_hasInitialStandardHandles = false;

@@ -23,6 +23,38 @@ namespace Win32Bridge
 {
 namespace Bridge
 {
+    struct GuestModuleSnapshotEntry
+    {
+        HMODULE module;
+        DWORD imageSize;
+        std::wstring path;
+        DWORD entryPointRva;
+    };
+
+    struct GuestToolhelpSnapshot
+    {
+        struct Process
+        {
+            DWORD id;
+            DWORD parentId;
+            DWORD threadCount;
+            std::wstring path;
+        };
+        struct Thread
+        {
+            DWORD id;
+            DWORD processId;
+        };
+        DWORD processId = 0;
+        std::vector<GuestModuleSnapshotEntry> modules;
+        std::vector<Process> processes;
+        std::vector<Thread> threads;
+        std::mutex lock;
+        size_t nextModule = 0;
+        size_t nextProcess = 0;
+        size_t nextThread = 0;
+    };
+
     // Maps PE DLLs from the executable's authorized source folder, falling
     // back to the guest C: drive for modules intentionally placed there.
     // Module handles are guest image bases, never host HMODULEs.
@@ -59,9 +91,11 @@ namespace Bridge
         bool RemoveDllDirectory(PVOID cookie, DWORD* win32Error);
         bool SetDllDirectory(LPCWSTR path, DWORD* win32Error);
         DWORD GetDllDirectory(DWORD bufferLength, LPWSTR buffer, DWORD* win32Error) const;
-        bool GetModulePath(HMODULE module, std::wstring* path, DWORD* win32Error) const;
+        bool GetModulePath(HMODULE module, std::wstring* path, DWORD* win32Error,
+            bool executableOnly = false) const;
         FARPROC GetProcAddress(HMODULE module, LPCSTR nameOrOrdinal, DWORD* win32Error);
         bool GetMappedImage(HMODULE module, const BYTE** imageBase, size_t* imageSize) const;
+        void AppendModuleSnapshot(std::vector<GuestModuleSnapshotEntry>& entries) const;
         bool DescribeAddress(ULONG_PTR address, std::wstring* description) const;
         bool FreeLibrary(HMODULE module, DWORD* win32Error);
         bool DisableThreadNotifications(HMODULE module, DWORD* win32Error);

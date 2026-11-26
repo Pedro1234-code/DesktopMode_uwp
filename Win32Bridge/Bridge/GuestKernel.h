@@ -15,6 +15,7 @@
 #include <thread>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <functional>
 
 struct IUnknown;
@@ -24,6 +25,7 @@ namespace Win32Bridge
 namespace Bridge
 {
     class GuestIoCompletionPort;
+    struct GuestToolhelpSnapshot;
 
     // Per-run, in-process kernel-object table.  The values handed to a guest
     // are tokens only; host event/mutex handles are never exposed to PE code.
@@ -37,7 +39,10 @@ namespace Bridge
         class Completion final
         {
         public:
+            explicit operator bool() const { return m_object != nullptr; }
             void Finish(DWORD exitCode) const;
+            bool WaitForStart(const GuestKernelContext& owner, DWORD* cancellationCode = nullptr) const;
+            void SetProcessDetails(const Completion& thread, const std::wstring& imagePath) const;
         private:
             friend class GuestKernelContext;
             std::shared_ptr<ObjectRecord> m_object;
@@ -76,7 +81,7 @@ namespace Bridge
         static constexpr DWORD HandleInherit = 0x00000001u;
         static constexpr DWORD HandleProtectFromClose = 0x00000002u;
 
-        GuestKernelContext() = default;
+        explicit GuestKernelContext(const GuestKernelContext* parent = nullptr);
         GuestConsoleContext& Console() { return m_console; }
         GuestPipeContext& Pipes() { return m_pipes; }
         GuestThreadpoolTimers& Timers() { return m_timers; }
@@ -87,7 +92,11 @@ namespace Bridge
 
         HANDLE CreateEvent(bool manualReset, bool initialState, LPCWSTR name, DWORD* win32Error,
             bool inherit = false, DWORD access = GENERIC_ALL);
-        HANDLE OpenCompletion(DWORD id, bool process, bool inherit, DWORD* error);
+        HANDLE OpenCompletion(DWORD id, bool process, bool inherit, DWORD* error, DWORD access,
+            DWORD owningProcessId = 0);
+        bool IsCurrentProcessHandle(HANDLE process, DWORD requiredAccess) const;
+        HANDLE CreateFileMappingHandle(const std::shared_ptr<void>& mapping, DWORD access, bool inherit, DWORD* error);
+        std::shared_ptr<void> LookupFileMappingHandle(HANDLE handle, DWORD* access) const;
         HANDLE CreateToken(DWORD* error);
         bool IsToken(HANDLE handle) const;
         HANDLE OpenEvent(DWORD desiredAccess, BOOL inheritHandle, LPCWSTR name, DWORD* win32Error);
@@ -112,6 +121,8 @@ namespace Bridge
         HRESULT PublishGraphicsHandle(HANDLE nativeHandle, LPCWSTR name, bool inherit, HANDLE* output);
         HRESULT OpenGraphicsHandle(LPCWSTR name, HANDLE* output);
         std::shared_ptr<void> LeaseGraphicsHandle(HANDLE guestHandle) const;
+        HANDLE CreateToolhelpSnapshot(std::shared_ptr<GuestToolhelpSnapshot> snapshot, bool inherit, DWORD* error);
+        std::shared_ptr<GuestToolhelpSnapshot> LookupToolhelpSnapshot(HANDLE handle) const;
         bool SetD3D12Factory(std::shared_ptr<IUnknown> factory);
         std::shared_ptr<IUnknown> D3D12Factory() const;
         bool ResetEvent(HANDLE guestHandle, DWORD* win32Error);
@@ -164,15 +175,22 @@ namespace Bridge
             DWORD* win32Error, bool (*hasPendingApc)());
         static void NotifyAlertableWaiters();
         bool ValidateWaitHandles(DWORD count, const HANDLE* handles, bool waitAll, DWORD* win32Error) const;
-        bool CreateCompletionObject(DWORD objectId, bool process, Completion* completion, HANDLE* handle, DWORD* win32Error, bool inherit = false);
+        bool CreateCompletionObject(DWORD objectId, bool process, Completion* completion, HANDLE* handle,
+            DWORD* win32Error, bool inherit = false, DWORD owningProcessId = 0, bool startSuspended = false);
+        bool ResumeThread(HANDLE thread, DWORD* previousCount, DWORD* win32Error);
+        bool TerminateSuspendedProcess(HANDLE process, DWORD exitCode, DWORD* win32Error);
+        void CaptureToolhelpProcesses(GuestToolhelpSnapshot& snapshot, bool processes, bool threads) const;
         bool GetExitCode(HANDLE guestHandle, bool process, LPDWORD exitCode, DWORD* win32Error) const;
         bool GetThreadId(HANDLE guestHandle, LPDWORD threadId, DWORD* win32Error) const;
-        bool GetCompletionId(HANDLE guestHandle, bool process, LPDWORD id, DWORD* win32Error) const;
+        bool GetCompletionId(HANDLE guestHandle, bool process, LPDWORD id, DWORD* win32Error,
+            DWORD requiredAccess = 0, bool ownerId = false) const;
+        bool GetProcessImagePath(HANDLE process, std::wstring& path, DWORD* win32Error) const;
         bool Owns(HANDLE guestHandle) const { return Lookup(guestHandle) != nullptr; }
         bool HandleFlags(HANDLE guestHandle, DWORD* flags, DWORD mask, bool set, DWORD* win32Error);
         bool Duplicate(HANDLE guestHandle, bool inherit, HANDLE* duplicate, DWORD* win32Error,
             DWORD desiredAccess = 0, bool sameAccess = true);
-        bool InheritHandles(const GuestKernelContext& parent, DWORD* win32Error);
+        bool InheritHandles(const GuestKernelContext& parent, DWORD* win32Error,
+            const std::unordered_set<ULONG_PTR>* selected);
 
         // This is intentionally separate from storage's CloseFile: Kernel32's
         // CloseHandle shim tries this table first, then its existing file path.
@@ -202,12 +220,14 @@ namespace Bridge
             Event,
             NativeWait,
             GraphicsHandle,
+            ToolhelpSnapshot,
             Token,
             Mutex,
             Semaphore,
             WaitableTimer,
             IoCompletionPort,
             File,
+            FileMapping,
             Process,
             Thread
         };
@@ -255,6 +275,8 @@ namespace Bridge
             std::unique_ptr<WaitableTimerSchedule> timer;
             std::shared_ptr<GuestIoCompletionPort> ioPort;
             std::shared_ptr<void> graphicsHandle;
+            std::shared_ptr<void> fileMapping;
+            std::shared_ptr<GuestToolhelpSnapshot> toolhelpSnapshot;
 
             // Mutex state.  A guest thread is represented by its bridge-host
             // thread identity, which preserves recursive acquisition.
@@ -267,7 +289,14 @@ namespace Bridge
             LONG semaphoreMaximum = 0;
 
             DWORD objectId = 0;
+            // Parent PID for process objects and owning PID for thread objects.
+            DWORD owningProcessId = 0;
             DWORD exitCode = STILL_ACTIVE;
+            DWORD startSuspendCount = 0;
+            bool startCancelled = false;
+            std::weak_ptr<ObjectRecord> primaryThread;
+            std::wstring imagePath;
+            bool processDetailsReady = false;
         };
         struct HandleEntry
         {
@@ -325,6 +354,7 @@ namespace Bridge
             bool inherit, DWORD access = MAXDWORD);
         static void ReleaseHandle(const std::shared_ptr<ObjectRecord>& object);
         std::shared_ptr<ObjectRecord> Lookup(HANDLE guestHandle, DWORD* access = nullptr) const;
+        std::shared_ptr<ObjectRecord> FindCompletion(DWORD id, bool process) const;
         using WaitObjects = std::array<std::shared_ptr<ObjectRecord>, MAXIMUM_WAIT_OBJECTS>;
         bool ResolveWaitHandles(DWORD count, const HANDLE* handles, bool waitAll, WaitObjects* objects, DWORD* win32Error) const;
         DWORD WaitForResolvedObjects(const WaitObjects& objects, DWORD count, bool waitAll,
@@ -337,7 +367,12 @@ namespace Bridge
         mutable std::mutex m_handlesLock;
         std::unordered_map<ULONG_PTR, HandleEntry> m_handles;
         std::shared_ptr<IUnknown> m_d3d12Factory;
-        std::unordered_map<ULONGLONG, std::weak_ptr<ObjectRecord>> m_completionObjects;
+        struct CompletionDirectory
+        {
+            std::mutex lock;
+            std::unordered_map<ULONGLONG, std::weak_ptr<ObjectRecord>> objects;
+        };
+        std::shared_ptr<CompletionDirectory> m_completionDirectory;
         ULONG_PTR m_nextHandle = FirstHandleToken;
 
         static std::mutex s_namedObjectsLock;

@@ -16295,7 +16295,8 @@ bool GuestWindowManager::DispatchOneSentMessage(DWORD threadId)
     return true;
 }
 
-BOOL GuestWindowManager::PostGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam, DWORD* win32Error)
+BOOL GuestWindowManager::PostGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
+    DWORD* win32Error, UINT queueBits)
 {
     DWORD targetThread = BridgeGetCurrentThreadId();
     if (window)
@@ -16315,7 +16316,7 @@ BOOL GuestWindowManager::PostGuestMessage(HWND window, UINT message, WPARAM wPar
         targetThread = record->threadId;
     }
     const auto queue = MessageQueueForThread(targetThread, true);
-    if (!queue || !queue->Post(window, message, wParam, lParam))
+    if (!queue || !queue->Post(window, message, wParam, lParam, queueBits))
     {
         SetWin32Error(win32Error, ERROR_NOT_ENOUGH_QUOTA);
         return FALSE;
@@ -16693,6 +16694,16 @@ GuestGetMessageResult GuestWindowManager::GetGuestMessage(GuestAbi::Message* mes
     }
 }
 
+DWORD GuestWindowManager::GetGuestQueueStatus(UINT mask, bool clearChanges, bool dispatchSent)
+{
+    const DWORD threadId = BridgeGetCurrentThreadId();
+    const auto queue = MessageQueueForThread(threadId, true);
+    if (!queue) return 0;
+    if (dispatchSent && !(mask & QS_SENDMESSAGE))
+        while (DispatchOneSentMessage(threadId)) {}
+    return queue->GetStatus(mask, clearChanges);
+}
+
 bool GuestWindowManager::WaitForGuestMessage(DWORD milliseconds)
 {
     const auto queue = MessageQueueForThread(BridgeGetCurrentThreadId(), true);
@@ -16919,7 +16930,7 @@ void GuestWindowManager::PostPaintRegion(
             post = true;
         }
     }
-    if (post && !PostGuestMessage(window->handle, GuestAbi::WmPaint, 0, 0, nullptr))
+    if (post && !PostGuestMessage(window->handle, GuestAbi::WmPaint, 0, 0, nullptr, QS_PAINT))
     {
         // A bounded queue can reject a paint while the region remains dirty.
         // Do not strand that region behind a phantom "posted" bit: a later
@@ -16943,7 +16954,7 @@ void GuestWindowManager::PostInternalPaint(const std::shared_ptr<WindowRecord>& 
             post = true;
         }
     }
-    if (post && !PostGuestMessage(window->handle, GuestAbi::WmPaint, 0, 0, nullptr))
+    if (post && !PostGuestMessage(window->handle, GuestAbi::WmPaint, 0, 0, nullptr, QS_PAINT))
     {
         std::lock_guard<std::mutex> guard(window->lock);
         window->paintPosted = false;
@@ -18511,7 +18522,8 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
             if (message == GuestAbi::WmLButtonDown)
                 SetGuestForegroundWindow(target, true, nullptr);
             PostGuestMessage(target, nonClientMessage,
-                static_cast<WPARAM>(hit), screenPosition, nullptr);
+                static_cast<WPARAM>(hit), screenPosition, nullptr,
+                nonClientMessage == GuestAbi::WmNcMouseMove ? QS_MOUSEMOVE : QS_MOUSEBUTTON);
             return;
         }
     }
@@ -18538,7 +18550,8 @@ void GuestWindowManager::HandlePointer(PointerEventArgs^ args, UINT requestedMes
         ? GuestAbi::MakeMouseLParam(SignedCoordinateWord(screenX - clientOrigin.x),
             SignedCoordinateWord(screenY - clientOrigin.y))
         : position;
-    PostGuestMessage(target, message, state, clientPosition, nullptr);
+    PostGuestMessage(target, message, state, clientPosition, nullptr,
+        message == GuestAbi::WmMouseMove ? QS_MOUSEMOVE : QS_MOUSEBUTTON);
     }
     catch (Exception^ error)
     {
@@ -18673,7 +18686,7 @@ void GuestWindowManager::HandleWheel(PointerEventArgs^ args)
         static_cast<WPARAM>(wheelData);
     // WM_MOUSEWHEEL is one of the mouse messages whose lParam is expressed in
     // screen coordinates, including when the target is a child window.
-    PostGuestMessage(target, GuestAbi::WmMouseWheel, wParam, screenPosition, nullptr);
+    PostGuestMessage(target, GuestAbi::WmMouseWheel, wParam, screenPosition, nullptr, QS_MOUSEBUTTON);
     }
     catch (Exception^ error)
     {
@@ -19021,7 +19034,7 @@ void GuestWindowManager::HandleKey(KeyEventArgs^ args, UINT message)
     if (target && IsGuestWindowVisibleInternal(target) && IsGuestWindowEnabledInternal(target))
     {
         PostGuestMessage(target, message, static_cast<WPARAM>(args->VirtualKey),
-            static_cast<LPARAM>(keyData), nullptr);
+            static_cast<LPARAM>(keyData), nullptr, QS_KEY);
     }
 }
 
@@ -19049,15 +19062,15 @@ void GuestWindowManager::HandleCharacter(CharacterReceivedEventArgs^ args)
     if (codePoint <= 0xffff)
     {
         PostGuestMessage(target, GuestAbi::WmChar,
-            static_cast<WPARAM>(codePoint), 0, nullptr);
+            static_cast<WPARAM>(codePoint), 0, nullptr, QS_KEY);
     }
     else
     {
         const UINT32 scalar = codePoint - 0x10000;
         const wchar_t high = static_cast<wchar_t>(0xd800 + (scalar >> 10));
         const wchar_t low = static_cast<wchar_t>(0xdc00 + (scalar & 0x3ff));
-        PostGuestMessage(target, GuestAbi::WmChar, static_cast<WPARAM>(high), 0, nullptr);
-        PostGuestMessage(target, GuestAbi::WmChar, static_cast<WPARAM>(low), 0, nullptr);
+        PostGuestMessage(target, GuestAbi::WmChar, static_cast<WPARAM>(high), 0, nullptr, QS_KEY);
+        PostGuestMessage(target, GuestAbi::WmChar, static_cast<WPARAM>(low), 0, nullptr, QS_KEY);
     }
     args->Handled = true;
 }

@@ -936,7 +936,8 @@ bool GuestStorageContext::DuplicateFile(HANDLE source, bool inherit, HANDLE* dup
     return RegisterFileLocked(record, inherit ? 1u : 0u, duplicate, error);
 }
 
-bool GuestStorageContext::InheritFiles(const GuestStorageContext& parent, DWORD* error)
+bool GuestStorageContext::InheritFiles(const GuestStorageContext& parent, DWORD* error,
+    const std::unordered_set<ULONG_PTR>* selected)
 {
     if (this == &parent) { SetWin32Error(error, ERROR_SUCCESS); return true; }
     if (m_sharedFiles != parent.m_sharedFiles) { SetWin32Error(error, ERROR_INVALID_PARAMETER); return false; }
@@ -945,7 +946,7 @@ bool GuestStorageContext::InheritFiles(const GuestStorageContext& parent, DWORD*
     {
         auto files = m_files; auto flags = m_fileFlags;
         for (const auto& entry : parent.m_fileFlags)
-            if ((entry.second & 1u) && files.find(entry.first) == files.end())
+            if ((entry.second & 1u) && (!selected || selected->count(entry.first)) && files.find(entry.first) == files.end())
             { files.emplace(entry.first, parent.m_files.at(entry.first)); flags.emplace(entry); }
         if (files.size() + m_finds.size() > MaximumHandles)
         { SetWin32Error(error, ERROR_TOO_MANY_OPEN_FILES); return false; }

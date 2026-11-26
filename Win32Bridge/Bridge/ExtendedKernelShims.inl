@@ -356,11 +356,11 @@ PTP_TIMER WINAPI BridgeCreateThreadpoolTimer(PTP_TIMER_CALLBACK callback,PVOID c
 void WINAPI BridgeSetThreadpoolTimer(PTP_TIMER timer,PFILETIME due,DWORD period,DWORD){auto kernel=CurrentGuestKernelContext();FILETIME copy{};if(due&&!CopyConsoleBytes(&copy,due,sizeof(copy))){SetGuestLastError(ERROR_NOACCESS);return;}SetGuestLastError(kernel&&kernel->Timers().Set(timer,due?&copy:nullptr,period)?0:ERROR_INVALID_HANDLE);}
 void WINAPI BridgeWaitForThreadpoolTimerCallbacks(PTP_TIMER timer,BOOL cancel){auto kernel=CurrentGuestKernelContext();SetGuestLastError(kernel&&kernel->Timers().Wait(timer,cancel!=FALSE)?0:ERROR_INVALID_HANDLE);}
 void WINAPI BridgeCloseThreadpoolTimer(PTP_TIMER timer){auto kernel=CurrentGuestKernelContext();SetGuestLastError(kernel&&kernel->Timers().Close(timer)?0:ERROR_INVALID_HANDLE);}
-HANDLE WINAPI BridgeOpenThread(DWORD, BOOL inherit, DWORD id)
+HANDLE WINAPI BridgeOpenThread(DWORD access, BOOL inherit, DWORD id)
 {
     auto kernel = CurrentGuestKernelContext();
     DWORD error = ERROR_INVALID_HANDLE;
-    const HANDLE handle = kernel ? kernel->OpenCompletion(id, false, inherit != FALSE, &error) : nullptr;
+    const HANDLE handle = kernel ? kernel->OpenCompletion(id, false, inherit != FALSE, &error, access) : nullptr;
     SetGuestLastError(error);
     return handle;
 }
@@ -369,20 +369,47 @@ BOOL WINAPI BridgeCreateProcessAsUserW(HANDLE token,LPCWSTR app,LPWSTR command,L
     if(token){DWORD size=0;BridgeGetTokenInformation(token,TokenUser,nullptr,0,&size);if(!size){SetGuestLastError(ERROR_INVALID_HANDLE);return FALSE;}}
     return BridgeCreateProcessW(app,command,process,thread,inherit,flags,environment,directory,startup,information);
 }
-struct GuestAttributeListHeader{ULONGLONG magic;DWORD capacity,count;};
-BOOL WINAPI BridgeInitializeProcThreadAttributeList(void* list,DWORD count,DWORD flags,SIZE_T* size){
-    if(!size||flags||count>64){SetGuestLastError(ERROR_INVALID_PARAMETER);return FALSE;}
-    SIZE_T required=sizeof(GuestAttributeListHeader)+static_cast<SIZE_T>(count)*3*sizeof(ULONG_PTR);SIZE_T supplied=*size;*size=required;
-    if(!list||supplied<required){SetGuestLastError(ERROR_INSUFFICIENT_BUFFER);return FALSE;}
-    GuestAttributeListHeader header{0x5742333241545452ull,count,0};if(!CopyConsoleBytes(list,&header,sizeof(header))){SetGuestLastError(ERROR_NOACCESS);return FALSE;}SetGuestLastError(0);return TRUE;
+BOOL WINAPI BridgeInitializeProcThreadAttributeList(void* list, DWORD count, DWORD flags, SIZE_T* size)
+{
+    if (!size || flags || count > MaximumGuestAttributes)
+    { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    const SIZE_T required = sizeof(GuestAttributeListHeader) + count * sizeof(GuestAttributeEntry);
+    SIZE_T supplied = 0;
+    if ((list && !CopyConsoleBytes(&supplied, size, sizeof(supplied))) ||
+        !CopyConsoleBytes(size, &required, sizeof(required)))
+    { SetGuestLastError(ERROR_NOACCESS); return FALSE; }
+    if (!list || supplied < required)
+    { SetGuestLastError(ERROR_INSUFFICIENT_BUFFER); return FALSE; }
+    const GuestAttributeListHeader header{GuestAttributeListMagic, count, 0};
+    const bool copied = CopyConsoleBytes(list, &header, sizeof(header));
+    SetGuestLastError(copied ? ERROR_SUCCESS : ERROR_NOACCESS);
+    return copied;
 }
-BOOL WINAPI BridgeUpdateProcThreadAttribute(void* list,DWORD,ULONG_PTR,void*,SIZE_T,void*,SIZE_T*){
-    GuestAttributeListHeader header{};if(!list||!CopyConsoleBytes(&header,list,sizeof(header))||header.magic!=0x5742333241545452ull){SetGuestLastError(ERROR_INVALID_PARAMETER);return FALSE;}
-    // CreateProcess currently rejects EXTENDED_STARTUPINFO_PRESENT. Do not
-    // accept attributes that would be silently ignored at process creation.
-    SetGuestLastError(ERROR_NOT_SUPPORTED);return FALSE;
+BOOL WINAPI BridgeUpdateProcThreadAttribute(void* list, DWORD flags, ULONG_PTR attribute, void* value,
+    SIZE_T size, void* previous, SIZE_T* returned)
+{
+    if (flags || !value || previous || returned)
+    { SetGuestLastError(ERROR_INVALID_PARAMETER); return FALSE; }
+    GuestAttributeListHeader header{};
+    const DWORD status = ReadGuestAttributeList(list, header);
+    if (status != ERROR_SUCCESS) { SetGuestLastError(status); return FALSE; }
+    if (attribute != GuestProcThreadAttributeHandleList)
+    { SetGuestLastError(ERROR_NOT_SUPPORTED); return FALSE; }
+    if (!size || size % sizeof(HANDLE)) { SetGuestLastError(ERROR_BAD_LENGTH); return FALSE; }
+    if (header.count >= header.capacity) { SetGuestLastError(ERROR_GEN_FAILURE); return FALSE; }
+    if (header.count) { SetGuestLastError(ERROR_OBJECT_NAME_EXISTS); return FALSE; }
+    const GuestAttributeEntry entry{attribute, size, value};
+    ++header.count;
+    const bool copied = CopyConsoleBytes(static_cast<BYTE*>(list) + sizeof(header), &entry, sizeof(entry)) &&
+        CopyConsoleBytes(list, &header, sizeof(header));
+    SetGuestLastError(copied ? ERROR_SUCCESS : ERROR_NOACCESS);
+    return copied;
 }
-void WINAPI BridgeDeleteProcThreadAttributeList(void* list){GuestAttributeListHeader empty{};if(list)CopyConsoleBytes(list,&empty,sizeof(empty));}
+void WINAPI BridgeDeleteProcThreadAttributeList(void* list)
+{
+    const GuestAttributeListHeader empty{};
+    if (list) CopyConsoleBytes(list, &empty, sizeof(empty));
+}
 ImportResolution ResolveExtendedKernelImport(const ImportedSymbol& symbol){
     ImportResolution result{ImportDisposition::Unsupported,L"No extended kernel adapter.",0};
 #define KERNEL_EXTRA(exportName,function) if(symbol.name==L##exportName)result.targetAddress=reinterpret_cast<ULONGLONG>(&function);else

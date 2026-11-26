@@ -1,6 +1,7 @@
 #include "pch.h"
 #include "Bridge\\GuestKernel.h"
 #include "Bridge/GuestIoCompletionPort.h"
+#include "Bridge/GuestModule.h"
 #include "Bridge/GuestStorage.h"
 #include "Bridge/Kernel32Shims.h"
 
@@ -78,6 +79,28 @@ namespace
         return (static_cast<ULONGLONG>(id) << 1) | (process ? 1u : 0u);
     }
 
+    DWORD MapCompletionAccess(bool process, DWORD access)
+    {
+        const DWORD all = process ? PROCESS_ALL_ACCESS : THREAD_ALL_ACCESS;
+        if (access & (MAXIMUM_ALLOWED | GENERIC_ALL)) return all;
+
+        DWORD mapped = access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE);
+        if (access & GENERIC_READ)
+            mapped |= STANDARD_RIGHTS_READ | (process ? PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+                : THREAD_QUERY_INFORMATION | THREAD_GET_CONTEXT);
+        if (access & GENERIC_WRITE)
+            mapped |= STANDARD_RIGHTS_WRITE | (process ? PROCESS_CREATE_PROCESS | PROCESS_CREATE_THREAD |
+                PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_DUP_HANDLE | PROCESS_SET_QUOTA |
+                PROCESS_SET_INFORMATION | PROCESS_SUSPEND_RESUME : THREAD_SET_CONTEXT | THREAD_SET_INFORMATION |
+                THREAD_SET_LIMITED_INFORMATION | THREAD_SUSPEND_RESUME | THREAD_TERMINATE);
+        if (access & GENERIC_EXECUTE)
+            mapped |= STANDARD_RIGHTS_EXECUTE | SYNCHRONIZE | (process ? PROCESS_TERMINATE |
+                PROCESS_QUERY_LIMITED_INFORMATION : THREAD_QUERY_LIMITED_INFORMATION | THREAD_RESUME);
+        if (process && (mapped & PROCESS_QUERY_INFORMATION)) mapped |= PROCESS_QUERY_LIMITED_INFORMATION;
+        if (!process && (mapped & THREAD_QUERY_INFORMATION)) mapped |= THREAD_QUERY_LIMITED_INFORMATION;
+        return mapped;
+    }
+
     ULONGLONG FileTimeValue(FILETIME time)
     {
         return (static_cast<ULONGLONG>(time.dwHighDateTime) << 32) | time.dwLowDateTime;
@@ -91,6 +114,11 @@ std::unordered_map<std::wstring, std::weak_ptr<GuestKernelContext::ObjectRecord>
     GuestKernelContext::s_namedGraphicsHandles;
 std::mutex GuestKernelContext::s_dispatcherLock;
 std::condition_variable GuestKernelContext::s_dispatcherChanged;
+
+GuestKernelContext::GuestKernelContext(const GuestKernelContext* parent)
+    : m_completionDirectory(parent ? parent->m_completionDirectory : std::make_shared<CompletionDirectory>())
+{
+}
 
 GuestKernelContext::~GuestKernelContext()
 {
@@ -765,7 +793,8 @@ HANDLE GuestKernelContext::CreateSemaphore(LONG initialCount, LONG maximumCount,
 }
 
 bool GuestKernelContext::CreateCompletionObject(
-    DWORD objectId, bool process, Completion* completion, HANDLE* handle, DWORD* win32Error, bool inherit)
+    DWORD objectId, bool process, Completion* completion, HANDLE* handle, DWORD* win32Error, bool inherit,
+    DWORD owningProcessId, bool startSuspended)
 {
     if (!completion)
     {
@@ -777,21 +806,26 @@ bool GuestKernelContext::CreateCompletionObject(
         auto object = std::make_shared<ObjectRecord>(process ? ObjectKind::Process : ObjectKind::Thread);
         object->manualReset = true;
         object->objectId = objectId;
+        object->owningProcessId = !process && !owningProcessId ? BridgeGetCurrentProcessId() : owningProcessId;
+        object->startSuspendCount = !process && startSuspended ? 1u : 0u;
         const auto key = CompletionKey(objectId, process);
-        std::lock_guard<std::mutex> guard(m_handlesLock);
-        for (auto item = m_completionObjects.begin(); item != m_completionObjects.end();)
+        std::lock_guard<std::mutex> handlesGuard(m_handlesLock);
+        std::lock_guard<std::mutex> directoryGuard(m_completionDirectory->lock);
+        auto& objects = m_completionDirectory->objects;
+        for (auto item = objects.begin(); item != objects.end();)
         {
-            if (item->second.expired()) item = m_completionObjects.erase(item);
+            if (item->second.expired()) item = objects.erase(item);
             else ++item;
         }
-        if (!m_completionObjects.emplace(key, object).second)
+        if (!objects.emplace(key, object).second)
         {
             SetWin32Error(win32Error, ERROR_ALREADY_EXISTS);
             return false;
         }
-        if (handle && !AddObjectLocked(object, handle, win32Error, inherit))
+        const DWORD access = process ? PROCESS_ALL_ACCESS : THREAD_ALL_ACCESS;
+        if (handle && !AddObjectLocked(object, handle, win32Error, inherit, access))
         {
-            m_completionObjects.erase(key);
+            objects.erase(key);
             return false;
         }
         completion->m_object = std::move(object);
@@ -803,6 +837,61 @@ bool GuestKernelContext::CreateCompletionObject(
         SetWin32Error(win32Error, ERROR_NOT_ENOUGH_MEMORY);
         return false;
     }
+}
+
+HANDLE GuestKernelContext::CreateFileMappingHandle(const std::shared_ptr<void>& mapping, DWORD access, bool inherit,
+    DWORD* error)
+{
+    try
+    {
+        const auto object = std::make_shared<ObjectRecord>(ObjectKind::FileMapping);
+        object->fileMapping = mapping;
+        HANDLE handle = nullptr;
+        return AddObject(object, &handle, error, inherit, access) ? handle : nullptr;
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetWin32Error(error, ERROR_NOT_ENOUGH_MEMORY);
+        return nullptr;
+    }
+}
+
+std::shared_ptr<void> GuestKernelContext::LookupFileMappingHandle(HANDLE handle, DWORD* access) const
+{
+    const auto object = Lookup(handle, access);
+    return object && object->kind == ObjectKind::FileMapping ? object->fileMapping : nullptr;
+}
+
+void GuestKernelContext::CaptureToolhelpProcesses(GuestToolhelpSnapshot& snapshot, bool processes, bool threads) const
+{
+    std::unordered_map<DWORD, size_t> processIndices;
+    {
+        std::lock_guard<std::mutex> directoryGuard(m_completionDirectory->lock);
+        std::lock_guard<std::mutex> dispatcherGuard(s_dispatcherLock);
+        const auto& objects = m_completionDirectory->objects;
+        for (const auto& item : objects)
+        {
+            const auto object = item.second.lock();
+            if (!object || object->kind != ObjectKind::Process || !object->processDetailsReady || object->signaled)
+                continue;
+            const size_t index = snapshot.processes.size();
+            processIndices.emplace(object->objectId, index);
+            if (processes) snapshot.processes.push_back({ object->objectId, object->owningProcessId, 0, object->imagePath });
+        }
+        for (const auto& item : objects)
+        {
+            const auto object = item.second.lock();
+            if (!object || object->kind != ObjectKind::Thread || object->signaled) continue;
+            const auto process = processIndices.find(object->owningProcessId);
+            if (process == processIndices.end()) continue;
+            if (processes) ++snapshot.processes[process->second].threadCount;
+            if (threads) snapshot.threads.push_back({ object->objectId, object->owningProcessId });
+        }
+    }
+    std::sort(snapshot.processes.begin(), snapshot.processes.end(),
+        [](const auto& left, const auto& right) { return left.id < right.id; });
+    std::sort(snapshot.threads.begin(), snapshot.threads.end(),
+        [](const auto& left, const auto& right) { return left.id < right.id; });
 }
 
 void GuestKernelContext::Completion::Finish(DWORD exitCode) const
@@ -817,10 +906,143 @@ void GuestKernelContext::Completion::Finish(DWORD exitCode) const
     s_dispatcherChanged.notify_all();
 }
 
+bool GuestKernelContext::Completion::WaitForStart(const GuestKernelContext& owner, DWORD* cancellationCode) const
+{
+    if (!m_object) return false;
+    std::unique_lock<std::mutex> guard(s_dispatcherLock);
+    s_dispatcherChanged.wait(guard, [&]()
+    {
+        return !m_object->startSuspendCount || m_object->startCancelled || m_object->signaled || owner.IsStopping();
+    });
+    if (m_object->startSuspendCount && !m_object->startCancelled && !m_object->signaled)
+    {
+        m_object->startCancelled = true;
+        m_object->exitCode = ERROR_OPERATION_ABORTED;
+    }
+    if (m_object->startCancelled || m_object->signaled)
+    {
+        if (cancellationCode) *cancellationCode = m_object->exitCode;
+        return false;
+    }
+    return true;
+}
+
+void GuestKernelContext::Completion::SetProcessDetails(const Completion& thread, const std::wstring& imagePath) const
+{
+    std::lock_guard<std::mutex> guard(s_dispatcherLock);
+    m_object->primaryThread = thread.m_object;
+    m_object->imagePath = imagePath;
+    m_object->processDetailsReady = true;
+}
+
+bool GuestKernelContext::GetProcessImagePath(HANDLE process, std::wstring& path, DWORD* win32Error) const
+{
+    DWORD access = 0;
+    const auto object = Lookup(process, &access);
+    if (!object || object->kind != ObjectKind::Process)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    if (!(access & PROCESS_QUERY_LIMITED_INFORMATION))
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(s_dispatcherLock);
+    if (object->imagePath.empty())
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    path = object->imagePath;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestKernelContext::TerminateSuspendedProcess(HANDLE process, DWORD exitCode, DWORD* win32Error)
+{
+    DWORD access = 0;
+    const auto object = Lookup(process, &access);
+    if (!object || object->kind != ObjectKind::Process)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    if (!(access & PROCESS_TERMINATE))
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(s_dispatcherLock);
+        const auto thread = object->primaryThread.lock();
+        if (object->signaled || (thread && thread->startCancelled))
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
+        if (!thread || !thread->startSuspendCount || thread->signaled)
+        {
+            SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
+            return false;
+        }
+        thread->exitCode = exitCode;
+        thread->startCancelled = true;
+    }
+    s_dispatcherChanged.notify_all();
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
+bool GuestKernelContext::ResumeThread(HANDLE thread, DWORD* previousCount, DWORD* win32Error)
+{
+    DWORD access = MAXDWORD;
+    std::shared_ptr<ObjectRecord> object;
+    if (thread == BridgeGetCurrentThread())
+        object = FindCompletion(BridgeGetCurrentThreadId(), false);
+    else
+        object = Lookup(thread, &access);
+
+    if (!object || object->kind != ObjectKind::Thread)
+    {
+        SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
+        return false;
+    }
+    if (!(access & THREAD_SUSPEND_RESUME))
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+        return false;
+    }
+    DWORD count;
+    {
+        std::lock_guard<std::mutex> guard(s_dispatcherLock);
+        if (object->startCancelled && !object->signaled)
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
+        count = object->signaled ? 0 : object->startSuspendCount;
+        if (count) --object->startSuspendCount;
+    }
+    if (count == 1) s_dispatcherChanged.notify_all();
+    if (previousCount) *previousCount = count;
+    SetWin32Error(win32Error, ERROR_SUCCESS);
+    return true;
+}
+
 bool GuestKernelContext::GetExitCode(
     HANDLE guestHandle, bool process, LPDWORD exitCode, DWORD* win32Error) const
 {
-    const auto object = Lookup(guestHandle);
+    const HANDLE current = process ? BridgeGetCurrentProcess() : BridgeGetCurrentThread();
+    if (guestHandle == current && CurrentGuestKernelContext() == this)
+    {
+        if (exitCode) *exitCode = STILL_ACTIVE;
+        SetWin32Error(win32Error, exitCode ? ERROR_SUCCESS : ERROR_INVALID_PARAMETER);
+        return exitCode != nullptr;
+    }
+    DWORD access = 0;
+    const auto object = Lookup(guestHandle, &access);
     if (!object || !exitCode)
     {
         SetWin32Error(win32Error, object ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE);
@@ -834,6 +1056,13 @@ bool GuestKernelContext::GetExitCode(
             SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
             return false;
         }
+        const DWORD queryAccess = process ? PROCESS_QUERY_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION
+            : THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION;
+        if (!(access & queryAccess))
+        {
+            SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+            return false;
+        }
         code = object->signaled ? object->exitCode : STILL_ACTIVE;
     }
     *exitCode = code;
@@ -841,14 +1070,23 @@ bool GuestKernelContext::GetExitCode(
     return true;
 }
 
+bool GuestKernelContext::IsCurrentProcessHandle(HANDLE process, DWORD requiredAccess) const
+{
+    if (process == BridgeGetCurrentProcess()) return true;
+    DWORD id = 0;
+    return GetCompletionId(process, true, &id, nullptr, requiredAccess) && id == BridgeGetCurrentProcessId();
+}
+
 bool GuestKernelContext::GetThreadId(HANDLE guestHandle, LPDWORD threadId, DWORD* win32Error) const
 {
     return GetCompletionId(guestHandle, false, threadId, win32Error);
 }
 
-bool GuestKernelContext::GetCompletionId(HANDLE guestHandle, bool process, LPDWORD id, DWORD* win32Error) const
+bool GuestKernelContext::GetCompletionId(HANDLE guestHandle, bool process, LPDWORD id, DWORD* win32Error,
+    DWORD requiredAccess, bool ownerId) const
 {
-    const auto object = Lookup(guestHandle);
+    DWORD access = 0;
+    const auto object = Lookup(guestHandle, &access);
     if (!object || !id)
     {
         SetWin32Error(win32Error, object ? ERROR_INVALID_PARAMETER : ERROR_INVALID_HANDLE);
@@ -862,7 +1100,12 @@ bool GuestKernelContext::GetCompletionId(HANDLE guestHandle, bool process, LPDWO
             return false;
         }
     }
-    *id = object->objectId;
+    if ((access & requiredAccess) != requiredAccess)
+    {
+        SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+        return false;
+    }
+    *id = ownerId ? object->owningProcessId : object->objectId;
     SetWin32Error(win32Error, ERROR_SUCCESS);
     return true;
 }
@@ -1229,6 +1472,23 @@ std::shared_ptr<void> GuestKernelContext::LeaseGraphicsHandle(HANDLE guestHandle
     return object->closed ? nullptr : object->graphicsHandle;
 }
 
+HANDLE GuestKernelContext::CreateToolhelpSnapshot(std::shared_ptr<GuestToolhelpSnapshot> snapshot,
+    bool inherit, DWORD* error)
+{
+    auto object = std::make_shared<ObjectRecord>(ObjectKind::ToolhelpSnapshot);
+    object->toolhelpSnapshot = std::move(snapshot);
+    HANDLE handle = nullptr;
+    return AddObject(object, &handle, error, inherit) ? handle : nullptr;
+}
+
+std::shared_ptr<GuestToolhelpSnapshot> GuestKernelContext::LookupToolhelpSnapshot(HANDLE handle) const
+{
+    const auto object = Lookup(handle);
+    if (!object || object->kind != ObjectKind::ToolhelpSnapshot) return {};
+    std::lock_guard<std::mutex> guard(s_dispatcherLock);
+    return object->closed ? nullptr : object->toolhelpSnapshot;
+}
+
 bool GuestKernelContext::SetD3D12Factory(std::shared_ptr<IUnknown> factory)
 {
     std::shared_ptr<IUnknown> previous;
@@ -1301,7 +1561,8 @@ bool GuestKernelContext::ResolveWaitHandles(
             object = storage->LookupFileSignal(handles[index]).m_object;
             if (object) access = SYNCHRONIZE;
         }
-        if (!object || object->kind == ObjectKind::Token || object->kind == ObjectKind::GraphicsHandle)
+        if (!object || object->kind == ObjectKind::Token || object->kind == ObjectKind::GraphicsHandle ||
+            object->kind == ObjectKind::ToolhelpSnapshot || object->kind == ObjectKind::FileMapping)
         {
             SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
             return false;
@@ -1560,27 +1821,58 @@ bool GuestKernelContext::Duplicate(HANDLE guestHandle, bool inherit, HANDLE* dup
 {
     const auto token = reinterpret_cast<ULONG_PTR>(guestHandle);
     std::lock_guard<std::mutex> guard(m_handlesLock);
-    const auto found = m_handles.find(token);
-    if (found == m_handles.end())
+    std::shared_ptr<ObjectRecord> object;
+    DWORD access = 0;
+    if (guestHandle == BridgeGetCurrentProcess())
+    {
+        object = FindCompletion(BridgeGetCurrentProcessId(), true);
+        access = PROCESS_ALL_ACCESS;
+    }
+    else if (guestHandle == BridgeGetCurrentThread())
+    {
+        object = FindCompletion(BridgeGetCurrentThreadId(), false);
+        access = THREAD_ALL_ACCESS;
+    }
+    else
+    {
+        const auto found = m_handles.find(token);
+        if (found != m_handles.end())
+        {
+            object = found->second.object;
+            access = found->second.access;
+        }
+    }
+    if (!object)
     {
         SetWin32Error(win32Error, ERROR_INVALID_HANDLE);
         return false;
     }
-    const auto object = found->second.object;
-    DWORD access = found->second.access;
     if (!sameAccess)
     {
-        if (!IsSynchronizationObject(object->kind))
+        if (object->kind == ObjectKind::Process || object->kind == ObjectKind::Thread || object->kind == ObjectKind::FileMapping)
+        {
+            const DWORD requested = object->kind == ObjectKind::FileMapping ? desiredAccess
+                : MapCompletionAccess(object->kind == ObjectKind::Process, desiredAccess);
+            if (requested & ~access)
+            {
+                SetWin32Error(win32Error, ERROR_ACCESS_DENIED);
+                return false;
+            }
+            access = requested;
+        }
+        else if (IsSynchronizationObject(object->kind))
+            access = MapSynchronizationAccess(object->kind, desiredAccess, false) & SynchronizationAllAccess(object->kind);
+        else
         {
             SetWin32Error(win32Error, ERROR_NOT_SUPPORTED);
             return false;
         }
-        access = MapSynchronizationAccess(object->kind, desiredAccess, false) & SynchronizationAllAccess(object->kind);
     }
     return AddObjectLocked(object, duplicate, win32Error, inherit, access);
 }
 
-bool GuestKernelContext::InheritHandles(const GuestKernelContext& parent, DWORD* win32Error)
+bool GuestKernelContext::InheritHandles(const GuestKernelContext& parent, DWORD* win32Error,
+    const std::unordered_set<ULONG_PTR>* selected)
 {
     if (this == &parent)
     {
@@ -1590,7 +1882,7 @@ bool GuestKernelContext::InheritHandles(const GuestKernelContext& parent, DWORD*
     std::unique_lock<std::mutex> target(m_handlesLock, std::defer_lock);
     std::unique_lock<std::mutex> source(parent.m_handlesLock, std::defer_lock);
     std::lock(target, source);
-    if (!m_handles.empty() || !m_completionObjects.empty())
+    if (!m_handles.empty())
     {
         SetWin32Error(win32Error, ERROR_INVALID_PARAMETER);
         return false;
@@ -1599,22 +1891,18 @@ bool GuestKernelContext::InheritHandles(const GuestKernelContext& parent, DWORD*
     try
     {
         decltype(m_handles) inherited;
-        decltype(m_completionObjects) completions;
         for (const auto& item : parent.m_handles)
         {
-            if (!(item.second.flags & HandleInherit) || item.second.object->kind == ObjectKind::IoCompletionPort)
+            if (!(item.second.flags & HandleInherit) || item.second.object->kind == ObjectKind::IoCompletionPort ||
+                (selected && !selected->count(item.first)))
                 continue;
             inherited.emplace(item);
-            const auto& object = item.second.object;
-            if (object->kind == ObjectKind::Process || object->kind == ObjectKind::Thread)
-                completions.emplace(CompletionKey(object->objectId, object->kind == ObjectKind::Process), object);
         }
         {
             std::lock_guard<std::mutex> guard(s_dispatcherLock);
             for (const auto& item : inherited) ++item.second.object->handleReferences;
         }
         m_handles.swap(inherited);
-        m_completionObjects.swap(completions);
     }
     catch (const std::bad_alloc&)
     {
@@ -1681,7 +1969,6 @@ void GuestKernelContext::CloseAll()
         std::lock_guard<std::mutex> guard(m_handlesLock);
         handles.swap(m_handles);
         factory = std::move(m_d3d12Factory);
-        m_completionObjects.clear();
         m_nextHandle = FirstHandleToken;
     }
     for (const auto& item : handles) ReleaseHandle(item.second.object);
@@ -1824,18 +2111,34 @@ ULONG GuestKernelContext::SetTraceInformation(ULONGLONG handle,ULONG kind,const 
     try{found->second.traits.assign(data,data+length);}catch(const std::bad_alloc&){return ERROR_NOT_ENOUGH_MEMORY;}return 0;
 }
 
-HANDLE GuestKernelContext::OpenCompletion(DWORD id, bool process, bool inherit, DWORD* error)
+std::shared_ptr<GuestKernelContext::ObjectRecord> GuestKernelContext::FindCompletion(DWORD id, bool process) const
 {
-    std::lock_guard<std::mutex> guard(m_handlesLock);
-    const auto found = m_completionObjects.find(CompletionKey(id, process));
-    const auto object = found == m_completionObjects.end() ? nullptr : found->second.lock();
-    if (!object)
+    std::lock_guard<std::mutex> guard(m_completionDirectory->lock);
+    const auto& objects = m_completionDirectory->objects;
+    const auto found = objects.find(CompletionKey(id, process));
+    return found == objects.end() ? nullptr : found->second.lock();
+}
+
+HANDLE GuestKernelContext::OpenCompletion(DWORD id, bool process, bool inherit, DWORD* error, DWORD access,
+    DWORD owningProcessId)
+{
+    const auto object = FindCompletion(id, process);
+    if (!object || (owningProcessId && object->owningProcessId != owningProcessId))
     {
         SetWin32Error(error, ERROR_INVALID_PARAMETER);
         return nullptr;
     }
+    if (process)
+    {
+        std::lock_guard<std::mutex> guard(s_dispatcherLock);
+        if (!object->processDetailsReady)
+        {
+            SetWin32Error(error, ERROR_INVALID_PARAMETER);
+            return nullptr;
+        }
+    }
     HANDLE handle = nullptr;
-    return AddObjectLocked(object, &handle, error, inherit) ? handle : nullptr;
+    return AddObject(object, &handle, error, inherit, MapCompletionAccess(process, access)) ? handle : nullptr;
 }
 
 HANDLE GuestKernelContext::CreateToken(DWORD* error){auto object=std::make_shared<ObjectRecord>(ObjectKind::Token);HANDLE handle=nullptr;return AddObject(object,&handle,error)?handle:nullptr;}

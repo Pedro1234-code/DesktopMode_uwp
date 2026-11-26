@@ -1366,7 +1366,8 @@ void GuestModuleLoader::SetDefaultDllDirectories(DWORD flags)
 bool GuestModuleLoader::GetModulePath(
     HMODULE module,
     std::wstring* path,
-    DWORD* win32Error) const
+    DWORD* win32Error,
+    bool executableOnly) const
 {
     std::lock_guard<std::recursive_mutex> loaderGuard(m_loaderLock);
     if (!path)
@@ -1377,7 +1378,7 @@ bool GuestModuleLoader::GetModulePath(
     path->clear();
     std::lock_guard<std::mutex> guard(m_lock);
     const auto found = FindModuleLocked(module);
-    if (!found)
+    if (!found || (executableOnly && (found->resourceOnly || found->unloading)))
     {
         SetWin32Error(win32Error, ERROR_MOD_NOT_FOUND);
         return false;
@@ -1548,6 +1549,17 @@ bool GuestModuleLoader::GetMappedImage(HMODULE module, const BYTE** imageBase, s
     *imageBase = candidate->runtime.Base();
     *imageSize = candidate->runtime.Size();
     return true;
+}
+
+void GuestModuleLoader::AppendModuleSnapshot(std::vector<GuestModuleSnapshotEntry>& entries) const
+{
+    // Capture committed metadata without waiting for a guest DLL callback on
+    // another runtime thread, which may itself be waiting on the caller.
+    std::lock_guard<std::mutex> guard(m_lock);
+    for (const auto& module : m_modules)
+        if (!module->resourceOnly && !module->loading && !module->unloading)
+            entries.push_back({ reinterpret_cast<HMODULE>(module->runtime.Base()),
+                static_cast<DWORD>(module->runtime.Size()), module->canonicalName, module->mapped.entryPointRva });
 }
 
 bool GuestModuleLoader::DescribeAddress(ULONG_PTR address, std::wstring* description) const

@@ -146,7 +146,8 @@ namespace Bridge
         BOOL KillGuestTimer(HWND window, UINT_PTR timerId, DWORD* win32Error);
 
         LRESULT DefaultGuestWindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
-        BOOL PostGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam, DWORD* win32Error);
+        BOOL PostGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam,
+            DWORD* win32Error, UINT queueBits = QS_POSTMESSAGE);
         BOOL PostGuestThreadMessage(DWORD threadId, UINT message, WPARAM wParam,
             LPARAM lParam, DWORD* win32Error);
         LRESULT SendGuestMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam, DWORD* win32Error);
@@ -163,6 +164,7 @@ namespace Bridge
         void InterruptGuestThreadMessages(DWORD threadId, bool threadExited);
         GuestGetMessageResult GetGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum);
         bool WaitForGuestMessage(DWORD milliseconds = INFINITE);
+        DWORD GetGuestQueueStatus(UINT mask, bool clearChanges, bool dispatchSent = false);
         BOOL PeekGuestMessage(GuestAbi::Message* message, HWND filter, UINT minimum, UINT maximum, UINT removeFlags);
         BOOL TranslateGuestMessage(const GuestAbi::Message* message);
         LRESULT DispatchGuestMessage(const GuestAbi::Message* message, DWORD* win32Error);

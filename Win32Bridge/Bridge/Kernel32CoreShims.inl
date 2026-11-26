@@ -1303,31 +1303,102 @@ BOOL WINAPI BridgeReplaceFileA(
     }
 }
 
-BOOL WINAPI BridgeQueryFullProcessImageNameW(
-    HANDLE process, DWORD flags, LPWSTR path, PDWORD characterCount)
+bool GetGuestProcessImagePath(HANDLE process, bool nativePath, std::wstring& path)
 {
-    if (process != BridgeGetCurrentProcess() || flags > 1 || !path || !characterCount)
+    if (process == BridgeGetCurrentProcess())
+    {
+        const auto storage = CurrentGuestStorageContext();
+        if (!storage)
+        {
+            SetGuestLastError(ERROR_INVALID_HANDLE);
+            return false;
+        }
+        path = storage->ModulePath();
+    }
+    else
+    {
+        const auto kernel = CurrentGuestKernelContext();
+        DWORD error = ERROR_INVALID_HANDLE;
+        if (!kernel || !kernel->GetProcessImagePath(process, path, &error))
+        {
+            SetGuestLastError(error);
+            return false;
+        }
+    }
+    if (nativePath) path.insert(0, L"\\??\\");
+    return true;
+}
+
+template<typename Char>
+BOOL QueryGuestProcessImageName(HANDLE process, DWORD flags, Char* path, PDWORD characterCount)
+{
+    if (flags > 1 || !path || !characterCount)
     {
         SetGuestLastError(ERROR_INVALID_PARAMETER);
         return FALSE;
     }
-    GuestStorageContext* storage = CurrentGuestStorageContext();
-    if (!storage)
+    DWORD capacity = 0;
+    if (!CopyConsoleBytes(&capacity, characterCount, sizeof(capacity)))
     {
-        SetGuestLastError(ERROR_INVALID_FUNCTION);
+        SetGuestLastError(ERROR_NOACCESS);
         return FALSE;
     }
-    const std::wstring& modulePath = storage->ModulePath();
-    if (*characterCount <= modulePath.size())
+    try
     {
-        *characterCount = static_cast<DWORD>(modulePath.size() + 1);
-        SetGuestLastError(ERROR_INSUFFICIENT_BUFFER);
+        std::wstring wide;
+        if (!GetGuestProcessImagePath(process, flags != 0, wide)) return FALSE;
+        std::basic_string<Char> value;
+        if constexpr (std::is_same_v<Char, wchar_t>)
+        {
+            value = std::move(wide);
+        }
+        else
+        {
+            const int count = static_cast<int>(wide.size());
+            const int needed = ::WideCharToMultiByte(GuestAnsiCodePage, 0, wide.data(), count,
+                nullptr, 0, nullptr, nullptr);
+            if (needed <= 0)
+            {
+                SetGuestLastError(::GetLastError());
+                return FALSE;
+            }
+            value.resize(needed);
+            if (!::WideCharToMultiByte(GuestAnsiCodePage, 0, wide.data(), count,
+                value.data(), needed, nullptr, nullptr))
+            {
+                SetGuestLastError(::GetLastError());
+                return FALSE;
+            }
+        }
+        if (capacity <= value.size())
+        {
+            SetGuestLastError(ERROR_INSUFFICIENT_BUFFER);
+            return FALSE;
+        }
+        const DWORD written = static_cast<DWORD>(value.size());
+        if (!CopyConsoleBytes(path, value.c_str(), (written + 1) * sizeof(Char)) ||
+            !CopyConsoleBytes(characterCount, &written, sizeof(written)))
+        {
+            SetGuestLastError(ERROR_NOACCESS);
+            return FALSE;
+        }
+        return TRUE;
+    }
+    catch (const std::bad_alloc&)
+    {
+        SetGuestLastError(ERROR_NOT_ENOUGH_MEMORY);
         return FALSE;
     }
-    memcpy(path, modulePath.c_str(), (modulePath.size() + 1) * sizeof(wchar_t));
-    *characterCount = static_cast<DWORD>(modulePath.size());
-    SetGuestLastError(ERROR_SUCCESS);
-    return TRUE;
+}
+
+BOOL WINAPI BridgeQueryFullProcessImageNameW(HANDLE process, DWORD flags, LPWSTR path, PDWORD characterCount)
+{
+    return QueryGuestProcessImageName(process, flags, path, characterCount);
+}
+
+BOOL WINAPI BridgeQueryFullProcessImageNameA(HANDLE process, DWORD flags, LPSTR path, PDWORD characterCount)
+{
+    return QueryGuestProcessImageName(process, flags, path, characterCount);
 }
 
 BOOL WINAPI BridgeGetModuleHandleExW(

@@ -3991,9 +3991,9 @@ DWORD WINAPI Win32Bridge::Bridge::BridgeMsgWaitForMultipleObjectsEx(
     {
         if ((flags & MWMO_ALERTABLE) && BridgeSleepEx(0, TRUE) == WAIT_IO_COMPLETION)
             return WAIT_IO_COMPLETION;
-        GuestAbi::Message message{};
-        const bool inputReady = wakeMask != 0 &&
-            manager->PeekGuestMessage(&message, nullptr, 0, 0, 0) != FALSE;
+        const DWORD queueStatus = manager->GetGuestQueueStatus(wakeMask, false, true);
+        const bool inputReady = (flags & MWMO_INPUTAVAILABLE)
+            ? HIWORD(queueStatus) != 0 : LOWORD(queueStatus) != 0;
         if (waitAll)
         {
             // Handle state may only be consumed when the queue is ready too.

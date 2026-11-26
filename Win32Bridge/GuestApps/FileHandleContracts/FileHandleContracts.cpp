@@ -1,7 +1,11 @@
 // Integration PE: run unchanged on desktop Windows or through Win32Bridge.
 // Zero exit means all checks passed; a nonzero exit identifies the failing line.
 #include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
+#include <array>
 #include <string>
+#include <vector>
 #include <cwchar>
 #include <cstdio>
 #include <cstring>
@@ -13,6 +17,7 @@ extern "C" __declspec(dllexport) int WINAPI BridgeLoaderContractExport()
 }
 
 #ifdef BRIDGE_VALIDATION_SUITE
+#include "../Validation/Log.h"
 #include "../Validation/Scratch.h"
 #define GetTempFileNameW Validation::CreateScratchFile
 #endif
@@ -36,6 +41,27 @@ struct View
     ~View() { if (bytes) UnmapViewOfFile(bytes); }
 };
 #define REQUIRE(expression) do { if (!(expression)) return __LINE__; } while (false)
+
+#ifdef BRIDGE_VALIDATION_SUITE
+Validation::Log* processLog = nullptr;
+#endif
+
+bool CheckChildExitCode(HANDLE handle, bool process, DWORD expected, const wchar_t* scenario)
+{
+    DWORD observed = 0;
+    const BOOL queried = process ? GetExitCodeProcess(handle, &observed) : GetExitCodeThread(handle, &observed);
+#ifdef BRIDGE_VALIDATION_SUITE
+    if (processLog)
+    {
+        if (!queried) processLog->Write(L"EXIT QUERY FAILED", scenario, GetLastError());
+        else processLog->Write(L"EXIT CODE", scenario, observed);
+    }
+#else
+    (void)scenario;
+#endif
+    return queried && observed == expected;
+}
+
 int ChildWriter(HANDLE ready)
 {
     DWORD flags = 0;
@@ -55,6 +81,252 @@ int ChildWriter(HANDLE ready)
     return 0;
 }
 
+DWORD WINAPI SuspendedThreadEntry(void* gate)
+{
+    REQUIRE(WaitForSingleObject(static_cast<HANDLE>(gate), 10000) == WAIT_OBJECT_0);
+    return 62;
+}
+
+int CheckSuspendedThread()
+{
+    Handle gate, thread, observer;
+    gate.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    REQUIRE(gate.value);
+    DWORD id = 0;
+    thread.value = CreateThread(nullptr, 0, SuspendedThreadEntry, gate.value, CREATE_SUSPENDED, &id);
+    REQUIRE(thread.value && id);
+
+    const int result = [&]() -> int
+    {
+        REQUIRE(WaitForSingleObject(thread.value, 0) == WAIT_TIMEOUT);
+        REQUIRE(CheckChildExitCode(thread.value, false, STILL_ACTIVE, L"Thread created suspended"));
+        observer.value = OpenThread(SYNCHRONIZE, FALSE, id);
+        REQUIRE(observer.value);
+        DWORD exitCode = 0;
+        REQUIRE(!GetExitCodeThread(observer.value, &exitCode) && GetLastError() == ERROR_ACCESS_DENIED);
+        REQUIRE(ResumeThread(observer.value) == MAXDWORD && GetLastError() == ERROR_ACCESS_DENIED);
+        using NtResumeThread = LONG (WINAPI*)(HANDLE, ULONG*);
+        const auto nativeResume = reinterpret_cast<NtResumeThread>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtResumeThread"));
+        ULONG count = 0;
+        REQUIRE(nativeResume && nativeResume(thread.value, &count) == 0 && count == 1);
+        REQUIRE(ResumeThread(thread.value) == 0);
+        return 0;
+    }();
+
+    if (result) ResumeThread(thread.value);
+    REQUIRE(SetEvent(gate.value));
+    REQUIRE(WaitForSingleObject(thread.value, 15000) == WAIT_OBJECT_0);
+    if (result) return result;
+    REQUIRE(CheckChildExitCode(thread.value, false, 62, L"Thread resumed after creation"));
+    return 0;
+}
+
+constexpr wchar_t InspectProcessArgument[] = L"--inspect-process ";
+constexpr wchar_t CheckInheritedHandlesArgument[] = L"--check-inherited-handles ";
+
+int CheckInheritedHandles(const wchar_t* arguments)
+{
+    std::array<HANDLE, 4> handles{};
+    for (auto& handle : handles)
+    {
+        wchar_t* end = nullptr;
+        const auto token = std::wcstoull(arguments, &end, 10);
+        REQUIRE(end != arguments && token);
+        handle = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(token));
+        arguments = end;
+    }
+    const HANDLE event = handles[0], mapping = handles[1], excludedPipe = handles[2], excludedMapping = handles[3];
+    REQUIRE(WaitForSingleObject(event, 0) == WAIT_OBJECT_0);
+    View shared;
+    shared.bytes = static_cast<char*>(MapViewOfFile(mapping, FILE_MAP_WRITE, 0, 0, 0));
+    REQUIRE(shared.bytes && shared.bytes[0] == 'p');
+    REQUIRE(!MapViewOfFile(excludedMapping, FILE_MAP_READ, 0, 0, 0) && GetLastError() == ERROR_INVALID_HANDLE);
+    DWORD handleFlags = 0;
+    REQUIRE(!GetHandleInformation(excludedPipe, &handleFlags) && GetLastError() == ERROR_INVALID_HANDLE);
+    shared.bytes[0] = 'c';
+    DWORD written = 0;
+    REQUIRE(WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), "ok", 2, &written, nullptr) && written == 2);
+    return 0;
+}
+
+int CheckSelectiveInheritance(const wchar_t* executable)
+{
+    SECURITY_ATTRIBUTES inherit{ sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE };
+    Handle event, mapping, excludedMapping, pipeRead, pipeWrite, ignoredRead, ignoredWrite;
+    event.value = CreateEventW(&inherit, TRUE, TRUE, nullptr);
+    mapping.value = CreateFileMappingW(INVALID_HANDLE_VALUE, &inherit, PAGE_READWRITE, 0, 4096, nullptr);
+    excludedMapping.value = CreateFileMappingW(INVALID_HANDLE_VALUE, &inherit, PAGE_READWRITE, 0, 4096, nullptr);
+    REQUIRE(event.value && mapping.value && excludedMapping.value);
+    REQUIRE(CreatePipe(&pipeRead.value, &pipeWrite.value, &inherit, 0));
+    REQUIRE(CreatePipe(&ignoredRead.value, &ignoredWrite.value, &inherit, 0));
+    View shared;
+    shared.bytes = static_cast<char*>(MapViewOfFile(mapping.value, FILE_MAP_WRITE, 0, 0, 0));
+    REQUIRE(shared.bytes);
+    shared.bytes[0] = 'p';
+
+    SIZE_T size = 0;
+    REQUIRE(!InitializeProcThreadAttributeList(nullptr, 1, 0, &size) && GetLastError() == ERROR_INSUFFICIENT_BUFFER && size);
+    std::vector<ULONG_PTR> buffer((size + sizeof(ULONG_PTR) - 1) / sizeof(ULONG_PTR));
+    struct Attributes
+    {
+        LPPROC_THREAD_ATTRIBUTE_LIST value;
+        bool initialized = false;
+        ~Attributes() { if (initialized) DeleteProcThreadAttributeList(value); }
+    } attributes{ reinterpret_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(buffer.data()) };
+    attributes.initialized = InitializeProcThreadAttributeList(attributes.value, 1, 0, &size) != FALSE;
+    REQUIRE(attributes.initialized);
+    HANDLE selected[] = { event.value, mapping.value, pipeWrite.value };
+    REQUIRE(UpdateProcThreadAttribute(attributes.value, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+        selected, sizeof(selected), nullptr, nullptr));
+
+    std::wstring command = L"\"" + std::wstring(executable) + L"\" " + CheckInheritedHandlesArgument;
+    for (const HANDLE value : { event.value, mapping.value, ignoredRead.value, excludedMapping.value })
+        command += std::to_wstring(reinterpret_cast<ULONG_PTR>(value)) + L" ";
+    STARTUPINFOEXW startup{};
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdOutput = startup.StartupInfo.hStdError = pipeWrite.value;
+    startup.lpAttributeList = attributes.value;
+    PROCESS_INFORMATION process{};
+    REQUIRE(CreateProcessW(executable, &command[0], nullptr, nullptr, TRUE,
+        EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED, nullptr, nullptr, &startup.StartupInfo, &process));
+    Handle thread, child;
+    thread.value = process.hThread;
+    child.value = process.hProcess;
+    pipeWrite.Reset();
+    mapping.Reset();
+    if (ResumeThread(thread.value) != 1)
+    {
+        TerminateProcess(child.value, ERROR_OPERATION_ABORTED);
+        return __LINE__;
+    }
+    REQUIRE(WaitForSingleObject(child.value, 15000) == WAIT_OBJECT_0);
+    REQUIRE(CheckChildExitCode(child.value, true, 0, L"Selective handle inheritance"));
+    REQUIRE(shared.bytes[0] == 'c');
+    char bytes[2]{};
+    DWORD read = 0;
+    REQUIRE(ReadFile(pipeRead.value, bytes, sizeof(bytes), &read, nullptr) && read == sizeof(bytes) &&
+        !std::memcmp(bytes, "ok", sizeof(bytes)));
+    return 0;
+}
+
+int InspectProcessHandles(DWORD processId, DWORD threadId)
+{
+    Handle process, thread, self;
+    process.value = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
+    thread.value = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, threadId);
+    REQUIRE(process.value && GetProcessId(process.value) == processId);
+    REQUIRE(thread.value && GetThreadId(thread.value) == threadId && GetProcessIdOfThread(thread.value) == processId);
+    REQUIRE(CheckChildExitCode(process.value, true, STILL_ACTIVE, L"Sibling process opened by ID"));
+    REQUIRE(CheckChildExitCode(thread.value, false, STILL_ACTIVE, L"Sibling thread opened by ID"));
+    self.value = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, TRUE, GetCurrentProcessId());
+    DWORD flags = 0;
+    REQUIRE(self.value && self.value != GetCurrentProcess());
+    REQUIRE(GetHandleInformation(self.value, &flags) && (flags & HANDLE_FLAG_INHERIT));
+    const HANDLE currentThread = GetCurrentThread();
+    REQUIRE(GetThreadId(currentThread) == GetCurrentThreadId());
+    Handle currentThreadCopy;
+    REQUIRE(DuplicateHandle(GetCurrentProcess(), currentThread, GetCurrentProcess(), &currentThreadCopy.value,
+        THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0));
+    REQUIRE(GetThreadId(currentThreadCopy.value) == GetCurrentThreadId());
+
+    struct NativeAttributes
+    {
+        ULONG length;
+        HANDLE root;
+        void* name;
+        ULONG attributes;
+        void* security;
+        void* qos;
+    } attributes{ sizeof(NativeAttributes) };
+    struct NativeId { HANDLE process, thread; } id{
+        reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(processId)),
+        reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(threadId))
+    };
+    using NtOpen = LONG (WINAPI*)(HANDLE*, DWORD, const NativeAttributes*, const NativeId*);
+    const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    const auto ntOpenProcess = reinterpret_cast<NtOpen>(GetProcAddress(ntdll, "NtOpenProcess"));
+    const auto ntOpenThread = reinterpret_cast<NtOpen>(GetProcAddress(ntdll, "NtOpenThread"));
+    Handle nativeProcess, nativeThread;
+    REQUIRE(ntOpenProcess && ntOpenThread);
+    const NativeId processOnly{ id.process, nullptr };
+    REQUIRE(ntOpenProcess(&nativeProcess.value, PROCESS_QUERY_LIMITED_INFORMATION, &attributes, &processOnly) == 0);
+    REQUIRE(ntOpenThread(&nativeThread.value, THREAD_QUERY_LIMITED_INFORMATION, &attributes, &id) == 0);
+    REQUIRE(GetProcessId(nativeProcess.value) == processId && GetThreadId(nativeThread.value) == threadId);
+    return 0;
+}
+
+int CheckSiblingInspection(const wchar_t* executable, DWORD targetProcess, DWORD targetThread)
+{
+    std::wstring command = L"\"" + std::wstring(executable) + L"\" " + InspectProcessArgument +
+        std::to_wstring(targetProcess) + L" " + std::to_wstring(targetThread);
+    STARTUPINFOW startup{ sizeof(STARTUPINFOW) };
+    PROCESS_INFORMATION process{};
+    REQUIRE(CreateProcessW(executable, &command[0], nullptr, nullptr, FALSE, 0, nullptr, nullptr, &startup, &process));
+    Handle processHandle, thread;
+    processHandle.value = process.hProcess;
+    thread.value = process.hThread;
+    REQUIRE(WaitForSingleObject(processHandle.value, 15000) == WAIT_OBJECT_0);
+    REQUIRE(CheckChildExitCode(processHandle.value, true, 0, L"Sibling process and thread inspection"));
+    return 0;
+}
+
+int CheckSuspendedProcess(const wchar_t* executable, bool cancel)
+{
+    std::wstring command = L"\"" + std::wstring(executable) + L"\" --exit-worker";
+    STARTUPINFOW startup{ sizeof(STARTUPINFOW) };
+    PROCESS_INFORMATION process{};
+    REQUIRE(CreateProcessW(executable, &command[0], nullptr, nullptr, FALSE, CREATE_SUSPENDED,
+        nullptr, nullptr, &startup, &process));
+    Handle primaryThread, processHandle;
+    primaryThread.value = process.hThread;
+    processHandle.value = process.hProcess;
+    const int result = [&]() -> int
+    {
+        REQUIRE(WaitForSingleObject(processHandle.value, 0) == WAIT_TIMEOUT);
+        REQUIRE(WaitForSingleObject(primaryThread.value, 0) == WAIT_TIMEOUT);
+        REQUIRE(CheckChildExitCode(primaryThread.value, false, STILL_ACTIVE, L"Primary thread created suspended"));
+        wchar_t path[MAX_PATH]{};
+        DWORD size = ARRAYSIZE(path);
+        REQUIRE(QueryFullProcessImageNameW(processHandle.value, 0, path, &size) &&
+            size == std::wcslen(path) && _wcsicmp(path, executable) == 0);
+        if (cancel)
+        {
+            Handle snapshot;
+            snapshot.value = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS | TH32CS_SNAPTHREAD, 0);
+            REQUIRE(snapshot.value != INVALID_HANDLE_VALUE);
+            PROCESSENTRY32W entry{ sizeof(PROCESSENTRY32W) };
+            BOOL found = Process32FirstW(snapshot.value, &entry);
+            while (found && entry.th32ProcessID != process.dwProcessId) found = Process32NextW(snapshot.value, &entry);
+            REQUIRE(found && entry.th32ParentProcessID == GetCurrentProcessId() && entry.cntThreads == 1);
+            THREADENTRY32 threadEntry{ sizeof(THREADENTRY32) };
+            found = Thread32First(snapshot.value, &threadEntry);
+            while (found && threadEntry.th32ThreadID != process.dwThreadId) found = Thread32Next(snapshot.value, &threadEntry);
+            REQUIRE(found && threadEntry.th32OwnerProcessID == process.dwProcessId);
+            if (const int inspection = CheckSiblingInspection(executable, process.dwProcessId, process.dwThreadId))
+                return inspection;
+            REQUIRE(TerminateProcess(processHandle.value, 91));
+        }
+        else REQUIRE(ResumeThread(primaryThread.value) == 1);
+        REQUIRE(WaitForSingleObject(processHandle.value, 15000) == WAIT_OBJECT_0);
+        REQUIRE(WaitForSingleObject(primaryThread.value, 0) == WAIT_OBJECT_0);
+        REQUIRE(CheckChildExitCode(processHandle.value, true, cancel ? 91u : 73u,
+            cancel ? L"Process canceled before startup" : L"Process resumed after creation"));
+        return 0;
+    }();
+    if (result && TerminateProcess(processHandle.value, 91))
+        WaitForSingleObject(processHandle.value, 15000);
+    return result;
+}
+
+int CheckSuspendedStartup(const wchar_t* executable)
+{
+    if (const int result = CheckSuspendedThread()) return result;
+    if (const int result = CheckSuspendedProcess(executable, false)) return result;
+    return CheckSuspendedProcess(executable, true);
+}
+
 DWORD WINAPI ExitFromWorker(void*)
 {
     Sleep(30);
@@ -65,6 +337,8 @@ DWORD WINAPI ExitFromWorker(void*)
 struct ThreadExitInputs { HANDLE mainThread; HANDLE gate; };
 ThreadExitInputs exitInputs{};
 
+DWORD WINAPI ThreadStartedAfterPrimaryExit(void*) { return 62; }
+
 DWORD WINAPI OutliveMainThread(void* parameter)
 {
     const auto& inputs = *static_cast<ThreadExitInputs*>(parameter);
@@ -72,6 +346,10 @@ DWORD WINAPI OutliveMainThread(void* parameter)
     mainThread.value = inputs.mainThread;
     REQUIRE(WaitForSingleObject(mainThread.value, 10000) == WAIT_OBJECT_0);
     REQUIRE(WaitForSingleObject(inputs.gate, 10000) == WAIT_OBJECT_0);
+    Handle thread;
+    thread.value = CreateThread(nullptr, 0, ThreadStartedAfterPrimaryExit, nullptr, 0, nullptr);
+    REQUIRE(thread.value && WaitForSingleObject(thread.value, 10000) == WAIT_OBJECT_0);
+    REQUIRE(CheckChildExitCode(thread.value, false, 62, L"Thread started after primary exit"));
     return 54;
 }
 
@@ -94,16 +372,58 @@ int CheckThreadShutdown(const wchar_t* executable, bool exitMainThread)
     Handle primaryThread, processHandle;
     primaryThread.value = process.hThread;
     processHandle.value = process.hProcess;
-    DWORD exit = 0;
+    Handle childModules;
+    bool remotePsapiVerified = false;
     if (exitMainThread)
     {
         REQUIRE(WaitForSingleObject(primaryThread.value, 15000) == WAIT_OBJECT_0);
-        REQUIRE(GetExitCodeThread(primaryThread.value, &exit) && exit == 13);
-        REQUIRE(GetExitCodeProcess(processHandle.value, &exit) && exit == STILL_ACTIVE);
+        REQUIRE(CheckChildExitCode(primaryThread.value, false, 13, L"ExitThread primary thread"));
+        REQUIRE(CheckChildExitCode(processHandle.value, true, STILL_ACTIVE, L"Process after primary thread exit"));
+        childModules.value = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, process.dwProcessId);
+        using EnumModules = BOOL (WINAPI*)(HANDLE, HMODULE*, DWORD, DWORD*);
+        using ModulePath = DWORD (WINAPI*)(HANDLE, HMODULE, LPWSTR, DWORD);
+        using ModuleInfo = BOOL (WINAPI*)(HANDLE, HMODULE, MODULEINFO*, DWORD);
+        const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+        const auto enumerate = reinterpret_cast<EnumModules>(GetProcAddress(kernel32, "K32EnumProcessModules"));
+        const auto getPath = reinterpret_cast<ModulePath>(GetProcAddress(kernel32, "K32GetModuleFileNameExW"));
+        const auto getInfo = reinterpret_cast<ModuleInfo>(GetProcAddress(kernel32, "K32GetModuleInformation"));
+        Handle limited;
+        limited.value = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process.dwProcessId);
+        HMODULE mainModule = nullptr;
+        DWORD needed = 0;
+        MODULEINFO info{};
+        wchar_t path[MAX_PATH]{};
+        wchar_t queriedImage[MAX_PATH]{};
+        DWORD imageLength = ARRAYSIZE(queriedImage);
+        char ansiImage[MAX_PATH]{};
+        DWORD ansiLength = ARRAYSIZE(ansiImage);
+        remotePsapiVerified = enumerate && getPath && getInfo && limited.value &&
+            QueryFullProcessImageNameW(limited.value, 0, queriedImage, &imageLength) &&
+            imageLength == std::wcslen(queriedImage) && _wcsicmp(queriedImage, executable) == 0 &&
+            QueryFullProcessImageNameA(limited.value, 0, ansiImage, &ansiLength) &&
+            ansiLength > 0 && ansiLength == std::strlen(ansiImage) &&
+            !enumerate(limited.value, &mainModule, sizeof(mainModule), &needed) &&
+            GetLastError() == ERROR_ACCESS_DENIED &&
+            getPath(limited.value, nullptr, path, ARRAYSIZE(path)) != 0 && _wcsicmp(path, executable) == 0 &&
+            enumerate(processHandle.value, &mainModule, sizeof(mainModule), &needed) &&
+            mainModule && needed >= sizeof(mainModule) &&
+            getInfo(processHandle.value, mainModule, &info, sizeof(info)) &&
+            info.lpBaseOfDll == mainModule && info.SizeOfImage > 0;
         REQUIRE(SetEvent(gate.value));
     }
     REQUIRE(WaitForSingleObject(processHandle.value, 15000) == WAIT_OBJECT_0);
-    REQUIRE(GetExitCodeProcess(processHandle.value, &exit) && exit == (exitMainThread ? 54u : 73u));
+    REQUIRE(CheckChildExitCode(processHandle.value, true, exitMainThread ? 54u : 73u,
+        exitMainThread ? L"Process after last worker exit" : L"ExitProcess from worker"));
+    if (exitMainThread)
+    {
+        REQUIRE(remotePsapiVerified);
+        REQUIRE(childModules.value != INVALID_HANDLE_VALUE);
+        MODULEENTRY32W entry{};
+        entry.dwSize = sizeof(entry);
+        REQUIRE(Module32FirstW(childModules.value, &entry) && entry.th32ProcessID == process.dwProcessId);
+        const auto separator = std::wcsrchr(executable, L'\\');
+        REQUIRE(entry.modBaseSize > 0 && _wcsicmp(entry.szModule, separator ? separator + 1 : executable) == 0);
+    }
     return 0;
 }
 
@@ -454,14 +774,34 @@ int CheckThreadSynchronization()
     entered.value = CreateEventW(nullptr, TRUE, FALSE, nullptr);
     REQUIRE(entered.value);
     AddressWaitTestState waiter{nativeWait, entered.value};
-    thread.value = CreateThread(nullptr, 0, WaitOnTestAddress, &waiter, 0, nullptr);
+    DWORD workerId = 0;
+    thread.value = CreateThread(nullptr, 0, WaitOnTestAddress, &waiter, 0, &workerId);
     REQUIRE(thread.value);
     const DWORD workerReady = WaitForSingleObject(entered.value, 5000);
+    Handle beforeExit;
+    beforeExit.value = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
     InterlockedExchange(&waiter.value, 1);
     WakeByAddressSingle(const_cast<LONG*>(&waiter.value));
     REQUIRE(WaitForSingleObject(thread.value, 5000) == WAIT_OBJECT_0 && workerReady == WAIT_OBJECT_0);
     DWORD threadStatus = MAXDWORD;
     REQUIRE(GetExitCodeThread(thread.value, &threadStatus) && threadStatus == 0);
+    thread.Reset();
+
+    Handle afterExit;
+    afterExit.value = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    REQUIRE(beforeExit.value != INVALID_HANDLE_VALUE && afterExit.value != INVALID_HANDLE_VALUE);
+    const auto containsThread = [](HANDLE snapshot, DWORD id)
+    {
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        for (BOOL valid = Thread32First(snapshot, &entry); valid; valid = Thread32Next(snapshot, &entry))
+            if (entry.th32OwnerProcessID == GetCurrentProcessId() && entry.th32ThreadID == id)
+                return true;
+        return false;
+    };
+    REQUIRE(containsThread(beforeExit.value, workerId));
+    REQUIRE(containsThread(afterExit.value, GetCurrentThreadId()));
+    REQUIRE(!containsThread(afterExit.value, workerId));
 
     CONDITION_VARIABLE condition;
     SRWLOCK lock;
@@ -1334,6 +1674,49 @@ int CheckNativeLoader(const wchar_t* temporaryPath)
 
     wchar_t executable[MAX_PATH]{};
     REQUIRE(GetModuleFileNameW(nullptr, executable, MAX_PATH) > 0);
+    using ModuleNameW = DWORD (WINAPI*)(HANDLE, HMODULE, LPWSTR, DWORD);
+    using ModuleNameA = DWORD (WINAPI*)(HANDLE, HMODULE, LPSTR, DWORD);
+    const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    const auto modulePathW = reinterpret_cast<ModuleNameW>(GetProcAddress(kernel32, "K32GetModuleFileNameExW"));
+    const auto moduleNameW = reinterpret_cast<ModuleNameW>(GetProcAddress(kernel32, "K32GetModuleBaseNameW"));
+    const auto modulePathA = reinterpret_cast<ModuleNameA>(GetProcAddress(kernel32, "K32GetModuleFileNameExA"));
+    const auto moduleNameA = reinterpret_cast<ModuleNameA>(GetProcAddress(kernel32, "K32GetModuleBaseNameA"));
+    REQUIRE(modulePathW && moduleNameW && modulePathA && moduleNameA);
+
+    const HANDLE self = GetCurrentProcess();
+    wchar_t queriedPath[MAX_PATH]{}, queriedName[MAX_PATH]{};
+    const auto separator = std::wcsrchr(executable, L'\\');
+    const auto expectedName = separator ? separator + 1 : executable;
+    REQUIRE(modulePathW(self, nullptr, queriedPath, ARRAYSIZE(queriedPath)) == std::wcslen(executable) &&
+        std::wcscmp(queriedPath, executable) == 0);
+    REQUIRE(moduleNameW(self, mainImage, queriedName, ARRAYSIZE(queriedName)) == std::wcslen(expectedName) &&
+        std::wcscmp(queriedName, expectedName) == 0);
+    char ansiPath[MAX_PATH]{}, ansiName[MAX_PATH]{};
+    REQUIRE(modulePathA(self, mainImage, ansiPath, ARRAYSIZE(ansiPath)) != 0);
+    REQUIRE(moduleNameA(self, nullptr, ansiName, ARRAYSIZE(ansiName)) == std::strlen(ansiName));
+    const auto ansiSeparator = std::strrchr(ansiPath, '\\');
+    REQUIRE(ansiName[0] && std::strcmp(ansiName, ansiSeparator ? ansiSeparator + 1 : ansiPath) == 0);
+
+    Handle snapshot, snapshotAlias;
+    snapshot.value = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPPROCESS, GetCurrentProcessId());
+    REQUIRE(snapshot.value != INVALID_HANDLE_VALUE);
+    REQUIRE(DuplicateHandle(self, snapshot.value, self, &snapshotAlias.value, 0, FALSE, DUPLICATE_SAME_ACCESS));
+    snapshot.Reset();
+    MODULEENTRY32W moduleEntry{};
+    moduleEntry.dwSize = sizeof(moduleEntry);
+    REQUIRE(Module32FirstW(snapshotAlias.value, &moduleEntry));
+    REQUIRE(moduleEntry.hModule == mainImage && moduleEntry.th32ProcessID == GetCurrentProcessId());
+    REQUIRE(moduleEntry.modBaseSize != 0 && _wcsicmp(moduleEntry.szModule, expectedName) == 0);
+    PROCESSENTRY32W processEntry{};
+    processEntry.dwSize = sizeof(processEntry);
+    BOOL foundSelf = Process32FirstW(snapshotAlias.value, &processEntry);
+    while (foundSelf && processEntry.th32ProcessID != GetCurrentProcessId())
+        foundSelf = Process32NextW(snapshotAlias.value, &processEntry);
+    REQUIRE(foundSelf && processEntry.cntThreads > 0 && _wcsicmp(processEntry.szExeFile, expectedName) == 0);
+    while (Module32NextW(snapshotAlias.value, &moduleEntry)) {}
+    REQUIRE(GetLastError() == ERROR_NO_MORE_FILES);
+    REQUIRE(Module32FirstW(snapshotAlias.value, &moduleEntry) && moduleEntry.hModule == mainImage);
+
     TemporaryFile copy;
     REQUIRE(GetTempFileNameW(temporaryPath, L"ldr", 0, copy.path));
     REQUIRE(CopyFileW(executable, copy.path, FALSE));
@@ -1362,6 +1745,11 @@ int CheckNativeLoader(const wchar_t* temporaryPath)
     REQUIRE(lookup(nullptr, nullptr, &name, &found) == static_cast<LONG>(0xc0000135u) && found == module);
     module = LoadLibraryExW(copy.path, nullptr, DONT_RESOLVE_DLL_REFERENCES | LOAD_WITH_ALTERED_SEARCH_PATH);
     REQUIRE(module && FreeLibrary(module));
+    module = LoadLibraryExW(copy.path, nullptr, LOAD_LIBRARY_AS_DATAFILE);
+    REQUIRE(module);
+    const DWORD resourcePathLength = modulePathW(self, module, queriedPath, ARRAYSIZE(queriedPath));
+    REQUIRE(FreeLibrary(module));
+    REQUIRE(resourcePathLength == 0);
     return 0;
 }
 
@@ -1592,6 +1980,8 @@ int CheckMultipleWaits()
     REQUIRE(WaitForSingleObject(event.value, 0) == WAIT_OBJECT_0);
     constexpr UINT testMessage = WM_APP + 2;
     REQUIRE(SetEvent(event.value) && PostThreadMessageW(GetCurrentThreadId(), testMessage, 0, 0));
+    REQUIRE(PeekMessageW(&message, nullptr, testMessage, testMessage, PM_NOREMOVE));
+    REQUIRE(MsgWaitForMultipleObjectsEx(1, &event.value, 0, QS_POSTMESSAGE, MWMO_WAITALL) == WAIT_TIMEOUT);
     REQUIRE(MsgWaitForMultipleObjectsEx(1, &event.value, 0, QS_POSTMESSAGE, messageFlags) == WAIT_OBJECT_0);
     REQUIRE(PeekMessageW(&message, nullptr, testMessage, testMessage, PM_REMOVE));
     REQUIRE(WaitForSingleObject(event.value, 0) == WAIT_TIMEOUT);
@@ -1600,6 +1990,17 @@ int CheckMultipleWaits()
 }
 static int RunFileContracts(PWSTR command)
 {
+    const wchar_t* inheritance = command ? std::wcsstr(command, CheckInheritedHandlesArgument) : nullptr;
+    if (inheritance) return CheckInheritedHandles(inheritance + ARRAYSIZE(CheckInheritedHandlesArgument) - 1);
+    const wchar_t* inspection = command ? std::wcsstr(command, InspectProcessArgument) : nullptr;
+    if (inspection)
+    {
+        wchar_t* thread = nullptr;
+        const DWORD processId = std::wcstoul(inspection + ARRAYSIZE(InspectProcessArgument) - 1, &thread, 10);
+        const DWORD threadId = std::wcstoul(thread, nullptr, 10);
+        REQUIRE(processId && threadId);
+        return InspectProcessHandles(processId, threadId);
+    }
     const wchar_t* argument = command ? std::wcsstr(command, L"--writer ") : nullptr;
     if (argument)
         return ChildWriter(reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(std::wcstoull(argument + 9, nullptr, 10))));
@@ -1663,16 +2064,15 @@ static int RunFileContracts(PWSTR command)
     reopenedThread.value = OpenThread(SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, process.dwThreadId);
     REQUIRE(reopenedProcess.value && reopenedThread.value);
     REQUIRE(GetProcessId(processCopy.value) == process.dwProcessId);
-    DWORD exit = 0;
-    REQUIRE(GetExitCodeProcess(processCopy.value, &exit) && exit == STILL_ACTIVE);
+    REQUIRE(CheckChildExitCode(processCopy.value, true, STILL_ACTIVE, L"Writer before release"));
     REQUIRE(WaitForSingleObject(processCopy.value, 0) == WAIT_TIMEOUT);
     gate.Reset();
     REQUIRE(SetEvent(signal.value));
     signal.Reset();
     REQUIRE(WaitForSingleObject(reopenedThread.value, 15000) == WAIT_OBJECT_0);
-    REQUIRE(GetExitCodeThread(reopenedThread.value, &exit) && exit == 0);
+    REQUIRE(CheckChildExitCode(reopenedThread.value, false, 0, L"Writer primary thread"));
     REQUIRE(WaitForSingleObject(processCopy.value, 15000) == WAIT_OBJECT_0);
-    REQUIRE(GetExitCodeProcess(reopenedProcess.value, &exit) && exit == 0);
+    REQUIRE(CheckChildExitCode(reopenedProcess.value, true, 0, L"Writer process"));
     REQUIRE(SetFilePointerEx(duplicate.value, distance, &position, FILE_CURRENT) && position.QuadPart == 7);
     REQUIRE(WriteFile(duplicate.value, "tail", 4, &done, nullptr) && done == 4);
     REQUIRE(SetFilePointerEx(duplicate.value, distance, nullptr, FILE_BEGIN));
@@ -1728,7 +2128,11 @@ static int RunFileContracts(PWSTR command)
     const int multipleWaits = CheckMultipleWaits();
     if (multipleWaits) return multipleWaits;
     const int workerShutdown = CheckThreadShutdown(executable, false);
-    return workerShutdown ? workerShutdown : CheckThreadShutdown(executable, true);
+    if (workerShutdown) return workerShutdown;
+    const int primaryShutdown = CheckThreadShutdown(executable, true);
+    if (primaryShutdown) return primaryShutdown;
+    if (const int suspended = CheckSuspendedStartup(executable)) return suspended;
+    return CheckSelectiveInheritance(executable);
 }
 
 #ifdef BRIDGE_VALIDATION_SUITE
@@ -1746,6 +2150,20 @@ namespace
     template<int (*Test)()>
     int SyncCase(HWND) { return Test(); }
 
+    int SuspendedStartup(HWND)
+    {
+        wchar_t path[MAX_PATH]{};
+        REQUIRE(GetModuleFileNameW(nullptr, path, ARRAYSIZE(path)));
+        return CheckSuspendedStartup(path);
+    }
+
+    int SelectiveInheritance(HWND)
+    {
+        wchar_t path[MAX_PATH]{};
+        REQUIRE(GetModuleFileNameW(nullptr, path, ARRAYSIZE(path)));
+        return CheckSelectiveInheritance(path);
+    }
+
     int ProcessShutdown(HWND)
     {
         wchar_t path[MAX_PATH]{};
@@ -1760,7 +2178,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int)
 {
 #ifdef BRIDGE_VALIDATION_SUITE
     if (!command || (!std::wcsstr(command, L"--writer ") && !std::wcsstr(command, L"--exit-main-thread ") &&
-        !std::wcsstr(command, L"--exit-worker")))
+        !std::wcsstr(command, L"--exit-worker") && !std::wcsstr(command, InspectProcessArgument) &&
+        !std::wcsstr(command, CheckInheritedHandlesArgument)))
     {
         Validation::Log log(L"FileHandleContracts");
         const Validation::Button choices[] = {
@@ -1779,8 +2198,13 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR command, int)
             {L"Multi-object waits", SyncCase<CheckMultipleWaits>},
             {L"Thread synchronization", SyncCase<CheckThreadSynchronization>},
             {L"Process and thread shutdown", ProcessShutdown},
+            {L"Suspended process and thread startup", SuspendedStartup},
+            {L"Selective handle inheritance", SelectiveInheritance},
         };
-        return Validation::Panel(instance, log, choices, ARRAYSIZE(choices)).Show(L"Files, loader and synchronization") == -1 ? 0 : 1;
+        processLog = &log;
+        const auto result = Validation::Panel(instance, log, choices, ARRAYSIZE(choices)).Show(L"Files, loader and synchronization");
+        processLog = nullptr;
+        return result == -1 ? 0 : 1;
     }
 #else
     (void)instance;

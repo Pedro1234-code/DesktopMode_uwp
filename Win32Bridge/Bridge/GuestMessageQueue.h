@@ -34,8 +34,10 @@ namespace Bridge
 
         // Queues a posted message.  A null HWND represents a thread message.
         // Returns false when the bounded queue is full or has been closed.
-        bool Post(HWND hwnd, UINT message, WPARAM wParam = 0, LPARAM lParam = 0);
-        bool Post(const GuestAbi::Message& message);
+        bool Post(HWND hwnd, UINT message, WPARAM wParam = 0, LPARAM lParam = 0,
+            UINT queueBits = QS_POSTMESSAGE);
+        bool Post(const GuestAbi::Message& message, UINT queueBits = QS_POSTMESSAGE);
+        DWORD GetStatus(UINT mask, bool clearChanges);
 
         // Timers are low-priority queue work in USER32.  Retain at most one
         // pending WM_TIMER for a given (HWND, id) pair, so a slow guest message
@@ -86,7 +88,13 @@ namespace Bridge
         bool WaitForMessage(DWORD milliseconds = INFINITE);
 
     private:
-        using MessageList = std::deque<GuestAbi::Message>;
+        struct Entry : GuestAbi::Message
+        {
+            Entry(const GuestAbi::Message& message, UINT bits)
+                : GuestAbi::Message(message), queueBits(bits) {}
+            UINT queueBits;
+        };
+        using MessageList = std::deque<Entry>;
 
         static bool Matches(
             const GuestAbi::Message& message,
@@ -103,6 +111,7 @@ namespace Bridge
         mutable std::mutex m_mutex;
         std::condition_variable m_messageAvailable;
         MessageList m_messages;
+        UINT m_changedBits = 0;
         bool m_closed = false;
     };
 }

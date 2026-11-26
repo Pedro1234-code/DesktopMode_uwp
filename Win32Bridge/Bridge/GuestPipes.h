@@ -5,6 +5,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -114,25 +115,19 @@ public:
         }
         catch (const std::bad_alloc&) { *error = ERROR_NOT_ENOUGH_MEMORY; return false; }
     }
-    void Inherit(const GuestPipeContext& parent)
+    void Inherit(const GuestPipeContext& parent, const std::unordered_set<ULONG_PTR>* selected = nullptr)
     {
         if (this == &parent) return;
         std::unique_lock<std::mutex> a(lock, std::defer_lock), b(parent.lock, std::defer_lock); std::lock(a,b);
         std::unordered_map<ULONG_PTR, Entry> fresh;
         for (const auto& item : parent.handles)
-            if (item.second.flags & 1u)
+            if ((item.second.flags & 1u) && (!selected || selected->count(item.first)))
             {
                 const auto& source = item.second.endpoint;
                 fresh.emplace(item.first, Entry{std::make_shared<Endpoint>(source->pipe, source->writer), item.second.flags});
             }
         handles.swap(fresh);
         for (auto& old : fresh) old.second.endpoint->Close();
-    }
-    void Adopt(GuestPipeContext& source)
-    {
-        if (this == &source) return;
-        std::unique_lock<std::mutex> a(lock, std::defer_lock), b(source.lock, std::defer_lock); std::lock(a,b);
-        handles.swap(source.handles);
     }
     bool Read(HANDLE value, BYTE* buffer, DWORD count, DWORD* done, DWORD* error)
     {

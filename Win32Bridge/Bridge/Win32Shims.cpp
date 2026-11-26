@@ -639,6 +639,7 @@ static ImportResolution ResolveRuntimeImportDirect(const ImportedSymbol& symbol)
     if (versionResolution.targetAddress != 0) return versionResolution;
     if (_wcsicmp(canonical.library.c_str(), L"kernel32.dll") == 0 ||
         _wcsicmp(canonical.library.c_str(), L"kernelbase.dll") == 0 ||
+        _wcsicmp(canonical.library.c_str(), L"psapi.dll") == 0 ||
         _wcsicmp(canonical.library.c_str(), L"ntdll.dll") == 0)
     {
         return ResolveKernel32Import(canonical);
