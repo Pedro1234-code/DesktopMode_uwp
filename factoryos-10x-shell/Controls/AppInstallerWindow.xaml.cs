@@ -106,7 +106,9 @@ namespace factoryos_10x_shell.Controls
         {
             if (m_running || !m_ready) return;
             if (m_installed) { CloseRequested?.Invoke(); return; }
+            bool repackAndSign = RepackAndSign.IsChecked == true;
             m_running = true;
+            RepackAndSign.IsEnabled = false;
             ConnectionHelp.Visibility = Visibility.Collapsed;
             PackageDetailsScroll.Visibility = Visibility.Visible;
             CancelButton.Content = "Hide";
@@ -115,11 +117,13 @@ namespace factoryos_10x_shell.Controls
             SetInstallOptionsEnabled(false);
             InstallProgress.Visibility = Visibility.Visible;
             Heading.Text = "Installing " + PackageTitle;
+            if (repackAndSign) Status.Text = "Preparing to repack and sign…";
             try
             {
                 string launchNotice = await AppPackageService.InstallAsync(m_package, m_dependencies, Username.Text, Password.Password,
                     TrustLocalCertificate.IsChecked == true, new Progress<string>(message => { if (m_running) Status.Text = message; }),
-                    LaunchWhenReady.IsChecked == true, m_preview.IdentityName, m_preview.ApplicationId);
+                    LaunchWhenReady.IsChecked == true, m_preview.IdentityName, m_preview.ApplicationId,
+                    repackAndSign, m_preview.Architecture, m_preview.Version);
                 m_installed = true;
                 CancelButton.Visibility = Visibility.Collapsed;
                 Heading.Text = PackageTitle + " is installed!";
@@ -157,6 +161,7 @@ namespace factoryos_10x_shell.Controls
                 m_running = false;
                 CancelButton.Content = "Close";
                 LaunchWhenReady.IsEnabled = !m_installed && !string.IsNullOrEmpty(m_preview.ApplicationId);
+                RepackAndSign.IsEnabled = !m_installed;
                 InstallButton.IsEnabled = true;
                 SetInstallOptionsEnabled(!m_installed);
                 InstallProgress.Visibility = Visibility.Collapsed;

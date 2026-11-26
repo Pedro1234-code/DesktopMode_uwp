@@ -553,29 +553,43 @@ int32_t DownloadBroker::PickFile(int32_t mode, const char* title,
   auto output = std::make_shared<std::string>();
   auto extensionsList = ParseExtensions(extensions);
   std::wstring pickerTitle = Widen(title);
-  std::wstring suggestedName = Widen(defaultName);
+  std::wstring suggestedNameOrFolderButtonLabel = Widen(defaultName);
 
   gDispatcher.RunAsync(CoreDispatcherPriority::Normal,
                        [mode, pickerTitle = std::move(pickerTitle),
-                        suggestedName = std::move(suggestedName),
+                        suggestedNameOrFolderButtonLabel =
+                            std::move(suggestedNameOrFolderButtonLabel),
                         extensionsList = std::move(extensionsList), output,
                         completed]() mutable {
     try {
-      if (mode == 2) {
+      // Mode 4 is a host-only extension from nsFilePicker::ShowFolderPicker.
+      constexpr int32_t kUploadFolderPickerMode = 4;
+      constexpr int32_t kDownloadFolderPickerMode = 2;
+      const bool forDownloads = mode == kDownloadFolderPickerMode;
+      if (forDownloads || mode == kUploadFolderPickerMode) {
         FolderPicker picker;
         picker.ViewMode(PickerViewMode::List);
         picker.SuggestedStartLocation(PickerLocationId::Downloads);
-        picker.SettingsIdentifier(L"GeckoDownloads");
-        picker.CommitButtonText(L"Use for downloads");
+        if (forDownloads) {
+          picker.SettingsIdentifier(L"GeckoDownloads");
+          picker.CommitButtonText(L"Use for downloads");
+        } else {
+          picker.SettingsIdentifier(L"GeckoFolderUpload");
+          picker.CommitButtonText(suggestedNameOrFolderButtonLabel.empty()
+                                      ? L"Select folder"
+                                      : suggestedNameOrFolderButtonLabel.c_str());
+        }
         picker.FileTypeFilter().Append(L"*");
         auto operation = picker.PickSingleFolderAsync();
-        operation.Completed([output, completed](auto const& async,
-                                                AsyncStatus status) {
+        operation.Completed([output, completed, forDownloads](
+                                auto const& async, AsyncStatus status) {
           try {
             if (status == AsyncStatus::Completed) {
               auto folder = async.GetResults();
               if (folder) {
-                RememberDestination(folder);
+                if (forDownloads) {
+                  RememberDestination(folder);
+                }
                 *output = Narrow(std::wstring(folder.Path()));
               }
             }
@@ -586,6 +600,7 @@ int32_t DownloadBroker::PickFile(int32_t mode, const char* title,
           ::SetEvent(completed);
         });
       } else if (mode == 1) {
+        const auto& suggestedName = suggestedNameOrFolderButtonLabel;
         FileSavePicker picker;
         picker.SuggestedStartLocation(PickerLocationId::Downloads);
         picker.SettingsIdentifier(L"GeckoSaveAs");

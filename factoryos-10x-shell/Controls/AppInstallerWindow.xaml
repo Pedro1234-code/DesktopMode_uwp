@@ -47,6 +47,8 @@
    </ScrollViewer>
    <StackPanel Grid.Row="2" Margin="24,8,24,18" Spacing="10">
     <ProgressBar x:Name="InstallProgress" Height="4" IsIndeterminate="True"/><TextBlock x:Name="Status" TextWrapping="Wrap" MaxHeight="70" IsTextSelectionEnabled="True" AutomationProperties.LiveSetting="Polite"/>
+    <CheckBox x:Name="RepackAndSign" Content="Add Mouse support" FontSize="13"
+              ToolTipService.ToolTip="Install a separate test copy signed with the local TestPub certificate."/>
     <Grid Margin="0,0,0,24"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="120"/><ColumnDefinition Width="12"/><ColumnDefinition Width="120"/></Grid.ColumnDefinitions>
      <CheckBox x:Name="LaunchWhenReady" Content="Launch when ready" IsChecked="True" FontSize="13" VerticalAlignment="Center"/>
      <Button x:Name="InstallButton" Grid.Column="1" Content="Install" IsEnabled="False" Click="Install_Click" Style="{StaticResource InstallerAction}" Background="{ThemeResource SystemControlHighlightAccentBrush}" Foreground="White"/>

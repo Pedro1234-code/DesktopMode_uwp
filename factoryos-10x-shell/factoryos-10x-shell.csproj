@@ -191,6 +191,9 @@
     </Compile>
     <Compile Include="Services\Helpers\DevicePortalSettingsService.cs" />
     <Compile Include="Services\Files\AppPackageService.cs" />
+    <Compile Include="Services\Files\AppPackageRepackService.cs" />
+    <Compile Include="Services\Files\AppPackageRepackWriter.cs" />
+    <Compile Include="Services\Files\AppPackageSignature.cs" />
     <Compile Include="Controls\AppInstallerWindow.xaml.cs">
       <DependentUpon>AppInstallerWindow.xaml</DependentUpon>
     </Compile>

@@ -42,17 +42,29 @@ namespace factoryos_10x_shell.Services.Files
             using (var archive = new ZipArchive(input, ZipArchiveMode.Read))
             {
                 var bundle = Entry(archive, "AppxMetadata/AppxBundleManifest.xml");
-                if (bundle == null) return ReadPackage(archive);
+                if (bundle == null)
+                {
+                    if (AppPackageRepackService.IsBundle(file))
+                        throw new InvalidDataException("The bundle manifest is missing.");
+                    return ReadPackage(archive);
+                }
                 var manifest = ReadXml(bundle);
                 string architecture = Windows.ApplicationModel.Package.Current.Id.Architecture.ToString().ToLowerInvariant();
                 var package = manifest.Descendants().Where(e => e.Name.LocalName == "Package" &&
+                    e.Parent?.Name.LocalName == "Packages" &&
                     string.Equals((string)e.Attribute("Type"), "application", StringComparison.OrdinalIgnoreCase))
-                    .Where(e => string.Equals((string)e.Attribute("Architecture"), architecture, StringComparison.OrdinalIgnoreCase) ||
-                        string.Equals((string)e.Attribute("Architecture"), "neutral", StringComparison.OrdinalIgnoreCase))
-                    .OrderByDescending(e => string.Equals((string)e.Attribute("Architecture"), architecture, StringComparison.OrdinalIgnoreCase)).FirstOrDefault();
+                    .Where(e => string.Equals((string)e.Attribute("Architecture") ?? "neutral", architecture, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals((string)e.Attribute("Architecture") ?? "neutral", "neutral", StringComparison.OrdinalIgnoreCase))
+                    .OrderByDescending(e => string.Equals((string)e.Attribute("Architecture"), architecture, StringComparison.OrdinalIgnoreCase))
+                    .FirstOrDefault();
                 if (package == null) throw new InvalidDataException("This bundle has no application package for " + architecture + ".");
-                var payload = Entry(archive, (string)package.Attribute("FileName"));
-                if (payload == null) throw new InvalidDataException("The bundle references a missing file: " + (string)package.Attribute("FileName"));
+                string fileName = NormalizePackagePath((string)package.Attribute("FileName"));
+                if (string.IsNullOrWhiteSpace(fileName))
+                    throw new InvalidDataException("The bundle does not name its application package.");
+                string decodedFileName = Uri.UnescapeDataString(fileName);
+                var payload = Entry(archive, fileName) ?? archive.Entries.FirstOrDefault(e =>
+                    string.Equals(Uri.UnescapeDataString(NormalizePackagePath(e.FullName)), decodedFileName, StringComparison.OrdinalIgnoreCase));
+                if (payload == null) throw new InvalidDataException("The bundle references a missing file: " + fileName);
                 if (payload.CompressedLength == payload.Length &&
                     long.TryParse((string)package.Attribute("Offset"), out long offset) && offset >= 0 &&
                     payload.Length <= input.Length && offset <= input.Length - payload.Length &&
@@ -188,11 +200,24 @@ namespace factoryos_10x_shell.Services.Files
 
         internal static async Task<string> InstallAsync(StorageFile package, System.Collections.Generic.IReadOnlyList<StorageFile> dependencies,
             string username, string password, bool trustLocalCertificate, IProgress<string> progress,
-            bool launchWhenReady = false, string identityName = null, string applicationId = null)
+            bool launchWhenReady = false, string identityName = null, string applicationId = null, bool repackAndSign = false,
+            string architecture = null, string version = null)
         {
             if (!await InstallLock.WaitAsync(0)) throw new InvalidOperationException("Another installation is already in progress.");
+            StorageFolder repackFolder = null;
             try
             {
+                bool isBundle = AppPackageRepackService.IsBundle(package);
+                StorageFile certificate = null;
+                if (repackAndSign)
+                {
+                    repackFolder = await ApplicationData.Current.TemporaryFolder.CreateFolderAsync(
+                        "AppInstaller-Repack", CreationCollisionOption.GenerateUniqueName);
+                    certificate = await repackFolder.CreateFileAsync("DesktopMode-TestPub.cer");
+                    identityName = AppPackageRepackService.NewIdentity();
+                    package = await AppPackageRepackService.CreateAsync(package, repackFolder, certificate, identityName, progress);
+                }
+
                 using (var timeout = new CancellationTokenSource(TimeSpan.FromMinutes(20)))
                 using (var filter = new HttpBaseProtocolFilter())
                 {
@@ -224,10 +249,11 @@ namespace factoryos_10x_shell.Services.Files
                             if ((int)state.StatusCode == 204) throw new InvalidOperationException("Device Portal is already installing another package. Wait for it to finish.");
                         using (var body = new HttpMultipartFormDataContent())
                         {
-                            if (dependencies.Select(file => file.Name).Concat(new[] { package.Name }).Distinct(StringComparer.OrdinalIgnoreCase).Count() != dependencies.Count + 1)
+                            var files = new[] { package }.Concat(dependencies);
+                            if (certificate != null) files = files.Concat(new[] { certificate });
+                            if (files.GroupBy(file => file.Name, StringComparer.OrdinalIgnoreCase).Any(group => group.Count() > 1))
                                 throw new InvalidOperationException("The selected packages have duplicate file names. Select each dependency only once.");
-                            await AddFileAsync(body, package);
-                            foreach (var dependency in dependencies) await AddFileAsync(body, dependency);
+                            foreach (var file in files) await AddFileAsync(body, file);
                             progress.Report("Sending package to Device Portal…");
                             var uploadProgress = new Progress<HttpProgress>(value => {
                                 ulong total = value.TotalBytesToSend.GetValueOrDefault();
@@ -260,13 +286,14 @@ namespace factoryos_10x_shell.Services.Files
                                     using (var packages = await client.GetAsync(new Uri(Portal, "api/app/packagemanager/packages")).AsTask(timeout.Token))
                                     {
                                         CheckResponse(packages);
-                                        var installed = JObject.Parse(await packages.Content.ReadAsStringAsync())["InstalledPackages"]?.FirstOrDefault(
-                                            item => !string.IsNullOrEmpty(identityName) &&
-                                                ((string)item["PackageFullName"])?.StartsWith(identityName + "_", StringComparison.OrdinalIgnoreCase) == true);
+                                        var installed = FindInstalledPackage(
+                                            JObject.Parse(await packages.Content.ReadAsStringAsync())["InstalledPackages"],
+                                            identityName, architecture, version, applicationId, isBundle);
                                         fullName = (string)installed?["PackageFullName"];
                                         if (string.IsNullOrEmpty(fullName)) throw new InvalidOperationException("The installed package could not be found for registration verification.");
                                         string relativeId = (string)installed["PackageRelativeId"];
-                                        if (!string.IsNullOrEmpty(relativeId)) appId = relativeId;
+                                        if ((!isBundle || string.IsNullOrEmpty(appId)) && !string.IsNullOrEmpty(relativeId))
+                                            appId = relativeId;
                                     }
                                     progress.Report("Checking app registration…");
                                     await EnsureCurrentUserRegistrationAsync(fullName, progress, timeout.Token);
@@ -294,7 +321,34 @@ namespace factoryos_10x_shell.Services.Files
                 }
             }
             catch (OperationCanceledException) { throw new TimeoutException("Device Portal did not finish in time. Installation may still be running; check the portal before trying again."); }
-            finally { InstallLock.Release(); }
+            finally
+            {
+                try
+                {
+                    if (repackFolder != null) await repackFolder.DeleteAsync(StorageDeleteOption.PermanentDelete);
+                }
+                catch (Exception error)
+                {
+                    factoryos_10x_shell.Services.Helpers.ShellDiagnostics.WriteDebug(
+                        "App Installer: temporary repack cleanup failed: 0x" + error.HResult.ToString("X8"));
+                }
+                finally { InstallLock.Release(); }
+            }
+        }
+
+        private static JToken FindInstalledPackage(JToken packages, string identityName, string architecture,
+            string version, string applicationId, bool isBundle)
+        {
+            if (packages == null || string.IsNullOrEmpty(identityName)) return null;
+            return packages.Children()
+                .Select(item => new { Item = item, Parts = ((string)item["PackageFullName"] ?? "").Split('_') })
+                .Where(entry => entry.Parts.Length == 5 && (!isBundle || entry.Parts[3].Length == 0) &&
+                    string.Equals(entry.Parts[0], identityName, StringComparison.OrdinalIgnoreCase))
+                .OrderByDescending(entry => string.Equals(entry.Parts[2], architecture, StringComparison.OrdinalIgnoreCase))
+                .ThenByDescending(entry => string.Equals(entry.Parts[1], version, StringComparison.Ordinal))
+                .ThenByDescending(entry => !string.IsNullOrEmpty(applicationId) &&
+                    string.Equals((string)entry.Item["PackageRelativeId"], applicationId, StringComparison.OrdinalIgnoreCase))
+                .Select(entry => entry.Item).FirstOrDefault();
         }
 
         private static Task EnsureCurrentUserRegistrationAsync(string fullName, IProgress<string> progress, CancellationToken cancellation)
