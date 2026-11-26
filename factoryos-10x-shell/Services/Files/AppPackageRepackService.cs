@@ -63,7 +63,7 @@ namespace factoryos_10x_shell.Services.Files
 
         internal static string NewIdentity()
         {
-            const string prefix = "Alguma.Coisa.";
+            const string prefix = "Microsoft.MicrosoftEdge.";
 
             var name = new StringBuilder(prefix);
             while (name.Length < prefix.Length + 8)

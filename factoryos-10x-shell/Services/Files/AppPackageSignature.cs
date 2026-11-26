@@ -9,7 +9,7 @@ namespace factoryos_10x_shell.Services.Files
 {
     internal static class AppPackageSignature
     {
-        internal const string Publisher = "CN=TestPub";
+        internal const string Publisher = "CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond, S=Washington, C=US";
         private const string IndirectData = "1.3.6.1.4.1.311.2.1.4";
         private const string Sha256 = "2.16.840.1.101.3.4.2.1";
         private const string Rsa = "1.2.840.113549.1.1.1";
