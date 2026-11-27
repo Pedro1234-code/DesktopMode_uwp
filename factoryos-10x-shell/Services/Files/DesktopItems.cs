@@ -87,6 +87,7 @@ namespace factoryos_10x_shell.Services.Files
                 case "CoreShell.Files": AppState.Instance.RequestFilesOpen(resetFiles); return true;
                 case "CoreShell.Notepad": AppState.Instance.RequestNotepadOpen(); return true;
                 case "CoreShell.Settings": AppState.Instance.RequestSettingsOpen(); return true;
+                case "CoreShell.Store": AppState.Instance.RequestStoreOpen(); return true;
                 case "CoreShell.Calculator": AppState.Instance.RequestCalculatorOpen(); return true;
                 case "CoreShell.Firefox": AppState.Instance.RequestFirefoxOpen(); return true;
                 default: return await appHelper.LaunchAppAsync(model);

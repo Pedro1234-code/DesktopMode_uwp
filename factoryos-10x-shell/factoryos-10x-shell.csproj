@@ -155,6 +155,13 @@
     <Compile Include="Controls\SettingsWindow.xaml.cs">
       <DependentUpon>SettingsWindow.xaml</DependentUpon>
     </Compile>
+    <Compile Include="Services\Store\StoreCatalog.cs" />
+    <Compile Include="Services\Store\StoreDelivery.cs" />
+    <Content Include="Services\Store\*.xml" />
+    <Content Include="Services\Store\StoreLib-LICENSE.txt" />
+    <Compile Include="Controls\StoreWindow.xaml.cs">
+      <DependentUpon>StoreWindow.xaml</DependentUpon>
+    </Compile>
     <Compile Include="Controls\CalculatorWindow.xaml.cs">
       <DependentUpon>CalculatorWindow.xaml</DependentUpon>
     </Compile>
@@ -191,6 +198,7 @@
     </Compile>
     <Compile Include="Services\Helpers\DevicePortalSettingsService.cs" />
     <Compile Include="Services\Files\AppPackageService.cs" />
+    <Compile Include="Services\Files\RepackedAppRegistry.cs" />
     <Compile Include="Services\Files\AppPackageRepackService.cs" />
     <Compile Include="Services\Files\AppPackageRepackWriter.cs" />
     <Compile Include="Services\Files\AppPackageSignature.cs" />
@@ -247,6 +255,10 @@
   <ItemGroup>
     <Content Include="Assets\Terminal\fit.js" />
     <Content Include="Assets\Terminal\terminal.png" />
+    <Content Include="Assets\Store\Store.png" />
+    <Content Include="Assets\Store\StoreIcons.ttf" />
+    <Content Include="Assets\Store\*Tile.png" />
+    <Content Include="Assets\Store\*Cover.jpg" />
     <Content Include="Assets\Terminal\index.html" />
     <Content Include="Assets\Terminal\LICENSE-fit" />
     <Content Include="Assets\Terminal\LICENSE-xterm" />
@@ -422,6 +434,10 @@
     <Page Include="Controls\SettingsWindow.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
+    </Page>
+    <Page Include="Controls\StoreWindow.xaml">
+      <Generator>MSBuild:Compile</Generator>
+      <SubType>Designer</SubType>
     </Page>
     <Page Include="Controls\CalculatorWindow.xaml">
       <SubType>Designer</SubType>

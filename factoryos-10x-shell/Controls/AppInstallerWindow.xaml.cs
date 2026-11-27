@@ -33,7 +33,25 @@ namespace factoryos_10x_shell.Controls
         internal bool OpensPackage(StorageFile file) => m_package?.IsEqual(file) == true;
         internal void ActivateFromTaskbar() => ActivationRequested?.Invoke();
 
-        public AppInstallerWindow() { InitializeComponent(); }
+        public AppInstallerWindow()
+        {
+            InitializeComponent();
+            RepackAndSign.Checked += RepackOptionChanged;
+            RepackAndSign.Unchecked += RepackOptionChanged;
+        }
+
+        private bool HasUpdate(bool repacked) => m_preview != null &&
+            Version.TryParse(m_preview.OriginalVersion, out var version) &&
+            RepackedAppRegistry.InstalledVersion(m_preview.OriginalIdentityName, repacked) is Version installed &&
+            version > installed;
+
+        private void RepackOptionChanged(object sender, RoutedEventArgs e)
+        {
+            if (!m_ready || m_running || m_installed) return;
+            bool update = HasUpdate(RepackAndSign.IsChecked == true);
+            InstallButton.Content = update ? "Update" : "Install";
+            Heading.Text = (update ? "Update " : "Install ") + PackageTitle;
+        }
         internal AppInstallerWindow(StorageFile package) : this()
         {
             m_package = package;
@@ -46,10 +64,17 @@ namespace factoryos_10x_shell.Controls
             try
             {
                 var preview = await AppPackageService.ReadAsync(m_package);
+                try { await RepackedAppRegistry.InitializeAsync(); }
+                catch (Exception error)
+                {
+                    ShellDiagnostics.RecordException("Reading repacked app versions", error);
+                    Status.Text = "Could not read the repacked app history.";
+                }
                 if (m_closed) return;
                 m_preview = preview;
                 PackageTitle = preview.Name;
-                Heading.Text = "Install " + preview.Name + "?";
+                Heading.Text = "Install " + preview.Name;
+                if (!HasUpdate(repacked: false) && HasUpdate(repacked: true)) RepackAndSign.IsChecked = true;
                 Publisher.Text = "Publisher: " + preview.Publisher;
                 VersionText.Text = "Version: " + preview.Version;
                 Description.Text = preview.Description;
@@ -78,6 +103,7 @@ namespace factoryos_10x_shell.Controls
                 }
                 m_ready = true;
                 InstallButton.IsEnabled = true;
+                RepackOptionChanged(this, e);
                 Changed?.Invoke();
             }
             catch (Exception error)
@@ -107,6 +133,7 @@ namespace factoryos_10x_shell.Controls
             if (m_running || !m_ready) return;
             if (m_installed) { CloseRequested?.Invoke(); return; }
             bool repackAndSign = RepackAndSign.IsChecked == true;
+            bool update = HasUpdate(repackAndSign);
             m_running = true;
             RepackAndSign.IsEnabled = false;
             ConnectionHelp.Visibility = Visibility.Collapsed;
@@ -116,17 +143,18 @@ namespace factoryos_10x_shell.Controls
             InstallButton.IsEnabled = false;
             SetInstallOptionsEnabled(false);
             InstallProgress.Visibility = Visibility.Visible;
-            Heading.Text = "Installing " + PackageTitle;
+            Heading.Text = (update ? "Updating " : "Installing ") + PackageTitle;
             if (repackAndSign) Status.Text = "Preparing to repack and sign…";
             try
             {
                 string launchNotice = await AppPackageService.InstallAsync(m_package, m_dependencies, Username.Text, Password.Password,
                     TrustLocalCertificate.IsChecked == true, new Progress<string>(message => { if (m_running) Status.Text = message; }),
                     LaunchWhenReady.IsChecked == true, m_preview.IdentityName, m_preview.ApplicationId,
-                    repackAndSign, m_preview.Architecture, m_preview.Version);
+                    repackAndSign, m_preview.Architecture, m_preview.Version, m_preview.OriginalIdentityName, m_preview.OriginalVersion,
+                    m_preview.OriginalFamilyName);
                 m_installed = true;
                 CancelButton.Visibility = Visibility.Collapsed;
-                Heading.Text = PackageTitle + " is installed!";
+                Heading.Text = PackageTitle + (update ? " was updated!" : " is installed!");
                 Status.Text = string.IsNullOrEmpty(launchNotice) ? "Installation completed successfully." : launchNotice;
                 InstallButton.Content = "Close";
                 try

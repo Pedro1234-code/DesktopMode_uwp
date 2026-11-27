@@ -25,6 +25,10 @@ namespace factoryos_10x_shell.Services.Files
     {
         public string Name, Publisher, Version, Description, Architecture, Capabilities;
         public string IdentityName, ApplicationId;
+        public string BundleIdentityName, BundleVersion;
+        public string OriginalFamilyName;
+        public string OriginalIdentityName => BundleIdentityName ?? IdentityName;
+        public string OriginalVersion => BundleVersion ?? Version;
         public byte[] Logo;
         public bool HasLocalizedResources;
     }
@@ -49,6 +53,14 @@ namespace factoryos_10x_shell.Services.Files
                     return ReadPackage(archive);
                 }
                 var manifest = ReadXml(bundle);
+                var bundleIdentity = manifest.Root.Elements().FirstOrDefault(e => e.Name.LocalName == "Identity");
+                AppPackagePreview WithBundleIdentity(AppPackagePreview preview)
+                {
+                    preview.BundleIdentityName = (string)bundleIdentity?.Attribute("Name");
+                    preview.BundleVersion = (string)bundleIdentity?.Attribute("Version");
+                    preview.OriginalFamilyName = GetFamilyName(bundleIdentity) ?? preview.OriginalFamilyName;
+                    return preview;
+                }
                 string architecture = Windows.ApplicationModel.Package.Current.Id.Architecture.ToString().ToLowerInvariant();
                 var package = manifest.Descendants().Where(e => e.Name.LocalName == "Package" &&
                     e.Parent?.Name.LocalName == "Packages" &&
@@ -71,7 +83,7 @@ namespace factoryos_10x_shell.Services.Files
                     MatchesPayload(input, offset, payload))
                 {
                     using (var slice = new PackageSlice(input, offset, payload.Length))
-                    using (var nested = new ZipArchive(slice, ZipArchiveMode.Read)) return ReadPackage(nested);
+                    using (var nested = new ZipArchive(slice, ZipArchiveMode.Read)) return WithBundleIdentity(ReadPackage(nested));
                 }
                 var temporary = await ApplicationData.Current.TemporaryFolder.CreateFileAsync("installer-preview.appx", CreationCollisionOption.GenerateUniqueName);
                 try
@@ -80,7 +92,7 @@ namespace factoryos_10x_shell.Services.Files
                     using (var destination = await temporary.OpenStreamForWriteAsync())
                         await source.CopyToAsync(destination);
                     using (var stream = await temporary.OpenStreamForReadAsync())
-                    using (var nested = new ZipArchive(stream, ZipArchiveMode.Read)) return ReadPackage(nested);
+                    using (var nested = new ZipArchive(stream, ZipArchiveMode.Read)) return WithBundleIdentity(ReadPackage(nested));
                 }
                 finally
                 {
@@ -164,6 +176,7 @@ namespace factoryos_10x_shell.Services.Files
             Func<string, string> property = name => properties?.Elements().FirstOrDefault(e => e.Name.LocalName == name)?.Value;
             var result = new AppPackagePreview();
             result.IdentityName = (string)identity.Attribute("Name");
+            result.OriginalFamilyName = GetFamilyName(identity);
             result.ApplicationId = (string)manifest.Descendants().FirstOrDefault(e => e.Name.LocalName == "Application")?.Attribute("Id");
             Func<string, string, string> text = (value, fallback) => {
                 if (value?.StartsWith("ms-resource:", StringComparison.OrdinalIgnoreCase) == true) { result.HasLocalizedResources = true; return fallback; }
@@ -198,10 +211,31 @@ namespace factoryos_10x_shell.Services.Files
             return int.TryParse(match.Groups[1].Value, out int scale) ? scale : 100;
         }
 
+        private static string GetFamilyName(XElement identity)
+        {
+            string name = (string)identity?.Attribute("Name"), publisher = (string)identity?.Attribute("Publisher");
+            if (string.IsNullOrEmpty(name) || string.IsNullOrEmpty(publisher)) return null;
+            const string alphabet = "0123456789abcdefghjkmnpqrstvwxyz";
+            using (var sha = System.Security.Cryptography.SHA256.Create())
+            {
+                var hash = sha.ComputeHash(System.Text.Encoding.Unicode.GetBytes(publisher));
+                var suffix = new char[13];
+                for (int i = 0; i < suffix.Length; i++)
+                {
+                    int bit = i * 5;
+                    int index = bit / 8;
+                    int pair = (hash[index] << 8) | (index < 7 ? hash[index + 1] : 0);
+                    suffix[i] = alphabet[(pair >> (11 - bit % 8)) & 31];
+                }
+                return name + "_" + new string(suffix);
+            }
+        }
+
         internal static async Task<string> InstallAsync(StorageFile package, System.Collections.Generic.IReadOnlyList<StorageFile> dependencies,
             string username, string password, bool trustLocalCertificate, IProgress<string> progress,
             bool launchWhenReady = false, string identityName = null, string applicationId = null, bool repackAndSign = false,
-            string architecture = null, string version = null)
+            string architecture = null, string version = null, string originalIdentityName = null, string originalVersion = null,
+            string originalFamilyName = null)
         {
             if (!await InstallLock.WaitAsync(0)) throw new InvalidOperationException("Another installation is already in progress.");
             StorageFolder repackFolder = null;
@@ -209,12 +243,20 @@ namespace factoryos_10x_shell.Services.Files
             {
                 bool isBundle = AppPackageRepackService.IsBundle(package);
                 StorageFile certificate = null;
+                originalIdentityName = originalIdentityName ?? identityName;
+                Version.TryParse(originalVersion ?? version, out var packageVersion);
                 if (repackAndSign)
                 {
+                    await RepackedAppRegistry.InitializeAsync();
+                    if (packageVersion == null)
+                        throw new InvalidDataException("The original package version is invalid.");
+                    var installedVersion = RepackedAppRegistry.InstalledVersion(originalIdentityName, repacked: true);
+                    if (installedVersion != null && packageVersion < installedVersion)
+                        throw new InvalidOperationException("A newer repacked version is already installed.");
+                    identityName = await RepackedAppRegistry.ReserveIdentityAsync(originalIdentityName);
                     repackFolder = await ApplicationData.Current.TemporaryFolder.CreateFolderAsync(
                         "AppInstaller-Repack", CreationCollisionOption.GenerateUniqueName);
                     certificate = await repackFolder.CreateFileAsync("DesktopMode-TestPub.cer");
-                    identityName = AppPackageRepackService.NewIdentity();
                     package = await AppPackageRepackService.CreateAsync(package, repackFolder, certificate, identityName, progress);
                 }
 
@@ -277,6 +319,18 @@ namespace factoryos_10x_shell.Services.Files
                                 CheckResponse(response);
                                 CheckResult(JObject.Parse(await response.Content.ReadAsStringAsync()), true);
                                 string registrationNotice = string.Empty;
+                                try
+                                {
+                                    if (string.IsNullOrWhiteSpace(originalIdentityName) || packageVersion == null)
+                                        throw new InvalidDataException("The original package name or version is missing.");
+                                    await RepackedAppRegistry.InitializeAsync();
+                                    await RepackedAppRegistry.RecordInstallationAsync(originalIdentityName, packageVersion, repackAndSign, originalFamilyName);
+                                }
+                                catch (Exception error)
+                                {
+                                    Helpers.ShellDiagnostics.RecordException("Saving package installation version", error);
+                                    registrationNotice = "The package was installed, but its update history could not be saved.";
+                                }
                                 string fullName = null;
                                 string appId = applicationId;
                                 try
@@ -301,7 +355,8 @@ namespace factoryos_10x_shell.Services.Files
                                 catch (Exception error)
                                 {
                                     await LogRegistrationAsync("Registration verification failed; HRESULT=0x" + error.HResult.ToString("X8") + ".");
-                                    registrationNotice = "The package was installed, but registration for the current Shell user could not be confirmed: " + error.Message;
+                                    registrationNotice = (registrationNotice.Length == 0 ? "" : registrationNotice + " ") +
+                                        "The package was installed, but registration for the current Shell user could not be confirmed: " + error.Message;
                                 }
                                 if (launchWhenReady && !string.IsNullOrEmpty(appId) && string.IsNullOrEmpty(registrationNotice))
                                 {

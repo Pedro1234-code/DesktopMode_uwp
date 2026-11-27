@@ -1,0 +1,454 @@
+<UserControl
+    x:Class="factoryos_10x_shell.Controls.StoreWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="using:factoryos_10x_shell.Controls"
+    xmlns:muxc="using:Microsoft.UI.Xaml.Controls"
+    Width="960" Height="670">
+    <UserControl.Resources>
+        <FontFamily x:Key="StoreFluentIcons">ms-appx:///Assets/Store/StoreIcons.ttf#Store Fluent Icons</FontFamily>
+        <Style x:Key="RailItem" TargetType="muxc:NavigationViewItem">
+            <Setter Property="MinHeight" Value="58" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+        </Style>
+        <Style x:Key="PosterArrow" TargetType="Button">
+            <Setter Property="Width" Value="28" />
+            <Setter Property="Height" Value="28" />
+            <Setter Property="IsTabStop" Value="False" />
+            <Setter Property="Margin" Value="12" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Grid>
+                            <VisualStateManager.VisualStateGroups>
+                                <VisualStateGroup x:Name="CommonStates">
+                                    <VisualState x:Name="Normal" />
+                                    <VisualState x:Name="PointerOver">
+                                        <VisualState.Setters><Setter Target="Arrow.FontSize" Value="9" /></VisualState.Setters>
+                                    </VisualState>
+                                    <VisualState x:Name="Pressed">
+                                        <VisualState.Setters>
+                                            <Setter Target="Arrow.FontSize" Value="7" />
+                                            <Setter Target="Arrow.Foreground" Value="{ThemeResource SystemControlForegroundBaseMediumBrush}" />
+                                        </VisualState.Setters>
+                                    </VisualState>
+                                </VisualStateGroup>
+                            </VisualStateManager.VisualStateGroups>
+                            <Rectangle Margin="-12" Fill="Transparent" />
+                            <Border CornerRadius="14" Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}" />
+                            <FontIcon x:Name="Arrow" FontFamily="{ThemeResource SymbolThemeFontFamily}"
+                                      FontSize="8" Glyph="{TemplateBinding Content}" MirroredWhenRightToLeft="True" />
+                        </Grid>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <DataTemplate x:Key="ProductCard" x:DataType="local:StorePreviewProduct">
+            <Grid Width="218" Padding="16,14" ColumnSpacing="8" Background="Transparent"
+                  PointerEntered="Card_PointerEntered" PointerExited="Card_PointerExited">
+                <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                <Border Width="36" Height="36" CornerRadius="4"><Image x:Name="CardTile" Source="{x:Bind Tile}" /></Border>
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <TextBlock x:Name="CardTitle" Text="{x:Bind Name}" FontSize="14" LineHeight="20" FontWeight="SemiBold"
+                               TextWrapping="WrapWholeWords" MaxLines="2" TextTrimming="CharacterEllipsis" />
+                    <TextBlock Text="{x:Bind Category}" FontSize="12" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" />
+                </StackPanel>
+                <TextBlock Grid.Column="2" Text="{x:Bind Price}" FontSize="11" VerticalAlignment="Center" MaxWidth="68"
+                           TextTrimming="CharacterEllipsis"
+                           Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" />
+            </Grid>
+        </DataTemplate>
+        <DataTemplate x:Key="FeaturedPoster" x:DataType="local:StorePreviewProduct">
+            <Button Click="Poster_Click" Loaded="PressMotion_Loaded"
+                    PointerEntered="Card_PointerEntered" PointerExited="Card_PointerExited"
+                    Padding="0" BorderThickness="0" CornerRadius="8"
+                    AutomationProperties.Name="{x:Bind Name}" HorizontalContentAlignment="Stretch">
+                <Grid Width="400" Height="250" CornerRadius="8">
+                    <Image x:Name="PosterArt" Source="{x:Bind Cover}" Stretch="UniformToFill" />
+                    <Grid VerticalAlignment="Bottom" RequestedTheme="Dark" IsHitTestVisible="False">
+                        <Grid.Background>
+                            <LinearGradientBrush StartPoint="0,0" EndPoint="0,1">
+                                <GradientStop Offset="0" Color="#00000000" />
+                                <GradientStop Offset="0.5" Color="#90000000" />
+                                <GradientStop Offset="1" Color="#FF000000" />
+                            </LinearGradientBrush>
+                        </Grid.Background>
+                        <StackPanel Padding="16">
+                            <TextBlock x:Name="CardTitle" Text="{x:Bind Name}" Foreground="White" FontSize="16" FontWeight="SemiBold" />
+                            <TextBlock Text="{x:Bind Category}" Foreground="#CCFFFFFF" FontSize="12" />
+                        </StackPanel>
+                    </Grid>
+                </Grid>
+            </Button>
+        </DataTemplate>
+    </UserControl.Resources>
+    <Border Background="{ThemeResource ApplicationPageBackgroundThemeBrush}"
+            BorderBrush="{ThemeResource SystemControlForegroundBaseMediumLowBrush}" BorderThickness="1" CornerRadius="8">
+        <Grid x:Name="WindowRoot" KeyDown="WindowRoot_KeyDown">
+            <Grid.Resources>
+                <ResourceDictionary>
+                    <ResourceDictionary.ThemeDictionaries>
+                        <ResourceDictionary x:Key="Default">
+                            <SolidColorBrush x:Key="AppCardHoverBrush" Color="#FF353535" />
+                            <SolidColorBrush x:Key="AppCardPressedBrush" Color="#FF292929" />
+                            <SolidColorBrush x:Key="PreviewBackground" Color="#FF2A2E39" />
+                            <Thickness x:Key="AppCardBorderThickness">0</Thickness>
+                        </ResourceDictionary>
+                        <ResourceDictionary x:Key="Light">
+                            <SolidColorBrush x:Key="AppCardHoverBrush" Color="White" />
+                            <SolidColorBrush x:Key="AppCardPressedBrush" Color="#FFF1F1F1" />
+                            <SolidColorBrush x:Key="PreviewBackground" Color="White" />
+                            <Thickness x:Key="AppCardBorderThickness">0</Thickness>
+                        </ResourceDictionary>
+                        <ResourceDictionary x:Key="HighContrast">
+                            <SolidColorBrush x:Key="AppCardHoverBrush" Color="{ThemeResource SystemColorButtonFaceColor}" />
+                            <SolidColorBrush x:Key="AppCardPressedBrush" Color="{ThemeResource SystemColorWindowColor}" />
+                            <SolidColorBrush x:Key="PreviewBackground" Color="{ThemeResource SystemColorWindowColor}" />
+                            <Thickness x:Key="AppCardBorderThickness">0,0,0,1</Thickness>
+                        </ResourceDictionary>
+                    </ResourceDictionary.ThemeDictionaries>
+                    <Style x:Key="CompactCardItem" TargetType="GridViewItem">
+                        <Setter Property="Margin" Value="0,0,8,8" />
+                        <Setter Property="UseSystemFocusVisuals" Value="True" />
+                        <Setter Property="Template">
+                            <Setter.Value>
+                                <ControlTemplate TargetType="GridViewItem">
+                                    <Grid x:Name="Surface" Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                                          CornerRadius="8" BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}"
+                                          BorderThickness="{ThemeResource AppCardBorderThickness}" Control.IsTemplateFocusTarget="True">
+                                        <VisualStateManager.VisualStateGroups>
+                                            <VisualStateGroup x:Name="CommonStates">
+                                                <VisualState x:Name="Normal">
+                                                    <Storyboard><PointerUpThemeAnimation TargetName="Surface" /></Storyboard>
+                                                </VisualState>
+                                                <VisualState x:Name="PointerOver">
+                                                    <VisualState.Setters><Setter Target="Surface.Background" Value="{ThemeResource AppCardHoverBrush}" /></VisualState.Setters>
+                                                    <Storyboard><PointerUpThemeAnimation TargetName="Surface" /></Storyboard>
+                                                </VisualState>
+                                                <VisualState x:Name="Pressed">
+                                                    <VisualState.Setters><Setter Target="Surface.Background" Value="{ThemeResource AppCardPressedBrush}" /></VisualState.Setters>
+                                                    <Storyboard><PointerDownThemeAnimation TargetName="Surface" /></Storyboard>
+                                                </VisualState>
+                                            </VisualStateGroup>
+                                        </VisualStateManager.VisualStateGroups>
+                                        <Grid.BackgroundTransition><BrushTransition Duration="0:0:0.083" /></Grid.BackgroundTransition>
+                                        <ContentPresenter Content="{TemplateBinding Content}" ContentTemplate="{TemplateBinding ContentTemplate}" />
+                                    </Grid>
+                                </ControlTemplate>
+                            </Setter.Value>
+                        </Setter>
+                    </Style>
+                    <Style x:Key="StoreCatalogGrid" TargetType="GridView">
+                        <Setter Property="ItemTemplate" Value="{StaticResource ProductCard}" />
+                        <Setter Property="ItemContainerStyle" Value="{StaticResource CompactCardItem}" />
+                        <Setter Property="SelectionMode" Value="None" />
+                        <Setter Property="IsItemClickEnabled" Value="True" />
+                        <Setter Property="ItemsPanel">
+                            <Setter.Value><ItemsPanelTemplate><ItemsWrapGrid Orientation="Horizontal" /></ItemsPanelTemplate></Setter.Value>
+                        </Setter>
+                    </Style>
+                </ResourceDictionary>
+            </Grid.Resources>
+            <Grid.RowDefinitions><RowDefinition Height="48" /><RowDefinition Height="*" /></Grid.RowDefinitions>
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" MinWidth="72" /><ColumnDefinition Width="*" />
+                    <ColumnDefinition x:Name="HeaderGap" Width="40" /><ColumnDefinition x:Name="CaptionColumn" Width="220" />
+                </Grid.ColumnDefinitions>
+                <Grid Grid.ColumnSpan="4" Background="Transparent" PointerPressed="Grip_PointerPressed"
+                      PointerMoved="Grip_PointerMoved" PointerReleased="Grip_PointerEnded"
+                      PointerCanceled="Grip_PointerEnded" PointerCaptureLost="Grip_PointerEnded" />
+                <StackPanel Margin="12,0,0,0" Orientation="Horizontal" Spacing="16" VerticalAlignment="Center">
+                    <Button x:Name="BackButton" Click="Back_Click" Visibility="Collapsed" Margin="0,0,-12,0"
+                            Width="32" Height="32" Padding="0" Background="Transparent" BorderThickness="0" AutomationProperties.Name="Back">
+                        <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xE72B;" FontSize="16" />
+                    </Button>
+                    <Image Width="24" Height="24" Source="ms-appx:///Assets/Store/Store.png" IsHitTestVisible="False" />
+                    <TextBlock x:Name="StoreTitle" Text="Microsoft Store" FontSize="12" VerticalAlignment="Center" IsHitTestVisible="False" />
+                </StackPanel>
+                <AutoSuggestBox x:Name="CatalogSearch" Grid.ColumnSpan="2" Margin="260,0,0,0" MaxWidth="600" MinWidth="100"
+                                VerticalAlignment="Center" QueryIcon="Find" PlaceholderText="Search apps, games, and more"
+                                AutomationProperties.Name="Search Microsoft Store" AutomationProperties.LandmarkType="Search"
+                                QuerySubmitted="CatalogSearch_QuerySubmitted" />
+                <FontIcon x:Name="ProfileIcon" FontFamily="{StaticResource StoreFluentIcons}" Grid.Column="3" HorizontalAlignment="Left" Glyph="&#xE77B;"
+                          FontSize="20" Opacity="0.4" IsHitTestVisible="False" />
+                <StackPanel Grid.Column="3" HorizontalAlignment="Right" VerticalAlignment="Top" Orientation="Horizontal">
+                    <Button AutomationProperties.Name="Minimize" Click="Minimize_Click"
+                            Style="{StaticResource ShellCaptionButtonStyle}">
+                        <FontIcon Glyph="&#xE921;" FontSize="10" />
+                    </Button>
+                    <Button x:Name="MaximizeButton" AutomationProperties.Name="Maximize" Click="Maximize_Click"
+                            Style="{StaticResource ShellCaptionButtonStyle}">
+                        <FontIcon x:Name="MaximizeGlyph" Glyph="&#xE922;" FontSize="10" />
+                    </Button>
+                    <Button AutomationProperties.Name="Close" Click="Close_Click"
+                            Style="{StaticResource ShellCloseButtonStyle}">
+                        <FontIcon Glyph="&#xE8BB;" FontSize="10" />
+                    </Button>
+                </StackPanel>
+            </Grid>
+            <muxc:NavigationView x:Name="Sections" Grid.Row="1" PaneDisplayMode="Left" IsPaneOpen="True"
+                                 OpenPaneLength="72" CompactPaneLength="72" IsPaneToggleButtonVisible="False"
+                                 IsBackButtonVisible="Collapsed" IsSettingsVisible="False" IsTitleBarAutoPaddingEnabled="False"
+                                 SelectionFollowsFocus="Disabled">
+                <muxc:NavigationView.MenuItems>
+                    <muxc:NavigationViewItem x:Name="HomeItem" Tag="Home" AutomationProperties.Name="Home" Style="{StaticResource RailItem}">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="4">
+                            <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xE80F;" FontSize="20" Loaded="RailIcon_Loaded" />
+                            <TextBlock Text="Home" FontSize="10" TextAlignment="Center" />
+                        </StackPanel>
+                    </muxc:NavigationViewItem>
+                    <muxc:NavigationViewItem x:Name="AppsItem" Tag="Apps" AutomationProperties.Name="Apps" Style="{StaticResource RailItem}">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="4">
+                            <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xECAA;" FontSize="20" Loaded="RailIcon_Loaded" />
+                            <TextBlock Text="Apps" FontSize="10" TextAlignment="Center" />
+                        </StackPanel>
+                    </muxc:NavigationViewItem>
+                    <muxc:NavigationViewItem x:Name="GamingItem" Tag="Gaming" AutomationProperties.Name="Gaming" Style="{StaticResource RailItem}">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="4">
+                            <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xEB65;" FontSize="20" Loaded="RailIcon_Loaded" />
+                            <TextBlock Text="Gaming" FontSize="10" TextAlignment="Center" />
+                        </StackPanel>
+                    </muxc:NavigationViewItem>
+                </muxc:NavigationView.MenuItems>
+                <muxc:NavigationView.FooterMenuItems>
+                    <muxc:NavigationViewItem Tag="Downloads" AutomationProperties.Name="Downloads" Style="{StaticResource RailItem}">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="4">
+                            <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xE896;" FontSize="20" Loaded="RailIcon_Loaded" />
+                            <TextBlock Text="Downloads" FontSize="10" TextAlignment="Center" />
+                        </StackPanel>
+                    </muxc:NavigationViewItem>
+                    <muxc:NavigationViewItem Tag="Library" AutomationProperties.Name="Library" Style="{StaticResource RailItem}">
+                        <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center" Spacing="4">
+                            <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xE8F1;" FontSize="20" Loaded="RailIcon_Loaded" />
+                            <TextBlock Text="Library" FontSize="10" TextAlignment="Center" />
+                        </StackPanel>
+                    </muxc:NavigationViewItem>
+                </muxc:NavigationView.FooterMenuItems>
+                <ScrollViewer x:Name="PageScroll" HorizontalScrollMode="Disabled">
+                    <StackPanel x:Name="PageContent" MaxWidth="1860" Padding="36,24" Spacing="12">
+                        <Grid x:Name="Feature" Visibility="Collapsed" PointerEntered="Feature_PointerEntered" PointerExited="Feature_PointerExited">
+                            <Grid.RowDefinitions><RowDefinition Height="280" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                            <ScrollViewer x:Name="PosterScroll" VerticalScrollMode="Disabled" VerticalScrollBarVisibility="Disabled"
+                                          HorizontalScrollMode="Enabled" HorizontalScrollBarVisibility="Hidden">
+                                <ItemsControl x:Name="Posters" ItemTemplate="{StaticResource FeaturedPoster}" VerticalAlignment="Center">
+                                    <ItemsControl.ItemsPanel><ItemsPanelTemplate><StackPanel Orientation="Horizontal" Spacing="12" /></ItemsPanelTemplate></ItemsControl.ItemsPanel>
+                                </ItemsControl>
+                            </ScrollViewer>
+                            <Button x:Name="PreviousPoster" Style="{StaticResource PosterArrow}" Visibility="Collapsed" Content="&#xEDD9;" Loaded="PressMotion_Loaded"
+                                    HorizontalAlignment="Left" Click="PreviousFeature_Click" AutomationProperties.Name="Previous" />
+                            <Button x:Name="NextPoster" Style="{StaticResource PosterArrow}" Visibility="Collapsed" Content="&#xEDDA;" Loaded="PressMotion_Loaded"
+                                    HorizontalAlignment="Right" Click="NextFeature_Click" AutomationProperties.Name="Next" />
+                            <muxc:PipsPager x:Name="FeaturePager" Grid.Row="1" HorizontalAlignment="Center" AutomationProperties.Name="Featured items"
+                                            NextButtonVisibility="Collapsed" PreviousButtonVisibility="Collapsed" />
+                        </Grid>
+                        <Grid x:Name="HeaderRow" ColumnSpacing="8">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                            <TextBlock x:Name="PageTitle" VerticalAlignment="Center" FontWeight="SemiBold" FontSize="24"
+                                       TextWrapping="Wrap" AutomationProperties.HeadingLevel="Level1" />
+                            <Button x:Name="CheckUpdates" Grid.Column="1" Content="Check for updates" Visibility="Collapsed" Click="CheckUpdates_Click" />
+                            <ComboBox x:Name="CatalogRanking" Grid.Column="1" SelectedIndex="0"
+                                      AutomationProperties.Name="Catalog ranking" Visibility="Collapsed">
+                                <ComboBoxItem Tag="TopFree" Content="Top free" />
+                                <ComboBoxItem Tag="Trending" Content="Trending" />
+                                <ComboBoxItem Tag="TopPaid" Content="Top paid" />
+                            </ComboBox>
+                        </Grid>
+                        <Grid x:Name="LibraryFilters" ColumnSpacing="8" Visibility="Collapsed">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="*" /><ColumnDefinition Width="*" MaxWidth="200" /><ColumnDefinition Width="Auto" />
+                            </Grid.ColumnDefinitions>
+                            <ComboBox SelectedIndex="0" AutomationProperties.Name="Filter library">
+                                <ComboBoxItem Content="All" /><ComboBoxItem Content="Apps" /><ComboBoxItem Content="Games" />
+                            </ComboBox>
+                            <AutoSuggestBox Grid.Column="1" PlaceholderText="Search" QueryIcon="Find" AutomationProperties.Name="Search library" />
+                            <muxc:DropDownButton Grid.Column="2" AutomationProperties.Name="Sort and filter">
+                                <muxc:DropDownButton.Flyout>
+                                    <MenuFlyout Placement="Bottom">
+                                        <muxc:RadioMenuFlyoutItem Text="Sort by date" GroupName="LibrarySort" IsChecked="True" />
+                                        <muxc:RadioMenuFlyoutItem Text="Sort by name" GroupName="LibrarySort" />
+                                        <MenuFlyoutSeparator /><ToggleMenuFlyoutItem Text="Show installed apps only" />
+                                    </MenuFlyout>
+                                </muxc:DropDownButton.Flyout>
+                                <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xE8CB;" FontSize="16" />
+                            </muxc:DropDownButton>
+                        </Grid>
+                        <StackPanel x:Name="DownloadSections" Visibility="Collapsed" Spacing="12">
+                            <muxc:Expander HorizontalAlignment="Stretch" HorizontalContentAlignment="Stretch" IsExpanded="True">
+                                <muxc:Expander.Header>
+                                    <StackPanel Orientation="Horizontal" Padding="0,12" Spacing="20">
+                                        <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xEA18;" /><TextBlock Text="Updates and downloads" />
+                                    </StackPanel>
+                                </muxc:Expander.Header>
+                                <StackPanel Spacing="8">
+                                    <TextBlock x:Name="UpdateCheckStatus" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+                                    <ItemsControl x:Name="AvailableUpdates">
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate x:DataType="local:StoreAppUpdate">
+                                                <Grid Margin="0,0,0,8" Padding="8" ColumnSpacing="12" CornerRadius="6"
+                                                      Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}">
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <Image Width="32" Height="32" Source="{x:Bind Tile}" />
+                                                    <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                                        <TextBlock Text="{x:Bind Name}" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                                        <TextBlock Text="{x:Bind VersionLabel}" TextWrapping="Wrap" />
+                                                    </StackPanel>
+                                                    <Button Grid.Column="2" Click="DownloadUpdate_Click"
+                                                            AutomationProperties.Name="Download update" ToolTipService.ToolTip="Download update">
+                                                        <FontIcon FontFamily="{StaticResource StoreFluentIcons}" Glyph="&#xE896;" FontSize="16" />
+                                                    </Button>
+                                                </Grid>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                    <muxc:Expander Header="Device Portal connection" HorizontalAlignment="Left">
+                                        <StackPanel Spacing="8">
+                                            <TextBox x:Name="UpdatePortalUser" Header="Username (optional)" />
+                                            <PasswordBox x:Name="UpdatePortalPassword" Header="Password" />
+                                            <CheckBox x:Name="UpdateTrustLocal" IsChecked="True" Content="Allow the local Device Portal self-signed certificate" />
+                                        </StackPanel>
+                                    </muxc:Expander>
+                                    <TextBlock x:Name="DownloadName" TextWrapping="Wrap" />
+                                    <ProgressBar x:Name="DownloadProgress" Visibility="Collapsed" />
+                                    <TextBlock x:Name="DownloadStatus" Text="No downloads." TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+                                    <Button x:Name="CancelFromDownloads" Content="Cancel download" Visibility="Collapsed" Click="CancelDownload_Click" />
+                                </StackPanel>
+                            </muxc:Expander>
+                            <TextBlock Margin="0,12,0,0" Text="Recent updates" FontSize="20" FontWeight="SemiBold" />
+                        </StackPanel>
+                        <TextBlock x:Name="PageMessage" TextWrapping="Wrap" Opacity="0.78" AutomationProperties.LiveSetting="Polite" />
+                        <StackPanel x:Name="HomeCollections" Visibility="Collapsed" Spacing="12">
+                            <Grid>
+                                <TextBlock Text="Top free apps" VerticalAlignment="Center" FontSize="20" FontWeight="SemiBold"
+                                           AutomationProperties.HeadingLevel="Level2" />
+                                <Button HorizontalAlignment="Right" Content="See all apps" Click="SeeApps_Click" />
+                            </Grid>
+                            <GridView x:Name="HomeApps" Style="{StaticResource StoreCatalogGrid}" ItemClick="Products_ItemClick"
+                                      ScrollViewer.VerticalScrollMode="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled" />
+                            <Grid>
+                                <TextBlock Text="Top free games" VerticalAlignment="Center" FontSize="20" FontWeight="SemiBold"
+                                           AutomationProperties.HeadingLevel="Level2" />
+                                <Button HorizontalAlignment="Right" Content="See all games" Click="SeeGames_Click" />
+                            </Grid>
+                            <GridView x:Name="HomeGames" Style="{StaticResource StoreCatalogGrid}" ItemClick="Products_ItemClick"
+                                      ScrollViewer.VerticalScrollMode="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled" />
+                        </StackPanel>
+                        <GridView x:Name="Products" Style="{StaticResource StoreCatalogGrid}" ItemClick="Products_ItemClick"
+                                  ScrollViewer.VerticalScrollMode="Disabled" ScrollViewer.VerticalScrollBarVisibility="Disabled">
+                            <GridView.ItemContainerTransitions>
+                                <TransitionCollection><EntranceThemeTransition IsStaggeringEnabled="True" FromVerticalOffset="8" /></TransitionCollection>
+                            </GridView.ItemContainerTransitions>
+                        </GridView>
+                        <Button x:Name="MoreCatalogItems" Visibility="Collapsed" Content="Load more" Click="MoreCatalogItems_Click" />
+                        <StackPanel x:Name="ProductDetails" Visibility="Collapsed" Spacing="20">
+                            <Grid CornerRadius="8" RequestedTheme="Dark">
+                                <Image x:Name="DetailCover" Stretch="UniformToFill" />
+                                <Border>
+                                    <Border.Background>
+                                        <LinearGradientBrush StartPoint="0,0" EndPoint="1,0">
+                                            <GradientStop Color="#E0000000" Offset="0" /><GradientStop Color="#88000000" Offset="1" />
+                                        </LinearGradientBrush>
+                                    </Border.Background>
+                                </Border>
+                                <Grid Padding="16,20,16,16" ColumnSpacing="24" RowSpacing="16">
+                                    <Grid.ColumnDefinitions><ColumnDefinition Width="Auto" /><ColumnDefinition Width="*" /></Grid.ColumnDefinitions>
+                                    <Grid.RowDefinitions><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /><RowDefinition Height="Auto" /></Grid.RowDefinitions>
+                                    <Border Margin="0,8,0,0" Width="84" Height="84" CornerRadius="8"><Image x:Name="DetailIcon" /></Border>
+                                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="6">
+                                        <TextBlock x:Name="DetailTitle" FontSize="28" FontWeight="SemiBold" Foreground="White"
+                                                   TextWrapping="Wrap" AutomationProperties.HeadingLevel="Level1" />
+                                        <TextBlock x:Name="DetailPublisher" Foreground="White" TextWrapping="Wrap" />
+                                        <TextBlock x:Name="DetailCategory" Foreground="White" />
+                                    </StackPanel>
+                                    <TextBlock x:Name="DetailDescription" Grid.Row="1" Grid.ColumnSpan="2" HorizontalAlignment="Left"
+                                               MaxWidth="540" Foreground="White" TextWrapping="Wrap" />
+                                    <StackPanel Grid.Row="2" Grid.ColumnSpan="2" Spacing="8">
+                                        <Grid MaxWidth="430" MinHeight="48" ColumnSpacing="8" HorizontalAlignment="Left">
+                                            <Grid.ColumnDefinitions><ColumnDefinition Width="*" /><ColumnDefinition Width="Auto" /><ColumnDefinition Width="Auto" /></Grid.ColumnDefinitions>
+                                            <Button x:Name="GetButton" Grid.ColumnSpan="2" Content="Get" IsEnabled="False" MinWidth="110"
+                                                    HorizontalAlignment="Stretch" VerticalAlignment="Stretch"
+                                                    Style="{ThemeResource AccentButtonStyle}" Click="Get_Click" Loaded="PressMotion_Loaded" />
+                                            <Grid x:Name="GetProgressPanel" Visibility="Collapsed" CornerRadius="8" Padding="10,8"
+                                                  Background="{ThemeResource SystemControlBackgroundChromeMediumLowBrush}"
+                                                  AutomationProperties.LiveSetting="Polite">
+                                                <StackPanel VerticalAlignment="Center" Spacing="6">
+                                                    <TextBlock x:Name="GetProgressText" TextWrapping="Wrap" FontWeight="SemiBold" />
+                                                    <muxc:ProgressBar x:Name="GetProgress" AutomationProperties.Name="Installation progress"
+                                                        IsTabStop="True"
+                                                        IsIndeterminate="{Binding IsIndeterminate, ElementName=DownloadProgress}"
+                                                        Value="{Binding Value, ElementName=DownloadProgress}" />
+                                                </StackPanel>
+                                            </Grid>
+                                            <Button x:Name="CancelDownloadButton" Grid.Column="1" Visibility="Collapsed"
+                                                    Content="Cancel" VerticalAlignment="Center" Click="CancelDownload_Click" Loaded="PressMotion_Loaded" />
+                                            <CheckBox x:Name="RepackAndSignOption" Grid.Column="2" Content="Add Mouse support"
+                                                      IsChecked="False" IsEnabled="False" MinWidth="0" Padding="0"
+                                                      VerticalAlignment="Center" />
+                                        </Grid>
+                                        <TextBlock x:Name="GetStatus" TextWrapping="Wrap" AutomationProperties.LiveSetting="Polite" />
+                                        <muxc:Expander Header="Device Portal connection" HorizontalAlignment="Left">
+                                            <StackPanel Spacing="8">
+                                                <TextBox x:Name="PortalUser" Header="Username (optional)" />
+                                                <PasswordBox x:Name="PortalPassword" Header="Password" />
+                                                <CheckBox x:Name="TrustLocal" IsChecked="True" Content="Allow the local Device Portal self-signed certificate" />
+                                            </StackPanel>
+                                        </muxc:Expander>
+                                    </StackPanel>
+                                </Grid>
+                            </Grid>
+                            <StackPanel x:Name="ScreenshotSection" x:Load="False" Visibility="Collapsed" Spacing="8">
+                                <TextBlock Text="Screenshots" FontSize="20" FontWeight="SemiBold" AutomationProperties.HeadingLevel="Level2" />
+                                <FlipView x:Name="ProductScreenshots" Height="220" MaxWidth="420" HorizontalAlignment="Left"
+                                          AutomationProperties.Name="Product screenshots">
+                                    <FlipView.ItemTemplate>
+                                        <DataTemplate><Image Source="{Binding}" Stretch="Uniform" /></DataTemplate>
+                                    </FlipView.ItemTemplate>
+                                </FlipView>
+                            </StackPanel>
+                        </StackPanel>
+                    </StackPanel>
+                </ScrollViewer>
+            </muxc:NavigationView>
+            <Canvas x:Name="PreviewLayer" Grid.Row="1" Margin="72,0,0,0">
+                <Grid x:Name="ShadowHost" IsHitTestVisible="False" Visibility="{Binding Visibility, ElementName=CardPreview}">
+                    <Rectangle x:Name="ShadowMask" Fill="{ThemeResource PreviewBackground}" RadiusX="8" RadiusY="8" />
+                </Grid>
+                <Button x:Name="CardPreview" Visibility="Collapsed" Padding="0" IsTabStop="False"
+                        CornerRadius="8" Background="{ThemeResource PreviewBackground}" BorderThickness="1"
+                        BorderBrush="{ThemeResource SystemControlForegroundBaseLowBrush}" HorizontalContentAlignment="Stretch"
+                        PointerEntered="Preview_PointerEntered" PointerExited="Card_PointerExited"
+                        PointerWheelChanged="Preview_PointerWheelChanged" Click="Preview_Click" Loaded="PressMotion_Loaded">
+                    <Button.Template>
+                        <ControlTemplate TargetType="Button">
+                            <Border Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="8">
+                                <ContentPresenter Content="{TemplateBinding Content}" />
+                            </Border>
+                        </ControlTemplate>
+                    </Button.Template>
+                    <StackPanel>
+                        <Image x:Name="PreviewPoster" Height="150" Stretch="UniformToFill" Visibility="Collapsed" />
+                        <Grid x:Name="PreviewHeader" MinHeight="64" Padding="16,8" ColumnSpacing="8">
+                            <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+                            <Border Width="40" Height="40" CornerRadius="4"><Image x:Name="PreviewTile" /></Border>
+                            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                                <TextBlock x:Name="PreviewTitle" FontSize="14" FontWeight="SemiBold" TextWrapping="WrapWholeWords" MaxLines="2" TextTrimming="CharacterEllipsis" />
+                                <TextBlock x:Name="PreviewCategory" FontSize="12" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" />
+                            </StackPanel>
+                            <Button Grid.Column="2" Content="Get" IsEnabled="False" IsHitTestVisible="False" />
+                        </Grid>
+                        <TextBlock x:Name="PreviewDescription" FontSize="12" Margin="20,0,20,12" TextWrapping="WrapWholeWords"
+                                   MaxLines="2" TextTrimming="CharacterEllipsis" Foreground="{ThemeResource SystemControlForegroundBaseMediumBrush}" />
+                    </StackPanel>
+                </Button>
+            </Canvas>
+            <Border Grid.RowSpan="2" Width="16" Height="16" HorizontalAlignment="Right" VerticalAlignment="Bottom"
+                    Background="Transparent" Tag="BottomRight" PointerPressed="Grip_PointerPressed" PointerMoved="Grip_PointerMoved"
+                    PointerReleased="Grip_PointerEnded" PointerCanceled="Grip_PointerEnded" PointerCaptureLost="Grip_PointerEnded" />
+        </Grid>
+    </Border>
+</UserControl>

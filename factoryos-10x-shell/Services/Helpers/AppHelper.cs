@@ -438,6 +438,12 @@ namespace factoryos_10x_shell.Services.Helpers
                 var iconName = composite["IconName"] as string;
                 var appUri = composite["AppUri"] as string;
 
+                if (string.Equals(appId, "CoreShell.Store", StringComparison.OrdinalIgnoreCase))
+                {
+                    loaded.Add(new StartIconModel { AppId = "CoreShell.Store", IconName = "Microsoft Store" });
+                    continue;
+                }
+
                 // Files is a CoreShell window, not an installed UWP package. It has
                 // no AppListEntry to recover, so restore its pin directly.
                 if (string.Equals(appId, "CoreShell.Files", StringComparison.OrdinalIgnoreCase) ||
@@ -476,14 +482,24 @@ namespace factoryos_10x_shell.Services.Helpers
             }
 
             const string defaultPinsKey = "CoreShellDefaults_TaskbarPins_v1";
-            if (!(localSettings.Values[defaultPinsKey] is bool pinsSeeded && pinsSeeded))
+            const string storePinKey = "CoreShellDefaults_StoreTaskbarPin_v1";
+            bool seedDefaultPins = !(localSettings.Values[defaultPinsKey] is bool pinsSeeded && pinsSeeded);
+            bool seedStorePin = !(localSettings.Values[storePinKey] is bool storeSeeded && storeSeeded);
+            if (seedDefaultPins)
             {
                 if (!loaded.Any(app => string.Equals(app.AppId, "CoreShell.Files", StringComparison.OrdinalIgnoreCase)))
                     loaded.Add(new StartIconModel { AppId = "CoreShell.Files", IconName = "Files" });
                 if (!loaded.Any(app => string.Equals(app.AppId, "CoreShell.Firefox", StringComparison.OrdinalIgnoreCase)))
                     loaded.Add(new StartIconModel { AppId = "CoreShell.Firefox", IconName = "Strawfox" });
+            }
+            if (seedStorePin && !loaded.Any(app => string.Equals(app.AppId, "CoreShell.Store", StringComparison.OrdinalIgnoreCase)))
+                loaded.Add(new StartIconModel { AppId = "CoreShell.Store", IconName = "Microsoft Store" });
+
+            if (seedDefaultPins || seedStorePin)
+            {
                 SaveTaskbarPinnedApps(loaded);
                 localSettings.Values[defaultPinsKey] = true;
+                localSettings.Values[storePinKey] = true;
             }
 
             var dispatcher = Windows.ApplicationModel.Core.CoreApplication.MainView.CoreWindow.Dispatcher;

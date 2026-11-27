@@ -51,6 +51,7 @@ namespace factoryos_10x_shell.Views
         private readonly BitmapImage _notepadIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
         private readonly BitmapImage _settingsIconSource = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
         private readonly BitmapImage _calculatorIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
+        private readonly BitmapImage _storeIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Store/Store.png"));
         private readonly BitmapImage _firefoxIconSource = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
 
 
@@ -197,6 +198,7 @@ namespace factoryos_10x_shell.Views
             AppState.Instance.OnFilesStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnNotepadStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnSettingsStateChanged += RefreshInternalTaskbar;
+            AppState.Instance.OnStoreStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnCalculatorStateChanged += RefreshInternalTaskbar;
             AppState.Instance.OnFirefoxStateChanged += RefreshInternalTaskbar;
             // Activation only changes the highlight. Recreating every Button
@@ -262,6 +264,10 @@ namespace factoryos_10x_shell.Views
                 {
                     stack.Children.Add(CreateSettingsIcon(25));
                 }
+                else if (app.AppId == "CoreShell.Store")
+                {
+                    stack.Children.Add(CreateStoreIcon());
+                }
                 else if (app.AppId == "CoreShell.Calculator")
                 {
                     stack.Children.Add(CreateCalculatorIcon(25));
@@ -316,6 +322,11 @@ namespace factoryos_10x_shell.Views
                         if (model.AppId == "CoreShell.Settings")
                         {
                             AppState.Instance.RequestSettingsOpen();
+                            return;
+                        }
+                        if (model.AppId == "CoreShell.Store")
+                        {
+                            AppState.Instance.RequestStoreOpen();
                             return;
                         }
                         if (model.AppId == "CoreShell.Calculator")
@@ -662,6 +673,8 @@ namespace factoryos_10x_shell.Views
 
         private Image CreateSettingsIcon(double size) => new Image { Source = _settingsIconSource, Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
 
+        private Image CreateStoreIcon() => new Image { Source = _storeIconSource, Width = 26, Height = 26, Stretch = Stretch.Uniform };
+
         private Image CreateCalculatorIcon(double size) => new Image { Source = _calculatorIconSource, Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
 
         private Image CreateFirefoxIcon(double size) => new Image { Source = _firefoxIconSource, Width = size, Height = size, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center, Stretch = Stretch.Uniform };
@@ -717,12 +730,14 @@ namespace factoryos_10x_shell.Views
             bool isOpen = (appId == "CoreShell.Files" && AppState.Instance.IsFilesOpen)
                 || (appId == "CoreShell.Notepad" && AppState.Instance.IsNotepadOpen)
                 || (appId == "CoreShell.Settings" && AppState.Instance.IsSettingsOpen)
+                || (appId == "CoreShell.Store" && AppState.Instance.IsStoreOpen)
                 || (appId == "CoreShell.Calculator" && AppState.Instance.IsCalculatorOpen)
                 || (appId == "CoreShell.Firefox" && AppState.Instance.IsFirefoxOpen);
 
             bool isActive = (appId == "CoreShell.Files" && _shellWindowCoordinator.IsActive(ShellWindowKind.Files, appId))
                 || (appId == "CoreShell.Notepad" && _shellWindowCoordinator.IsActive(ShellWindowKind.Notepad, appId))
                 || (appId == "CoreShell.Settings" && _shellWindowCoordinator.IsActive(ShellWindowKind.Settings, appId))
+                || (appId == "CoreShell.Store" && _shellWindowCoordinator.IsActive(ShellWindowKind.Store, appId))
                 || (appId == "CoreShell.Calculator" && _shellWindowCoordinator.IsActive(ShellWindowKind.Calculator, appId))
                 || (appId == "CoreShell.Firefox" && _shellWindowCoordinator.IsActive(ShellWindowKind.Firefox, appId));
 
@@ -743,6 +758,7 @@ namespace factoryos_10x_shell.Views
             AddUnpinnedWindow(items, "CoreShell.Files", state.IsFilesOpen);
             AddUnpinnedWindow(items, "CoreShell.Notepad", state.IsNotepadOpen);
             AddUnpinnedWindow(items, "CoreShell.Settings", state.IsSettingsOpen);
+            AddUnpinnedWindow(items, "CoreShell.Store", state.IsStoreOpen);
             AddUnpinnedWindow(items, "CoreShell.Calculator", state.IsCalculatorOpen);
             AddUnpinnedWindow(items, "CoreShell.Firefox", state.IsFirefoxOpen);
 
@@ -823,6 +839,11 @@ namespace factoryos_10x_shell.Views
                     button.Content = CreateSettingsIcon(25);
                     ToolTipService.SetToolTip(button, "Settings");
                     button.Click += (s, e) => AppState.Instance.RequestSettingsOpen();
+                    break;
+                case "CoreShell.Store":
+                    button.Content = CreateStoreIcon();
+                    ToolTipService.SetToolTip(button, "Microsoft Store");
+                    button.Click += (s, e) => AppState.Instance.RequestStoreOpen();
                     break;
                 case "CoreShell.Calculator":
                     button.Content = CreateCalculatorIcon(24);

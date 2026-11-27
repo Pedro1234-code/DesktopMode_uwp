@@ -161,6 +161,7 @@
         <Canvas x:Name="NotepadWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
         <Canvas x:Name="SettingsWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
         <Canvas x:Name="CalculatorWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
+        <Canvas x:Name="StoreWindowHost" Margin="0,0,0,50" IsHitTestVisible="True" />
         <Canvas x:Name="FirefoxWindowHost" Margin="0,0,0,50" IsHitTestVisible="True">
             <Border
                 x:Name="FirefoxExternalWindow"

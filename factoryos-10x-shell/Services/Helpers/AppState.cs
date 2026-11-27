@@ -216,6 +216,23 @@ namespace factoryos_10x_shell.Services.Helpers
         public void ActivateSettings() => OnSettingsActivated?.Invoke();
         public void RequestWallpaper(string uri) => OnWallpaperRequested?.Invoke(uri);
 
+        public bool IsStoreOpen { get; private set; }
+        public bool IsStoreMinimized { get; private set; }
+        public event Action OnStoreRequested;
+        public event Action OnStoreStateChanged;
+        public event Action OnStoreActivated;
+
+        public void RequestStoreOpen() => OnStoreRequested?.Invoke();
+        public void ActivateStore() => OnStoreActivated?.Invoke();
+
+        public void SetStoreWindowState(bool isOpen, bool isMinimized)
+        {
+            if (IsStoreOpen == isOpen && IsStoreMinimized == isMinimized) return;
+            IsStoreOpen = isOpen;
+            IsStoreMinimized = isMinimized;
+            OnStoreStateChanged?.Invoke();
+        }
+
         public bool IsCalculatorOpen { get; private set; }
         public bool IsCalculatorMinimized { get; private set; }
         public event Action OnCalculatorRequested;

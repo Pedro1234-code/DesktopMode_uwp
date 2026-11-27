@@ -118,13 +118,26 @@ namespace factoryos_10x_shell.Views
         private int m_windows11PinPage;
         private int m_windows11PinsPerPage = 18;
         private const string Windows11PinsSetting = "Windows11.StartPins";
+        private const string StoreStartPinSeededKey = "CoreShellDefaults_StoreStartPin_v1";
 
         private List<string> GetWindows11PinIds()
         {
-            if (ApplicationData.Current.LocalSettings.Values[Windows11PinsSetting] is string saved)
-                return saved.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).ToList();
-            return new List<string> { "CoreShell.Files", "CoreShell.Firefox", "CoreShell.Notepad",
-                "CoreShell.Calculator", "CoreShell.Settings" };
+            var values = ApplicationData.Current.LocalSettings.Values;
+            if (!(values[Windows11PinsSetting] is string saved))
+                return new List<string> { "CoreShell.Files", "CoreShell.Firefox", "CoreShell.Notepad",
+                    "CoreShell.Calculator", "CoreShell.Settings", "CoreShell.Store" };
+
+            var pins = saved.Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries).ToList();
+            if (!(values[StoreStartPinSeededKey] is bool seeded && seeded))
+            {
+                if (!pins.Contains("CoreShell.Store", StringComparer.OrdinalIgnoreCase))
+                {
+                    pins.Add("CoreShell.Store");
+                    values[Windows11PinsSetting] = string.Join("\n", pins);
+                }
+                values[StoreStartPinSeededKey] = true;
+            }
+            return pins;
         }
 
         private void UpdateWindows11Start()
@@ -411,6 +424,7 @@ namespace factoryos_10x_shell.Views
                     if (pinned) ids.Remove(app.AppId);
                     else if (!ids.Contains(app.AppId)) ids.Add(app.AppId);
                     ApplicationData.Current.LocalSettings.Values[Windows11PinsSetting] = string.Join("\n", ids);
+                    ApplicationData.Current.LocalSettings.Values[StoreStartPinSeededKey] = true;
                     UpdateWindows11Start();
                 };
                 menu.Items.Add(pin);

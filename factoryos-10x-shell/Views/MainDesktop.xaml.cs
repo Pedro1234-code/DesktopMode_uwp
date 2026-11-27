@@ -39,6 +39,7 @@ using factoryos_10x_shell.Library.Models.InternalData;
 using factoryos_10x_shell.Services.Win32;
 using factoryos_10x_shell.Services.Windowing;
 using factoryos_10x_shell.Services.Files;
+using StoreWindow = factoryos_10x_shell.Controls.StoreWindow;
 
 namespace factoryos_10x_shell.Views
 {
@@ -68,6 +69,7 @@ namespace factoryos_10x_shell.Views
         private factoryos_10x_shell.Controls.FilesWindow FilesWindow;
         private factoryos_10x_shell.Controls.NotepadWindow NotepadWindow;
         private factoryos_10x_shell.Controls.SettingsWindow SettingsWindow;
+        private StoreWindow m_storeWindow;
         private factoryos_10x_shell.Controls.CalculatorWindow CalculatorWindow;
         private factoryos_10x_shell.Controls.FirefoxWindow FirefoxWindow;
         private bool m_startMenuCreated;
@@ -89,6 +91,7 @@ namespace factoryos_10x_shell.Views
         private readonly BitmapImage m_notepadIcon = new BitmapImage(new Uri("ms-appx:///Assets/Notepad/notepad.png"));
         private readonly BitmapImage m_settingsIcon = new BitmapImage(new Uri("ms-appx:///Windows10x-js-main/Icons/WindowsSettings.png"));
         private readonly BitmapImage m_calculatorIcon = new BitmapImage(new Uri("ms-appx:///Assets/Calculator/CalculatorAppList.targetsize-48.png"));
+        private readonly BitmapImage m_storeIcon = new BitmapImage(new Uri("ms-appx:///Assets/Store/Store.png"));
         private readonly BitmapImage m_firefoxIcon = new BitmapImage(new Uri("ms-appx:///Assets/Firefox/firefox.png"));
         private readonly Dictionary<string, BitmapImage> m_taskViewWebAppIcons = new Dictionary<string, BitmapImage>(StringComparer.Ordinal);
         private BitmapImage m_taskViewPackageIcon;
@@ -96,6 +99,7 @@ namespace factoryos_10x_shell.Views
         private const string FilesWindowIdentity = "CoreShell.Files";
         private const string NotepadWindowIdentity = "CoreShell.Notepad";
         private const string SettingsWindowIdentity = "CoreShell.Settings";
+        private const string StoreWindowIdentity = "CoreShell.Store";
         private const string CalculatorWindowIdentity = "CoreShell.Calculator";
         private const string FirefoxWindowIdentity = "CoreShell.Firefox";
 
@@ -212,6 +216,13 @@ namespace factoryos_10x_shell.Views
             AppState.Instance.OnSettingsRequested += SettingsRequested;
             AppState.Instance.OnSettingsStateChanged += SettingsStateChanged;
             AppState.Instance.OnSettingsActivated += SettingsActivated;
+            AppState.Instance.OnStoreRequested += OpenStore;
+            AppState.Instance.OnStoreActivated += () => ActivateShellWindow(ShellWindowKind.Store, StoreWindowIdentity);
+            AppState.Instance.OnStoreStateChanged += () =>
+            {
+                SynchronizeShellWindows();
+                RestoreMostRecentWindow();
+            };
             AppState.Instance.OnCalculatorRequested += CalculatorRequested;
             AppState.Instance.OnCalculatorStateChanged += CalculatorStateChanged;
             AppState.Instance.OnCalculatorActivated += CalculatorActivated;
@@ -873,6 +884,7 @@ namespace factoryos_10x_shell.Views
 
                 if (id == "CoreShell.Files" && AppState.Instance.UseWindows11Skin)
                     return (ImageSource)Application.Current.Resources["Windows11FilesIcon"];
+                if (id == StoreWindowIdentity) return m_storeIcon;
 
                 var helper = App.ServiceProvider.GetRequiredService<AppHelper>();
                 var model = helper.StartIcons.FirstOrDefault(app => string.Equals(app.AppId, id, StringComparison.OrdinalIgnoreCase));
@@ -1044,6 +1056,43 @@ namespace factoryos_10x_shell.Views
         private void SettingsActivated()
         {
             ActivateShellWindow(ShellWindowKind.Settings, SettingsWindowIdentity);
+        }
+
+        private async void OpenStore()
+        {
+            string stage = "Creating the Store window";
+            try
+            {
+                if (m_storeWindow == null)
+                {
+                    var store = new StoreWindow { Visibility = Visibility.Collapsed };
+                    store.Hiding += () => ReleaseFocusFromWindow(store);
+                    Canvas.SetLeft(store, 100);
+                    Canvas.SetTop(store, 48);
+                    stage = "Attaching the Store window";
+                    StoreWindowHost.Children.Add(store);
+                    m_storeWindow = store;
+                }
+                stage = "Activating the Store window";
+                m_storeWindow.Open();
+            }
+            catch (Exception error)
+            {
+                ShellDiagnostics.RecordException(stage, error);
+                try
+                {
+                    await new ContentDialog
+                    {
+                        Title = "Microsoft Store could not open",
+                        Content = $"Error 0x{error.HResult:X8}",
+                        CloseButtonText = "OK"
+                    }.ShowAsync();
+                }
+                catch (Exception dialogError)
+                {
+                    ShellDiagnostics.RecordException("Showing the Store launch error", dialogError);
+                }
+            }
         }
 
         private void CalculatorRequested() => EnsureCalculatorWindow().Open();
@@ -1345,6 +1394,8 @@ namespace factoryos_10x_shell.Views
                     return AppState.Instance.IsNotepadOpen;
                 case ShellWindowKind.Settings:
                     return AppState.Instance.IsSettingsOpen;
+                case ShellWindowKind.Store:
+                    return AppState.Instance.IsStoreOpen;
                 case ShellWindowKind.Calculator:
                     return AppState.Instance.IsCalculatorOpen;
                 case ShellWindowKind.Firefox:
@@ -1374,6 +1425,8 @@ namespace factoryos_10x_shell.Views
                     return !AppState.Instance.IsNotepadMinimized;
                 case ShellWindowKind.Settings:
                     return !AppState.Instance.IsSettingsMinimized;
+                case ShellWindowKind.Store:
+                    return !AppState.Instance.IsStoreMinimized;
                 case ShellWindowKind.Calculator:
                     return !AppState.Instance.IsCalculatorMinimized;
                 case ShellWindowKind.Firefox:
@@ -1408,6 +1461,9 @@ namespace factoryos_10x_shell.Views
                 case ShellWindowKind.Settings:
                     AppState.Instance.RequestSettingsOpen();
                     break;
+                case ShellWindowKind.Store:
+                    AppState.Instance.RequestStoreOpen();
+                    break;
                 case ShellWindowKind.Calculator:
                     AppState.Instance.RequestCalculatorOpen();
                     break;
@@ -1435,7 +1491,7 @@ namespace factoryos_10x_shell.Views
             {
                 WindowHost, NativeWindowHost, FilesWindowHost, NotepadWindowHost,
                 SettingsWindowHost, CalculatorWindowHost, FirefoxWindowHost,
-                FileOperationWindowHost, AppInstallerWindowHost
+                FileOperationWindowHost, AppInstallerWindowHost, StoreWindowHost
             };
             var layers = new int[hosts.Length];
             int zIndex = 2;
@@ -1534,6 +1590,9 @@ namespace factoryos_10x_shell.Views
                 m_firefoxIcon,
                 AppState.Instance.IsFirefoxOpen,
                 AppState.Instance.IsFirefoxMinimized);
+
+            AddBuiltInWindowDescriptor(descriptors, ShellWindowKind.Store, StoreWindowIdentity, "Microsoft Store",
+                "Catalog preview", "\uE719", m_storeIcon, AppState.Instance.IsStoreOpen, AppState.Instance.IsStoreMinimized);
 
             foreach (FileOperationModel operation in m_fileOperations.Windows)
             {
@@ -1782,6 +1841,9 @@ namespace factoryos_10x_shell.Views
                 case ShellWindowKind.Settings:
                     AppState.Instance.RequestSettingsOpen();
                     break;
+                case ShellWindowKind.Store:
+                    AppState.Instance.RequestStoreOpen();
+                    break;
                 case ShellWindowKind.Calculator:
                     AppState.Instance.RequestCalculatorOpen();
                     break;
@@ -1817,6 +1879,9 @@ namespace factoryos_10x_shell.Views
                     break;
                 case ShellWindowKind.Settings:
                     SettingsWindow?.CloseFromTaskView();
+                    break;
+                case ShellWindowKind.Store:
+                    m_storeWindow?.Close();
                     break;
                 case ShellWindowKind.Calculator:
                     CalculatorWindow?.CloseFromTaskView();
@@ -1855,7 +1920,7 @@ namespace factoryos_10x_shell.Views
             // Separately rounded XAML surfaces otherwise expose the wallpaper.
             double pixel = 1.0 / (pixelsPerDip * desktopScale);
             m_taskbarWorkspaceInset = AppState.Instance.TaskbarAutoHide ? 0 : Math.Max(0, m_taskbarReservedHeight - pixel);
-            foreach (var host in new[] { AppInstallerWindowHost, FilesWindowHost, FileOperationWindowHost, NotepadWindowHost, SettingsWindowHost, CalculatorWindowHost, FirefoxWindowHost })
+            foreach (var host in new[] { AppInstallerWindowHost, FilesWindowHost, FileOperationWindowHost, NotepadWindowHost, SettingsWindowHost, CalculatorWindowHost, FirefoxWindowHost, StoreWindowHost })
                 host.Margin = new Thickness(0, 0, 0, m_taskbarWorkspaceInset);
             DesktopSurface.Margin = new Thickness(0, 0, 0, AppState.Instance.TaskbarAutoHide ? 0 : m_taskbarReservedHeight);
             TaskViewOverlay.Margin = new Thickness(0, 0, 0, m_taskbarWorkspaceInset);

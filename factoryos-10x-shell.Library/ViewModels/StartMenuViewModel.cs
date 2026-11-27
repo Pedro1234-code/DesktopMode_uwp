@@ -94,6 +94,19 @@ namespace factoryos_10x_shell.Library.ViewModels
             terminalIcon.IconGlyph = null;
             terminalIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Terminal/terminal.png"));
 
+            var storeIcon = m_appHelper.StartIcons.FirstOrDefault(app => app.AppId == "CoreShell.Store");
+            if (storeIcon == null)
+            {
+                storeIcon = new StartIconModel
+                {
+                    AppId = "CoreShell.Store",
+                    IconName = "Microsoft Store"
+                };
+                m_appHelper.StartIcons.Insert(m_appHelper.StartIcons.IndexOf(firefoxIcon) + 1, storeIcon);
+            }
+            storeIcon.IconGlyph = null;
+            storeIcon.IconSource = new BitmapImage(new Uri("ms-appx:///Assets/Store/Store.png"));
+
             AppsListGridHeight = 310;
             AppsListToggleContent = "Show all";
         }
